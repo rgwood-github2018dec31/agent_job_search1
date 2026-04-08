@@ -1,0 +1,22 @@
+[project]
+name = "agent-job-search1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "claude-agent-sdk>=0.1.56",
+    "pypdf>=5.0",
+]
+
+[dependency-groups]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "live_agent_claude: marks tests that require a live Claude API connection",
+]

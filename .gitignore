@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Resume (personal info)
+*-resume-*.pdf
+
+# Saved job postings (runtime data)
+saved_jobs-*/
+
+# Playwright browser profile
+.playwright-mcp/
+
+# Python version file (machine-specific)
+.python-version
+
+JOB_REQUIREMENTS.md
