@@ -47,7 +47,7 @@ async def test_save_job_posting_creates_file(tmp_path, monkeypatch):
     saved_dirs = list(tmp_path.glob("saved_jobs-*"))
     assert len(saved_dirs) == 1
 
-    files = list(saved_dirs[0].glob("job_posting-shopify-senior_software_engineer-rating_4-*.md"))
+    files = list(saved_dirs[0].glob("job_posting-noid-rating_4-shopify-senior_software_engineer-*.md"))
     assert len(files) == 1
     assert files[0].read_text() == "# Senior Software Engineer at Shopify\n\nGreat remote role."
 
@@ -64,7 +64,7 @@ async def test_save_job_posting_result_contains_path(tmp_path, monkeypatch):
 
     text = result["content"][0]["text"]
     assert "saved_jobs-" in text
-    assert "job_posting-acme-engineer-rating_2-" in text
+    assert "job_posting-noid-rating_2-acme-engineer-" in text
 
 
 async def test_save_job_posting_creates_daily_dir(tmp_path, monkeypatch):
@@ -175,10 +175,10 @@ async def test_save_job_posting_filename_contains_job_id_and_timestamp(tmp_path,
 
     await main.do_save_job_posting("Stripe", "Staff Engineer", 5, "content", job_id="9876543210")
 
-    files = list(tmp_path.glob("saved_jobs-*/job_posting-stripe-staff_engineer-rating_5-9876543210-*.md"))
+    files = list(tmp_path.glob("saved_jobs-*/job_posting-9876543210-rating_5-stripe-staff_engineer-*.md"))
     assert len(files) == 1
     # Timestamp suffix should be a numeric string
-    stem = files[0].stem  # e.g. job_posting-stripe-...-9876543210-1744123456
+    stem = files[0].stem  # e.g. job_posting-9876543210-rating_5-stripe-staff_engineer-1744123456
     timestamp_part = stem.split("-")[-1]
     assert timestamp_part.isdigit()
 

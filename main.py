@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pypdf
+from rich.console import Console
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -34,6 +35,8 @@ def load_env() -> None:
 
 load_env()
 
+console = Console()
+
 PROJECT_DIR = Path(__file__).parent
 JOB_REQUIREMENTS_PATH = PROJECT_DIR / "JOB_REQUIREMENTS.md"
 BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
@@ -47,14 +50,14 @@ def send_telegram(text: str) -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("Warning: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification.")
+        console.print("[yellow]Warning: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification.[/yellow]")
         return
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
     urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
 
 
-# Filename pattern: job_posting-{company}-{desc}-rating_{N}-{job_id}-{timestamp}.md
-_SAVED_JOB_RE = re.compile(r"^job_posting-.+-rating_\d+-(.+)-(\d+)\.md$")
+# Filename pattern: job_posting-{linkedin_id}[-rating_{N}]-{company}-{desc}-{timestamp}.md
+_SAVED_JOB_RE = re.compile(r"^job_posting-(\d+|noid)(?:-rating_\d+)?-.+-\d+\.md$")
 
 
 def load_reviewed_job_ids() -> set[str]:
@@ -80,7 +83,8 @@ async def do_save_job_posting(
 
     ts = int(time.time())
     id_part = job_id if job_id else "noid"
-    filename = f"job_posting-{underscorify(company)}-{underscorify(description)}-rating_{rating}-{id_part}-{ts}.md"
+    rating_part = f"-rating_{rating}" if rating is not None else ""
+    filename = f"job_posting-{id_part}{rating_part}-{underscorify(company)}-{underscorify(description)}-{ts}.md"
     (dir_path / filename).write_text(content, encoding="utf-8")
 
     return {"content": [{"type": "text", "text": f"Saved: saved_jobs-{date_str}/{filename}"}]}
@@ -181,7 +185,7 @@ def load_resume() -> str | None:
     if not matches:
         return None
     latest = max(matches, key=lambda p: p.stat().st_mtime)
-    print(f"Loaded resume: {latest.name}")
+    console.print(f"[dim]Loaded resume: {latest.name}[/dim]")
     if latest.suffix.lower() == ".pdf":
         reader = pypdf.PdfReader(latest)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -194,7 +198,7 @@ def build_system_prompt() -> str:
     if resume:
         parts.append(f"--- RESUME ---\n{resume}\n--- END RESUME ---")
     else:
-        print("Warning: no resume file found matching R_Garth_Wood-resume-*.*")
+        console.print("[yellow]Warning: no resume file found matching R_Garth_Wood-resume-*.*[/yellow]")
 
     if JOB_REQUIREMENTS_PATH.exists():
         requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
@@ -207,7 +211,7 @@ def build_system_prompt() -> str:
             f"--- ALREADY REVIEWED LINKEDIN JOB IDs (skip these) ---\n{ids_str}\n"
             f"--- END ALREADY REVIEWED ---"
         )
-        print(f"Loaded {len(reviewed_ids)} previously reviewed job ID(s).")
+        console.print(f"[dim]Loaded {len(reviewed_ids)} previously reviewed job ID(s).[/dim]")
 
     parts.append(AGENT_INSTRUCTIONS)
     return "\n\n".join(parts)
@@ -232,11 +236,11 @@ async def main() -> None:
         cwd=str(PROJECT_DIR),
     )
 
-    print("Job Search Agent")
-    print("=" * 40)
-    print("Note: On first run, you may need to log in to LinkedIn in the browser window.")
-    print("Type 'quit' to exit.\n")
-    print("Reading your resume and job requirements - please wait ...")
+    console.print("[bold cyan]Job Search Agent[/bold cyan]")
+    console.print("[cyan]" + "=" * 40 + "[/cyan]")
+    console.print("[dim]Note: On first run, you may need to log in to LinkedIn in the browser window.[/dim]")
+    console.print("[dim]Type 'quit' to exit.[/dim]\n")
+    console.print("[yellow]Reading your resume and job requirements - please wait ...[/yellow]")
 
     initial = "You have the resume and JOB_REQUIREMENTS.md in your context. Review them, then ask the user: 'Should I start the search on LinkedIn?'"
 
@@ -244,7 +248,7 @@ async def main() -> None:
         await client.query(initial)
 
         while True:
-            print("\nAgent: ", end="", flush=True)
+            console.print("\n[bold green]Agent:[/bold green] ", end="")
             async for msg in client.receive_response():
                 if isinstance(msg, AssistantMessage):
                     for block in msg.content:
@@ -252,8 +256,19 @@ async def main() -> None:
                             print(block.text, end="", flush=True)
                 elif isinstance(msg, ResultMessage):
                     print()
+                    parts = []
+                    if msg.usage:
+                        parts.append(f"in={msg.usage.get('input_tokens', 0)} out={msg.usage.get('output_tokens', 0)}")
+                        cache_read = msg.usage.get("cache_read_input_tokens", 0)
+                        cache_write = msg.usage.get("cache_creation_input_tokens", 0)
+                        if cache_read or cache_write:
+                            parts.append(f"cache_read={cache_read} cache_write={cache_write}")
+                    if msg.total_cost_usd is not None:
+                        parts.append(f"cost=${msg.total_cost_usd:.4f}")
+                    if parts:
+                        console.print(f"[dim]{' · '.join(parts)}[/dim]")
 
-            user_input = input("\nYou: ").strip()
+            user_input = input("\n\033[1;34mYou:\033[0m ").strip()
             if user_input.lower() in ("quit", "exit", "q"):
                 break
             if not user_input:
