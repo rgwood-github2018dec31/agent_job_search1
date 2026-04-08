@@ -8,7 +8,7 @@ This is a personal autonomous job search agent built on the Claude Agent SDK. It
 1. Reads the user's resume
 2. Periodically searches LinkedIn for relevant job postings
 3. Asks the user whether specific jobs are suitable, building up a preference profile over time
-4. Autonomously applies to jobs via email (with cover letter + resume), web forms, or LinkedIn
+4. [In a future version] Autonomously applies to jobs via email (with cover letter + resume), web forms, or LinkedIn
 
 ## Commands
 
@@ -22,6 +22,10 @@ uv run pytest                          # Run all tests (skips live tests if no A
 uv run pytest -m "not live_agent_claude"  # Unit tests only
 uv run pytest -m live_agent_claude     # Live agent tests (requires ANTHROPIC_API_KEY)
 ```
+
+## Testing
+
+Run `uv run --group test pytest` after most code changes to catch regressions. The test suite is fast and covers all core tool logic.
 
 ## Architecture
 
