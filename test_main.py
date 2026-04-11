@@ -144,43 +144,138 @@ async def test_notify_user_returns_error_on_failure(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# load_reviewed_job_ids
+# do_check_and_record_job
 # ---------------------------------------------------------------------------
 
-def test_load_reviewed_job_ids_empty(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
-    assert main.load_reviewed_job_ids() == set()
+from datetime import date, timedelta
 
 
-async def test_load_reviewed_job_ids_from_saved_files(tmp_path, monkeypatch):
+def _recent_date() -> str:
+    return (date.today() - timedelta(days=5)).isoformat()
+
+
+def _old_date() -> str:
+    return (date.today() - timedelta(days=30)).isoformat()
+
+
+async def test_check_and_record_job_new(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
+
+    result = await main.do_check_and_record_job("linkedin", "1234567890", _recent_date(), "Shopify", "Senior Engineer")
+
+    assert result["content"][0]["text"] == "new"
+    files = list((tmp_path / "processed_jobs").glob("job_posting-linkedin-1234567890-*.yaml"))
+    assert len(files) == 1
+
+
+async def test_check_and_record_job_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
+
+    await main.do_check_and_record_job("linkedin", "1234567890", _recent_date(), "Shopify", "Senior Engineer")
+    result = await main.do_check_and_record_job("linkedin", "1234567890", _recent_date(), "Shopify", "Senior Engineer")
+
+    assert result["content"][0]["text"] == "already_processed"
+
+
+async def test_check_and_record_job_too_old(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
+
+    result = await main.do_check_and_record_job("linkedin", "9999999999", _old_date(), "OldCo", "Stale Role")
+
+    assert result["content"][0]["text"] == "too_old"
+    assert not list((tmp_path / "processed_jobs").glob("*.yaml"))
+
+
+async def test_check_and_record_job_different_sites(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
+
+    r1 = await main.do_check_and_record_job("linkedin", "111", _recent_date(), "Corp", "Engineer")
+    r2 = await main.do_check_and_record_job("indeed", "111", _recent_date(), "Corp", "Engineer")
+
+    assert r1["content"][0]["text"] == "new"
+    assert r2["content"][0]["text"] == "new"
+
+
+async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
+
+    posted = _recent_date()
+    await main.do_check_and_record_job("linkedin", "5555555555", posted, "Stripe", "Staff Engineer")
+
+    files = list((tmp_path / "processed_jobs").glob("*.yaml"))
+    data = yaml.safe_load(files[0].read_text())
+    assert data["site"] == "linkedin"
+    assert data["job_id"] == "5555555555"
+    assert data["date_posted"] == posted
+    assert data["date_recorded"] == date.today().isoformat()
+    assert data["company"] == "Stripe"
+    assert data["description"] == "Staff Engineer"
+
+
+# ---------------------------------------------------------------------------
+# load_processed_jobs
+# ---------------------------------------------------------------------------
+
+async def test_load_processed_jobs_from_md_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
 
     await main.do_save_job_posting("Shopify", "Engineer", 4, "content", job_id="3859234876")
     await main.do_save_job_posting("Acme", "Designer", 2, "content", job_id="1122334455")
 
-    ids = main.load_reviewed_job_ids()
-    assert ids == {"3859234876", "1122334455"}
+    main.load_processed_jobs()
+    assert ("linkedin", "3859234876") in main._processed_jobs
+    assert ("linkedin", "1122334455") in main._processed_jobs
 
 
-async def test_load_reviewed_job_ids_excludes_noid(tmp_path, monkeypatch):
+async def test_load_processed_jobs_from_yaml_files(tmp_path, monkeypatch):
+    import yaml
+
     monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
 
-    await main.do_save_job_posting("Corp", "Role", 3, "content", job_id=None)
+    (tmp_path / "processed_jobs").mkdir()
+    (tmp_path / "processed_jobs" / "job_posting-indeed-42-2026Apr10-000-co-role.yaml").write_text(
+        yaml.dump({"site": "indeed", "job_id": "42", "date_posted": "2026-04-05",
+                   "date_recorded": "2026-04-10", "company": "co", "description": "role"})
+    )
 
-    assert main.load_reviewed_job_ids() == set()
+    main.load_processed_jobs()
+    assert ("indeed", "42") in main._processed_jobs
 
 
-async def test_save_job_posting_filename_contains_job_id_and_timestamp(tmp_path, monkeypatch):
+async def test_load_processed_jobs_combines_both(tmp_path, monkeypatch):
+    import yaml
+
     monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(main, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(main, "_processed_jobs", set())
 
-    await main.do_save_job_posting("Stripe", "Staff Engineer", 5, "content", job_id="9876543210")
+    await main.do_save_job_posting("Corp", "Role", 3, "content", job_id="111")
 
-    files = list(tmp_path.glob("saved_jobs-*/job_posting-9876543210-rating_5-stripe-staff_engineer-*.md"))
-    assert len(files) == 1
-    # Timestamp suffix should be a numeric string
-    stem = files[0].stem  # e.g. job_posting-9876543210-rating_5-stripe-staff_engineer-1744123456
-    timestamp_part = stem.split("-")[-1]
-    assert timestamp_part.isdigit()
+    (tmp_path / "processed_jobs").mkdir()
+    (tmp_path / "processed_jobs" / "job_posting-indeed-999-2026Apr10-000-co-role.yaml").write_text(
+        yaml.dump({"site": "indeed", "job_id": "999", "date_posted": "2026-04-05",
+                   "date_recorded": "2026-04-10", "company": "co", "description": "role"})
+    )
+
+    main.load_processed_jobs()
+    assert ("linkedin", "111") in main._processed_jobs
+    assert ("indeed", "999") in main._processed_jobs
 
 
 # ---------------------------------------------------------------------------

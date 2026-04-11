@@ -5,11 +5,12 @@ import re
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import pypdf
+import yaml
 from rich.console import Console
 
 from claude_agent_sdk import (
@@ -40,7 +41,10 @@ console = Console()
 
 PROJECT_DIR = Path(__file__).parent
 JOB_REQUIREMENTS_PATH = PROJECT_DIR / "JOB_REQUIREMENTS.md"
+PROCESSED_JOBS_DIR = PROJECT_DIR / "processed_jobs"
 BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
+
+_processed_jobs: set[tuple[str, str]] = set()
 
 
 def underscorify(s: str) -> str:
@@ -57,20 +61,34 @@ def send_telegram(text: str) -> None:
     urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
 
 
-# Filename pattern: job_posting-{linkedin_id}[-rating_{N}]-{company}-{desc}-{timestamp}.md
-_SAVED_JOB_RE = re.compile(r"^job_posting-(\d+|noid)(?:-rating_\d+)?-.+-\d+\.md$")
+# Old MD filename pattern: job_posting-{linkedin_id}[-rating_{N}]-{company}-{desc}-{timestamp}.md
+_SAVED_JOB_MD_RE = re.compile(r"^job_posting-(\d+|noid)(?:-rating_\d+)?-.+-\d+\.md$")
 
 
-def load_reviewed_job_ids() -> set[str]:
-    """Return LinkedIn job IDs that have already been reviewed (from saved filenames)."""
-    ids: set[str] = set()
+def load_processed_jobs() -> None:
+    """Populate _processed_jobs from both old MD filenames and new per-job YAML files."""
+    global _processed_jobs
+    ids: set[tuple[str, str]] = set()
+
+    # Old format: extract (linkedin, job_id) from saved MD filenames
     for f in PROJECT_DIR.glob("saved_jobs-*/job_posting-*.md"):
-        m = _SAVED_JOB_RE.match(f.name)
+        m = _SAVED_JOB_MD_RE.match(f.name)
         if m:
             job_id = m.group(1)
             if job_id != "noid":
-                ids.add(job_id)
-    return ids
+                ids.add(("linkedin", job_id))
+
+    # New format: load (site, job_id) from per-job YAML files
+    for f in PROCESSED_JOBS_DIR.glob("*.yaml"):
+        try:
+            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+            if data and "site" in data and "job_id" in data:
+                ids.add((data["site"], str(data["job_id"])))
+        except Exception:
+            pass
+
+    _processed_jobs = ids
+    console.print(f"[dim]Loaded {len(_processed_jobs)} previously processed job(s).[/dim]")
 
 
 # --- Tool implementations (plain async functions, directly testable) ---
@@ -108,6 +126,42 @@ async def do_update_job_requirements(content: str) -> dict:
     }
 
 
+async def do_check_and_record_job(
+    site: str, job_id: str, date_posted: str, company: str, description: str,
+    url: str | None = None, content: str | None = None
+) -> dict:
+    key = (site, job_id)
+    if key in _processed_jobs:
+        return {"content": [{"type": "text", "text": "already_processed"}]}
+
+    try:
+        posted = date.fromisoformat(date_posted)
+        if (date.today() - posted).days > 21:
+            return {"content": [{"type": "text", "text": "too_old"}]}
+    except ValueError:
+        pass  # unparseable date: proceed anyway
+
+    PROCESSED_JOBS_DIR.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime("%Y%b%d")
+    ts = int(time.time())
+    filename = f"job_posting-{site}-{job_id}-{date_str}-{ts}-{underscorify(company)}-{underscorify(description)}.yaml"
+    data = {
+        "site": site,
+        "job_id": job_id,
+        "date_posted": date_posted,
+        "date_recorded": date.today().isoformat(),
+        "company": company,
+        "description": description,
+    }
+    if url:
+        data["url"] = url
+    if content:
+        data["content"] = content
+    (PROCESSED_JOBS_DIR / filename).write_text(yaml.dump(data, default_flow_style=False), encoding="utf-8")
+    _processed_jobs.add(key)
+    return {"content": [{"type": "text", "text": "new"}]}
+
+
 # --- Tool wrappers (SDK @tool decorators delegate to the implementations above) ---
 
 @tool(
@@ -142,8 +196,23 @@ async def update_job_requirements(args: dict[str, Any]) -> dict:
     return await do_update_job_requirements(args["content"])
 
 
+@tool(
+    "check_and_record_job",
+    "Before evaluating any job, call this with the site name, job ID, posting date (YYYY-MM-DD), "
+    "company name, and job title/description. Returns 'already_processed' (skip it), "
+    "'too_old' (skip it), or 'new' (proceed to evaluate). "
+    "Optionally pass url (the job posting URL) and content (full text of the posting) to persist them in the record.",
+    {"site": str, "job_id": str, "date_posted": str, "company": str, "description": str, "url": str, "content": str},
+)
+async def check_and_record_job(args: dict[str, Any]) -> dict:
+    return await do_check_and_record_job(
+        args["site"], args["job_id"], args["date_posted"], args["company"], args["description"],
+        url=args.get("url"), content=args.get("content"),
+    )
+
+
 def make_job_search_server(interactive: bool):
-    tools = [save_job_posting, notify_user]
+    tools = [check_and_record_job, save_job_posting, notify_user]
     if interactive:
         tools.append(update_job_requirements)
     return create_sdk_mcp_server(
@@ -162,8 +231,7 @@ Do not write files directly to disk. Use the save_job_posting tool to persist jo
 When browsing LinkedIn:
 - Navigate to https://www.linkedin.com/jobs/ to search for jobs
 - Extract: job title, company, location, salary (if shown), and key requirements
-- **Skip any job posted more than 3 weeks ago** — check the posting date shown on each listing and discard old ones without saving them
-- **Skip any job whose LinkedIn ID appears in the ALREADY REVIEWED list** in your context
+- **Before evaluating any job, call `check_and_record_job` with the site, job ID, posting date (YYYY-MM-DD), company, and job title. If it returns `already_processed` or `too_old`, skip the job entirely. Only proceed with jobs that return `new`.**
 
 The user's LinkedIn session is persisted so they should already be logged in. If not, ask them to log in via the browser.
 
@@ -235,13 +303,7 @@ def build_system_prompt(interactive: bool) -> str:
     parts.append(instructions)
 
     # Dynamic content last so the static prefix above can be cached.
-    parts.append(f"Today's date: {datetime.now().strftime('%Y-%m-%d')}. Skip any job posted more than 3 weeks before this date.")
-
-    reviewed_ids = load_reviewed_job_ids()
-    if reviewed_ids:
-        ids_str = ", ".join(sorted(reviewed_ids))
-        parts.append(f"ALREADY REVIEWED LINKEDIN JOB IDs (skip these): {ids_str}")
-        console.print(f"[dim]Loaded {len(reviewed_ids)} previously reviewed job ID(s).[/dim]")
+    parts.append(f"Today's date: {datetime.now().strftime('%Y-%m-%d')}.")
 
     return "\n\n".join(parts)
 
@@ -361,6 +423,7 @@ async def main() -> None:
     args = parser.parse_args()
     interactive = not args.non_interactive
 
+    load_processed_jobs()
     system_prompt = build_system_prompt(interactive)
 
     options = ClaudeAgentOptions(
