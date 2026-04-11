@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
     create_sdk_mcp_server,
     tool,
 )
@@ -310,6 +311,12 @@ def build_system_prompt(interactive: bool) -> str:
 
 # --- Main ---
 
+def print_thinking(text: str) -> None:
+    MAX_CHARS = 1000
+    display = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + f"\n… ({len(text) - MAX_CHARS} more chars)"
+    console.print(f"\n[dim italic]Thinking: {display}[/dim italic]\n")
+
+
 def print_result_stats(msg: ResultMessage) -> None:
     parts = []
     if msg.usage:
@@ -339,7 +346,9 @@ async def run_interactive(client: ClaudeSDKClient) -> None:
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
-                    if isinstance(block, TextBlock):
+                    if isinstance(block, ThinkingBlock):
+                        print_thinking(block.thinking)
+                    elif isinstance(block, TextBlock):
                         print(block.text, end="", flush=True)
             elif isinstance(msg, ResultMessage):
                 print()
@@ -388,7 +397,9 @@ async def run_non_interactive(client: ClaudeSDKClient) -> None:
     async for msg in client.receive_response():
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
-                if isinstance(block, TextBlock):
+                if isinstance(block, ThinkingBlock):
+                    print_thinking(block.thinking)
+                elif isinstance(block, TextBlock):
                     print(block.text, end="", flush=True)
         elif isinstance(msg, ResultMessage):
             print()
@@ -438,7 +449,6 @@ async def main() -> None:
         },
         permission_mode="acceptEdits",
         cwd=str(PROJECT_DIR),
-        task_budget={"tokens": 200_000} if not interactive else None,
     )
 
     async with ClaudeSDKClient(options) as client:
