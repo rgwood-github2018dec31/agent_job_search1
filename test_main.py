@@ -193,7 +193,7 @@ def test_build_system_prompt_includes_resume(tmp_path, monkeypatch):
 
     (tmp_path / "R_Garth_Wood-resume-2026Apr08v1.md").write_text("# Garth Wood\n\nExperienced engineer.")
 
-    prompt = main.build_system_prompt()
+    prompt = main.build_system_prompt(interactive=True)
     assert "Garth Wood" in prompt
     assert "RESUME" in prompt
 
@@ -205,7 +205,7 @@ def test_build_system_prompt_includes_job_requirements(tmp_path, monkeypatch):
 
     req_path.write_text("# Requirements\n\n- Remote only")
 
-    prompt = main.build_system_prompt()
+    prompt = main.build_system_prompt(interactive=True)
     assert "Remote only" in prompt
     assert "JOB_REQUIREMENTS.md" in prompt
 
@@ -214,7 +214,7 @@ def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
     monkeypatch.setattr(main, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
 
-    main.build_system_prompt()
+    main.build_system_prompt(interactive=True)
 
     assert "Warning" in capsys.readouterr().out
 
