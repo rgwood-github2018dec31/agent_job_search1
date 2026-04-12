@@ -15,6 +15,8 @@ import pypdf
 import yaml
 from rich.console import Console
 
+from config import MODEL_NAME_HIGH, MODEL_NAME_LOW, MODEL_NAME_MEDIUM
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -426,7 +428,7 @@ async def generate_search_queries() -> list[str]:
         'Reply with ONLY a JSON array of strings, e.g. ["Principal AI Engineer", "Staff ML Engineer"].'
     )
     options = ClaudeAgentOptions(
-        model="claude-sonnet-4-6",
+        model=MODEL_NAME_MEDIUM,
         permission_mode="acceptEdits",
         cwd=str(PROJECT_DIR),
     )
@@ -614,8 +616,7 @@ async def run_non_interactive() -> None:
         },
         permission_mode="bypassPermissions",
         cwd=str(PROJECT_DIR),
-        # model="claude-haiku-4-5-20251001",
-        model="claude-haiku-4-5",
+        model=MODEL_NAME_LOW,
         # thinking={"type": "disabled"},
     )
     async with ClaudeSDKClient(scraper_options) as scraper:
