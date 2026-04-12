@@ -277,7 +277,11 @@ def load_resume() -> str | None:
     matches = list(PROJECT_DIR.glob("R_Garth_Wood-resume-*.*"))
     if not matches:
         return None
-    latest = max(matches, key=lambda p: p.stat().st_mtime)
+    md_matches = [p for p in matches if p.suffix.lower() == ".md"]
+    if md_matches:
+        latest = max(md_matches, key=lambda p: p.stat().st_mtime)
+    else:
+        latest = max(matches, key=lambda p: p.stat().st_mtime)
     console.print(f"[dim]Loaded resume: {latest.name}[/dim]")
     if latest.suffix.lower() == ".pdf":
         reader = pypdf.PdfReader(latest)
