@@ -454,6 +454,7 @@ async def main() -> None:
         },
         permission_mode="acceptEdits",
         cwd=str(PROJECT_DIR),
+        effort="low" if not interactive else None,
     )
 
     async with ClaudeSDKClient(options) as client:
