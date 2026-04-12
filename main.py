@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 import re
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -433,6 +434,10 @@ async def main() -> None:
     )
     args = parser.parse_args()
     interactive = not args.non_interactive
+
+    if not interactive and not JOB_REQUIREMENTS_PATH.exists():
+        console.print("[red]Error: JOB_REQUIREMENTS.md not found. Non-interactive mode requires it.[/red]")
+        sys.exit(1)
 
     load_processed_jobs()
     system_prompt = build_system_prompt(interactive)
