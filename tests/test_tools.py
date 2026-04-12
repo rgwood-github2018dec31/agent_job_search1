@@ -2,8 +2,7 @@
 
 import pytest
 
-import main
-import tools_generic
+from agentic_job_search import agent, tools
 
 
 # ---------------------------------------------------------------------------
@@ -11,23 +10,23 @@ import tools_generic
 # ---------------------------------------------------------------------------
 
 def test_underscorify_basic():
-    assert tools_generic.underscorify("Hello World") == "hello_world"
+    assert tools.underscorify("Hello World") == "hello_world"
 
 
 def test_underscorify_special_chars():
-    assert tools_generic.underscorify("Shopify Inc.") == "shopify_inc"
+    assert tools.underscorify("Shopify Inc.") == "shopify_inc"
 
 
 def test_underscorify_consecutive_separators():
-    assert tools_generic.underscorify("Senior  Software---Engineer") == "senior_software_engineer"
+    assert tools.underscorify("Senior  Software---Engineer") == "senior_software_engineer"
 
 
 def test_underscorify_leading_trailing():
-    assert tools_generic.underscorify("  leading and trailing  ") == "leading_and_trailing"
+    assert tools.underscorify("  leading and trailing  ") == "leading_and_trailing"
 
 
 def test_underscorify_numbers():
-    assert tools_generic.underscorify("GPT-4 Engineer") == "gpt_4_engineer"
+    assert tools.underscorify("GPT-4 Engineer") == "gpt_4_engineer"
 
 
 # ---------------------------------------------------------------------------
@@ -35,9 +34,9 @@ def test_underscorify_numbers():
 # ---------------------------------------------------------------------------
 
 async def test_save_job_posting_creates_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
 
-    result = await tools_generic.do_save_job_posting(
+    result = await tools.do_save_job_posting(
         company="Shopify",
         description="Senior Software Engineer",
         rating=4,
@@ -54,9 +53,9 @@ async def test_save_job_posting_creates_file(tmp_path, monkeypatch):
 
 
 async def test_save_job_posting_result_contains_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
 
-    result = await tools_generic.do_save_job_posting(
+    result = await tools.do_save_job_posting(
         company="Acme",
         description="Engineer",
         rating=2,
@@ -69,10 +68,10 @@ async def test_save_job_posting_result_contains_path(tmp_path, monkeypatch):
 
 
 async def test_save_job_posting_creates_daily_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
 
     for rating in (3, 5):
-        await tools_generic.do_save_job_posting(
+        await tools.do_save_job_posting(
             company="Corp",
             description="Role",
             rating=rating,
@@ -89,20 +88,20 @@ async def test_save_job_posting_creates_daily_dir(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_update_job_requirements_writes_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(tools, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
 
     content = "# Requirements\n\n- Remote only\n- Canada or EU\n"
-    result = await tools_generic.do_update_job_requirements(content)
+    result = await tools.do_update_job_requirements(content)
 
     assert not result.get("isError")
     assert (tmp_path / "JOB_REQUIREMENTS.md").read_text() == content
 
 
 async def test_update_job_requirements_returns_content(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(tools, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
 
     content = "# Requirements\n\n- Senior only\n"
-    result = await tools_generic.do_update_job_requirements(content)
+    result = await tools.do_update_job_requirements(content)
 
     # New contents must be in the tool result so the agent has them in context
     assert content in result["content"][0]["text"]
@@ -110,10 +109,10 @@ async def test_update_job_requirements_returns_content(tmp_path, monkeypatch):
 
 async def test_update_job_requirements_overwrites(tmp_path, monkeypatch):
     path = tmp_path / "JOB_REQUIREMENTS.md"
-    monkeypatch.setattr(tools_generic, "JOB_REQUIREMENTS_PATH", path)
+    monkeypatch.setattr(tools, "JOB_REQUIREMENTS_PATH", path)
 
-    await tools_generic.do_update_job_requirements("first version")
-    await tools_generic.do_update_job_requirements("second version")
+    await tools.do_update_job_requirements("first version")
+    await tools.do_update_job_requirements("second version")
 
     assert path.read_text() == "second version"
 
@@ -124,9 +123,9 @@ async def test_update_job_requirements_overwrites(tmp_path, monkeypatch):
 
 async def test_notify_user_calls_send_telegram(monkeypatch):
     sent = []
-    monkeypatch.setattr(tools_generic, "send_telegram", lambda msg: sent.append(msg))
+    monkeypatch.setattr(tools, "send_telegram", lambda msg: sent.append(msg))
 
-    result = await tools_generic.do_notify_user("Found a match: Senior Engineer @ Shopify")
+    result = await tools.do_notify_user("Found a match: Senior Engineer @ Shopify")
 
     assert not result.get("isError")
     assert sent == ["Found a match: Senior Engineer @ Shopify"]
@@ -136,9 +135,9 @@ async def test_notify_user_returns_error_on_failure(monkeypatch):
     def boom(msg):
         raise RuntimeError("network error")
 
-    monkeypatch.setattr(tools_generic, "send_telegram", boom)
+    monkeypatch.setattr(tools, "send_telegram", boom)
 
-    result = await tools_generic.do_notify_user("hello")
+    result = await tools.do_notify_user("hello")
 
     assert result.get("isError")
     assert "network error" in result["content"][0]["text"]
@@ -160,11 +159,11 @@ def _old_date() -> str:
 
 
 async def test_check_and_record_job_new(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
-    result = await tools_generic.do_check_and_record_job(
+    result = await tools.do_check_and_record_job(
         "linkedin", "1234567890", "Shopify", "Senior Engineer", date_posted=_recent_date()
     )
 
@@ -174,14 +173,14 @@ async def test_check_and_record_job_new(tmp_path, monkeypatch):
 
 
 async def test_check_and_record_job_duplicate(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
-    await tools_generic.do_check_and_record_job(
+    await tools.do_check_and_record_job(
         "linkedin", "1234567890", "Shopify", "Senior Engineer", date_posted=_recent_date()
     )
-    result = await tools_generic.do_check_and_record_job(
+    result = await tools.do_check_and_record_job(
         "linkedin", "1234567890", "Shopify", "Senior Engineer", date_posted=_recent_date()
     )
 
@@ -189,11 +188,11 @@ async def test_check_and_record_job_duplicate(tmp_path, monkeypatch):
 
 
 async def test_check_and_record_job_too_old(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
-    result = await tools_generic.do_check_and_record_job(
+    result = await tools.do_check_and_record_job(
         "linkedin", "9999999999", "OldCo", "Stale Role", date_posted=_old_date()
     )
 
@@ -202,14 +201,14 @@ async def test_check_and_record_job_too_old(tmp_path, monkeypatch):
 
 
 async def test_check_and_record_job_different_sites(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
-    r1 = await tools_generic.do_check_and_record_job(
+    r1 = await tools.do_check_and_record_job(
         "linkedin", "111", "Corp", "Engineer", date_posted=_recent_date()
     )
-    r2 = await tools_generic.do_check_and_record_job(
+    r2 = await tools.do_check_and_record_job(
         "indeed", "111", "Corp", "Engineer", date_posted=_recent_date()
     )
 
@@ -220,12 +219,12 @@ async def test_check_and_record_job_different_sites(tmp_path, monkeypatch):
 async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
     import yaml
 
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
     posted = _recent_date()
-    await tools_generic.do_check_and_record_job(
+    await tools.do_check_and_record_job(
         "linkedin", "5555555555", "Stripe", "Staff Engineer", date_posted=posted
     )
 
@@ -244,24 +243,24 @@ async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_load_processed_jobs_from_md_files(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
-    await tools_generic.do_save_job_posting("Shopify", "Engineer", 4, "content", job_id="3859234876")
-    await tools_generic.do_save_job_posting("Acme", "Designer", 2, "content", job_id="1122334455")
+    await tools.do_save_job_posting("Shopify", "Engineer", 4, "content", job_id="3859234876")
+    await tools.do_save_job_posting("Acme", "Designer", 2, "content", job_id="1122334455")
 
-    tools_generic.load_processed_jobs()
-    assert ("linkedin", "3859234876") in tools_generic._processed_jobs
-    assert ("linkedin", "1122334455") in tools_generic._processed_jobs
+    tools.load_processed_jobs()
+    assert ("linkedin", "3859234876") in tools._processed_jobs
+    assert ("linkedin", "1122334455") in tools._processed_jobs
 
 
 async def test_load_processed_jobs_from_yaml_files(tmp_path, monkeypatch):
     import yaml
 
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
     (tmp_path / "processed_jobs").mkdir()
     (tmp_path / "processed_jobs" / "job_posting-indeed-42-2026Apr10-000-co-role.yaml").write_text(
@@ -269,18 +268,18 @@ async def test_load_processed_jobs_from_yaml_files(tmp_path, monkeypatch):
                    "date_recorded": "2026-04-10", "company": "co", "description": "role"})
     )
 
-    tools_generic.load_processed_jobs()
-    assert ("indeed", "42") in tools_generic._processed_jobs
+    tools.load_processed_jobs()
+    assert ("indeed", "42") in tools._processed_jobs
 
 
 async def test_load_processed_jobs_combines_both(tmp_path, monkeypatch):
     import yaml
 
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(tools_generic, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools_generic, "_processed_jobs", set())
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
+    monkeypatch.setattr(tools, "_processed_jobs", set())
 
-    await tools_generic.do_save_job_posting("Corp", "Role", 3, "content", job_id="111")
+    await tools.do_save_job_posting("Corp", "Role", 3, "content", job_id="111")
 
     (tmp_path / "processed_jobs").mkdir()
     (tmp_path / "processed_jobs" / "job_posting-indeed-999-2026Apr10-000-co-role.yaml").write_text(
@@ -288,9 +287,9 @@ async def test_load_processed_jobs_combines_both(tmp_path, monkeypatch):
                    "date_recorded": "2026-04-10", "company": "co", "description": "role"})
     )
 
-    tools_generic.load_processed_jobs()
-    assert ("linkedin", "111") in tools_generic._processed_jobs
-    assert ("indeed", "999") in tools_generic._processed_jobs
+    tools.load_processed_jobs()
+    assert ("linkedin", "111") in tools._processed_jobs
+    assert ("indeed", "999") in tools._processed_jobs
 
 
 # ---------------------------------------------------------------------------
@@ -298,33 +297,33 @@ async def test_load_processed_jobs_combines_both(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_build_system_prompt_includes_resume(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(main, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(agent, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
 
     (tmp_path / "R_Garth_Wood-resume-2026Apr08v1.md").write_text("# Garth Wood\n\nExperienced engineer.")
 
-    prompt = main.build_system_prompt(interactive=True)
+    prompt = agent.build_system_prompt(interactive=True)
     assert "Garth Wood" in prompt
     assert "RESUME" in prompt
 
 
 def test_build_system_prompt_includes_job_requirements(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
     req_path = tmp_path / "JOB_REQUIREMENTS.md"
-    monkeypatch.setattr(main, "JOB_REQUIREMENTS_PATH", req_path)
+    monkeypatch.setattr(agent, "JOB_REQUIREMENTS_PATH", req_path)
 
     req_path.write_text("# Requirements\n\n- Remote only")
 
-    prompt = main.build_system_prompt(interactive=True)
+    prompt = agent.build_system_prompt(interactive=True)
     assert "Remote only" in prompt
     assert "JOB_REQUIREMENTS.md" in prompt
 
 
 def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(main, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(main, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(agent, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
 
-    main.build_system_prompt(interactive=True)
+    agent.build_system_prompt(interactive=True)
 
     assert "Warning" in capsys.readouterr().out
 
@@ -336,8 +335,8 @@ def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys)
 @pytest.mark.skip(reason="live test — run manually to verify Telegram integration")
 async def test_send_telegram_live():
     """Sends a real Telegram message. Run once to verify credentials work."""
-    main.load_env()
-    tools_generic.send_telegram("test message from agent_job_search1 test suite")
+    agent.load_env()
+    tools.send_telegram("test message from agentic_job_search test suite")
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +346,7 @@ async def test_send_telegram_live():
 @pytest.mark.live_agent_claude
 async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
     """Agent uses the save_job_posting tool when instructed to save a job."""
-    monkeypatch.setattr(tools_generic, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
@@ -356,7 +355,7 @@ async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
             "You are a job search assistant. "
             "When asked to save a job, use the save_job_posting tool exactly once."
         ),
-        mcp_servers={"job_search": tools_generic.make_job_search_server(interactive=False)},
+        mcp_servers={"job_search": tools.make_job_search_server(interactive=False)},
         permission_mode="acceptEdits",
     )
 

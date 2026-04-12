@@ -9,15 +9,12 @@ from pathlib import Path
 
 import pypdf
 
-# Model tier constants
-MODEL_NAME_HIGH = "claude-opus-4-6"
-MODEL_NAME_MEDIUM = "claude-sonnet-4-6"
-MODEL_NAME_LOW = "claude-haiku-4-5"
-
-import tools_generic
-from tools_generic import (
+from agentic_job_search.config import MODEL_NAME_LOW, MODEL_NAME_MEDIUM
+import agentic_job_search.tools_generic as tools_module
+from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
     PROJECT_DIR,
+    RUN_DIR,
     console,
     load_processed_jobs,
     make_evaluator_server,
@@ -37,7 +34,7 @@ from claude_agent_sdk import (
 
 
 def load_env() -> None:
-    env_path = Path(__file__).parent / ".env"
+    env_path = PROJECT_DIR / ".env"
     if not env_path.exists():
         return
     for line in env_path.read_text().splitlines():
@@ -50,14 +47,6 @@ def load_env() -> None:
 load_env()
 
 BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
-
-_total_stats: dict = {
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "cache_read_input_tokens": 0,
-    "cache_creation_input_tokens": 0,
-    "total_cost_usd": 0.0,
-}
 
 
 # --- Prompt construction ---
@@ -134,7 +123,7 @@ Evaluate only this one job, then stop. Do not browse other pages.
 
 
 def load_resume() -> str | None:
-    matches = list(PROJECT_DIR.glob("*-resume-*.md")) + list(PROJECT_DIR.glob("*-resume-*.pdf"))
+    matches = list(RUN_DIR.glob("*-resume-*.md")) + list(RUN_DIR.glob("*-resume-*.pdf"))
     if not matches:
         return None
     md_matches = [p for p in matches if p.suffix.lower() == ".md"]
@@ -210,8 +199,6 @@ async def generate_search_queries() -> list[str]:
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         text_parts.append(block.text)
-            elif isinstance(msg, ResultMessage):
-                accumulate_stats(msg)
     raw = "".join(text_parts)
     console.print(f"[dim]Query generation response: {raw[:200]}[/dim]")
     # Extract JSON array even if wrapped in a markdown code fence
@@ -232,7 +219,7 @@ def build_evaluator_prompt() -> str:
     return "\n\n".join(parts)
 
 
-# --- Main ---
+# --- Runner ---
 
 def print_thinking(text: str) -> None:
     MAX_CHARS = 1000
@@ -240,27 +227,7 @@ def print_thinking(text: str) -> None:
     console.print(f"\n[dim italic]Thinking: {display}[/dim italic]\n")
 
 
-def accumulate_stats(msg: ResultMessage) -> None:
-    if msg.usage:
-        _total_stats["input_tokens"] += msg.usage.get("input_tokens", 0)
-        _total_stats["output_tokens"] += msg.usage.get("output_tokens", 0)
-        _total_stats["cache_read_input_tokens"] += msg.usage.get("cache_read_input_tokens", 0)
-        _total_stats["cache_creation_input_tokens"] += msg.usage.get("cache_creation_input_tokens", 0)
-    if msg.total_cost_usd is not None:
-        _total_stats["total_cost_usd"] += msg.total_cost_usd
-
-
-def format_total_stats() -> str:
-    s = _total_stats
-    parts = [f"in={s['input_tokens']} out={s['output_tokens']}"]
-    if s["cache_read_input_tokens"] or s["cache_creation_input_tokens"]:
-        parts.append(f"cache_read={s['cache_read_input_tokens']} cache_write={s['cache_creation_input_tokens']}")
-    parts.append(f"total_cost=${s['total_cost_usd']:.4f}")
-    return " · ".join(parts)
-
-
 def print_result_stats(msg: ResultMessage) -> None:
-    accumulate_stats(msg)
     parts = []
     if msg.usage:
         parts.append(f"in={msg.usage.get('input_tokens', 0)} out={msg.usage.get('output_tokens', 0)}")
@@ -305,15 +272,13 @@ async def run_interactive(client: ClaudeSDKClient) -> None:
 
         await client.query(user_input)
 
-    console.print(f"\n[dim]Session totals: {format_total_stats()}[/dim]")
-
 
 _RATING_RE = re.compile(r"-rating_(\d+)-")
 
 
 def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
     """Return (num_evaluated, num_high_rated) for job files created since snapshot."""
-    jobs_after = set(PROJECT_DIR.glob("saved_jobs-*/job_posting-*.md"))
+    jobs_after = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
     new_jobs = jobs_after - jobs_before
     num_evaluated = len(new_jobs)
     num_high_rated = sum(
@@ -381,13 +346,13 @@ async def evaluate_candidate(candidate: dict, playwright_mcp: dict, evaluator_pr
 
 
 async def run_non_interactive() -> None:
-    tools_generic._candidates = []
+    tools_module._candidates = []
 
     console.print("[bold cyan]Job Search Agent — Non-interactive Mode[/bold cyan]")
     console.print("[cyan]" + "=" * 40 + "[/cyan]")
 
     start_time = time.time()
-    jobs_before = set(PROJECT_DIR.glob("saved_jobs-*/job_posting-*.md"))
+    jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 
     playwright_mcp = {
         "type": "stdio",
@@ -414,17 +379,13 @@ async def run_non_interactive() -> None:
     async with ClaudeSDKClient(scraper_options) as scraper:
         await run_scraper(scraper, queries)
 
-    candidates = tools_generic._candidates
+    candidates = tools_module._candidates
     console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]\n")
 
     if not candidates:
         console.print("[dim]No new candidates found.[/dim]")
         elapsed_mins = (time.time() - start_time) / 60
-        total_stats_str = format_total_stats()
-        console.print(f"[dim]Totals: {total_stats_str}[/dim]")
-        send_telegram(
-            f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• {total_stats_str}"
-        )
+        send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min")
         return
 
     # Stage 2: sonnet evaluator — one fresh session per job, system prompt cached after job 1
@@ -435,15 +396,13 @@ async def run_non_interactive() -> None:
 
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
-    total_stats_str = format_total_stats()
 
     stats_lines = [
         "Job search run complete",
         f"• Candidates found: {len(candidates)}",
         f"• Jobs saved: {num_evaluated}",
-        f"• Jobs rated >=4: {num_high_rated}",
+        f"• Jobs rated ≥4: {num_high_rated}",
         f"• Elapsed: {elapsed_mins:.1f} min",
-        f"• {total_stats_str}",
     ]
     stats_msg = "\n".join(stats_lines)
     console.print(f"\n[dim]{stats_msg}[/dim]")
@@ -487,7 +446,3 @@ async def main() -> None:
             await run_interactive(client)
     else:
         await run_non_interactive()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

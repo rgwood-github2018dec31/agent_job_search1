@@ -25,3 +25,5 @@ saved_jobs-*/
 .python-version
 
 JOB_REQUIREMENTS.md
+
+run_dir/

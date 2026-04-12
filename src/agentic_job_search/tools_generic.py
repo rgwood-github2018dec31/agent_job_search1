@@ -17,9 +17,10 @@ from claude_agent_sdk import (
 
 console = Console()
 
-PROJECT_DIR = Path(__file__).parent
-JOB_REQUIREMENTS_PATH = PROJECT_DIR / "JOB_REQUIREMENTS.md"
-PROCESSED_JOBS_DIR = PROJECT_DIR / "processed_jobs"
+PROJECT_DIR = Path(__file__).parent.parent.parent  # src/agentic_job_search/ -> src/ -> project root
+RUN_DIR = PROJECT_DIR / "run_dir"
+JOB_REQUIREMENTS_PATH = RUN_DIR / "JOB_REQUIREMENTS.md"
+PROCESSED_JOBS_DIR = RUN_DIR / "processed_jobs"
 
 _processed_jobs: set[tuple[str, str]] = set()
 _candidates: list[dict] = []
@@ -49,7 +50,7 @@ def load_processed_jobs() -> None:
     ids: set[tuple[str, str]] = set()
 
     # Old format: extract (linkedin, job_id) from saved MD filenames
-    for f in PROJECT_DIR.glob("saved_jobs-*/job_posting-*.md"):
+    for f in RUN_DIR.glob("saved_jobs-*/job_posting-*.md"):
         m = _SAVED_JOB_MD_RE.match(f.name)
         if m:
             job_id = m.group(1)
@@ -75,7 +76,7 @@ async def do_save_job_posting(
     company: str, description: str, rating: int, content: str, job_id: str | None = None
 ) -> dict:
     date_str = datetime.now().strftime("%Y%b%d")
-    dir_path = PROJECT_DIR / f"saved_jobs-{date_str}"
+    dir_path = RUN_DIR / f"saved_jobs-{date_str}"
     dir_path.mkdir(exist_ok=True)
 
     ts = int(time.time())
