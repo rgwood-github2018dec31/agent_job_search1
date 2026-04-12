@@ -51,6 +51,14 @@ load_env()
 
 BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
 
+_total_stats: dict = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "total_cost_usd": 0.0,
+}
+
 
 # --- Prompt construction ---
 
@@ -202,6 +210,8 @@ async def generate_search_queries() -> list[str]:
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         text_parts.append(block.text)
+            elif isinstance(msg, ResultMessage):
+                accumulate_stats(msg)
     raw = "".join(text_parts)
     console.print(f"[dim]Query generation response: {raw[:200]}[/dim]")
     # Extract JSON array even if wrapped in a markdown code fence
@@ -230,7 +240,27 @@ def print_thinking(text: str) -> None:
     console.print(f"\n[dim italic]Thinking: {display}[/dim italic]\n")
 
 
+def accumulate_stats(msg: ResultMessage) -> None:
+    if msg.usage:
+        _total_stats["input_tokens"] += msg.usage.get("input_tokens", 0)
+        _total_stats["output_tokens"] += msg.usage.get("output_tokens", 0)
+        _total_stats["cache_read_input_tokens"] += msg.usage.get("cache_read_input_tokens", 0)
+        _total_stats["cache_creation_input_tokens"] += msg.usage.get("cache_creation_input_tokens", 0)
+    if msg.total_cost_usd is not None:
+        _total_stats["total_cost_usd"] += msg.total_cost_usd
+
+
+def format_total_stats() -> str:
+    s = _total_stats
+    parts = [f"in={s['input_tokens']} out={s['output_tokens']}"]
+    if s["cache_read_input_tokens"] or s["cache_creation_input_tokens"]:
+        parts.append(f"cache_read={s['cache_read_input_tokens']} cache_write={s['cache_creation_input_tokens']}")
+    parts.append(f"total_cost=${s['total_cost_usd']:.4f}")
+    return " · ".join(parts)
+
+
 def print_result_stats(msg: ResultMessage) -> None:
+    accumulate_stats(msg)
     parts = []
     if msg.usage:
         parts.append(f"in={msg.usage.get('input_tokens', 0)} out={msg.usage.get('output_tokens', 0)}")
@@ -274,6 +304,8 @@ async def run_interactive(client: ClaudeSDKClient) -> None:
             continue
 
         await client.query(user_input)
+
+    console.print(f"\n[dim]Session totals: {format_total_stats()}[/dim]")
 
 
 _RATING_RE = re.compile(r"-rating_(\d+)-")
@@ -388,7 +420,11 @@ async def run_non_interactive() -> None:
     if not candidates:
         console.print("[dim]No new candidates found.[/dim]")
         elapsed_mins = (time.time() - start_time) / 60
-        send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min")
+        total_stats_str = format_total_stats()
+        console.print(f"[dim]Totals: {total_stats_str}[/dim]")
+        send_telegram(
+            f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• {total_stats_str}"
+        )
         return
 
     # Stage 2: sonnet evaluator — one fresh session per job, system prompt cached after job 1
@@ -399,13 +435,15 @@ async def run_non_interactive() -> None:
 
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
+    total_stats_str = format_total_stats()
 
     stats_lines = [
         "Job search run complete",
         f"• Candidates found: {len(candidates)}",
         f"• Jobs saved: {num_evaluated}",
-        f"• Jobs rated ≥4: {num_high_rated}",
+        f"• Jobs rated >=4: {num_high_rated}",
         f"• Elapsed: {elapsed_mins:.1f} min",
+        f"• {total_stats_str}",
     ]
     stats_msg = "\n".join(stats_lines)
     console.print(f"\n[dim]{stats_msg}[/dim]")
