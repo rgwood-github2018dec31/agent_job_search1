@@ -313,9 +313,8 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> float:
     return cost
 
 
-async def evaluate_candidate(candidate: dict, playwright_mcp: dict, evaluator_prompt: str) -> float:
-    """Stage 2: fresh sonnet session evaluates one job posting."""
-    console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
+async def evaluate_all_candidates(candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str) -> float:
+    """Stage 2: single session evaluates all job postings, reusing one browser."""
     options = ClaudeAgentOptions(
         system_prompt=evaluator_prompt,
         mcp_servers={
@@ -328,28 +327,30 @@ async def evaluate_candidate(candidate: dict, playwright_mcp: dict, evaluator_pr
     )
     cost = 0.0
     async with ClaudeSDKClient(options) as client:
-        await client.query(
-            f"Evaluate this job posting:\n"
-            f"Company: {candidate['company']}\n"
-            f"Title: {candidate['title']}\n"
-            f"URL: {candidate['url']}\n"
-            f"Posted: {candidate['date_posted']}\n"
-            f"Snippet: {candidate['snippet']}\n\n"
-            f"Navigate to the URL, read the full description, rate it 1–5, save it with save_job_posting, "
-            f"and call notify_user if rated 4 or 5."
-        )
-        async for msg in client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, ThinkingBlock):
-                        print_thinking(block.thinking)
-                    elif isinstance(block, TextBlock):
-                        print(block.text, end="", flush=True)
-            elif isinstance(msg, ResultMessage):
-                print()
-                print_result_stats(msg)
-                if msg.total_cost_usd is not None:
-                    cost += msg.total_cost_usd
+        for candidate in candidates:
+            console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
+            await client.query(
+                f"Evaluate this job posting:\n"
+                f"Company: {candidate['company']}\n"
+                f"Title: {candidate['title']}\n"
+                f"URL: {candidate['url']}\n"
+                f"Posted: {candidate['date_posted']}\n"
+                f"Snippet: {candidate['snippet']}\n\n"
+                f"Navigate to the URL, read the full description, rate it 1–5, save it with save_job_posting, "
+                f"and call notify_user if rated 4 or 5."
+            )
+            async for msg in client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, ThinkingBlock):
+                            print_thinking(block.thinking)
+                        elif isinstance(block, TextBlock):
+                            print(block.text, end="", flush=True)
+                elif isinstance(msg, ResultMessage):
+                    print()
+                    print_result_stats(msg)
+                    if msg.total_cost_usd is not None:
+                        cost += msg.total_cost_usd
     return cost
 
 
@@ -397,11 +398,10 @@ async def run_non_interactive() -> None:
         send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}")
         return
 
-    # Stage 2: sonnet evaluator — one fresh session per job, system prompt cached after job 1
+    # Stage 2: single session evaluates all jobs with one shared browser
     console.print("[yellow]Stage 2: Evaluating candidates ...[/yellow]\n")
-    evaluator_prompt = build_evaluator_prompt()  # built once, reused for all jobs
-    for candidate in candidates:
-        total_cost += await evaluate_candidate(candidate, playwright_mcp, evaluator_prompt)
+    evaluator_prompt = build_evaluator_prompt()
+    total_cost += await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt)
 
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
