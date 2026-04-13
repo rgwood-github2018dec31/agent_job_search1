@@ -288,7 +288,7 @@ def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
     return num_evaluated, num_high_rated
 
 
-async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> None:
+async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> float:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results."""
     query_list = "\n".join(f'- "{q}"' for q in queries)
     await client.query(
@@ -297,6 +297,7 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> None:
         "in the results list. Do not ask for permission — call the tools directly. "
         "Do not navigate to individual job pages. Stop when done."
     )
+    cost = 0.0
     async for msg in client.receive_response():
         if isinstance(msg, AssistantMessage):
             for block in msg.content:
@@ -307,9 +308,12 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> None:
         elif isinstance(msg, ResultMessage):
             print()
             print_result_stats(msg)
+            if msg.total_cost_usd is not None:
+                cost += msg.total_cost_usd
+    return cost
 
 
-async def evaluate_candidate(candidate: dict, playwright_mcp: dict, evaluator_prompt: str) -> None:
+async def evaluate_candidate(candidate: dict, playwright_mcp: dict, evaluator_prompt: str) -> float:
     """Stage 2: fresh sonnet session evaluates one job posting."""
     console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
     options = ClaudeAgentOptions(
@@ -322,6 +326,7 @@ async def evaluate_candidate(candidate: dict, playwright_mcp: dict, evaluator_pr
         cwd=str(PROJECT_DIR),
         effort="low",
     )
+    cost = 0.0
     async with ClaudeSDKClient(options) as client:
         await client.query(
             f"Evaluate this job posting:\n"
@@ -343,6 +348,9 @@ async def evaluate_candidate(candidate: dict, playwright_mcp: dict, evaluator_pr
             elif isinstance(msg, ResultMessage):
                 print()
                 print_result_stats(msg)
+                if msg.total_cost_usd is not None:
+                    cost += msg.total_cost_usd
+    return cost
 
 
 async def run_non_interactive() -> None:
@@ -352,6 +360,7 @@ async def run_non_interactive() -> None:
     console.print("[cyan]" + "=" * 40 + "[/cyan]")
 
     start_time = time.time()
+    total_cost = 0.0
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 
     playwright_mcp = {
@@ -377,7 +386,7 @@ async def run_non_interactive() -> None:
         model=MODEL_NAME_LOW,
     )
     async with ClaudeSDKClient(scraper_options) as scraper:
-        await run_scraper(scraper, queries)
+        total_cost += await run_scraper(scraper, queries)
 
     candidates = tools_module._candidates
     console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]\n")
@@ -385,14 +394,14 @@ async def run_non_interactive() -> None:
     if not candidates:
         console.print("[dim]No new candidates found.[/dim]")
         elapsed_mins = (time.time() - start_time) / 60
-        send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min")
+        send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}")
         return
 
     # Stage 2: sonnet evaluator — one fresh session per job, system prompt cached after job 1
     console.print("[yellow]Stage 2: Evaluating candidates ...[/yellow]\n")
     evaluator_prompt = build_evaluator_prompt()  # built once, reused for all jobs
     for candidate in candidates:
-        await evaluate_candidate(candidate, playwright_mcp, evaluator_prompt)
+        total_cost += await evaluate_candidate(candidate, playwright_mcp, evaluator_prompt)
 
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
@@ -403,6 +412,7 @@ async def run_non_interactive() -> None:
         f"• Jobs saved: {num_evaluated}",
         f"• Jobs rated ≥4: {num_high_rated}",
         f"• Elapsed: {elapsed_mins:.1f} min",
+        f"• Total cost: ${total_cost:.4f}",
     ]
     stats_msg = "\n".join(stats_lines)
     console.print(f"\n[dim]{stats_msg}[/dim]")
