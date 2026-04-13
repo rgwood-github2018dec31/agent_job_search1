@@ -2,7 +2,8 @@
 
 import pytest
 
-from agentic_job_search import agent, tools
+from agentic_job_search import agent
+from agentic_job_search import tools_generic as tools
 
 
 # ---------------------------------------------------------------------------

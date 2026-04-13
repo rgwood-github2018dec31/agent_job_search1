@@ -181,8 +181,8 @@ async def generate_search_queries() -> list[str]:
     context = "\n\n".join(parts)
     prompt = (
         f"{context}\n\n"
-        "Based on the resume and job requirements above, generate enough short LinkedIn job search queries "
-        "(2–6 words each, like a job title) to get good coverage of the most relevant senior AI/ML roles — "
+        "Based on the resume and job requirements above, generate enough short job search queries "
+        "(2–6 words each, like a job title) to get good coverage of the most relevant roles — "
         "enough to surface diverse results, but not so many that searches become redundant. "
         'Reply with ONLY a JSON array of strings, e.g. ["Principal AI Engineer", "Staff ML Engineer"].'
     )
@@ -446,3 +446,7 @@ async def main() -> None:
             await run_interactive(client)
     else:
         await run_non_interactive()
+
+
+def cli() -> None:
+    asyncio.run(main())

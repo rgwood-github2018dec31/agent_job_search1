@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-job-search = "agentic_job_search.agent:main"
+job-search = "agentic_job_search.agent:cli"
 
 [dependency-groups]
 test = [
