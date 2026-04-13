@@ -326,9 +326,9 @@ async def evaluate_all_candidates(candidates: list[dict], playwright_mcp: dict, 
         effort="low",
     )
     cost = 0.0
-    async with ClaudeSDKClient(options) as client:
-        for candidate in candidates:
-            console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
+    for candidate in candidates:
+        console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
+        async with ClaudeSDKClient(options) as client:
             await client.query(
                 f"Evaluate this job posting:\n"
                 f"Company: {candidate['company']}\n"
