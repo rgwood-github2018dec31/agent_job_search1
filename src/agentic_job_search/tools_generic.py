@@ -77,7 +77,7 @@ async def do_save_job_posting(
 ) -> dict:
     date_str = datetime.now().strftime("%Y%b%d")
     dir_path = RUN_DIR / f"saved_jobs-{date_str}"
-    dir_path.mkdir(exist_ok=True)
+    dir_path.mkdir(parents=True, exist_ok=True)
 
     ts = int(time.time())
     id_part = job_id if job_id else "noid"
@@ -141,7 +141,7 @@ async def do_check_and_record_job(
     if posted and (date.today() - posted).days > 21:
         return {"content": [{"type": "text", "text": "too_old"}]}
 
-    PROCESSED_JOBS_DIR.mkdir(exist_ok=True)
+    PROCESSED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime("%Y%b%d")
     ts = int(time.time())
     filename = f"job_posting-{site}-{job_id}-{date_str}-{ts}-{underscorify(company)}-{underscorify(description)}.yaml"
