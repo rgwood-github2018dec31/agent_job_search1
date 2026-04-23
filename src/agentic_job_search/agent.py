@@ -3,8 +3,11 @@ import asyncio
 import json
 import os
 import re
+import socket
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pypdf
@@ -354,6 +357,30 @@ async def evaluate_all_candidates(candidates: list[dict], playwright_mcp: dict, 
     return cost
 
 
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
+async def start_playwright_server(port: int) -> asyncio.subprocess.Process:
+    proc = await asyncio.create_subprocess_exec(
+        'npx', '@playwright/mcp@latest',
+        '--port', str(port),
+        '--user-data-dir', str(BROWSER_PROFILE_DIR),
+        '--shared-browser-context',
+    )
+    # Poll until the MCP endpoint is accepting connections
+    for _ in range(30):
+        await asyncio.sleep(1)
+        try:
+            urllib.request.urlopen(f'http://localhost:{port}/mcp', timeout=1)
+            break
+        except Exception:
+            pass
+    return proc
+
+
 async def run_non_interactive() -> None:
     tools_module._candidates = []
 
@@ -364,44 +391,47 @@ async def run_non_interactive() -> None:
     total_cost = 0.0
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 
-    playwright_mcp = {
-        "type": "stdio",
-        "command": "npx",
-        "args": ["@playwright/mcp@latest", "--user-data-dir", str(BROWSER_PROFILE_DIR)],
-    }
+    port = find_free_port()
+    console.print(f"[dim]Starting shared browser (port {port}) ...[/dim]")
+    playwright_proc = await start_playwright_server(port)
+    playwright_mcp = {'type': 'http', 'url': f'http://localhost:{port}/mcp'}
 
-    # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping
-    console.print("[yellow]Stage 1a: Generating search queries ...[/yellow]")
-    queries = await generate_search_queries()
-    console.print(f"[dim]Queries: {queries}[/dim]\n")
+    try:
+        # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping
+        console.print("[yellow]Stage 1a: Generating search queries ...[/yellow]")
+        queries = await generate_search_queries()
+        console.print(f"[dim]Queries: {queries}[/dim]\n")
 
-    console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
-    scraper_options = ClaudeAgentOptions(
-        system_prompt=build_scraper_prompt(),
-        mcp_servers={
-            "playwright": playwright_mcp,
-            "job_scraper": make_scraper_server(),
-        },
-        permission_mode="bypassPermissions",
-        cwd=str(PROJECT_DIR),
-        model=MODEL_NAME_LOW,
-    )
-    async with ClaudeSDKClient(scraper_options) as scraper:
-        total_cost += await run_scraper(scraper, queries)
+        console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
+        scraper_options = ClaudeAgentOptions(
+            system_prompt=build_scraper_prompt(),
+            mcp_servers={
+                "playwright": playwright_mcp,
+                "job_scraper": make_scraper_server(),
+            },
+            permission_mode="bypassPermissions",
+            cwd=str(PROJECT_DIR),
+            model=MODEL_NAME_LOW,
+        )
+        async with ClaudeSDKClient(scraper_options) as scraper:
+            total_cost += await run_scraper(scraper, queries)
 
-    candidates = tools_module._candidates
-    console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]\n")
+        candidates = tools_module._candidates
+        console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]\n")
 
-    if not candidates:
-        console.print("[dim]No new candidates found.[/dim]")
-        elapsed_mins = (time.time() - start_time) / 60
-        send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}")
-        return
+        if not candidates:
+            console.print("[dim]No new candidates found.[/dim]")
+            elapsed_mins = (time.time() - start_time) / 60
+            send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}")
+            return
 
-    # Stage 2: single session evaluates all jobs with one shared browser
-    console.print("[yellow]Stage 2: Evaluating candidates ...[/yellow]\n")
-    evaluator_prompt = build_evaluator_prompt()
-    total_cost += await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt)
+        # Stage 2: all evaluations share the same browser via the SSE server
+        console.print("[yellow]Stage 2: Evaluating candidates ...[/yellow]\n")
+        evaluator_prompt = build_evaluator_prompt()
+        total_cost += await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt)
+    finally:
+        playwright_proc.terminate()
+        await playwright_proc.wait()
 
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
