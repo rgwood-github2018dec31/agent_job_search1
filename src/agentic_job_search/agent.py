@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -363,13 +364,25 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-async def start_playwright_server(port: int) -> asyncio.subprocess.Process:
-    proc = await asyncio.create_subprocess_exec(
+async def start_playwright_server(port: int, browser_mode: str = 'minimized') -> asyncio.subprocess.Process:
+    cmd = [
         'npx', '@playwright/mcp@latest',
         '--port', str(port),
         '--user-data-dir', str(BROWSER_PROFILE_DIR),
         '--shared-browser-context',
-    )
+    ]
+    tmp_config: str | None = None
+    if browser_mode == 'headless':
+        cmd.append('--headless')
+    elif browser_mode == 'minimized':
+        # Pass --start-minimized via a temp config file (no direct CLI flag for launch args)
+        config = {'browser': {'launchOptions': {'args': ['--start-minimized']}}}
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(config, f)
+            tmp_config = f.name
+        cmd += ['--config', tmp_config]
+    # 'visible': no additional flags
+    proc = await asyncio.create_subprocess_exec(*cmd)
     # Poll until the MCP endpoint is accepting connections
     for _ in range(30):
         await asyncio.sleep(1)
@@ -378,10 +391,12 @@ async def start_playwright_server(port: int) -> asyncio.subprocess.Process:
             break
         except Exception:
             pass
+    if tmp_config:
+        Path(tmp_config).unlink(missing_ok=True)
     return proc
 
 
-async def run_non_interactive() -> None:
+async def run_non_interactive(browser_mode: str = 'headless') -> None:
     tools_module._candidates = []
 
     console.print("[bold cyan]Job Search Agent — Non-interactive Mode[/bold cyan]")
@@ -392,8 +407,8 @@ async def run_non_interactive() -> None:
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 
     port = find_free_port()
-    console.print(f"[dim]Starting shared browser (port {port}) ...[/dim]")
-    playwright_proc = await start_playwright_server(port)
+    console.print(f"[dim]Starting shared browser ({browser_mode}, port {port}) ...[/dim]")
+    playwright_proc = await start_playwright_server(port, browser_mode=browser_mode)
     playwright_mcp = {'type': 'http', 'url': f'http://localhost:{port}/mcp'}
 
     try:
@@ -459,6 +474,12 @@ async def main() -> None:
         action="store_true",
         help="Run autonomously: search LinkedIn, rate jobs, notify on 4+, no user interaction",
     )
+    parser.add_argument(
+        "--browser",
+        choices=["headless", "minimized", "visible"],
+        default="headless",
+        help="Browser display mode for non-interactive runs (default: headless)",
+    )
     args = parser.parse_args()
     interactive = not args.non_interactive
 
@@ -485,7 +506,7 @@ async def main() -> None:
         async with ClaudeSDKClient(options) as client:
             await run_interactive(client)
     else:
-        await run_non_interactive()
+        await run_non_interactive(browser_mode=args.browser)
 
 
 def cli() -> None:
