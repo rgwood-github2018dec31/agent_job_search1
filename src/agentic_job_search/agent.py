@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import pypdf
 
@@ -34,6 +35,8 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ThinkingBlock,
+    create_sdk_mcp_server,
+    tool,
 )
 
 
@@ -99,7 +102,7 @@ The information visible in search results (title, company, snippet, date) is all
 For each job visible in the search results:
 1. Call check_and_record_job with site="linkedin", the job ID (from the URL), company, and title. Pass date_posted only if it's visible in the results — it may be relative like "4 days ago", or it may not be shown at all; both are fine.
 2. If it returns "new", call queue_candidate immediately with whatever is visible: URL, title, company, snippet, and date_posted if shown.
-3. If it returns "already_processed" or "too_old", skip it.
+3. If it returns "already_processed", "too_old", or "already_applied", skip it.
 
 Only pass information that is directly visible in the search results listing. Do not infer or fabricate missing fields. Stage 2 will navigate to the job page and fill in any missing details.
 
@@ -178,38 +181,55 @@ async def generate_search_queries() -> list[str]:
     parts = []
     resume = load_resume()
     if resume:
-        parts.append(f"--- RESUME ---\n{resume}\n--- END RESUME ---")
+        parts.append(f'--- RESUME ---\n{resume}\n--- END RESUME ---')
     if JOB_REQUIREMENTS_PATH.exists():
-        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
-        parts.append(f"--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---")
-    context = "\n\n".join(parts)
+        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding='utf-8')
+        parts.append(f'--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---')
+    context = '\n\n'.join(parts)
+
+    captured: list[str] = []
+
+    @tool(
+        'submit_search_queries',
+        'Submit the generated list of job search queries.',
+        {
+            'type': 'object',
+            'properties': {
+                'queries': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': '2–6 word LinkedIn search queries, e.g. ["Staff ML Engineer", "Principal AI Engineer"]',
+                },
+            },
+            'required': ['queries'],
+        },
+    )
+    async def _submit(args: dict[str, Any]) -> dict:
+        captured.extend(args['queries'])
+        return {'content': [{'type': 'text', 'text': 'Queries submitted.'}]}
+
+    query_server = create_sdk_mcp_server(name='query_generator', version='1.0.0', tools=[_submit])
+
     prompt = (
-        f"{context}\n\n"
-        "Based on the resume and job requirements above, generate enough short job search queries "
-        "(2–6 words each, like a job title) to get good coverage of the most relevant roles — "
-        "enough to surface diverse results, but not so many that searches become redundant. "
-        'Reply with ONLY a JSON array of strings, e.g. ["Principal AI Engineer", "Staff ML Engineer"].'
+        f'{context}\n\n'
+        'Based on the resume and job requirements above, generate enough short job search queries '
+        '(2–6 words each, like a job title) to get good coverage of the most relevant roles — '
+        'enough to surface diverse results, but not so many that searches become redundant. '
+        'Call the submit_search_queries tool with your list of queries.'
     )
     options = ClaudeAgentOptions(
         model=MODEL_NAME_MEDIUM,
-        permission_mode="acceptEdits",
+        mcp_servers={'query_generator': query_server},
+        permission_mode='acceptEdits',
         cwd=str(PROJECT_DIR),
     )
-    text_parts: list[str] = []
     async with ClaudeSDKClient(options) as client:
-        await client.query(prompt)
-        async for msg in client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        text_parts.append(block.text)
-    raw = "".join(text_parts)
-    # console.print(f"[dim]Query generation response: {raw[:200]}[/dim]")
-    # Extract JSON array even if wrapped in a markdown code fence
-    m = re.search(r"\[.*\]", raw, re.DOTALL)
-    if not m:
-        raise ValueError(f"No JSON array found in query generation response: {raw!r}")
-    return json.loads(m.group())
+        response = await client.query(prompt)
+    console.print(f"\n[dim]{response=}[/dim]")
+
+    if not captured:
+        raise ValueError('LLM did not call submit_search_queries')
+    return captured
 
 
 def build_evaluator_prompt() -> str:
@@ -221,6 +241,17 @@ def build_evaluator_prompt() -> str:
         parts.append(f"--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---")
     parts.append(EVALUATOR_INSTRUCTIONS)
     return "\n\n".join(parts)
+
+
+def build_reference_block() -> str:
+    texts = tools_module._reference_job_texts
+    if not texts:
+        return ''
+    parts = ['--- REFERENCE JOBS (jobs I have applied to — treat as 5/5 calibration examples) ---']
+    for i, text in enumerate(texts[:5], 1):
+        parts.append(f'[Reference Job {i}]\n{text[:3000]}')
+    parts.append('--- END REFERENCE JOBS ---')
+    return '\n\n'.join(parts)
 
 
 # --- Runner ---
@@ -317,7 +348,9 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> float:
     return cost
 
 
-async def evaluate_all_candidates(candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str) -> float:
+async def evaluate_all_candidates(
+    candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str, reference_block: str = ''
+) -> float:
     """Stage 2: single session evaluates all job postings, reusing one browser."""
     options = ClaudeAgentOptions(
         system_prompt=evaluator_prompt,
@@ -332,17 +365,20 @@ async def evaluate_all_candidates(candidates: list[dict], playwright_mcp: dict, 
     cost = 0.0
     for candidate in candidates:
         console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
+        query = (
+            f"Evaluate this job posting:\n"
+            f"Company: {candidate['company']}\n"
+            f"Title: {candidate['title']}\n"
+            f"URL: {candidate['url']}\n"
+            f"Posted: {candidate['date_posted']}\n"
+            f"Snippet: {candidate['snippet']}\n\n"
+            f"Navigate to the URL, read the full description, rate it 1–5, save it with save_job_posting, "
+            f"and call notify_user if rated 4 or 5."
+        )
+        if reference_block:
+            query = f'{reference_block}\n\n{query}'
         async with ClaudeSDKClient(options) as client:
-            await client.query(
-                f"Evaluate this job posting:\n"
-                f"Company: {candidate['company']}\n"
-                f"Title: {candidate['title']}\n"
-                f"URL: {candidate['url']}\n"
-                f"Posted: {candidate['date_posted']}\n"
-                f"Snippet: {candidate['snippet']}\n\n"
-                f"Navigate to the URL, read the full description, rate it 1–5, save it with save_job_posting, "
-                f"and call notify_user if rated 4 or 5."
-            )
+            await client.query(query)
             async for msg in client.receive_response():
                 if isinstance(msg, AssistantMessage):
                     for block in msg.content:
@@ -443,7 +479,8 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
         # Stage 2: all evaluations share the same browser via the SSE server
         console.print("[yellow]Stage 2: Evaluating candidates ...[/yellow]\n")
         evaluator_prompt = build_evaluator_prompt()
-        total_cost += await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt)
+        reference_block = build_reference_block()
+        total_cost += await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt, reference_block)
     finally:
         playwright_proc.terminate()
         await playwright_proc.wait()
@@ -488,6 +525,7 @@ async def main() -> None:
         sys.exit(1)
 
     load_processed_jobs()
+    await tools_module.load_downloads_applied_pdfs()
 
     if interactive:
         options = ClaudeAgentOptions(

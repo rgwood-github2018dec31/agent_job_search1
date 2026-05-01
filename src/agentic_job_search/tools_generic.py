@@ -7,9 +7,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import anthropic
+import pypdf
 import yaml
 from rich.console import Console
 
+from agentic_job_search.config import MODEL_NAME_LOW
 from claude_agent_sdk import (
     create_sdk_mcp_server,
     tool,
@@ -24,6 +27,133 @@ PROCESSED_JOBS_DIR = RUN_DIR / "processed_jobs"
 
 _processed_jobs: set[tuple[str, str]] = set()
 _candidates: list[dict] = []
+_applied_companies: dict[str, str] = {}  # company_name -> PDF filename
+_reference_job_texts: list[str] = []     # extracted text for evaluator prompt injection
+
+
+async def _extract_company_from_text(text: str) -> str:
+    """Use LLM with forced tool call to extract the hiring company name from job description text."""
+    client = anthropic.AsyncAnthropic()
+    response = await client.messages.create(
+        model=MODEL_NAME_LOW,
+        max_tokens=256,
+        tools=[{
+            'name': 'record_company',
+            'description': 'Record the company that posted this job',
+            'input_schema': {
+                'type': 'object',
+                'properties': {
+                    'company_name': {'type': 'string', 'description': 'Name of the hiring company'},
+                    'explanation': {'type': 'string', 'description': 'Why you identified this company'},
+                    'confidence': {'type': 'integer', 'description': '1-5, 5 = most confident'},
+                },
+                'required': ['company_name', 'explanation', 'confidence'],
+            },
+        }],
+        tool_choice={'type': 'tool', 'name': 'record_company'},
+        messages=[{'role': 'user', 'content': f'What company posted this job?\n\n{text[:3000]}'}],
+    )
+    for block in response.content:
+        if block.type == 'tool_use':
+            return block.input['company_name']
+    return ''
+
+
+async def company_matches_applied(candidate: str) -> str | None:
+    """Return the source PDF filename if candidate matches a previously applied-to company, else None."""
+    if not _applied_companies:
+        return None
+    companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
+    client = anthropic.AsyncAnthropic()
+    response = await client.messages.create(
+        model=MODEL_NAME_LOW,
+        max_tokens=256,
+        tools=[{
+            'name': 'record_match_result',
+            'description': 'Record whether the candidate company matches any applied company',
+            'input_schema': {
+                'type': 'object',
+                'properties': {
+                    'matches': {'type': 'boolean', 'description': 'True if same organization'},
+                    'matched_company_name': {'type': 'string', 'description': 'The matching company name from the list, or empty string if no match'},
+                    'explanation': {'type': 'string', 'description': 'Reasoning for the decision'},
+                    'confidence': {'type': 'integer', 'description': '1-5, 5 = most confident'},
+                },
+                'required': ['matches', 'matched_company_name', 'explanation', 'confidence'],
+            },
+        }],
+        tool_choice={'type': 'tool', 'name': 'record_match_result'},
+        messages=[{
+            'role': 'user',
+            'content': (
+                f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
+                f'{companies_list}'
+            ),
+        }],
+    )
+    for block in response.content:
+        if block.type == 'tool_use':
+            if not block.input['matches']:
+                return None
+            matched = block.input.get('matched_company_name', '')
+            return _applied_companies.get(matched, '<unknown PDF>')
+    return None
+
+
+async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
+    """Scan ~/Downloads for job description PDFs saved April 2026+, extract companies and text."""
+    global _applied_companies, _reference_job_texts
+
+    if cache_path is None:
+        cache_path = RUN_DIR / 'downloads_pdf_cache.yaml'
+
+    cutoff = datetime(2026, 4, 1).timestamp()
+    downloads = Path.home() / 'Downloads'
+
+    cache: dict = {}
+    if cache_path.exists():
+        try:
+            cache = yaml.safe_load(cache_path.read_text(encoding='utf-8')) or {}
+        except Exception:
+            cache = {}
+
+    pdfs = [p for p in downloads.glob('*.pdf') if p.stat().st_mtime >= cutoff]
+
+    companies: dict[str, str] = {}  # company_name -> pdf filename
+    texts: list[str] = []
+    cache_dirty = False
+
+    for pdf in pdfs:
+        key = str(pdf)
+        mtime = pdf.stat().st_mtime
+        entry = cache.get(key)
+
+        if entry and abs(entry.get('mtime', 0) - mtime) < 1.0:
+            company = entry.get('company', '')
+            text = entry.get('text', '')
+        else:
+            try:
+                reader = pypdf.PdfReader(pdf)
+                text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+            except Exception as e:
+                console.print(f'[yellow]Warning: could not read {pdf.name}: {e}[/yellow]')
+                continue
+
+            company = await _extract_company_from_text(text)
+            cache[key] = {'mtime': mtime, 'company': company, 'text': text}
+            cache_dirty = True
+
+        if company:
+            companies[company] = pdf.name
+        if text:
+            texts.append(text)
+
+    if cache_dirty:
+        cache_path.write_text(yaml.dump(cache, default_flow_style=False), encoding='utf-8')
+
+    _applied_companies = companies
+    _reference_job_texts = texts
+    console.print(f'[dim]Loaded {len(pdfs)} applied-job PDF(s) from Downloads ({len(companies)} companies).[/dim]')
 
 
 def underscorify(s: str) -> str:
@@ -137,6 +267,11 @@ async def do_check_and_record_job(
     if key in _processed_jobs:
         return {"content": [{"type": "text", "text": "already_processed"}]}
 
+    matched_pdf = await company_matches_applied(company)
+    if matched_pdf is not None:
+        console.print(f"[dim]Skipping {company} — already applied ({matched_pdf}).[/dim]")
+        return {"content": [{"type": "text", "text": "already_applied"}]}
+
     posted = parse_posting_date(date_posted)
     if posted and (date.today() - posted).days > 21:
         return {"content": [{"type": "text", "text": "too_old"}]}
@@ -211,7 +346,7 @@ async def update_job_requirements(args: dict[str, Any]) -> dict:
 @tool(
     "check_and_record_job",
     "Before evaluating any job, call this with the site name, job ID, company name, and job title/description. "
-    "Returns 'already_processed' (skip it), 'too_old' (skip it), or 'new' (proceed to evaluate). "
+    "Returns 'already_processed' (skip it), 'too_old' (skip it), 'already_applied' (skip it), or 'new' (proceed to evaluate). "
     "date_posted is optional — pass whatever is visible (YYYY-MM-DD or relative like '4 days ago'); omit if not shown. "
     "Optionally pass url (the job posting URL) and content (full text of the posting) to persist them in the record.",
     {"site": str, "job_id": str, "company": str, "description": str, "date_posted": str, "url": str, "content": str},

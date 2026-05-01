@@ -1,6 +1,9 @@
 """Tests for the job search agent."""
 
+import os
 import pytest
+from datetime import datetime
+from pathlib import Path
 
 from agentic_job_search import agent
 from agentic_job_search import tools_generic as tools
@@ -374,3 +377,178 @@ async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
     assert len(saved_dirs) == 1, "Expected a saved_jobs-* directory to be created"
     files = list(saved_dirs[0].glob("job_posting-testcorp-*-rating_4-*.md"))
     assert len(files) == 1, f"Expected one saved job file, found: {list(saved_dirs[0].iterdir())}"
+
+
+# ---------------------------------------------------------------------------
+# company_matches_applied
+# ---------------------------------------------------------------------------
+
+async def test_company_matches_applied_empty_dict_skips_llm(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {})
+    monkeypatch.setattr(tools.anthropic, 'AsyncAnthropic', lambda: (_ for _ in ()).throw(AssertionError('LLM should not be called')))
+    result = await tools.company_matches_applied('Shopify')
+    assert result is None
+
+
+async def test_company_matches_applied_returns_filename_on_yes(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
+
+    class FakeBlock:
+        type = 'tool_use'
+        input = {'matches': True, 'matched_company_name': 'Shopify', 'explanation': 'same org', 'confidence': 5}
+
+    class FakeResponse:
+        content = [FakeBlock()]
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            return FakeResponse()
+
+    class FakeClient:
+        messages = FakeMessages()
+
+    monkeypatch.setattr(tools.anthropic, 'AsyncAnthropic', lambda: FakeClient())
+    result = await tools.company_matches_applied('Shopify Inc.')
+    assert result == 'shopify_jd.pdf'
+
+
+async def test_company_matches_applied_returns_none_on_no(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
+
+    class FakeBlock:
+        type = 'tool_use'
+        input = {'matches': False, 'matched_company_name': '', 'explanation': 'different org', 'confidence': 5}
+
+    class FakeResponse:
+        content = [FakeBlock()]
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            return FakeResponse()
+
+    class FakeClient:
+        messages = FakeMessages()
+
+    monkeypatch.setattr(tools.anthropic, 'AsyncAnthropic', lambda: FakeClient())
+    result = await tools.company_matches_applied('Acme Corp')
+    assert result is None
+
+
+async def test_check_and_record_job_skips_applied_company(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
+
+    async def fake_matches(candidate):
+        return 'shopify_job.pdf'
+
+    monkeypatch.setattr(tools, 'company_matches_applied', fake_matches)
+
+    result = await tools.do_check_and_record_job(
+        'linkedin', '9999', 'Shopify Inc.', 'Staff Engineer', date_posted=_recent_date()
+    )
+    assert result['content'][0]['text'] == 'already_applied'
+    assert not list((tmp_path / 'processed_jobs').glob('*.yaml'))
+
+
+# ---------------------------------------------------------------------------
+# load_downloads_applied_pdfs
+# ---------------------------------------------------------------------------
+
+async def test_load_downloads_applied_pdfs_ignores_old(tmp_path, monkeypatch):
+    fake_home = tmp_path / 'home'
+    fake_home.mkdir()
+    fake_downloads = fake_home / 'Downloads'
+    fake_downloads.mkdir()
+    old_pdf = fake_downloads / 'old_job.pdf'
+    old_pdf.write_bytes(b'%PDF-1.4 fake')
+    old_mtime = datetime(2026, 3, 1).timestamp()
+    os.utime(old_pdf, (old_mtime, old_mtime))
+
+    monkeypatch.setattr(tools, '_applied_companies', {})
+    monkeypatch.setattr(tools, '_reference_job_texts', [])
+    monkeypatch.setattr(Path, 'home', staticmethod(lambda: fake_home))
+
+    await tools.load_downloads_applied_pdfs(cache_path=tmp_path / 'cache.yaml')
+
+    assert tools._applied_companies == {}
+
+
+async def test_load_downloads_applied_pdfs_uses_cache(tmp_path, monkeypatch):
+    import yaml as yaml_mod
+    fake_home = tmp_path / 'home'
+    fake_home.mkdir()
+    fake_downloads = fake_home / 'Downloads'
+    fake_downloads.mkdir()
+    pdf_path = fake_downloads / 'job.pdf'
+    pdf_path.write_bytes(b'%PDF-1.4 fake')
+    mtime = datetime(2026, 4, 15).timestamp()
+    os.utime(pdf_path, (mtime, mtime))
+
+    cache_path = tmp_path / 'cache.yaml'
+    cache_path.write_text(yaml_mod.dump({
+        str(pdf_path): {'mtime': mtime, 'company': 'CachedCorp', 'text': 'job description text'}
+    }))
+
+    extract_called = []
+
+    async def fake_extract(text):
+        extract_called.append(text)
+        return 'ShouldNotBeCalled'
+
+    monkeypatch.setattr(tools, '_extract_company_from_text', fake_extract)
+    monkeypatch.setattr(Path, 'home', staticmethod(lambda: fake_home))
+
+    await tools.load_downloads_applied_pdfs(cache_path=cache_path)
+
+    assert extract_called == [], 'LLM should not be called on cache hit'
+    assert 'CachedCorp' in tools._applied_companies
+
+
+# ---------------------------------------------------------------------------
+# build_reference_block
+# ---------------------------------------------------------------------------
+
+def test_build_reference_block_empty_when_no_texts(monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [])
+    assert agent.build_reference_block() == ''
+
+
+def test_build_reference_block_includes_text(monkeypatch):
+    from agentic_job_search import agent
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['This is a great remote job at Acme.'])
+    block = agent.build_reference_block()
+    assert 'Acme' in block
+    assert 'REFERENCE JOBS' in block
+
+
+def test_build_reference_block_caps_at_5_pdfs(monkeypatch):
+    from agentic_job_search import agent
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [f'job text {i}' for i in range(10)])
+    block = agent.build_reference_block()
+    assert block.count('[Reference Job') == 5
+
+
+# ---------------------------------------------------------------------------
+# Live tests for Downloads PDF loading
+# ---------------------------------------------------------------------------
+
+@pytest.mark.live_agent_claude
+async def test_extract_company_from_text_live():
+    text = '''
+    Software Engineer — Remote
+    Shopify
+    We are looking for an experienced software engineer to join our team.
+    You will work on our e-commerce platform serving millions of merchants.
+    Requirements: 5+ years Python, strong distributed systems knowledge.
+    '''
+    company = await tools._extract_company_from_text(text)
+    assert company.strip() != ''
+    assert 'shopify' in company.lower()
+
+
+@pytest.mark.live_agent_claude
+async def test_company_matches_applied_live(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {'BMO Financial Group': 'bmo_job.pdf'})
+    result = await tools.company_matches_applied('BMO')
+    assert result is not None
