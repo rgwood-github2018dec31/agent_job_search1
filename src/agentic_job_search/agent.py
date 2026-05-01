@@ -204,7 +204,7 @@ async def generate_search_queries() -> list[str]:
                     if isinstance(block, TextBlock):
                         text_parts.append(block.text)
     raw = "".join(text_parts)
-    console.print(f"[dim]Query generation response: {raw[:200]}[/dim]")
+    # console.print(f"[dim]Query generation response: {raw[:200]}[/dim]")
     # Extract JSON array even if wrapped in a markdown code fence
     m = re.search(r"\[.*\]", raw, re.DOTALL)
     if not m:
