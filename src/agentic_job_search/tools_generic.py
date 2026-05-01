@@ -7,13 +7,14 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import anthropic
 import pypdf
 import yaml
 from rich.console import Console
 
 from agentic_job_search.config import JOB_MAX_AGE_DAYS, JOB_SEARCH_START_DATE, MODEL_NAME_LOW
 from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
     create_sdk_mcp_server,
     tool,
 )
@@ -32,72 +33,71 @@ _reference_job_texts: list[str] = []     # extracted text for evaluator prompt i
 
 
 async def _extract_company_from_text(text: str) -> str:
-    """Use LLM with forced tool call to extract the hiring company name from job description text."""
-    client = anthropic.AsyncAnthropic()
-    response = await client.messages.create(
+    """Use agent SDK to extract the hiring company name from job description text."""
+    captured: list[str] = []
+
+    @tool('record_company', 'Record the company that posted this job', {
+        'type': 'object',
+        'properties': {
+            'company_name': {'type': 'string', 'description': 'Name of the hiring company'},
+        },
+        'required': ['company_name'],
+    })
+    async def _record(args: dict[str, Any]) -> dict:
+        captured.append(args['company_name'])
+        return {'content': [{'type': 'text', 'text': 'Recorded.'}]}
+
+    server = create_sdk_mcp_server(name='company_extractor', version='1.0.0', tools=[_record])
+    options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
-        max_tokens=256,
-        tools=[{
-            'name': 'record_company',
-            'description': 'Record the company that posted this job',
-            'input_schema': {
-                'type': 'object',
-                'properties': {
-                    'company_name': {'type': 'string', 'description': 'Name of the hiring company'},
-                    'explanation': {'type': 'string', 'description': 'Why you identified this company'},
-                    'confidence': {'type': 'integer', 'description': '1-5, 5 = most confident'},
-                },
-                'required': ['company_name', 'explanation', 'confidence'],
-            },
-        }],
-        tool_choice={'type': 'tool', 'name': 'record_company'},
-        messages=[{'role': 'user', 'content': f'What company posted this job?\n\n{text[:3000]}'}],
+        mcp_servers={'company_extractor': server},
+        permission_mode='acceptEdits',
+        cwd=str(PROJECT_DIR),
     )
-    for block in response.content:
-        if block.type == 'tool_use':
-            return block.input['company_name']
-    return ''
+    async with ClaudeSDKClient(options) as client:
+        await client.query(f'What company posted this job? Call record_company with the result.\n\n{text[:3000]}')
+    return captured[0] if captured else ''
 
 
 async def company_matches_applied(candidate: str) -> str | None:
     """Return the source PDF filename if candidate matches a previously applied-to company, else None."""
     if not _applied_companies:
         return None
+
+    captured: list[dict] = []
     companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
-    client = anthropic.AsyncAnthropic()
-    response = await client.messages.create(
+
+    @tool('record_match_result', 'Record whether the candidate matches an applied company', {
+        'type': 'object',
+        'properties': {
+            'matches': {'type': 'boolean', 'description': 'True if same organization'},
+            'matched_company_name': {'type': 'string', 'description': 'Matching name from the list, or empty string'},
+        },
+        'required': ['matches', 'matched_company_name'],
+    })
+    async def _record(args: dict[str, Any]) -> dict:
+        captured.append(args)
+        return {'content': [{'type': 'text', 'text': 'Recorded.'}]}
+
+    server = create_sdk_mcp_server(name='company_matcher', version='1.0.0', tools=[_record])
+    options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
-        max_tokens=256,
-        tools=[{
-            'name': 'record_match_result',
-            'description': 'Record whether the candidate company matches any applied company',
-            'input_schema': {
-                'type': 'object',
-                'properties': {
-                    'matches': {'type': 'boolean', 'description': 'True if same organization'},
-                    'matched_company_name': {'type': 'string', 'description': 'The matching company name from the list, or empty string if no match'},
-                    'explanation': {'type': 'string', 'description': 'Reasoning for the decision'},
-                    'confidence': {'type': 'integer', 'description': '1-5, 5 = most confident'},
-                },
-                'required': ['matches', 'matched_company_name', 'explanation', 'confidence'],
-            },
-        }],
-        tool_choice={'type': 'tool', 'name': 'record_match_result'},
-        messages=[{
-            'role': 'user',
-            'content': (
-                f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
-                f'{companies_list}'
-            ),
-        }],
+        mcp_servers={'company_matcher': server},
+        permission_mode='acceptEdits',
+        cwd=str(PROJECT_DIR),
     )
-    for block in response.content:
-        if block.type == 'tool_use':
-            if not block.input['matches']:
-                return None
-            matched = block.input.get('matched_company_name', '')
-            return _applied_companies.get(matched, '<unknown PDF>')
-    return None
+    async with ClaudeSDKClient(options) as client:
+        await client.query(
+            f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
+            f'{companies_list}\n\nCall record_match_result with your answer.'
+        )
+    if not captured:
+        return None
+    result = captured[0]
+    if not result['matches']:
+        return None
+    matched = result.get('matched_company_name', '')
+    return _applied_companies.get(matched, '<unknown PDF>')
 
 
 async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:

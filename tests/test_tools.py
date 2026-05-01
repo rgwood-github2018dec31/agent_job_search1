@@ -385,51 +385,51 @@ async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
 
 async def test_company_matches_applied_empty_dict_skips_llm(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {})
-    monkeypatch.setattr(tools.anthropic, 'AsyncAnthropic', lambda: (_ for _ in ()).throw(AssertionError('LLM should not be called')))
+    sdk_called = []
+
+    class FakeSDKClient:
+        def __init__(self, options): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def query(self, prompt): sdk_called.append(True)
+
+    monkeypatch.setattr(tools, 'ClaudeSDKClient', FakeSDKClient)
     result = await tools.company_matches_applied('Shopify')
     assert result is None
+    assert not sdk_called
+
+
+def _make_sdk_mock(monkeypatch, tool_args: dict):
+    """Patch ClaudeSDKClient so query() fires the first registered tool with tool_args."""
+    registered = {}
+
+    def fake_create_server(name, version, tools):
+        registered['tools'] = tools
+        return object()
+
+    monkeypatch.setattr(tools, 'create_sdk_mcp_server', fake_create_server)
+
+    class FakeSDKClient:
+        def __init__(self, options): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def query(self, prompt):
+            for t in registered.get('tools', []):
+                await t.handler(tool_args)
+
+    monkeypatch.setattr(tools, 'ClaudeSDKClient', FakeSDKClient)
 
 
 async def test_company_matches_applied_returns_filename_on_yes(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
-
-    class FakeBlock:
-        type = 'tool_use'
-        input = {'matches': True, 'matched_company_name': 'Shopify', 'explanation': 'same org', 'confidence': 5}
-
-    class FakeResponse:
-        content = [FakeBlock()]
-
-    class FakeMessages:
-        async def create(self, **kwargs):
-            return FakeResponse()
-
-    class FakeClient:
-        messages = FakeMessages()
-
-    monkeypatch.setattr(tools.anthropic, 'AsyncAnthropic', lambda: FakeClient())
+    _make_sdk_mock(monkeypatch, {'matches': True, 'matched_company_name': 'Shopify'})
     result = await tools.company_matches_applied('Shopify Inc.')
     assert result == 'shopify_jd.pdf'
 
 
 async def test_company_matches_applied_returns_none_on_no(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
-
-    class FakeBlock:
-        type = 'tool_use'
-        input = {'matches': False, 'matched_company_name': '', 'explanation': 'different org', 'confidence': 5}
-
-    class FakeResponse:
-        content = [FakeBlock()]
-
-    class FakeMessages:
-        async def create(self, **kwargs):
-            return FakeResponse()
-
-    class FakeClient:
-        messages = FakeMessages()
-
-    monkeypatch.setattr(tools.anthropic, 'AsyncAnthropic', lambda: FakeClient())
+    _make_sdk_mock(monkeypatch, {'matches': False, 'matched_company_name': ''})
     result = await tools.company_matches_applied('Acme Corp')
     assert result is None
 
@@ -522,11 +522,13 @@ def test_build_reference_block_includes_text(monkeypatch):
     assert 'REFERENCE JOBS' in block
 
 
-def test_build_reference_block_caps_at_5_pdfs(monkeypatch):
+def test_build_reference_block_caps_at_max_pdfs(monkeypatch):
     from agentic_job_search import agent
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [f'job text {i}' for i in range(10)])
+    from agentic_job_search.config import MAX_REFERENCE_JOBS
+    n = MAX_REFERENCE_JOBS + 5
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [f'job text {i}' for i in range(n)])
     block = agent.build_reference_block()
-    assert block.count('[Reference Job') == 5
+    assert block.count('[Reference Job') == MAX_REFERENCE_JOBS
 
 
 # ---------------------------------------------------------------------------
