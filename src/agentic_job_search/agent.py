@@ -12,9 +12,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-import pypdf
-
-from agentic_job_search.config import MODEL_NAME_LOW, MODEL_NAME_MEDIUM
+from agentic_job_search.config import MAX_REFERENCE_JOBS, MODEL_NAME_LOW, MODEL_NAME_MEDIUM, THINKING_MAX_CHARS
 import agentic_job_search.tools_generic as tools_module
 from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
@@ -130,19 +128,13 @@ Evaluate only this one job, then stop. Do not browse other pages.
 
 
 def load_resume() -> str | None:
-    matches = list(RUN_DIR.glob("*-resume-*.md")) + list(RUN_DIR.glob("*-resume-*.pdf"))
+    matches = list(RUN_DIR.glob('*-resume-*.md'))
+    matches += list(RUN_DIR.glob('*-Resume-*.md'))
     if not matches:
         return None
-    md_matches = [p for p in matches if p.suffix.lower() == ".md"]
-    if md_matches:
-        latest = max(md_matches, key=lambda p: p.stat().st_mtime)
-    else:
-        latest = max(matches, key=lambda p: p.stat().st_mtime)
-    console.print(f"[dim]Loaded resume: {latest.name}[/dim]")
-    if latest.suffix.lower() == ".pdf":
-        reader = pypdf.PdfReader(latest)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    return latest.read_text(encoding="utf-8")
+    latest = max(matches, key=lambda p: p.stat().st_mtime)
+    console.print(f'[dim]Loaded resume: {latest.name}[/dim]')
+    return latest.read_text(encoding='utf-8')
 
 
 def build_system_prompt(interactive: bool) -> str:
@@ -248,7 +240,7 @@ def build_reference_block() -> str:
     if not texts:
         return ''
     parts = ['--- REFERENCE JOBS (jobs I have applied to — treat as 5/5 calibration examples) ---']
-    for i, text in enumerate(texts[:5], 1):
+    for i, text in enumerate(texts[:MAX_REFERENCE_JOBS], 1):
         parts.append(f'[Reference Job {i}]\n{text[:3000]}')
     parts.append('--- END REFERENCE JOBS ---')
     return '\n\n'.join(parts)
@@ -257,8 +249,7 @@ def build_reference_block() -> str:
 # --- Runner ---
 
 def print_thinking(text: str) -> None:
-    MAX_CHARS = 1000
-    display = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + f"\n… ({len(text) - MAX_CHARS} more chars)"
+    display = text if len(text) <= THINKING_MAX_CHARS else text[:THINKING_MAX_CHARS] + f'\n… ({len(text) - THINKING_MAX_CHARS} more chars)'
     console.print(f"\n[dim italic]Thinking: {display}[/dim italic]\n")
 
 
@@ -419,16 +410,18 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
         cmd += ['--config', tmp_config]
     # 'visible': no additional flags
     proc = await asyncio.create_subprocess_exec(*cmd)
-    # Poll until the MCP endpoint is accepting connections
-    for _ in range(30):
-        await asyncio.sleep(1)
-        try:
-            urllib.request.urlopen(f'http://localhost:{port}/mcp', timeout=1)
-            break
-        except Exception:
-            pass
-    if tmp_config:
-        Path(tmp_config).unlink(missing_ok=True)
+    try:
+        # Poll until the MCP endpoint is accepting connections
+        for _ in range(30):
+            await asyncio.sleep(1)
+            try:
+                urllib.request.urlopen(f'http://localhost:{port}/mcp', timeout=1)
+                break
+            except Exception:
+                pass
+    finally:
+        if tmp_config:
+            Path(tmp_config).unlink(missing_ok=True)
     return proc
 
 

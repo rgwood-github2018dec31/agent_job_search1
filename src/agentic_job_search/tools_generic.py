@@ -12,7 +12,7 @@ import pypdf
 import yaml
 from rich.console import Console
 
-from agentic_job_search.config import MODEL_NAME_LOW
+from agentic_job_search.config import JOB_MAX_AGE_DAYS, JOB_SEARCH_START_DATE, MODEL_NAME_LOW
 from claude_agent_sdk import (
     create_sdk_mcp_server,
     tool,
@@ -107,7 +107,7 @@ async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
     if cache_path is None:
         cache_path = RUN_DIR / 'downloads_pdf_cache.yaml'
 
-    cutoff = datetime(2026, 4, 1).timestamp()
+    cutoff = JOB_SEARCH_START_DATE.timestamp()
     downloads = Path.home() / 'Downloads'
 
     cache: dict = {}
@@ -273,7 +273,7 @@ async def do_check_and_record_job(
         return {"content": [{"type": "text", "text": "already_applied"}]}
 
     posted = parse_posting_date(date_posted)
-    if posted and (date.today() - posted).days > 21:
+    if posted and (date.today() - posted).days > JOB_MAX_AGE_DAYS:
         return {"content": [{"type": "text", "text": "too_old"}]}
 
     PROCESSED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
