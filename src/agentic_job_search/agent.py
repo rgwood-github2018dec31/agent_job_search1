@@ -7,8 +7,7 @@ import socket
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
+import requests
 from pathlib import Path
 from typing import Any
 
@@ -411,11 +410,11 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
     # 'visible': no additional flags
     proc = await asyncio.create_subprocess_exec(*cmd)
     try:
-        # Poll until the MCP endpoint is accepting connections
+        console.print(f'[dim]→ GET http://localhost:{port}/mcp (polling until ready)[/dim]')
         for _ in range(30):
             await asyncio.sleep(1)
             try:
-                urllib.request.urlopen(f'http://localhost:{port}/mcp', timeout=1)
+                requests.get(f'http://localhost:{port}/mcp', timeout=1)
                 break
             except Exception:
                 pass

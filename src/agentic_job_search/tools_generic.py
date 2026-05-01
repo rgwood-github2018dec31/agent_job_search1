@@ -1,13 +1,12 @@
 import os
 import re
 import time
-import urllib.parse
-import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pypdf
+import requests
 import yaml
 from rich.console import Console
 
@@ -166,8 +165,8 @@ def send_telegram(text: str) -> None:
     if not token or not chat_id:
         console.print("[yellow]Warning: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification.[/yellow]")
         return
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+    console.print(f'[dim]→ POST api.telegram.org/sendMessage[/dim]')
+    requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat_id, 'text': text})
 
 
 # Old MD filename pattern: job_posting-{linkedin_id}[-rating_{N}]-{company}-{desc}-{timestamp}.md
