@@ -2,6 +2,9 @@ import os
 
 import pytest
 
+from agentic_job_search.agent import load_env
+load_env()
+
 
 def _claude_available() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))

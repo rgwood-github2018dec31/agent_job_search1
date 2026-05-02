@@ -33,6 +33,7 @@ from claude_agent_sdk import (
     TextBlock,
     ThinkingBlock,
     create_sdk_mcp_server,
+    query as sdk_query,
     tool,
 )
 
@@ -210,13 +211,14 @@ async def generate_search_queries() -> list[str]:
     )
     options = ClaudeAgentOptions(
         model=MODEL_NAME_MEDIUM,
+        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
         mcp_servers={'query_generator': query_server},
-        permission_mode='acceptEdits',
+        allowed_tools=['mcp__query_generator__submit_search_queries'],
+        permission_mode='bypassPermissions',
         cwd=str(PROJECT_DIR),
     )
-    async with ClaudeSDKClient(options) as client:
-        response = await client.query(prompt)
-    console.print(f"\n[dim]{response=}[/dim]")
+    async for _ in sdk_query(prompt=prompt, options=options):
+        pass
 
     if not captured:
         raise ValueError('LLM did not call submit_search_queries')
@@ -517,6 +519,7 @@ async def main() -> None:
         sys.exit(1)
 
     load_processed_jobs()
+    await tools_module.categorize_downloads_pdfs()
     await tools_module.load_downloads_applied_pdfs()
 
     if interactive:

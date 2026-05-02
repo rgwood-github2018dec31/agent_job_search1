@@ -387,20 +387,19 @@ async def test_company_matches_applied_empty_dict_skips_llm(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {})
     sdk_called = []
 
-    class FakeSDKClient:
-        def __init__(self, options): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        async def query(self, prompt): sdk_called.append(True)
+    async def fake_sdk_query(**kwargs):
+        sdk_called.append(True)
+        return
+        yield  # make it an async generator
 
-    monkeypatch.setattr(tools, 'ClaudeSDKClient', FakeSDKClient)
+    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
     result = await tools.company_matches_applied('Shopify')
     assert result is None
     assert not sdk_called
 
 
 def _make_sdk_mock(monkeypatch, tool_args: dict):
-    """Patch ClaudeSDKClient so query() fires the first registered tool with tool_args."""
+    """Patch sdk_query so it fires the first registered MCP tool with tool_args."""
     registered = {}
 
     def fake_create_server(name, version, tools):
@@ -409,15 +408,13 @@ def _make_sdk_mock(monkeypatch, tool_args: dict):
 
     monkeypatch.setattr(tools, 'create_sdk_mcp_server', fake_create_server)
 
-    class FakeSDKClient:
-        def __init__(self, options): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        async def query(self, prompt):
-            for t in registered.get('tools', []):
-                await t.handler(tool_args)
+    async def fake_sdk_query(**kwargs):
+        for t in registered.get('tools', []):
+            await t.handler(tool_args)
+        return
+        yield  # make it an async generator
 
-    monkeypatch.setattr(tools, 'ClaudeSDKClient', FakeSDKClient)
+    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
 
 
 async def test_company_matches_applied_returns_filename_on_yes(monkeypatch):
@@ -455,15 +452,10 @@ async def test_check_and_record_job_skips_applied_company(tmp_path, monkeypatch)
 # load_downloads_applied_pdfs
 # ---------------------------------------------------------------------------
 
-async def test_load_downloads_applied_pdfs_ignores_old(tmp_path, monkeypatch):
+async def test_load_downloads_applied_pdfs_ignores_uncategorized(tmp_path, monkeypatch):
     fake_home = tmp_path / 'home'
-    fake_home.mkdir()
-    fake_downloads = fake_home / 'Downloads'
-    fake_downloads.mkdir()
-    old_pdf = fake_downloads / 'old_job.pdf'
-    old_pdf.write_bytes(b'%PDF-1.4 fake')
-    old_mtime = datetime(2026, 3, 1).timestamp()
-    os.utime(old_pdf, (old_mtime, old_mtime))
+    (fake_home / 'Downloads').mkdir(parents=True)
+    (fake_home / 'Downloads' / 'uncategorized.pdf').write_bytes(b'%PDF fake')
 
     monkeypatch.setattr(tools, '_applied_companies', {})
     monkeypatch.setattr(tools, '_reference_job_texts', [])
@@ -477,13 +469,10 @@ async def test_load_downloads_applied_pdfs_ignores_old(tmp_path, monkeypatch):
 async def test_load_downloads_applied_pdfs_uses_cache(tmp_path, monkeypatch):
     import yaml as yaml_mod
     fake_home = tmp_path / 'home'
-    fake_home.mkdir()
-    fake_downloads = fake_home / 'Downloads'
-    fake_downloads.mkdir()
-    pdf_path = fake_downloads / 'job.pdf'
+    (fake_home / 'Downloads').mkdir(parents=True)
+    pdf_path = fake_home / 'Downloads' / 'cat-saved_jd-acme_job.pdf'
     pdf_path.write_bytes(b'%PDF-1.4 fake')
-    mtime = datetime(2026, 4, 15).timestamp()
-    os.utime(pdf_path, (mtime, mtime))
+    mtime = pdf_path.stat().st_mtime
 
     cache_path = tmp_path / 'cache.yaml'
     cache_path.write_text(yaml_mod.dump({
@@ -532,6 +521,76 @@ def test_build_reference_block_caps_at_max_pdfs(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _categorize_pdf_text and categorize_downloads_pdfs
+# ---------------------------------------------------------------------------
+
+async def test_categorize_pdf_text_saved_jd(monkeypatch):
+    _make_sdk_mock(monkeypatch, {'category': 'saved_jd'})
+    result = await tools._categorize_pdf_text('job posting text', 'acme_job.pdf')
+    assert result == 'saved_jd'
+
+
+async def test_categorize_pdf_text_returns_none_when_tool_not_called(monkeypatch):
+    async def fake_sdk_query(**kwargs):
+        return  # tool never called
+        yield
+
+    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
+    result = await tools._categorize_pdf_text('some random text', 'random.pdf')
+    assert result is None
+
+
+async def test_categorize_downloads_pdfs_renames_uncategorized(tmp_path, monkeypatch):
+    pdf = tmp_path / 'report.pdf'
+    pdf.write_bytes(b'%PDF fake')
+
+    async def fake_categorize(text, filename):
+        return 'saved_jd'
+
+    monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
+    class FakeReader:
+        pages = []
+        def __init__(self, path): pass
+
+    monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
+    await tools.categorize_downloads_pdfs(downloads_dir=tmp_path)
+    assert not pdf.exists()
+    assert (tmp_path / 'cat-saved_jd-report.pdf').exists()
+
+
+async def test_categorize_downloads_pdfs_skips_rename_on_error(tmp_path, monkeypatch):
+    pdf = tmp_path / 'report.pdf'
+    pdf.write_bytes(b'%PDF fake')
+
+    async def fake_categorize(text, filename):
+        return None  # simulate tool-not-called failure
+
+    monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
+    class FakeReader:
+        pages = []
+        def __init__(self, path): pass
+
+    monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
+    await tools.categorize_downloads_pdfs(downloads_dir=tmp_path)
+    assert pdf.exists()  # original file untouched
+
+
+async def test_categorize_downloads_pdfs_skips_already_categorized(tmp_path, monkeypatch):
+    pdf = tmp_path / 'cat-other-old_report.pdf'
+    pdf.write_bytes(b'%PDF fake')
+    sdk_called = []
+
+    async def fake_categorize(text, filename):
+        sdk_called.append(True)
+        return 'other'
+
+    monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
+    await tools.categorize_downloads_pdfs(downloads_dir=tmp_path)
+    assert not sdk_called
+    assert pdf.exists()
+
+
+# ---------------------------------------------------------------------------
 # Live tests for Downloads PDF loading
 # ---------------------------------------------------------------------------
 
@@ -547,6 +606,36 @@ async def test_extract_company_from_text_live():
     company = await tools._extract_company_from_text(text)
     assert company.strip() != ''
     assert 'shopify' in company.lower()
+
+
+@pytest.mark.live_agent_claude
+async def test_categorize_pdf_text_live_saved_jd():
+    text = '''
+    Principal AI Engineer — Remote Canada
+    Dayforce
+    We are hiring a Principal AI Engineer to lead our machine learning platform.
+    Responsibilities: Design agentic AI systems, lead a team of ML engineers,
+    build RAG pipelines and LLM evaluation frameworks.
+    Requirements: 10+ years experience, Python, deep learning expertise.
+    Salary: CAD $220,000 base + equity.
+    '''
+    category = await tools._categorize_pdf_text(text, 'Principal AI Engineer _ Dayforce Jobs.pdf')
+    assert category is not None, 'tool was not called'
+    assert category == 'saved_jd', f'expected saved_jd, got {category!r}'
+
+
+@pytest.mark.live_agent_claude
+async def test_categorize_pdf_text_live_other():
+    text = '''
+    Your Airbnb booking confirmation
+    Check-in: June 12, 2026
+    Check-out: June 15, 2026
+    Property: Cozy cabin in Whistler
+    Total: $450 CAD
+    '''
+    category = await tools._categorize_pdf_text(text, 'Your trip overview – Airbnb.pdf')
+    assert category is not None, 'tool was not called'
+    assert category != 'saved_jd', f'expected non-jd category, got {category!r}'
 
 
 @pytest.mark.live_agent_claude

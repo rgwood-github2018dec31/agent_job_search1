@@ -10,11 +10,11 @@ import requests
 import yaml
 from rich.console import Console
 
-from agentic_job_search.config import JOB_MAX_AGE_DAYS, JOB_SEARCH_START_DATE, MODEL_NAME_LOW
+from agentic_job_search.config import JOB_MAX_AGE_DAYS, MODEL_NAME_LOW
 from claude_agent_sdk import (
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     create_sdk_mcp_server,
+    query as sdk_query,
     tool,
 )
 
@@ -49,12 +49,14 @@ async def _extract_company_from_text(text: str) -> str:
     server = create_sdk_mcp_server(name='company_extractor', version='1.0.0', tools=[_record])
     options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
+        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
         mcp_servers={'company_extractor': server},
-        permission_mode='acceptEdits',
+        allowed_tools=['mcp__company_extractor__record_company'],
+        permission_mode='bypassPermissions',
         cwd=str(PROJECT_DIR),
     )
-    async with ClaudeSDKClient(options) as client:
-        await client.query(f'What company posted this job? Call record_company with the result.\n\n{text[:3000]}')
+    async for _ in sdk_query(prompt=f'What company posted this job? Call record_company with the result.\n\n{text[:3000]}', options=options):
+        pass
     return captured[0] if captured else ''
 
 
@@ -81,15 +83,17 @@ async def company_matches_applied(candidate: str) -> str | None:
     server = create_sdk_mcp_server(name='company_matcher', version='1.0.0', tools=[_record])
     options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
+        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
         mcp_servers={'company_matcher': server},
-        permission_mode='acceptEdits',
+        allowed_tools=['mcp__company_matcher__record_match_result'],
+        permission_mode='bypassPermissions',
         cwd=str(PROJECT_DIR),
     )
-    async with ClaudeSDKClient(options) as client:
-        await client.query(
-            f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
-            f'{companies_list}\n\nCall record_match_result with your answer.'
-        )
+    async for _ in sdk_query(
+        prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}\n\nCall record_match_result with your answer.',
+        options=options,
+    ):
+        pass
     if not captured:
         return None
     result = captured[0]
@@ -99,14 +103,80 @@ async def company_matches_applied(candidate: str) -> str | None:
     return _applied_companies.get(matched, '<unknown PDF>')
 
 
+async def _categorize_pdf_text(text: str, filename: str) -> str:
+    """Use agent SDK to assign a category label to a PDF. Returns a snake_case string."""
+    captured: list[str] = []
+
+    @tool('record_category', 'Record the category for this PDF', {
+        'type': 'object',
+        'properties': {
+            'category': {
+                'type': 'string',
+                'description': (
+                    'Category for the PDF. Use "saved_jd" for job descriptions/postings, '
+                    '"other" for unrelated content, or a short snake_case label you derive '
+                    'such as "resume", "contract", "invoice", "article".'
+                ),
+            },
+        },
+        'required': ['category'],
+    })
+    async def _record(args: dict[str, Any]) -> dict:
+        captured.append(args['category'])
+        return {'content': [{'type': 'text', 'text': 'Recorded.'}]}
+
+    server = create_sdk_mcp_server(name='pdf_categorizer', version='1.0.0', tools=[_record])
+    options = ClaudeAgentOptions(
+        model=MODEL_NAME_LOW,
+        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
+        mcp_servers={'pdf_categorizer': server},
+        allowed_tools=['mcp__pdf_categorizer__record_category'],
+        permission_mode='bypassPermissions',
+        cwd=str(PROJECT_DIR),
+    )
+    prompt = (
+        f'You must call the record_category tool. Do not respond with text — only call the tool.\n\n'
+        f'Filename: {filename}\n\n'
+        f'Content:\n{text}'
+    )
+    async for _ in sdk_query(prompt=prompt, options=options):
+        pass
+    if not captured:
+        console.print(f'[yellow]Warning: record_category not called for {filename}[/yellow]')
+        return None
+    return underscorify(captured[0]) or 'other'
+
+
+async def categorize_downloads_pdfs(downloads_dir: Path | None = None) -> None:
+    """Rename uncategorized PDFs in ~/Downloads with a cat-<category>- prefix."""
+    downloads = downloads_dir or Path.home() / 'Downloads'
+    uncategorized = [p for p in downloads.glob('*.pdf') if not p.name.startswith('cat-')]
+    if not uncategorized:
+        return
+    console.print(f'[dim]Categorizing {len(uncategorized)} uncategorized PDF(s) in Downloads...[/dim]')
+    for pdf in uncategorized:
+        try:
+            reader = pypdf.PdfReader(pdf)
+            text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+        except Exception as e:
+            console.print(f'[yellow]Warning: could not read {pdf.name}: {e}[/yellow]')
+            continue
+        console.print(f'[dim]  Categorizing {pdf.name}...[/dim]')
+        category = await _categorize_pdf_text(text[:3000], pdf.name)
+        if category is None:
+            continue
+        new_name = f'cat-{category}-{pdf.name}'
+        console.print(f'[dim]  → {new_name}[/dim]')
+        pdf.rename(pdf.parent / new_name)
+
+
 async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
-    """Scan ~/Downloads for job description PDFs saved April 2026+, extract companies and text."""
+    """Load cat-saved_jd-*.pdf from ~/Downloads, extracting company names and full text."""
     global _applied_companies, _reference_job_texts
 
     if cache_path is None:
         cache_path = RUN_DIR / 'downloads_pdf_cache.yaml'
 
-    cutoff = JOB_SEARCH_START_DATE.timestamp()
     downloads = Path.home() / 'Downloads'
 
     cache: dict = {}
@@ -116,13 +186,14 @@ async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
         except Exception:
             cache = {}
 
-    pdfs = [p for p in downloads.glob('*.pdf') if p.stat().st_mtime >= cutoff]
+    # pdfs = list(downloads.glob('cat-saved_jd-*.pdf'))
 
     companies: dict[str, str] = {}  # company_name -> pdf filename
     texts: list[str] = []
     cache_dirty = False
 
-    for pdf in pdfs:
+    i = 0
+    for pi, pdf in enumerate(downloads.glob('cat-saved_jd-*.pdf')):
         key = str(pdf)
         mtime = pdf.stat().st_mtime
         entry = cache.get(key)
@@ -152,7 +223,7 @@ async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
 
     _applied_companies = companies
     _reference_job_texts = texts
-    console.print(f'[dim]Loaded {len(pdfs)} applied-job PDF(s) from Downloads ({len(companies)} companies).[/dim]')
+    console.print(f'[dim]Loaded {i} applied-job PDF(s) from Downloads ({len(companies)} companies).[/dim]')
 
 
 def underscorify(s: str) -> str:
