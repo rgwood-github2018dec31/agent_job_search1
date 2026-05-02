@@ -183,16 +183,15 @@ async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
     if cache_path.exists():
         try:
             cache = yaml.safe_load(cache_path.read_text(encoding='utf-8')) or {}
-        except Exception:
+        except Exception as e:
+            console.print(f'[yellow]Warning: could not read cache {cache_path}: {e}[/yellow]')
             cache = {}
-
-    # pdfs = list(downloads.glob('cat-saved_jd-*.pdf'))
 
     companies: dict[str, str] = {}  # company_name -> pdf filename
     texts: list[str] = []
     cache_dirty = False
 
-    i = 0
+    pi = 0
     for pi, pdf in enumerate(downloads.glob('cat-saved_jd-*.pdf')):
         key = str(pdf)
         mtime = pdf.stat().st_mtime
@@ -223,7 +222,7 @@ async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
 
     _applied_companies = companies
     _reference_job_texts = texts
-    console.print(f'[dim]Loaded {i} applied-job PDF(s) from Downloads ({len(companies)} companies).[/dim]')
+    console.print(f'[dim]Loaded {pi} applied-job PDF(s) from Downloads ({len(companies)} companies).[/dim]')
 
 
 def underscorify(s: str) -> str:
@@ -263,8 +262,8 @@ def load_processed_jobs() -> None:
             data = yaml.safe_load(f.read_text(encoding="utf-8"))
             if data and "site" in data and "job_id" in data:
                 ids.add((data["site"], str(data["job_id"])))
-        except Exception:
-            pass
+        except Exception as e:
+            console.print(f'[yellow]Warning: could not read {f}: {e}[/yellow]')
 
     _processed_jobs = ids
     console.print(f"[dim]Loaded {len(_processed_jobs)} previously processed job(s).[/dim]")
