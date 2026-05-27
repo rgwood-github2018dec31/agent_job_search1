@@ -398,21 +398,20 @@ async def test_company_matches_applied_empty_dict_skips_llm(monkeypatch):
     assert not sdk_called
 
 
-def _make_sdk_mock(monkeypatch, tool_args: dict):
-    """Patch sdk_query so it fires the first registered MCP tool with tool_args."""
-    registered = {}
-
-    def fake_create_server(name, version, tools):
-        registered['tools'] = tools
-        return object()
-
-    monkeypatch.setattr(tools, 'create_sdk_mcp_server', fake_create_server)
+def _make_sdk_mock(monkeypatch, structured_output: dict):
+    """Patch sdk_query so it yields a ResultMessage with structured_output."""
+    from claude_agent_sdk import ResultMessage
 
     async def fake_sdk_query(**kwargs):
-        for t in registered.get('tools', []):
-            await t.handler(tool_args)
-        return
-        yield  # make it an async generator
+        yield ResultMessage(
+            subtype='success',
+            duration_ms=100,
+            duration_api_ms=100,
+            is_error=False,
+            num_turns=1,
+            session_id='fake-session',
+            structured_output=structured_output,
+        )
 
     monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
 

@@ -217,8 +217,11 @@ async def generate_search_queries() -> list[str]:
         permission_mode='bypassPermissions',
         cwd=str(PROJECT_DIR),
     )
-    async for _ in sdk_query(prompt=prompt, options=options):
-        pass
+    try:
+        async for _ in sdk_query(prompt=prompt, options=options):
+            pass
+    except Exception as ex:
+        raise RuntimeError(f'Stage 1a (query generation) failed: {ex}') from ex
 
     if not captured:
         raise ValueError('LLM did not call submit_search_queries')
@@ -318,25 +321,28 @@ def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
 async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> float:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results."""
     query_list = "\n".join(f'- "{q}"' for q in queries)
-    await client.query(
-        f"Begin scraping LinkedIn now. Use these search queries:\n{query_list}\n\n"
-        "For each query, call check_and_record_job and queue_candidate for each new job found "
-        "in the results list. Do not ask for permission — call the tools directly. "
-        "Do not navigate to individual job pages. Stop when done."
-    )
-    cost = 0.0
-    async for msg in client.receive_response():
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, ThinkingBlock):
-                    print_thinking(block.thinking)
-                elif isinstance(block, TextBlock):
-                    print(block.text, end="", flush=True)
-        elif isinstance(msg, ResultMessage):
-            print()
-            print_result_stats(msg)
-            if msg.total_cost_usd is not None:
-                cost += msg.total_cost_usd
+    try:
+        await client.query(
+            f"Begin scraping LinkedIn now. Use these search queries:\n{query_list}\n\n"
+            "For each query, call check_and_record_job and queue_candidate for each new job found "
+            "in the results list. Do not ask for permission — call the tools directly. "
+            "Do not navigate to individual job pages. Stop when done."
+        )
+        cost = 0.0
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, ThinkingBlock):
+                        print_thinking(block.thinking)
+                    elif isinstance(block, TextBlock):
+                        print(block.text, end="", flush=True)
+            elif isinstance(msg, ResultMessage):
+                print()
+                print_result_stats(msg)
+                if msg.total_cost_usd is not None:
+                    cost += msg.total_cost_usd
+    except Exception as ex:
+        raise RuntimeError(f'Stage 1b (scraper) failed: {ex}') from ex
     return cost
 
 
@@ -369,20 +375,23 @@ async def evaluate_all_candidates(
         )
         if reference_block:
             query = f'{reference_block}\n\n{query}'
-        async with ClaudeSDKClient(options) as client:
-            await client.query(query)
-            async for msg in client.receive_response():
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, ThinkingBlock):
-                            print_thinking(block.thinking)
-                        elif isinstance(block, TextBlock):
-                            print(block.text, end="", flush=True)
-                elif isinstance(msg, ResultMessage):
-                    print()
-                    print_result_stats(msg)
-                    if msg.total_cost_usd is not None:
-                        cost += msg.total_cost_usd
+        try:
+            async with ClaudeSDKClient(options) as client:
+                await client.query(query)
+                async for msg in client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, ThinkingBlock):
+                                print_thinking(block.thinking)
+                            elif isinstance(block, TextBlock):
+                                print(block.text, end="", flush=True)
+                    elif isinstance(msg, ResultMessage):
+                        print()
+                        print_result_stats(msg)
+                        if msg.total_cost_usd is not None:
+                            cost += msg.total_cost_usd
+        except Exception as ex:
+            console.print(f"[red]Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}[/red]")
     return cost
 
 

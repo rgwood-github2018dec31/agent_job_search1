@@ -13,6 +13,7 @@ from rich.console import Console
 from agentic_job_search.config import JOB_MAX_AGE_DAYS, MODEL_NAME_LOW
 from claude_agent_sdk import (
     ClaudeAgentOptions,
+    ResultMessage,
     create_sdk_mcp_server,
     query as sdk_query,
     tool,
@@ -33,31 +34,26 @@ _reference_job_texts: list[str] = []     # extracted text for evaluator prompt i
 
 async def _extract_company_from_text(text: str) -> str:
     """Use agent SDK to extract the hiring company name from job description text."""
-    captured: list[str] = []
-
-    @tool('record_company', 'Record the company that posted this job', {
-        'type': 'object',
-        'properties': {
-            'company_name': {'type': 'string', 'description': 'Name of the hiring company'},
-        },
-        'required': ['company_name'],
-    })
-    async def _record(args: dict[str, Any]) -> dict:
-        captured.append(args['company_name'])
-        return {'content': [{'type': 'text', 'text': 'Recorded.'}]}
-
-    server = create_sdk_mcp_server(name='company_extractor', version='1.0.0', tools=[_record])
     options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
-        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
-        mcp_servers={'company_extractor': server},
-        allowed_tools=['mcp__company_extractor__record_company'],
+        tools=[],
         permission_mode='bypassPermissions',
+        output_format={
+            'type': 'json_schema',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'company_name': {'type': 'string', 'description': 'Name of the hiring company'},
+                },
+                'required': ['company_name'],
+            },
+        },
         cwd=str(PROJECT_DIR),
     )
-    async for _ in sdk_query(prompt=f'What company posted this job? Call record_company with the result.\n\n{text[:3000]}', options=options):
-        pass
-    return captured[0] if captured else ''
+    async for msg in sdk_query(prompt=f'What company posted this job?\n\n{text[:3000]}', options=options):
+        if isinstance(msg, ResultMessage) and msg.structured_output:
+            return msg.structured_output.get('company_name', '')
+    return ''
 
 
 async def company_matches_applied(candidate: str) -> str | None:
@@ -65,86 +61,69 @@ async def company_matches_applied(candidate: str) -> str | None:
     if not _applied_companies:
         return None
 
-    captured: list[dict] = []
     companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
-
-    @tool('record_match_result', 'Record whether the candidate matches an applied company', {
-        'type': 'object',
-        'properties': {
-            'matches': {'type': 'boolean', 'description': 'True if same organization'},
-            'matched_company_name': {'type': 'string', 'description': 'Matching name from the list, or empty string'},
-        },
-        'required': ['matches', 'matched_company_name'],
-    })
-    async def _record(args: dict[str, Any]) -> dict:
-        captured.append(args)
-        return {'content': [{'type': 'text', 'text': 'Recorded.'}]}
-
-    server = create_sdk_mcp_server(name='company_matcher', version='1.0.0', tools=[_record])
     options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
-        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
-        mcp_servers={'company_matcher': server},
-        allowed_tools=['mcp__company_matcher__record_match_result'],
+        tools=[],
         permission_mode='bypassPermissions',
+        output_format={
+            'type': 'json_schema',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'matches': {'type': 'boolean', 'description': 'True if same organization'},
+                    'matched_company_name': {'type': 'string', 'description': 'Matching name from the list, or empty string'},
+                },
+                'required': ['matches', 'matched_company_name'],
+            },
+        },
         cwd=str(PROJECT_DIR),
     )
-    async for _ in sdk_query(
-        prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}\n\nCall record_match_result with your answer.',
+    async for msg in sdk_query(
+        prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}',
         options=options,
     ):
-        pass
-    if not captured:
-        return None
-    result = captured[0]
-    if not result['matches']:
-        return None
-    matched = result.get('matched_company_name', '')
-    return _applied_companies.get(matched, '<unknown PDF>')
+        if isinstance(msg, ResultMessage) and msg.structured_output:
+            result = msg.structured_output
+            if not result.get('matches'):
+                return None
+            matched = result.get('matched_company_name', '')
+            return _applied_companies.get(matched, '<unknown PDF>')
+    return None
 
 
 async def _categorize_pdf_text(text: str, filename: str) -> str:
     """Use agent SDK to assign a category label to a PDF. Returns a snake_case string."""
-    captured: list[str] = []
-
-    @tool('record_category', 'Record the category for this PDF', {
-        'type': 'object',
-        'properties': {
-            'category': {
-                'type': 'string',
-                'description': (
-                    'Category for the PDF. Use "saved_jd" for job descriptions/postings, '
-                    '"other" for unrelated content, or a short snake_case label you derive '
-                    'such as "resume", "contract", "invoice", "article".'
-                ),
-            },
-        },
-        'required': ['category'],
-    })
-    async def _record(args: dict[str, Any]) -> dict:
-        captured.append(args['category'])
-        return {'content': [{'type': 'text', 'text': 'Recorded.'}]}
-
-    server = create_sdk_mcp_server(name='pdf_categorizer', version='1.0.0', tools=[_record])
     options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
-        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
-        mcp_servers={'pdf_categorizer': server},
-        allowed_tools=['mcp__pdf_categorizer__record_category'],
+        tools=[],
         permission_mode='bypassPermissions',
+        output_format={
+            'type': 'json_schema',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'category': {
+                        'type': 'string',
+                        'description': (
+                            'Category for the PDF. Use "saved_jd" for job descriptions/postings, '
+                            '"other" for unrelated content, or a short snake_case label you derive '
+                            'such as "resume", "contract", "invoice", "article".'
+                        ),
+                    },
+                },
+                'required': ['category'],
+            },
+        },
         cwd=str(PROJECT_DIR),
     )
-    prompt = (
-        f'You must call the record_category tool. Do not respond with text — only call the tool.\n\n'
-        f'Filename: {filename}\n\n'
-        f'Content:\n{text}'
-    )
-    async for _ in sdk_query(prompt=prompt, options=options):
-        pass
-    if not captured:
-        console.print(f'[yellow]Warning: record_category not called for {filename}[/yellow]')
-        return None
-    return underscorify(captured[0]) or 'other'
+    prompt = f'Filename: {filename}\n\nContent:\n{text}'
+    async for msg in sdk_query(prompt=prompt, options=options):
+        if isinstance(msg, ResultMessage) and msg.structured_output:
+            category = msg.structured_output.get('category', '')
+            return underscorify(category) or 'other'
+    console.print(f'[yellow]Warning: no structured output for {filename}[/yellow]')
+    return None
 
 
 async def categorize_downloads_pdfs(downloads_dir: Path | None = None) -> None:
