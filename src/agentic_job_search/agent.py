@@ -67,6 +67,9 @@ When browsing LinkedIn:
 
 The user's LinkedIn session is persisted so they should already be logged in. If not, ask them to log in via the browser.
 
+## Hard rule — US jobs without visa sponsorship
+If the job is located in the United States, check whether the posting explicitly states that visa sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", "willing to sponsor"). If it does NOT explicitly mention visa sponsorship, rate it **1** immediately.
+
 ## Rating jobs
 
 Rate every job you evaluate on a 1–5 scale:
@@ -111,6 +114,9 @@ Do not evaluate jobs, do not click job titles, do not open job detail pages — 
 EVALUATOR_INSTRUCTIONS = """You are evaluating a single job posting.
 
 Navigate to the job URL provided. Read the full job description carefully.
+
+## Hard rule — US jobs without visa sponsorship
+If the job is located in the United States, check whether the posting explicitly states that visa sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", "willing to sponsor"). If it does NOT explicitly mention visa sponsorship, rate it **1** immediately and do not evaluate further.
 
 Rate the job 1–5 based on the requirements below:
 - 1 — Poor fit (missing key requirements or deal-breakers)
