@@ -115,6 +115,12 @@ EVALUATOR_INSTRUCTIONS = """You are evaluating a single job posting.
 
 Navigate to the job URL provided. Read the full job description carefully.
 
+## Hard rule — closed postings
+If the page shows "No longer accepting applications" (or equivalent), rate it **1** immediately and do not evaluate further.
+
+## Hard rule — postings older than one month
+If the posting date visible on the page is more than 30 days ago, rate it **1** immediately and do not evaluate further.
+
 ## Hard rule — US jobs without visa sponsorship
 If the job is located in the United States, check whether the posting explicitly states that visa sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", "willing to sponsor"). If it does NOT explicitly mention visa sponsorship, rate it **1** immediately and do not evaluate further.
 
