@@ -63,7 +63,7 @@ Do not write files directly to disk. Use the save_job_posting tool to persist jo
 When browsing LinkedIn:
 - Navigate to https://www.linkedin.com/jobs/ to search for jobs
 - Extract: job title, company, location, remote/in-person/hybrid (if shown), salary (if shown), and key requirements
-- **Before evaluating any job, call `check_and_record_job` with the site, job ID, posting date (YYYY-MM-DD), company, and job title. If it returns `already_processed` or `too_old`, skip the job entirely. Only proceed with jobs that return `new`.**
+- **Before evaluating any job, call `check_and_record_job` with the site, job ID, posting date (YYYY-MM-DD), company, and job title. If it returns `already_processed`, `too_old`, `already_applied`, or `auth_required`, skip the job entirely. Only proceed with jobs that return `new`.**
 
 The user's LinkedIn session is persisted so they should already be logged in. If not, ask them to log in via the browser.
 
@@ -100,7 +100,7 @@ The information visible in search results (title, company, snippet, date) is all
 For each job visible in the search results:
 1. Call check_and_record_job with site="linkedin", the job ID (from the URL), company, and title. Pass date_posted only if it's visible in the results — it may be relative like "4 days ago", or it may not be shown at all; both are fine.
 2. If it returns "new", call queue_candidate immediately with whatever is visible: URL, title, company, snippet, and date_posted if shown.
-3. If it returns "already_processed", "too_old", or "already_applied", skip it.
+3. If it returns "already_processed", "too_old", "already_applied", or "auth_required", skip it.
 
 Only pass information that is directly visible in the search results listing. Do not infer or fabricate missing fields. Stage 2 will navigate to the job page and fill in any missing details.
 

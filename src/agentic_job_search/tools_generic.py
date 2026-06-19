@@ -283,6 +283,28 @@ async def do_update_job_requirements(content: str) -> dict:
     }
 
 
+_AUTH_REQUIRED_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r'must be (legally )?authorized to work in the (us|united states)',
+        r'no visa sponsorship',
+        r'not able to (provide |offer )?sponsor',
+        r'cannot (provide |offer )?sponsor',
+        r'sponsorship (is )?not (available|provided|offered)',
+        r'will not (provide |offer )?sponsor',
+        r'unable to (provide |offer )?sponsor',
+        r'us citizens? and (lawful )?permanent residents?',
+        r'currently (legally )?authorized to work in the (us|united states)',
+        r"this (position|role|job) (does not|doesn't) (provide|offer|support) (visa )?sponsorship",
+        r'employment authorization (without|not requiring) sponsorship',
+    ]
+]
+
+
+def _requires_current_us_auth(text: str) -> bool:
+    """Return True if text indicates the job requires current US work authorization (no sponsorship)."""
+    return any(p.search(text) for p in _AUTH_REQUIRED_PATTERNS)
+
+
 def parse_posting_date(date_posted: str | None) -> date | None:
     """Parse an absolute (YYYY-MM-DD) or relative ('4 days ago') posting date."""
     if not date_posted:
@@ -323,6 +345,11 @@ async def do_check_and_record_job(
     posted = parse_posting_date(date_posted)
     if posted and (date.today() - posted).days > JOB_MAX_AGE_DAYS:
         return {"content": [{"type": "text", "text": "too_old"}]}
+
+    combined_text = ' '.join(filter(None, [description, content]))
+    if _requires_current_us_auth(combined_text):
+        console.print(f'[dim]Skipping {company} — requires current US work authorization.[/dim]')
+        return {"content": [{"type": "text", "text": "auth_required"}]}
 
     PROCESSED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime("%Y%b%d")
@@ -394,7 +421,7 @@ async def update_job_requirements(args: dict[str, Any]) -> dict:
 @tool(
     "check_and_record_job",
     "Before evaluating any job, call this with the site name, job ID, company name, and job title/description. "
-    "Returns 'already_processed' (skip it), 'too_old' (skip it), 'already_applied' (skip it), or 'new' (proceed to evaluate). "
+    "Returns 'already_processed' (skip it), 'too_old' (skip it), 'already_applied' (skip it), 'auth_required' (skip it — requires current US work authorization), or 'new' (proceed to evaluate). "
     "date_posted is optional — pass whatever is visible (YYYY-MM-DD or relative like '4 days ago'); omit if not shown. "
     "Optionally pass url (the job posting URL) and content (full text of the posting) to persist them in the record.",
     {"site": str, "job_id": str, "company": str, "description": str, "date_posted": str, "url": str, "content": str},

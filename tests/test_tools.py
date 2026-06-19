@@ -243,6 +243,68 @@ async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _requires_current_us_auth
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('text', [
+    'Must be authorized to work in the US without sponsorship',
+    'No visa sponsorship available for this role',
+    'We are not able to sponsor work visas',
+    'We cannot sponsor or transfer visas',
+    'Sponsorship is not available for this position',
+    'Will not sponsor applicants for work visas',
+    'US citizens and permanent residents only',
+    'Currently authorized to work in the United States',
+    "This position does not provide visa sponsorship",
+    'Employment authorization without sponsorship required',
+    'must be legally authorized to work in the united states',
+])
+def test_requires_current_us_auth_matches(text):
+    assert tools._requires_current_us_auth(text), f'Expected match for: {text!r}'
+
+
+@pytest.mark.parametrize('text', [
+    'Senior ML Engineer — Remote Canada',
+    'Principal Data Scientist — EU remote',
+    'We are open to visa sponsorship for exceptional candidates',
+    'Staff AI Engineer at Shopify',
+    'Sponsorship available for the right candidate',
+    'Remote role, open to all locations',
+])
+def test_requires_current_us_auth_no_false_positives(text):
+    assert not tools._requires_current_us_auth(text), f'Expected no match for: {text!r}'
+
+
+async def test_check_and_record_job_auth_required(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
+
+    result = await tools.do_check_and_record_job(
+        'linkedin', '7777777777', 'AcmeUS', 'Senior Engineer',
+        date_posted=_recent_date(),
+        content='Must be authorized to work in the US without sponsorship.',
+    )
+
+    assert result['content'][0]['text'] == 'auth_required'
+    assert not list((tmp_path / 'processed_jobs').glob('*.yaml'))
+
+
+async def test_check_and_record_job_auth_not_triggered_for_canada(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
+
+    result = await tools.do_check_and_record_job(
+        'linkedin', '8888888888', 'Shopify', 'Staff Engineer',
+        date_posted=_recent_date(),
+        content='Remote role open to candidates in Canada. We welcome all applicants.',
+    )
+
+    assert result['content'][0]['text'] == 'new'
+
+
+# ---------------------------------------------------------------------------
 # load_processed_jobs
 # ---------------------------------------------------------------------------
 
