@@ -109,6 +109,59 @@ At runtime, `check_and_record_job` enforces:
 
 `date_posted` accepts absolute (`YYYY-MM-DD`) or relative (`"4 days ago"`) formats; omit if not shown.
 
+## Requirements
+
+### Actors
+
+- **User** — the job seeker; runs the agent and provides feedback on job postings
+- **Scheduler** — a scheduled system event (e.g. cron) that triggers autonomous runs; a kind of User with no interactive input
+- **LinkedIn** — external job board; serves search results and job pages (secondary actor)
+- **Telegram** — external messaging service; delivers notifications to the User (secondary actor)
+
+### Business Object Model
+
+- **Resume** — user's CV stored as Markdown in `run_dir/`
+- **JOB_REQUIREMENTS.md** — agent-managed preference file; read-only in non-interactive mode
+- **Search Query** — short LinkedIn search string derived from Resume and JOB_REQUIREMENTS.md (2–6 per run)
+- **Job Posting** — a LinkedIn listing with company, title, description, URL, job_id, date_posted, and a 1–5 rating
+- **Processed Job Record** — `processed_jobs/*.yaml` keyed by `(site, job_id)`; drives deduplication across runs
+- **Saved Job** — evaluated posting stored as `saved_jobs-{date}/job_posting-{id}-rating_{n}-*.md`
+
+### Use Cases
+
+**User**
+- **Run interactive review**: present Job Postings one at a time and collect feedback
+  - includes: Evaluate Job Fit
+  - includes: Refine Job Requirements
+- **Refine Job Requirements**: rewrite JOB_REQUIREMENTS.md based on User feedback on a Job Posting
+
+**Scheduler**
+- **Run autonomous search**: discover and rate Job Postings without user interaction
+  - includes: Generate Search Queries
+  - includes: Scrape Job Postings
+  - includes: Evaluate Job Fit
+
+**System** (invoked via includes)
+- **Generate Search Queries**: derive Search Queries from Resume and JOB_REQUIREMENTS.md
+- **Scrape Job Postings**: execute Search Queries on LinkedIn and collect candidate Job Postings
+  - includes: Deduplicate Job Posting
+  - includes: Filter Stale Job Posting
+- **Deduplicate Job Posting**: skip a Job Posting already present in Processed Job Records
+- **Filter Stale Job Posting**: skip a Job Posting whose scraped date is > 21 days old
+- **Evaluate Job Fit**: navigate to Job Posting URL, score fit 1–5, save as Saved Job
+  - includes: Notify User of Match
+  - extends: Rate Closed or Expired Job Posting
+- **Rate Closed or Expired Job Posting**: force rating to 1 if Job Posting shows "No longer accepting applications" or posting date > 30 days old; extends Evaluate Job Fit
+- **Rate Unsupported US Job**: force rating to 1 if Job Posting is US-located without explicit visa sponsorship; extends Evaluate Job Fit
+- **Notify User of Match**: send Telegram notification when a Saved Job has rating ≥ 4
+
+### Non-functional Requirements
+
+- **Cost efficiency** — Haiku for the high-volume scraping stage; Sonnet for evaluation; evaluator prompt built once and reused to maximise prompt-cache hits
+- **Idempotency** — processed-job records persist across runs so jobs are never evaluated twice
+- **Notification latency** — Telegram alerts sent immediately when a job is rated 4 or 5 during evaluation
+- **Rating hard rules (applied before fit scoring)**: closed postings → 1; postings > 30 days old → 1; US jobs without explicit sponsorship → 1
+
 ## Git conventions
 
 - Use `git mv` when moving or renaming tracked files
