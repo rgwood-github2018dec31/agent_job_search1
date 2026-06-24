@@ -22,7 +22,6 @@ from agentic_job_search.tools_generic import (
     make_evaluator_server,
     make_job_search_server,
     make_scraper_server,
-    send_telegram,
 )
 
 from claude_agent_sdk import (
@@ -52,6 +51,20 @@ def load_env() -> None:
 load_env()
 
 BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
+TELEGRAM_MCP_URL = 'http://localhost:8004/mcp'
+
+
+async def _send_pipeline_notification(text: str) -> None:
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    try:
+        async with streamable_http_client(TELEGRAM_MCP_URL) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                await session.call_tool('send_message', {'text': text})
+    except Exception as ex:
+        console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
 
 
 # --- Prompt construction ---
@@ -100,6 +113,22 @@ You are fully authorized to call all available tools. Call them directly — do 
 
 The information visible in search results (title, company, snippet, date) is all you need. A separate evaluation agent will visit individual job pages later. Your only job is to queue candidates from what you can see in the results list.
 
+## Location targeting
+
+For each search query, run it against both target regions:
+
+1. **Canada (remote)**:
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2
+
+2. **European Union (remote)**:
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2
+
+(f_WT=2 = Remote filter. URL-encode spaces as `+`. Example for "Principal AI Engineer":
+  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=Canada&f_WT=2
+  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=European+Union&f_WT=2)
+
+If either location-filtered search returns fewer than 3 new candidates, also run the same query without location filters to catch globally-remote roles that may accept candidates from those regions.
+
 For each job visible in the search results:
 1. Call check_and_record_job with site="linkedin", the job ID (from the URL), company, and title. Pass date_posted only if it's visible in the results — it may be relative like "4 days ago", or it may not be shown at all; both are fine.
 2. If it returns "new", call queue_candidate immediately with whatever is visible: URL, title, company, snippet, and date_posted if shown.
@@ -133,7 +162,7 @@ Rate the job 1–5 based on the requirements below:
 
 Then:
 1. Call save_job_posting with the full job content, your rating, company, title, and job_id.
-2. If rating is 4 or 5, call notify_user with a brief summary.
+2. If rating is 4 or 5, call send_message with a brief summary.
 
 Evaluate only this one job, then stop. Do not browse other pages.
 """
@@ -367,6 +396,7 @@ async def evaluate_all_candidates(
         mcp_servers={
             "playwright": playwright_mcp,
             "job_evaluator": make_evaluator_server(),
+            "telegram": {"type": "http", "url": TELEGRAM_MCP_URL},
         },
         permission_mode="bypassPermissions",
         cwd=str(PROJECT_DIR),
@@ -383,7 +413,7 @@ async def evaluate_all_candidates(
             f"Posted: {candidate['date_posted']}\n"
             f"Snippet: {candidate['snippet']}\n\n"
             f"Navigate to the URL, read the full description, rate it 1–5, save it with save_job_posting, "
-            f"and call notify_user if rated 4 or 5."
+            f"and call send_message if rated 4 or 5."
         )
         if reference_block:
             query = f'{reference_block}\n\n{query}'
@@ -488,7 +518,7 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
         if not candidates:
             console.print("[dim]No new candidates found.[/dim]")
             elapsed_mins = (time.time() - start_time) / 60
-            send_telegram(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}")
+            await _send_pipeline_notification(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}")
             return
 
         # Stage 2: all evaluations share the same browser via the SSE server
@@ -513,10 +543,7 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
     ]
     stats_msg = "\n".join(stats_lines)
     console.print(f"\n[dim]{stats_msg}[/dim]")
-    try:
-        send_telegram(stats_msg)
-    except Exception as e:
-        console.print(f"[yellow]Warning: failed to send stats via Telegram: {e}[/yellow]")
+    await _send_pipeline_notification(stats_msg)
 
 
 async def main() -> None:

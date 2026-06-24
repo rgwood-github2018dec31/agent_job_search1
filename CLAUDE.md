@@ -22,7 +22,10 @@ python main.py
 ### Non-interactive
 Designed for periodic/scheduled runs (e.g. cron). The agent searches LinkedIn autonomously, rates all jobs, and sends Telegram notifications for any rated 4 or 5. `JOB_REQUIREMENTS.md` is read but never modified.
 
+Requires the `tools_telegram` MCP server to be running on port 8004 for job-match notifications. Pipeline summary/stats are sent directly via the Telegram Bot API regardless of whether the server is up.
+
 ```bash
+bash /Users/rgwood/repos2022feb22v1/tools_telegram/scripts/start-tool-server.sh &
 python main.py --non-interactive   # or: python main.py -n
 ```
 

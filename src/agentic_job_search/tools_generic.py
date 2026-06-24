@@ -1,4 +1,4 @@
-import os
+
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import pypdf
-import requests
 import yaml
 from rich.console import Console
 
@@ -208,16 +207,6 @@ def underscorify(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
 
 
-def send_telegram(text: str) -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        console.print("[yellow]Warning: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, skipping notification.[/yellow]")
-        return
-    console.print(f'[dim]→ POST api.telegram.org/sendMessage[/dim]')
-    requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id': chat_id, 'text': text})
-
-
 # Old MD filename pattern: job_posting-{linkedin_id}[-rating_{N}]-{company}-{desc}-{timestamp}.md
 _SAVED_JOB_MD_RE = re.compile(r"^job_posting-(\d+|noid)(?:-rating_\d+)?-.+-\d+\.md$")
 
@@ -264,14 +253,6 @@ async def do_save_job_posting(
     (dir_path / filename).write_text(content, encoding="utf-8")
 
     return {"content": [{"type": "text", "text": f"Saved: saved_jobs-{date_str}/{filename}"}]}
-
-
-async def do_notify_user(message: str) -> dict:
-    try:
-        send_telegram(message)
-        return {"content": [{"type": "text", "text": "Notification sent."}]}
-    except Exception as e:
-        return {"content": [{"type": "text", "text": f"Notification failed: {e}"}], "isError": True}
 
 
 async def do_update_job_requirements(content: str) -> dict:
@@ -400,15 +381,6 @@ async def save_job_posting(args: dict[str, Any]) -> dict:
 
 
 @tool(
-    "notify_user",
-    "Send a Telegram notification to the user. Use for jobs rated 4 or 5.",
-    {"message": str},
-)
-async def notify_user(args: dict[str, Any]) -> dict:
-    return await do_notify_user(args["message"])
-
-
-@tool(
     "update_job_requirements",
     "Rewrite JOB_REQUIREMENTS.md with a complete, updated summary of the user's job preferences. "
     "Always rewrite the full file — never append. Returns the new contents so they are in context.",
@@ -453,7 +425,7 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
 
 def make_job_search_server(interactive: bool):
     """MCP server for interactive mode."""
-    tools = [check_and_record_job, save_job_posting, notify_user]
+    tools = [check_and_record_job, save_job_posting]
     if interactive:
         tools.append(update_job_requirements)
     return create_sdk_mcp_server(name="job_search", version="1.0.0", tools=tools)
@@ -468,8 +440,8 @@ def make_scraper_server():
 
 
 def make_evaluator_server():
-    """MCP server for stage 2: saves evaluated jobs and sends notifications."""
+    """MCP server for stage 2: saves evaluated jobs."""
     return create_sdk_mcp_server(
         name="job_evaluator", version="1.0.0",
-        tools=[save_job_posting, notify_user],
+        tools=[save_job_posting],
     )

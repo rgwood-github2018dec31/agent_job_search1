@@ -122,32 +122,6 @@ async def test_update_job_requirements_overwrites(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# do_notify_user
-# ---------------------------------------------------------------------------
-
-async def test_notify_user_calls_send_telegram(monkeypatch):
-    sent = []
-    monkeypatch.setattr(tools, "send_telegram", lambda msg: sent.append(msg))
-
-    result = await tools.do_notify_user("Found a match: Senior Engineer @ Shopify")
-
-    assert not result.get("isError")
-    assert sent == ["Found a match: Senior Engineer @ Shopify"]
-
-
-async def test_notify_user_returns_error_on_failure(monkeypatch):
-    def boom(msg):
-        raise RuntimeError("network error")
-
-    monkeypatch.setattr(tools, "send_telegram", boom)
-
-    result = await tools.do_notify_user("hello")
-
-    assert result.get("isError")
-    assert "network error" in result["content"][0]["text"]
-
-
-# ---------------------------------------------------------------------------
 # do_check_and_record_job
 # ---------------------------------------------------------------------------
 
@@ -392,17 +366,6 @@ def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys)
     agent.build_system_prompt(interactive=True)
 
     assert "Warning" in capsys.readouterr().out
-
-
-# ---------------------------------------------------------------------------
-# Live Telegram test (skipped — run manually with: pytest -p no:skip -k test_send_telegram_live)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.skip(reason="live test — run manually to verify Telegram integration")
-async def test_send_telegram_live():
-    """Sends a real Telegram message. Run once to verify credentials work."""
-    agent.load_env()
-    tools.send_telegram("test message from agentic_job_search test suite")
 
 
 # ---------------------------------------------------------------------------
