@@ -27,6 +27,7 @@ PROCESSED_JOBS_DIR = RUN_DIR / "processed_jobs"
 
 _processed_jobs: set[tuple[str, str]] = set()
 _candidates: list[dict] = []
+_candidates_per_query: dict[str, int] = {}
 _applied_companies: dict[str, str] = {}  # company_name -> PDF filename
 _reference_job_texts: list[str] = []     # extracted text for evaluator prompt injection
 
@@ -355,13 +356,15 @@ async def do_check_and_record_job(
 
 async def do_queue_candidate(
     site: str, job_id: str, url: str, title: str, company: str,
-    snippet: str, date_posted: str | None = None,
+    snippet: str, date_posted: str | None = None, query: str | None = None,
 ) -> dict:
     _candidates.append({
         "site": site, "job_id": job_id, "url": url,
         "title": title, "company": company,
         "date_posted": date_posted or "", "snippet": snippet,
     })
+    if query:
+        _candidates_per_query[query] = _candidates_per_query.get(query, 0) + 1
     return {"content": [{"type": "text", "text": f"Queued: {company} — {title}"}]}
 
 
@@ -411,13 +414,15 @@ async def check_and_record_job(args: dict[str, Any]) -> dict:
     "Call this after check_and_record_job returns 'new'. "
     "Pass what is visible in the search results: URL, title, company, snippet. "
     "date_posted is optional — pass it if visible (exact or relative), omit if not shown. "
+    "query is optional — pass the search query string that returned this result (e.g. 'Staff ML Engineer'). "
     "Do NOT navigate to the individual job page — a separate agent handles that in stage 2.",
-    {"site": str, "job_id": str, "url": str, "title": str, "company": str, "snippet": str, "date_posted": str},
+    {"site": str, "job_id": str, "url": str, "title": str, "company": str, "snippet": str, "date_posted": str, "query": str},
 )
 async def queue_candidate(args: dict[str, Any]) -> dict:
     return await do_queue_candidate(
         args["site"], args["job_id"], args["url"], args["title"],
         args["company"], args["snippet"], date_posted=args.get("date_posted"),
+        query=args.get("query"),
     )
 
 

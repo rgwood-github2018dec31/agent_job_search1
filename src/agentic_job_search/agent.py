@@ -131,7 +131,7 @@ If either location-filtered search returns fewer than 3 new candidates, also run
 
 For each job visible in the search results:
 1. Call check_and_record_job with site="linkedin", the job ID (from the URL), company, and title. Pass date_posted only if it's visible in the results — it may be relative like "4 days ago", or it may not be shown at all; both are fine.
-2. If it returns "new", call queue_candidate immediately with whatever is visible: URL, title, company, snippet, and date_posted if shown.
+2. If it returns "new", call queue_candidate immediately with whatever is visible: URL, title, company, snippet, date_posted if shown, and query set to the search query string currently being processed (e.g. "Staff ML Engineer").
 3. If it returns "already_processed", "too_old", "already_applied", or "auth_required", skip it.
 
 Only pass information that is directly visible in the search results listing. Do not infer or fabricate missing fields. Stage 2 will navigate to the job page and fill in any missing details.
@@ -479,6 +479,7 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
 
 async def run_non_interactive(browser_mode: str = 'headless') -> None:
     tools_module._candidates = []
+    tools_module._candidates_per_query = {}
 
     console.print("[bold cyan]Job Search Agent — Non-interactive Mode[/bold cyan]")
     console.print("[cyan]" + "=" * 40 + "[/cyan]")
@@ -496,6 +497,10 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
         # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping
         console.print("[yellow]Stage 1a: Generating search queries ...[/yellow]")
         queries = await generate_search_queries()
+        if not queries:
+            console.print("[red]Error: no search queries generated.[/red]")
+            await _send_pipeline_notification("Job search run FAILED\n• Error: no search queries generated")
+            return
         console.print(f"[dim]Queries: {queries}[/dim]\n")
 
         console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
@@ -513,12 +518,16 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
             total_cost += await run_scraper(scraper, queries)
 
         candidates = tools_module._candidates
+        candidates_per_query = tools_module._candidates_per_query
         console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]\n")
 
         if not candidates:
-            console.print("[dim]No new candidates found.[/dim]")
+            console.print("[red]Error: 0 jobs returned across all searches.[/red]")
             elapsed_mins = (time.time() - start_time) / 60
-            await _send_pipeline_notification(f"Job search run complete\n• No new candidates\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}")
+            query_lines = "\n".join(f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' for q in queries)
+            await _send_pipeline_notification(
+                f"Job search run FAILED\n• Error: 0 candidates found\n• Queries ({len(queries)}):\n{query_lines}\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}"
+            )
             return
 
         # Stage 2: all evaluations share the same browser via the SSE server
@@ -533,8 +542,13 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
 
+    query_lines = "\n".join(
+        f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' + (' ⚠' if candidates_per_query.get(q, 0) == 0 else '')
+        for q in queries
+    )
     stats_lines = [
         "Job search run complete",
+        f"• Queries ({len(queries)}):\n{query_lines}",
         f"• Candidates found: {len(candidates)}",
         f"• Jobs saved: {num_evaluated}",
         f"• Jobs rated ≥4: {num_high_rated}",

@@ -615,6 +615,52 @@ async def test_categorize_downloads_pdfs_skips_already_categorized(tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
+# do_queue_candidate
+# ---------------------------------------------------------------------------
+
+async def test_queue_candidate_appends_to_list(monkeypatch):
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+
+    await tools.do_queue_candidate(
+        'linkedin', '111', 'https://example.com', 'Staff Engineer', 'Acme', 'Great role'
+    )
+
+    assert len(tools._candidates) == 1
+    assert tools._candidates[0]['company'] == 'Acme'
+
+
+async def test_queue_candidate_tracks_query_count(monkeypatch):
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+
+    await tools.do_queue_candidate(
+        'linkedin', '111', 'https://example.com', 'Staff Engineer', 'Acme', 'snippet', query='Staff ML Engineer'
+    )
+    await tools.do_queue_candidate(
+        'linkedin', '222', 'https://example.com/2', 'Principal Engineer', 'Corp', 'snippet', query='Staff ML Engineer'
+    )
+    await tools.do_queue_candidate(
+        'linkedin', '333', 'https://example.com/3', 'Head of Eng', 'BigCo', 'snippet', query='Head of Engineering'
+    )
+
+    assert tools._candidates_per_query['Staff ML Engineer'] == 2
+    assert tools._candidates_per_query['Head of Engineering'] == 1
+
+
+async def test_queue_candidate_without_query_does_not_track(monkeypatch):
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+
+    await tools.do_queue_candidate(
+        'linkedin', '444', 'https://example.com', 'Engineer', 'Co', 'snippet'
+    )
+
+    assert tools._candidates_per_query == {}
+    assert len(tools._candidates) == 1
+
+
+# ---------------------------------------------------------------------------
 # Live tests for Downloads PDF loading
 # ---------------------------------------------------------------------------
 
