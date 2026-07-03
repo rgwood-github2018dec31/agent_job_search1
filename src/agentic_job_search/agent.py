@@ -7,6 +7,7 @@ import socket
 import sys
 import tempfile
 import time
+from datetime import datetime
 import requests
 from pathlib import Path
 from typing import Any
@@ -118,14 +119,14 @@ The information visible in search results (title, company, snippet, date) is all
 For each search query, run it against both target regions:
 
 1. **Canada (remote)**:
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2&sortBy=DD
 
 2. **European Union (remote)**:
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2&sortBy=DD
 
-(f_WT=2 = Remote filter. URL-encode spaces as `+`. Example for "Principal AI Engineer":
-  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=Canada&f_WT=2
-  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=European+Union&f_WT=2)
+(`f_WT=2` = Remote filter. `sortBy=DD` = newest first — critical so fresh postings appear before already-seen ones. URL-encode spaces as `+`. Example for "Principal AI Engineer":
+  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=Canada&f_WT=2&sortBy=DD
+  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=European+Union&f_WT=2&sortBy=DD)
 
 If either location-filtered search returns fewer than 3 new candidates, also run the same query without location filters to catch globally-remote roles that may accept candidates from those regions.
 
@@ -174,7 +175,8 @@ def load_resume() -> str | None:
     if not matches:
         return None
     latest = max(matches, key=lambda p: p.stat().st_mtime)
-    console.print(f'[dim]Loaded resume: {latest.name}[/dim]')
+    mtime = datetime.fromtimestamp(latest.stat().st_mtime).strftime('%Y-%m-%d')
+    console.print(f'[dim]Loaded resume ({len(matches)} found): {latest.name} (modified {mtime})[/dim]')
     return latest.read_text(encoding='utf-8')
 
 
