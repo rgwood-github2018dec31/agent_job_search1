@@ -519,7 +519,14 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
 
         candidates = tools_module._candidates
         candidates_per_query = tools_module._candidates_per_query
-        console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]\n")
+        query_summary_lines = [
+            f'  "{q}": {candidates_per_query.get(q, 0)} job(s)' + (' ⚠' if candidates_per_query.get(q, 0) == 0 else '')
+            for q in queries
+        ]
+        console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]")
+        for line in query_summary_lines:
+            console.print(f"[dim]{line}[/dim]")
+        console.print()
 
         if not candidates:
             console.print("[red]Error: 0 jobs returned across all searches.[/red]")
