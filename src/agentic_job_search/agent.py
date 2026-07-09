@@ -394,6 +394,7 @@ async def evaluate_all_candidates(
 ) -> float:
     """Stage 2: single session evaluates all job postings, reusing one browser."""
     options = ClaudeAgentOptions(
+        tools=[],
         system_prompt=evaluator_prompt,
         mcp_servers={
             "playwright": playwright_mcp,
@@ -403,6 +404,7 @@ async def evaluate_all_candidates(
         permission_mode="bypassPermissions",
         cwd=str(PROJECT_DIR),
         effort="low",
+        max_turns=15,
     )
     cost = 0.0
     for candidate in candidates:
@@ -507,6 +509,7 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
 
         console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
         scraper_options = ClaudeAgentOptions(
+            tools=[],
             system_prompt=build_scraper_prompt(),
             mcp_servers={
                 "playwright": playwright_mcp,
@@ -515,6 +518,7 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
             permission_mode="bypassPermissions",
             cwd=str(PROJECT_DIR),
             model=MODEL_NAME_LOW,
+            max_turns=40,
         )
         async with ClaudeSDKClient(scraper_options) as scraper:
             total_cost += await run_scraper(scraper, queries)
