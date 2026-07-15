@@ -70,7 +70,7 @@ The project uses the **[Claude Agent SDK](https://platform.claude.com/docs/en/ag
 
 ### Model tiers (`config.py`)
 
-- `MODEL_NAME_MEDIUM` (`claude-sonnet-4-6`) — query generation and job evaluation
+- `MODEL_NAME_MEDIUM` (`claude-sonnet-5`) — query generation and job evaluation
 - `MODEL_NAME_LOW` (`claude-haiku-4-5`) — LinkedIn scraping stage
 
 ### Non-interactive pipeline (`run_non_interactive` in `agent.py`)
