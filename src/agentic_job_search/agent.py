@@ -20,6 +20,7 @@ from agentic_job_search.tools_generic import (
     RUN_DIR,
     console,
     load_processed_jobs,
+    log_run_cost,
     make_evaluator_server,
     make_job_search_server,
     make_scraper_server,
@@ -211,7 +212,7 @@ def build_scraper_prompt() -> str:
     return "\n\n".join(parts)
 
 
-async def generate_search_queries() -> list[str]:
+async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
     """Use Sonnet to derive LinkedIn search queries from resume + job requirements."""
     parts = []
     resume = load_resume()
@@ -261,8 +262,11 @@ async def generate_search_queries() -> list[str]:
         cwd=str(PROJECT_DIR),
     )
     try:
-        async for _ in sdk_query(prompt=prompt, options=options):
-            pass
+        async for msg in sdk_query(prompt=prompt, options=options):
+            if isinstance(msg, ResultMessage):
+                print_result_stats(msg)
+                if stage_stats is not None:
+                    accumulate_stage_stats(stage_stats, msg)
     except Exception as ex:
         raise RuntimeError(f'Stage 1a (query generation) failed: {ex}') from ex
 
@@ -314,6 +318,26 @@ def print_result_stats(msg: ResultMessage) -> None:
         console.print(f"[dim]{' · '.join(parts)}[/dim]")
 
 
+def new_stage_stats() -> dict:
+    return {
+        "cost": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def accumulate_stage_stats(stats: dict, msg: ResultMessage) -> None:
+    if msg.usage:
+        stats["input_tokens"] += msg.usage.get("input_tokens", 0)
+        stats["output_tokens"] += msg.usage.get("output_tokens", 0)
+        stats["cache_read_input_tokens"] += msg.usage.get("cache_read_input_tokens", 0)
+        stats["cache_creation_input_tokens"] += msg.usage.get("cache_creation_input_tokens", 0)
+    if msg.total_cost_usd is not None:
+        stats["cost"] += msg.total_cost_usd
+
+
 async def run_interactive(client: ClaudeSDKClient) -> None:
     console.print("[bold cyan]Job Search Agent — Interactive Mode[/bold cyan]")
     console.print("[cyan]" + "=" * 40 + "[/cyan]")
@@ -361,7 +385,7 @@ def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
     return num_evaluated, num_high_rated
 
 
-async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> float:
+async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: dict) -> None:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results."""
     query_list = "\n".join(f'- "{q}"' for q in queries)
     try:
@@ -371,7 +395,6 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> float:
             "in the results list. Do not ask for permission — call the tools directly. "
             "Do not navigate to individual job pages. Stop when done."
         )
-        cost = 0.0
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
@@ -382,16 +405,14 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str]) -> float:
             elif isinstance(msg, ResultMessage):
                 print()
                 print_result_stats(msg)
-                if msg.total_cost_usd is not None:
-                    cost += msg.total_cost_usd
+                accumulate_stage_stats(stage_stats, msg)
     except Exception as ex:
         raise RuntimeError(f'Stage 1b (scraper) failed: {ex}') from ex
-    return cost
 
 
 async def evaluate_all_candidates(
-    candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str, reference_block: str = ''
-) -> float:
+    candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str, stage_stats: dict, reference_block: str = ''
+) -> None:
     """Stage 2: single session evaluates all job postings, reusing one browser."""
     options = ClaudeAgentOptions(
         tools=[],
@@ -406,7 +427,6 @@ async def evaluate_all_candidates(
         effort="low",
         max_turns=15,
     )
-    cost = 0.0
     for candidate in candidates:
         console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
         query = (
@@ -434,11 +454,9 @@ async def evaluate_all_candidates(
                     elif isinstance(msg, ResultMessage):
                         print()
                         print_result_stats(msg)
-                        if msg.total_cost_usd is not None:
-                            cost += msg.total_cost_usd
+                        accumulate_stage_stats(stage_stats, msg)
         except Exception as ex:
             console.print(f"[red]Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}[/red]")
-    return cost
 
 
 def find_free_port() -> int:
@@ -489,7 +507,11 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
     console.print("[cyan]" + "=" * 40 + "[/cyan]")
 
     start_time = time.time()
-    total_cost = 0.0
+    stage_stats = {
+        "query_generation": new_stage_stats(),
+        "scraping": new_stage_stats(),
+        "evaluation": new_stage_stats(),
+    }
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 
     port = find_free_port()
@@ -500,10 +522,18 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
     try:
         # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping
         console.print("[yellow]Stage 1a: Generating search queries ...[/yellow]")
-        queries = await generate_search_queries()
+        queries = await generate_search_queries(stage_stats["query_generation"])
         if not queries:
             console.print("[red]Error: no search queries generated.[/red]")
             await _send_pipeline_notification("Job search run FAILED\n• Error: no search queries generated")
+            log_run_cost({
+                "timestamp": datetime.now().isoformat(),
+                "mode": "non-interactive",
+                "status": "failed_no_queries",
+                "stage_stats": stage_stats,
+                "total_cost": sum(s["cost"] for s in stage_stats.values()),
+                "elapsed_minutes": (time.time() - start_time) / 60,
+            })
             return
         console.print(f"[dim]Queries: {queries}[/dim]\n")
 
@@ -521,7 +551,7 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
             max_turns=40,
         )
         async with ClaudeSDKClient(scraper_options) as scraper:
-            total_cost += await run_scraper(scraper, queries)
+            await run_scraper(scraper, queries, stage_stats["scraping"])
 
         candidates = tools_module._candidates
         candidates_per_query = tools_module._candidates_per_query
@@ -537,27 +567,40 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
         if not candidates:
             console.print("[red]Error: 0 jobs returned across all searches.[/red]")
             elapsed_mins = (time.time() - start_time) / 60
+            total_cost = sum(s["cost"] for s in stage_stats.values())
             query_lines = "\n".join(f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' for q in queries)
             await _send_pipeline_notification(
                 f"Job search run FAILED\n• Error: 0 candidates found\n• Queries ({len(queries)}):\n{query_lines}\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}"
             )
+            log_run_cost({
+                "timestamp": datetime.now().isoformat(),
+                "mode": "non-interactive",
+                "status": "failed_no_candidates",
+                "stage_stats": stage_stats,
+                "total_cost": total_cost,
+                "elapsed_minutes": elapsed_mins,
+            })
             return
 
         # Stage 2: all evaluations share the same browser via the SSE server
         console.print("[yellow]Stage 2: Evaluating candidates ...[/yellow]\n")
         evaluator_prompt = build_evaluator_prompt()
         reference_block = build_reference_block()
-        total_cost += await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt, reference_block)
+        await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt, stage_stats["evaluation"], reference_block)
     finally:
         playwright_proc.terminate()
         await playwright_proc.wait()
 
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
+    total_cost = sum(s["cost"] for s in stage_stats.values())
 
     query_lines = "\n".join(
         f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' + (' ⚠' if candidates_per_query.get(q, 0) == 0 else '')
         for q in queries
+    )
+    stage_cost_lines = "\n".join(
+        f'  - {name}: ${stats["cost"]:.4f}' for name, stats in stage_stats.items()
     )
     stats_lines = [
         "Job search run complete",
@@ -566,11 +609,23 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
         f"• Jobs saved: {num_evaluated}",
         f"• Jobs rated ≥4: {num_high_rated}",
         f"• Elapsed: {elapsed_mins:.1f} min",
+        f"• Cost by stage:\n{stage_cost_lines}",
         f"• Total cost: ${total_cost:.4f}",
     ]
     stats_msg = "\n".join(stats_lines)
     console.print(f"\n[dim]{stats_msg}[/dim]")
     await _send_pipeline_notification(stats_msg)
+    log_run_cost({
+        "timestamp": datetime.now().isoformat(),
+        "mode": "non-interactive",
+        "status": "complete",
+        "stage_stats": stage_stats,
+        "total_cost": total_cost,
+        "candidates_found": len(candidates),
+        "jobs_saved": num_evaluated,
+        "jobs_rated_high": num_high_rated,
+        "elapsed_minutes": elapsed_mins,
+    })
 
 
 async def main() -> None:

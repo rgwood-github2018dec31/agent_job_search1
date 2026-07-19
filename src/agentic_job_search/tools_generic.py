@@ -1,4 +1,5 @@
 
+import json
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -263,6 +264,17 @@ async def do_update_job_requirements(content: str) -> dict:
             {"type": "text", "text": f"JOB_REQUIREMENTS.md updated. New contents:\n\n{content}"}
         ]
     }
+
+
+COST_LOG_PATH = RUN_DIR / "cost_log.jsonl"
+
+
+def log_run_cost(record: dict, log_path: Path | None = None) -> None:
+    """Append a per-run cost record as one JSON line to cost_log.jsonl."""
+    path = log_path if log_path is not None else COST_LOG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 _AUTH_REQUIRED_PATTERNS = [

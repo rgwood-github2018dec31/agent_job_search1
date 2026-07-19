@@ -1,9 +1,10 @@
 """Tests for the job search agent."""
 
-import os
-import pytest
-from datetime import datetime
 from pathlib import Path
+import json
+from datetime import date, timedelta
+
+import pytest
 
 from agentic_job_search import agent
 from agentic_job_search import tools_generic as tools
@@ -122,10 +123,76 @@ async def test_update_job_requirements_overwrites(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# do_check_and_record_job
+# log_run_cost
 # ---------------------------------------------------------------------------
 
-from datetime import date, timedelta
+
+def test_log_run_cost_writes_jsonl_line(tmp_path):
+    log_path = tmp_path / "cost_log.jsonl"
+    record = {"mode": "non-interactive", "total_cost": 1.2345}
+
+    tools.log_run_cost(record, log_path=log_path)
+
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == record
+
+
+def test_log_run_cost_appends_multiple_runs(tmp_path):
+    log_path = tmp_path / "cost_log.jsonl"
+
+    tools.log_run_cost({"run": 1}, log_path=log_path)
+    tools.log_run_cost({"run": 2}, log_path=log_path)
+
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line) for line in lines] == [{"run": 1}, {"run": 2}]
+
+
+def test_log_run_cost_creates_parent_dirs(tmp_path):
+    log_path = tmp_path / "nested" / "cost_log.jsonl"
+
+    tools.log_run_cost({"run": 1}, log_path=log_path)
+
+    assert log_path.exists()
+
+
+def test_new_stage_stats_zeroed():
+    stats = agent.new_stage_stats()
+    assert stats == {
+        "cost": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def test_accumulate_stage_stats_sums_usage_and_cost():
+    class FakeResultMessage:
+        usage = {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 10,
+            "cache_creation_input_tokens": 5,
+        }
+        total_cost_usd = 0.01
+
+    stats = agent.new_stage_stats()
+    agent.accumulate_stage_stats(stats, FakeResultMessage())
+    agent.accumulate_stage_stats(stats, FakeResultMessage())
+
+    assert stats == {
+        "cost": 0.02,
+        "input_tokens": 200,
+        "output_tokens": 100,
+        "cache_read_input_tokens": 20,
+        "cache_creation_input_tokens": 10,
+    }
+
+
+# ---------------------------------------------------------------------------
+# do_check_and_record_job
+# ---------------------------------------------------------------------------
 
 
 def _recent_date() -> str:
