@@ -7,7 +7,9 @@ from datetime import date, timedelta
 import pytest
 
 from agentic_job_search import agent
+from agentic_job_search import extract_openrouter
 from agentic_job_search import tools_generic as tools
+from agentic_job_search import triage
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +88,24 @@ async def test_save_job_posting_creates_daily_dir(tmp_path, monkeypatch):
     saved_dirs = list(tmp_path.glob("saved_jobs-*"))
     assert len(saved_dirs) == 1  # same day → same dir
     assert len(list(saved_dirs[0].glob("*.md"))) == 2
+
+
+async def test_save_job_posting_caps_long_filename(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+
+    long_description = "triaged out " + "this is an extremely long triage reason sentence " * 10
+    result = await tools.do_save_job_posting(
+        company="A Very Long Company Name That Goes On And On Incorporated",
+        description=long_description,
+        rating=1,
+        content="content",
+        job_id="4442638114",
+    )
+
+    assert not result.get("isError")
+    files = list(tmp_path.glob("saved_jobs-*/job_posting-4442638114-rating_1-*.md"))
+    assert len(files) == 1
+    assert len(files[0].name.encode()) < 255
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +622,26 @@ def test_build_reference_block_includes_text(monkeypatch):
     assert 'REFERENCE JOBS' in block
 
 
+def test_build_evaluator_prompt_embeds_reference_block():
+    block = '--- REFERENCE JOBS ---\n[Reference Job 1]\nGreat job at Acme.\n--- END REFERENCE JOBS ---'
+    prompt = agent.build_evaluator_prompt(block)
+    assert 'Great job at Acme.' in prompt
+    assert prompt.index('REFERENCE JOBS') < prompt.index('You are evaluating a single job posting')
+
+
+def test_build_evaluator_prompt_strips_null_bytes():
+    block = 'Job at Acme\x00 with\x00 nulls from PDF extraction'
+    prompt = agent.build_evaluator_prompt(block)
+    assert '\x00' not in prompt
+    assert 'Job at Acme with nulls from PDF extraction' in prompt
+
+
+def test_build_evaluator_prompt_without_reference_block():
+    prompt = agent.build_evaluator_prompt()
+    assert 'REFERENCE JOBS' not in prompt
+    assert 'You are evaluating a single job posting' in prompt
+
+
 def test_build_reference_block_caps_at_max_pdfs(monkeypatch):
     from agentic_job_search import agent
     from agentic_job_search.config import MAX_REFERENCE_JOBS
@@ -725,6 +765,687 @@ async def test_queue_candidate_without_query_does_not_track(monkeypatch):
 
     assert tools._candidates_per_query == {}
     assert len(tools._candidates) == 1
+
+
+# ---------------------------------------------------------------------------
+# triage.extract_json_object
+# ---------------------------------------------------------------------------
+
+def test_extract_json_object_plain():
+    assert triage.extract_json_object('{"score": 3, "reason": "ok"}') == {'score': 3, 'reason': 'ok'}
+
+
+def test_extract_json_object_with_surrounding_prose():
+    text = 'Here is my answer:\n{"score": 2, "reason": "wrong stack"}\nHope that helps.'
+    assert triage.extract_json_object(text) == {'score': 2, 'reason': 'wrong stack'}
+
+
+def test_extract_json_object_nested():
+    text = 'prefix {"rating": 4, "details": {"stack": "python"}} suffix'
+    assert triage.extract_json_object(text) == {'rating': 4, 'details': {'stack': 'python'}}
+
+
+def test_extract_json_object_skips_broken_prefix():
+    text = 'broken { not json } then {"score": 5, "reason": "great"}'
+    assert triage.extract_json_object(text) == {'score': 5, 'reason': 'great'}
+
+
+def test_extract_json_object_raises_without_json():
+    with pytest.raises(ValueError):
+        triage.extract_json_object('no json here at all')
+
+
+# ---------------------------------------------------------------------------
+# do_submit_job_extract
+# ---------------------------------------------------------------------------
+
+async def test_submit_job_extract_captures(monkeypatch):
+    monkeypatch.setattr(tools, '_job_extracts', [])
+
+    await tools.do_submit_job_extract(
+        'Staff Engineer', 'Acme', 'Build agents in Python.',
+        location='Canada (Remote)', date_posted='3 days ago', closed=False, salary='CAD 200k',
+    )
+
+    assert len(tools._job_extracts) == 1
+    extract = tools._job_extracts[0]
+    assert extract['title'] == 'Staff Engineer'
+    assert extract['company'] == 'Acme'
+    assert extract['location'] == 'Canada (Remote)'
+    assert extract['closed'] is False
+
+
+async def test_submit_job_extract_defaults(monkeypatch):
+    monkeypatch.setattr(tools, '_job_extracts', [])
+
+    await tools.do_submit_job_extract('Engineer', 'Corp', 'desc')
+
+    extract = tools._job_extracts[0]
+    assert extract['location'] == ''
+    assert extract['date_posted'] == ''
+    assert extract['closed'] is False
+    assert extract['salary'] == ''
+    assert extract['sponsorship_note'] == ''
+    assert extract['language_requirement'] == ''
+    assert extract['relocation'] == ''
+
+
+# ---------------------------------------------------------------------------
+# apply_hard_rules
+# ---------------------------------------------------------------------------
+
+def _make_extract(**overrides) -> dict:
+    extract = {
+        'title': 'Staff AI Engineer', 'company': 'Acme',
+        'description': 'Build agentic AI systems in Python. Remote within Canada.',
+        'location': 'Canada (Remote)', 'date_posted': '3 days ago',
+        'closed': False, 'salary': '', 'sponsorship_note': '',
+        'language_requirement': '', 'relocation': '',
+    }
+    extract.update(overrides)
+    return extract
+
+
+def _make_candidate(**overrides) -> dict:
+    candidate = {
+        'site': 'linkedin', 'job_id': '123', 'url': 'https://example.com/job/123',
+        'title': 'Staff AI Engineer', 'company': 'Acme',
+        'date_posted': '', 'snippet': '',
+    }
+    candidate.update(overrides)
+    return candidate
+
+
+def test_apply_hard_rules_passes_good_job():
+    assert agent.apply_hard_rules(_make_candidate(), _make_extract()) is None
+
+
+def test_apply_hard_rules_closed_flag():
+    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(closed=True))
+    assert reason is not None and 'closed' in reason
+
+
+def test_apply_hard_rules_closed_text():
+    extract = _make_extract(description='This job is no longer accepting applications.')
+    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'closed' in reason
+
+
+def test_apply_hard_rules_stale_posting():
+    old = (date.today() - timedelta(days=45)).isoformat()
+    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
+    assert reason is not None and 'older than' in reason
+
+
+def test_apply_hard_rules_recent_posting_ok():
+    recent = (date.today() - timedelta(days=5)).isoformat()
+    assert agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=recent)) is None
+
+
+def test_apply_hard_rules_us_no_sponsorship():
+    extract = _make_extract(location='United States (Remote)')
+    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'sponsorship' in reason
+
+
+def test_apply_hard_rules_us_with_sponsorship_passes():
+    extract = _make_extract(
+        location='United States (Remote)',
+        sponsorship_note='We are willing to sponsor H-1B visas.',
+    )
+    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+def test_apply_hard_rules_explicit_no_auth_statement():
+    extract = _make_extract(description='Must be authorized to work in the US without sponsorship.')
+    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'sponsorship' in reason
+
+
+def test_apply_hard_rules_non_english_language_requirement():
+    extract = _make_extract(language_requirement='dutch')
+    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'dutch' in reason and 'non-English' in reason
+
+
+def test_apply_hard_rules_english_plus_other_language_rejects():
+    extract = _make_extract(language_requirement='english, ukrainian')
+    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'ukrainian' in reason
+
+
+def test_apply_hard_rules_english_only_requirement_passes():
+    assert agent.apply_hard_rules(_make_candidate(), _make_extract(language_requirement='english')) is None
+    assert agent.apply_hard_rules(_make_candidate(), _make_extract(language_requirement='english (b2)')) is None
+
+
+def test_apply_hard_rules_relocation_does_not_reject():
+    extract = _make_extract(relocation='Portugal')
+    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+def test_format_extract_text_includes_language_and_relocation():
+    extract = _make_extract(language_requirement='english, german', relocation='Berlin, Germany')
+    text = agent.format_extract_text(_make_candidate(), extract)
+    assert 'Language requirement: english, german' in text
+    assert 'Relocation required: Berlin, Germany' in text
+
+
+# ---------------------------------------------------------------------------
+# triage_job_fit / triage_rejects
+# ---------------------------------------------------------------------------
+
+async def test_triage_job_fit_parses_score(monkeypatch):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0):
+        return 'Sure! {"score": 2, "reason": "wrong domain"}'
+
+    monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
+    result = await triage.triage_job_fit('job text', 'profile')
+    assert result == {'score': 2, 'reason': 'wrong domain'}
+
+
+async def test_triage_job_fit_fails_open_when_server_down(monkeypatch):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0):
+        raise RuntimeError('connection refused')
+
+    monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
+    assert await triage.triage_job_fit('job text', 'profile') is None
+
+
+async def test_triage_job_fit_fails_open_on_garbage(monkeypatch):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0):
+        return 'I cannot help with that.'
+
+    monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
+    assert await triage.triage_job_fit('job text', 'profile') is None
+
+
+def test_triage_rejects_below_threshold():
+    from agentic_job_search.config import TRIAGE_THRESHOLD
+    assert triage.triage_rejects({'score': TRIAGE_THRESHOLD, 'reason': 'x'})
+    assert triage.triage_rejects({'score': 1, 'reason': 'x'})
+
+
+def test_triage_rejects_passes_above_threshold_and_none():
+    from agentic_job_search.config import TRIAGE_THRESHOLD
+    assert not triage.triage_rejects({'score': TRIAGE_THRESHOLD + 1, 'reason': 'x'})
+    assert not triage.triage_rejects(None)
+
+
+# ---------------------------------------------------------------------------
+# build_reference_summary provider chain + cache
+# ---------------------------------------------------------------------------
+
+async def test_build_reference_summary_openrouter_first(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    calls = []
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        calls.append('openrouter')
+        return 'Ideal role: senior AI engineering.', 0.001
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    stats = agent.new_stage_stats()
+    block = await agent.build_reference_summary(stats)
+
+    assert calls == ['openrouter']
+    assert 'Ideal role: senior AI engineering.' in block
+    assert 'IDEAL ROLE PROFILE' in block
+    assert stats['cost'] == pytest.approx(0.001)
+
+
+async def test_build_reference_summary_falls_back_to_local(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    calls = []
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        calls.append('openrouter')
+        raise RuntimeError('server down')
+
+    async def fake_local(prompt, system='', model='', max_tokens=0):
+        calls.append('ollama')
+        return 'Local summary of ideal role.'
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    monkeypatch.setattr(agent, 'generate_local', fake_local)
+    block = await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert calls == ['openrouter', 'ollama']
+    assert 'Local summary of ideal role.' in block
+
+
+async def test_build_reference_summary_falls_back_to_anthropic(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    calls = []
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        calls.append('openrouter')
+        raise RuntimeError('server down')
+
+    async def fake_local(prompt, system='', model='', max_tokens=0):
+        calls.append('ollama')
+        raise RuntimeError('server down too')
+
+    async def fake_anthropic(prompt, stage_stats):
+        calls.append('anthropic')
+        return 'Anthropic summary.'
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    monkeypatch.setattr(agent, 'generate_local', fake_local)
+    monkeypatch.setattr(agent, '_summarize_references_anthropic', fake_anthropic)
+    block = await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert calls == ['openrouter', 'ollama', 'anthropic']
+    assert 'Anthropic summary.' in block
+
+
+async def test_build_reference_summary_falls_back_to_full_block_when_all_fail(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError('down')
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fail)
+    monkeypatch.setattr(agent, 'generate_local', fail)
+    monkeypatch.setattr(agent, '_summarize_references_anthropic', fail)
+    block = await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert 'REFERENCE JOBS' in block  # old full block as last resort
+    assert 'Acme' in block
+
+
+async def test_build_reference_summary_cache_hit_skips_llm(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    calls = []
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        calls.append('openrouter')
+        return 'Summary v1.', 0.001
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    block1 = await agent.build_reference_summary(agent.new_stage_stats())
+    block2 = await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert calls == ['openrouter']  # second call served from cache
+    assert block1 == block2
+
+
+async def test_build_reference_summary_empty_without_texts(monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [])
+    assert await agent.build_reference_summary() == ''
+
+
+# ---------------------------------------------------------------------------
+# rate_job provider dispatch
+# ---------------------------------------------------------------------------
+
+async def test_rate_job_dispatches_to_openrouter(monkeypatch):
+    monkeypatch.setattr(agent, 'RATING_PROVIDER', 'openrouter')
+
+    async def fake_rate(system_prompt, user_prompt, model=''):
+        return {'rating': 4, 'company': 'Acme', 'title': 'Engineer', 'reasoning': 'good', 'summary': 'acme_engineer'}, 0.002
+
+    monkeypatch.setattr(agent, 'rate_with_openrouter', fake_rate)
+    stats = agent.new_stage_stats()
+    result = await agent.rate_job('system', 'job text', stats)
+
+    assert result['rating'] == 4
+    assert stats['cost'] == pytest.approx(0.002)
+
+
+async def test_rate_job_dispatches_to_ollama(monkeypatch):
+    monkeypatch.setattr(agent, 'RATING_PROVIDER', 'ollama')
+
+    async def fake_rate(system_prompt, user_prompt, model=''):
+        return {'rating': 3, 'company': 'Acme', 'title': 'Engineer', 'reasoning': 'ok', 'summary': 'acme_engineer'}
+
+    monkeypatch.setattr(agent, 'rate_with_ollama', fake_rate)
+    stats = agent.new_stage_stats()
+    result = await agent.rate_job('system', 'job text', stats)
+
+    assert result['rating'] == 3
+    assert stats['cost'] == 0.0
+
+
+async def test_rate_job_dispatches_to_anthropic_by_default(monkeypatch):
+    monkeypatch.setattr(agent, 'RATING_PROVIDER', 'anthropic')
+
+    async def fake_anthropic(evaluator_prompt, extract_text, stage_stats):
+        return {'rating': 5, 'company': 'Acme', 'title': 'Engineer', 'reasoning': 'great', 'summary': 'acme_engineer'}
+
+    monkeypatch.setattr(agent, '_rate_with_anthropic', fake_anthropic)
+    result = await agent.rate_job('system', 'job text', agent.new_stage_stats())
+    assert result['rating'] == 5
+
+
+# ---------------------------------------------------------------------------
+# extract_job_page_direct (deterministic fallback)
+# ---------------------------------------------------------------------------
+
+def _make_agent_sdk_mock(monkeypatch, structured_output: dict):
+    from claude_agent_sdk import ResultMessage
+
+    async def fake_sdk_query(**kwargs):
+        yield ResultMessage(
+            subtype='success', duration_ms=100, duration_api_ms=100, is_error=False,
+            num_turns=1, session_id='fake-session', structured_output=structured_output,
+        )
+
+    monkeypatch.setattr(agent, 'sdk_query', fake_sdk_query)
+
+
+def _make_mcp_session_mock(monkeypatch, snapshot_text: str, mcp_calls: list):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_mcp_session(url):
+        async def call(tool_name, args):
+            mcp_calls.append((tool_name, args.get('target')))
+            return snapshot_text
+
+        yield call
+
+    monkeypatch.setattr(agent, 'mcp_session', fake_mcp_session)
+
+
+async def test_extract_job_page_direct_condenses_snapshot(monkeypatch):
+    mcp_calls = []
+    _make_mcp_session_mock(monkeypatch, 'heading "Staff Engineer" text "Build agents." (no expand button)', mcp_calls)
+    _make_agent_sdk_mock(monkeypatch, {'title': 'Staff Engineer', 'company': 'Acme', 'description': 'Build agents.'})
+
+    extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats())
+
+    assert [c[0] for c in mcp_calls] == ['browser_navigate', 'browser_wait_for', 'browser_snapshot']
+    assert extract['title'] == 'Staff Engineer'
+    assert extract['closed'] is False  # default filled
+    assert extract['location'] == ''
+
+
+async def test_extract_job_page_direct_clicks_more_button(monkeypatch):
+    mcp_calls = []
+    _make_mcp_session_mock(monkeypatch, 'text "intro" button "… more" [ref=e611] text "rest"', mcp_calls)
+    _make_agent_sdk_mock(monkeypatch, {'title': 'T', 'company': 'C', 'description': 'D'})
+
+    await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats())
+
+    assert mcp_calls == [
+        ('browser_navigate', None), ('browser_wait_for', None), ('browser_snapshot', None),
+        ('browser_click', 'e611'), ('browser_wait_for', None), ('browser_snapshot', None),
+    ]
+
+
+async def test_extract_job_page_direct_returns_none_without_output(monkeypatch):
+    mcp_calls = []
+    _make_mcp_session_mock(monkeypatch, 'snapshot text', mcp_calls)
+
+    async def fake_sdk_query(**kwargs):
+        return
+        yield
+
+    monkeypatch.setattr(agent, 'sdk_query', fake_sdk_query)
+
+    extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats())
+    assert extract is None
+
+
+# ---------------------------------------------------------------------------
+# extract_job_page_openrouter (function-calling agent loop)
+# ---------------------------------------------------------------------------
+
+def _chat_response(tool_calls=None, content=None, ok=True, cost=0.001, error=None):
+    data = {'ok': ok, 'content': content, 'tool_calls': tool_calls, 'finish_reason': 'tool_calls' if tool_calls else 'stop',
+            'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'cost': cost}, 'cost_usd': cost}
+    if error:
+        data['error'] = error
+    return json.dumps(data)
+
+
+def _tool_call(call_id, name, args) -> dict:
+    return {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args) if isinstance(args, dict) else args}}
+
+
+_SUBMIT_ARGS = {'title': 'Staff Engineer', 'company': 'Acme', 'description': 'Build agents in Python.'}
+
+
+def _wire_openrouter_loop(monkeypatch, chat_responses: list, browser_calls: list, chat_requests: list):
+    """Wire fake chat responses and a browser-call recorder into the loop."""
+    from contextlib import asynccontextmanager
+
+    async def fake_call_mcp_tool(url, tool_name, args):
+        # Deep-copy: the loop mutates its messages list in place between calls
+        chat_requests.append(json.loads(json.dumps(args)))
+        return chat_responses.pop(0)
+
+    @asynccontextmanager
+    async def fake_mcp_session(url):
+        async def call(tool_name, args):
+            browser_calls.append((tool_name, args))
+            return f'snapshot of page after {tool_name}'
+
+        yield call
+
+    monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    monkeypatch.setattr(extract_openrouter, 'mcp_session', fake_mcp_session)
+
+
+async def test_openrouter_loop_happy_path(monkeypatch):
+    browser_calls, chat_requests = [], []
+    responses = [
+        _chat_response(tool_calls=[
+            _tool_call('c1', 'browser_navigate', {'url': 'https://example.com/job/123'}),
+            _tool_call('c2', 'browser_snapshot', {}),
+        ]),
+        _chat_response(tool_calls=[_tool_call('c3', 'submit_job_extract', _SUBMIT_ARGS)]),
+    ]
+    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+
+    stats = agent.new_stage_stats()
+    extract = await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', stats, 'system prompt'
+    )
+
+    assert extract['title'] == 'Staff Engineer'
+    assert extract['closed'] is False  # default filled
+    assert [c[0] for c in browser_calls] == ['browser_navigate', 'browser_snapshot']
+    assert stats['cost'] == pytest.approx(0.002)
+    assert stats['input_tokens'] == 200
+    # second request carries the assistant tool_calls turn and both tool results
+    roles = [m['role'] for m in chat_requests[1]['messages']]
+    assert roles == ['system', 'user', 'assistant', 'tool', 'tool']
+
+
+async def test_openrouter_loop_invalid_json_args_retries(monkeypatch):
+    browser_calls, chat_requests = [], []
+    responses = [
+        _chat_response(tool_calls=[_tool_call('c1', 'browser_navigate', '{not json')]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
+    ]
+    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+
+    extract = await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
+    )
+
+    assert extract is not None
+    assert browser_calls == []  # bad call never executed
+    error_msg = chat_requests[1]['messages'][-1]
+    assert error_msg['role'] == 'tool'
+    assert 'invalid JSON' in error_msg['content']
+
+
+async def test_openrouter_loop_missing_submit_fields_retries(monkeypatch):
+    browser_calls, chat_requests = [], []
+    responses = [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', {'title': 'T'})]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
+    ]
+    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+
+    extract = await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
+    )
+    assert extract is not None
+    assert 'missing required field' in chat_requests[1]['messages'][-1]['content']
+
+
+async def test_openrouter_loop_stops_at_iteration_cap(monkeypatch):
+    from agentic_job_search.config import EXTRACTOR_OPENROUTER_MAX_ITERATIONS
+    browser_calls, chat_requests = [], []
+    responses = [
+        _chat_response(tool_calls=[_tool_call(f'c{i}', 'browser_snapshot', {})])
+        for i in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS + 5)
+    ]
+    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+
+    extract = await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
+    )
+    assert extract is None
+    assert len(chat_requests) == EXTRACTOR_OPENROUTER_MAX_ITERATIONS
+
+
+async def test_openrouter_loop_returns_none_when_model_stops_without_submit(monkeypatch):
+    browser_calls, chat_requests = [], []
+    responses = [_chat_response(content='I could not find the job posting.')]
+    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+
+    extract = await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
+    )
+    assert extract is None
+
+
+async def test_openrouter_loop_returns_none_on_chat_error(monkeypatch):
+    browser_calls, chat_requests = [], []
+    responses = [_chat_response(ok=False, error='server down')]
+    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+
+    extract = await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
+    )
+    assert extract is None
+
+
+async def test_openrouter_loop_truncates_tool_results(monkeypatch):
+    from contextlib import asynccontextmanager
+    from agentic_job_search.config import EXTRACTOR_TOOL_RESULT_MAX_CHARS
+    chat_requests = []
+    responses = [
+        _chat_response(tool_calls=[_tool_call('c1', 'browser_snapshot', {})]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
+    ]
+
+    async def fake_call_mcp_tool(url, tool_name, args):
+        chat_requests.append(json.loads(json.dumps(args)))
+        return responses.pop(0)
+
+    @asynccontextmanager
+    async def fake_mcp_session(url):
+        async def call(tool_name, args):
+            return 'x' * (EXTRACTOR_TOOL_RESULT_MAX_CHARS * 3)
+
+        yield call
+
+    monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    monkeypatch.setattr(extract_openrouter, 'mcp_session', fake_mcp_session)
+
+    await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
+    )
+    tool_msg = chat_requests[1]['messages'][-1]
+    assert len(tool_msg['content']) == EXTRACTOR_TOOL_RESULT_MAX_CHARS
+
+
+async def test_extractor_provider_dispatch_openrouter(monkeypatch):
+    monkeypatch.setattr(agent, 'EXTRACTOR_PROVIDER', 'openrouter')
+    called = {'openrouter': 0, 'anthropic': 0, 'direct': 0}
+
+    async def fake_openrouter(candidate, url, stats, system_prompt):
+        called['openrouter'] += 1
+        return None
+
+    async def fake_anthropic(candidate, mcp, stats):
+        called['anthropic'] += 1
+        return None
+
+    async def fake_direct(candidate, url, stats):
+        called['direct'] += 1
+        return None
+
+    monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_openrouter)
+    monkeypatch.setattr(agent, 'extract_job_page', fake_anthropic)
+    monkeypatch.setattr(agent, 'extract_job_page_direct', fake_direct)
+
+    stats = {'extraction': agent.new_stage_stats(), 'rating': agent.new_stage_stats()}
+    await agent.evaluate_all_candidates(
+        [_make_candidate()], {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', stats
+    )
+
+    assert called == {'openrouter': 1, 'anthropic': 0, 'direct': 1}  # fallback still fires
+
+
+# ---------------------------------------------------------------------------
+# format_extract_text
+# ---------------------------------------------------------------------------
+
+def test_format_extract_text_includes_fields():
+    text = agent.format_extract_text(_make_candidate(), _make_extract(salary='CAD 200k'))
+    assert 'Title: Staff AI Engineer' in text
+    assert 'Company: Acme' in text
+    assert 'Salary: CAD 200k' in text
+    assert 'https://example.com/job/123' in text
+    assert 'Build agentic AI systems' in text
+
+
+def test_format_extract_text_falls_back_to_candidate_date():
+    candidate = _make_candidate(date_posted='2 days ago')
+    text = agent.format_extract_text(candidate, _make_extract(date_posted=''))
+    assert 'Posted: 2 days ago' in text
+
+
+# ---------------------------------------------------------------------------
+# Live tests for the LLM MCP tool servers (require servers on :8002/:8006)
+# ---------------------------------------------------------------------------
+
+def _require_llm_server(port: int) -> None:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        if s.connect_ex(('127.0.0.1', port)) != 0:
+            pytest.skip(f'LLM MCP tool server on :{port} is not running')
+
+
+@pytest.mark.live
+async def test_generate_local_live():
+    _require_llm_server(8002)
+    response = await triage.generate_local('Reply with exactly: OK', model='qwen3.6:latest', max_tokens=500)
+    assert response.strip() != ''
+
+
+@pytest.mark.live
+async def test_chat_openrouter_live():
+    _require_llm_server(8006)
+    content, cost_usd = await triage.chat_openrouter('Reply with exactly: OK', max_tokens=500)
+    assert content.strip() != ''
+    assert cost_usd >= 0
+
+
+@pytest.mark.live
+async def test_triage_job_fit_live():
+    _require_llm_server(8002)
+    result = await triage.triage_job_fit(
+        'Title: Dutch-speaking Junior Accountant\nLocation: Netherlands (on-site)\n'
+        'Requires fluent Dutch, 2 years accounting experience, on-site in Amsterdam.',
+        'The candidate is a senior AI engineer looking for remote Staff/Principal AI roles in Canada or the EU.',
+    )
+    assert result is not None, 'local LLM server not reachable'
+    assert result['score'] <= 2, f'expected clear non-fit, got {result}'
 
 
 # ---------------------------------------------------------------------------

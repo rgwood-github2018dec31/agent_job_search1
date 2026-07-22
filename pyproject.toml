@@ -33,4 +33,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "live_agent_claude: marks tests that require a live Claude API connection",
+    "live: marks tests that require the local/remote LLM MCP tool servers to be running",
 ]

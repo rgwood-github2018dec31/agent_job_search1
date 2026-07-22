@@ -31,6 +31,7 @@ _candidates: list[dict] = []
 _candidates_per_query: dict[str, int] = {}
 _applied_companies: dict[str, str] = {}  # company_name -> PDF filename
 _reference_job_texts: list[str] = []     # extracted text for evaluator prompt injection
+_job_extracts: list[dict] = []           # condensed page extracts captured from the Stage 2 extractor
 
 
 async def _extract_company_from_text(text: str) -> str:
@@ -80,17 +81,17 @@ async def company_matches_applied(candidate: str) -> str | None:
         },
         cwd=str(PROJECT_DIR),
     )
+    structured: dict | None = None
     async for msg in sdk_query(
         prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}',
         options=options,
     ):
         if isinstance(msg, ResultMessage) and msg.structured_output:
-            result = msg.structured_output
-            if not result.get('matches'):
-                return None
-            matched = result.get('matched_company_name', '')
-            return _applied_companies.get(matched, '<unknown PDF>')
-    return None
+            structured = msg.structured_output
+    if not structured or not structured.get('matches'):
+        return None
+    matched = structured.get('matched_company_name', '')
+    return _applied_companies.get(matched, '<unknown PDF>')
 
 
 async def _categorize_pdf_text(text: str, filename: str) -> str:
@@ -119,10 +120,12 @@ async def _categorize_pdf_text(text: str, filename: str) -> str:
         cwd=str(PROJECT_DIR),
     )
     prompt = f'Filename: {filename}\n\nContent:\n{text}'
+    category: str | None = None
     async for msg in sdk_query(prompt=prompt, options=options):
         if isinstance(msg, ResultMessage) and msg.structured_output:
             category = msg.structured_output.get('category', '')
-            return underscorify(category) or 'other'
+    if category is not None:
+        return underscorify(category) or 'other'
     console.print(f'[yellow]Warning: no structured output for {filename}[/yellow]')
     return None
 
@@ -142,7 +145,11 @@ async def categorize_downloads_pdfs(downloads_dir: Path | None = None) -> None:
             console.print(f'[yellow]Warning: could not read {pdf.name}: {e}[/yellow]')
             continue
         console.print(f'[dim]  Categorizing {pdf.name}...[/dim]')
-        category = await _categorize_pdf_text(text[:3000], pdf.name)
+        try:
+            category = await _categorize_pdf_text(text[:3000], pdf.name)
+        except Exception as ex:
+            console.print(f'[yellow]Warning: categorization failed for {pdf.name}, leaving uncategorized: {ex}[/yellow]')
+            continue
         if category is None:
             continue
         new_name = f'cat-{category}-{pdf.name}'
@@ -191,6 +198,11 @@ async def load_downloads_applied_pdfs(cache_path: Path | None = None) -> None:
             company = await _extract_company_from_text(text)
             cache[key] = {'mtime': mtime, 'company': company, 'text': text}
             cache_dirty = True
+
+        # PDF extraction can yield null bytes; they make the text unusable as a
+        # CLI subprocess argument (system prompt) — strip on load, covering
+        # both fresh extractions and previously cached entries.
+        text = text.replace('\x00', '')
 
         if company:
             companies[company] = pdf.name
@@ -251,7 +263,11 @@ async def do_save_job_posting(
     ts = int(time.time())
     id_part = job_id if job_id else "noid"
     rating_part = f"-rating_{rating}" if rating is not None else ""
-    filename = f"job_posting-{id_part}{rating_part}-{underscorify(company)}-{underscorify(description)}-{ts}.md"
+    # Cap name components — a long description (e.g. a full triage-reason sentence)
+    # can push the filename past the filesystem's 255-byte limit.
+    company_part = underscorify(company)[:40].rstrip('_')
+    description_part = underscorify(description)[:120].rstrip('_')
+    filename = f"job_posting-{id_part}{rating_part}-{company_part}-{description_part}-{ts}.md"
     (dir_path / filename).write_text(content, encoding="utf-8")
 
     return {"content": [{"type": "text", "text": f"Saved: saved_jobs-{date_str}/{filename}"}]}
@@ -366,6 +382,21 @@ async def do_check_and_record_job(
     return {"content": [{"type": "text", "text": "new"}]}
 
 
+async def do_submit_job_extract(
+    title: str, company: str, description: str,
+    location: str | None = None, date_posted: str | None = None,
+    closed: bool = False, salary: str | None = None, sponsorship_note: str | None = None,
+    language_requirement: str | None = None, relocation: str | None = None,
+) -> dict:
+    _job_extracts.append({
+        'title': title, 'company': company, 'description': description,
+        'location': location or '', 'date_posted': date_posted or '',
+        'closed': closed, 'salary': salary or '', 'sponsorship_note': sponsorship_note or '',
+        'language_requirement': language_requirement or '', 'relocation': relocation or '',
+    })
+    return {"content": [{"type": "text", "text": "Extract submitted."}]}
+
+
 async def do_queue_candidate(
     site: str, job_id: str, url: str, title: str, company: str,
     snippet: str, date_posted: str | None = None, query: str | None = None,
@@ -438,6 +469,45 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
     )
 
 
+@tool(
+    "submit_job_extract",
+    "Submit the condensed extract of the job posting page you navigated to. "
+    "Include only information-dense content: requirements, responsibilities, stack, seniority — "
+    "strip navigation chrome, boilerplate, and similar-jobs lists. "
+    "Set closed=true if the page shows 'No longer accepting applications' or equivalent. "
+    "Pass date_posted exactly as shown (absolute or relative like '4 days ago'). "
+    "Pass sponsorship_note with any visa/work-authorization statement, verbatim, if present. "
+    "Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), comma-separated "
+    "lowercase, e.g. 'english, german'; omit if no language requirement is stated. "
+    "Pass relocation with the country/city if the posting requires relocating to or residing in a "
+    "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles.",
+    {
+        'type': 'object',
+        'properties': {
+            'title': {'type': 'string'},
+            'company': {'type': 'string'},
+            'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
+            'location': {'type': 'string'},
+            'date_posted': {'type': 'string'},
+            'closed': {'type': 'boolean'},
+            'salary': {'type': 'string'},
+            'sponsorship_note': {'type': 'string'},
+            'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
+            'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
+        },
+        'required': ['title', 'company', 'description'],
+    },
+)
+async def submit_job_extract(args: dict[str, Any]) -> dict:
+    return await do_submit_job_extract(
+        args["title"], args["company"], args["description"],
+        location=args.get("location"), date_posted=args.get("date_posted"),
+        closed=args.get("closed", False), salary=args.get("salary"),
+        sponsorship_note=args.get("sponsorship_note"),
+        language_requirement=args.get("language_requirement"), relocation=args.get("relocation"),
+    )
+
+
 # --- MCP server factories ---
 
 def make_job_search_server(interactive: bool):
@@ -457,8 +527,8 @@ def make_scraper_server():
 
 
 def make_evaluator_server():
-    """MCP server for stage 2: saves evaluated jobs."""
+    """MCP server for stage 2: captures the condensed page extract from the Haiku extractor."""
     return create_sdk_mcp_server(
         name="job_evaluator", version="1.0.0",
-        tools=[save_job_posting],
+        tools=[submit_job_extract],
     )
