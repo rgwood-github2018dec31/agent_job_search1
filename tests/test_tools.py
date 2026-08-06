@@ -2,7 +2,8 @@
 
 from pathlib import Path
 import json
-from datetime import date, timedelta
+import os
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -560,49 +561,275 @@ async def test_check_and_record_job_skips_applied_company(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# load_downloads_applied_pdfs
+# applied-jobs corpus: ingest, load, horizon, agency handling
 # ---------------------------------------------------------------------------
 
-async def test_load_downloads_applied_pdfs_ignores_uncategorized(tmp_path, monkeypatch):
-    fake_home = tmp_path / 'home'
-    (fake_home / 'Downloads').mkdir(parents=True)
-    (fake_home / 'Downloads' / 'uncategorized.pdf').write_bytes(b'%PDF fake')
-
-    monkeypatch.setattr(tools, '_applied_companies', {})
-    monkeypatch.setattr(tools, '_reference_job_texts', [])
-    monkeypatch.setattr(Path, 'home', staticmethod(lambda: fake_home))
-
-    await tools.load_downloads_applied_pdfs(cache_path=tmp_path / 'cache.yaml')
-
-    assert tools._applied_companies == {}
+def _write_pdf(path: Path, mtime_date: date | None = None) -> Path:
+    """Create a placeholder PDF, optionally stamping its mtime to a given date."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'%PDF-1.4 fake')
+    if mtime_date is not None:
+        ts = datetime.combine(mtime_date, datetime.min.time()).timestamp()
+        os.utime(path, (ts, ts))
+    return path
 
 
-async def test_load_downloads_applied_pdfs_uses_cache(tmp_path, monkeypatch):
+def _index_entry(applied_date: date, mtime: float, **overrides) -> dict:
+    entry = {
+        'applied_date': applied_date,
+        'mtime': mtime,
+        'text': 'job description text',
+        'company': 'CachedCorp',
+        'job_title': 'Staff AI Engineer',
+        'is_agency': False,
+        'end_client': '',
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _no_legacy_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, 'LEGACY_DOWNLOADS_CACHE_PATH', tmp_path / 'missing_legacy_cache.yaml')
+
+
+async def test_ingest_date_prefixes_from_mtime_and_preserves_it(tmp_path, monkeypatch):
+    _no_legacy_cache(monkeypatch, tmp_path)
+    downloads = tmp_path / 'Downloads'
+    applied = tmp_path / 'applied_jobs'
+    applied_date = date(2026, 5, 13)
+    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', applied_date)
+    source_mtime = source.stat().st_mtime
+
+    moved = await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+
+    assert moved == 1
+    assert not source.exists(), 'source PDF should have moved, not been copied'
+    destination = applied / '2026-05-13-cat-saved_jd-acme_job.pdf'
+    assert destination.exists()
+    assert abs(destination.stat().st_mtime - source_mtime) < 1.0, 'mtime should survive the move'
+
+
+async def test_ingest_rolls_back_partial_move(tmp_path, monkeypatch):
+    """A copy that succeeds but whose source unlink fails must not leave a duplicate behind."""
+    _no_legacy_cache(monkeypatch, tmp_path)
+    downloads = tmp_path / 'Downloads'
+    applied = tmp_path / 'applied_jobs'
+    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 5, 13))
+
+    def fake_move(src, dst):
+        Path(dst).write_bytes(Path(src).read_bytes())  # copy succeeds, source stays
+        raise PermissionError('Operation not permitted')
+
+    monkeypatch.setattr(tools.shutil, 'move', fake_move)
+
+    moved = await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+
+    assert moved == 0
+    assert source.exists(), 'source must remain when the move failed'
+    assert not (applied / '2026-05-13-cat-saved_jd-acme_job.pdf').exists(), 'partial copy rolled back'
+
+
+async def test_ingest_dry_run_moves_nothing(tmp_path, monkeypatch):
+    _no_legacy_cache(monkeypatch, tmp_path)
+    downloads = tmp_path / 'Downloads'
+    applied = tmp_path / 'applied_jobs'
+    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 5, 13))
+
+    moved = await tools.ingest_downloads_applied_pdfs(
+        downloads_dir=downloads, applied_dir=applied, dry_run=True
+    )
+
+    assert moved == 1
+    assert source.exists()
+    assert not applied.exists()
+
+
+async def test_ingest_is_idempotent_for_already_prefixed_file(tmp_path, monkeypatch):
+    _no_legacy_cache(monkeypatch, tmp_path)
+    downloads = tmp_path / 'Downloads'
+    applied = tmp_path / 'applied_jobs'
+    # An already-ingested file re-downloaded into Downloads keeps its original date, and a
+    # second pass must not re-date it to today.
+    _write_pdf(downloads / '2026-04-13-cat-saved_jd-acme_job.pdf', date(2026, 7, 1))
+
+    await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    assert (applied / '2026-04-13-cat-saved_jd-acme_job.pdf').exists()
+
+    moved_again = await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    assert moved_again == 0
+    assert list(applied.glob('*.pdf')) == [applied / '2026-04-13-cat-saved_jd-acme_job.pdf']
+
+
+async def test_ingest_prefers_index_date_over_clobbered_mtime(tmp_path, monkeypatch):
+    """The whole point of the manifest: a rewritten mtime must not rewrite the applied date."""
     import yaml as yaml_mod
-    fake_home = tmp_path / 'home'
-    (fake_home / 'Downloads').mkdir(parents=True)
-    pdf_path = fake_home / 'Downloads' / 'cat-saved_jd-acme_job.pdf'
-    pdf_path.write_bytes(b'%PDF-1.4 fake')
-    mtime = pdf_path.stat().st_mtime
+    _no_legacy_cache(monkeypatch, tmp_path)
+    downloads = tmp_path / 'Downloads'
+    applied = tmp_path / 'applied_jobs'
+    applied.mkdir(parents=True)
+    _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 7, 25))  # mtime says July
+    (applied / 'index.yaml').write_text(yaml_mod.dump({
+        'cat-saved_jd-acme_job.pdf': {'applied_date': date(2026, 4, 13)},  # index says April
+    }))
 
-    cache_path = tmp_path / 'cache.yaml'
-    cache_path.write_text(yaml_mod.dump({
-        str(pdf_path): {'mtime': mtime, 'company': 'CachedCorp', 'text': 'job description text'}
+    await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+
+    assert (applied / '2026-04-13-cat-saved_jd-acme_job.pdf').exists()
+
+
+async def test_ingest_falls_back_to_legacy_downloads_cache_mtime(tmp_path, monkeypatch):
+    import yaml as yaml_mod
+    downloads = tmp_path / 'Downloads'
+    applied = tmp_path / 'applied_jobs'
+    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 7, 25))
+
+    legacy = tmp_path / 'downloads_pdf_cache.yaml'
+    legacy_ts = datetime.combine(date(2026, 4, 13), datetime.min.time()).timestamp()
+    legacy.write_text(yaml_mod.dump({str(source): {'mtime': legacy_ts, 'company': 'Acme'}}))
+    monkeypatch.setattr(tools, 'LEGACY_DOWNLOADS_CACHE_PATH', legacy)
+
+    await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+
+    assert (applied / '2026-04-13-cat-saved_jd-acme_job.pdf').exists()
+
+
+async def test_load_applied_jobs_uses_index_without_llm_call(tmp_path, monkeypatch):
+    import yaml as yaml_mod
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    pdf = _write_pdf(applied / '2026-07-20-cat-saved_jd-acme_job.pdf', date.today())
+
+    index_path = applied / 'index.yaml'
+    index_path.write_text(yaml_mod.dump({
+        pdf.name: _index_entry(date.today(), pdf.stat().st_mtime),
     }))
 
     extract_called = []
 
-    async def fake_extract(text):
-        extract_called.append(text)
-        return 'ShouldNotBeCalled'
+    async def fake_extract(text, filename):
+        extract_called.append(filename)
+        return {'company': 'ShouldNotBeCalled', 'job_title': '', 'is_agency': False, 'end_client': ''}
 
-    monkeypatch.setattr(tools, '_extract_company_from_text', fake_extract)
-    monkeypatch.setattr(Path, 'home', staticmethod(lambda: fake_home))
+    monkeypatch.setattr(tools, '_extract_applied_job_metadata', fake_extract)
 
-    await tools.load_downloads_applied_pdfs(cache_path=cache_path)
+    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
 
-    assert extract_called == [], 'LLM should not be called on cache hit'
+    assert extract_called == [], 'LLM should not be called on an index hit'
     assert 'CachedCorp' in tools._applied_companies
+    assert tools._reference_job_texts == ['job description text']
+    assert len(tools._applied_jobs) == 1
+
+
+async def test_load_applied_jobs_extracts_and_writes_index(tmp_path, monkeypatch):
+    _no_legacy_cache(monkeypatch, tmp_path)
+    import yaml as yaml_mod
+    applied = tmp_path / 'applied_jobs'
+    _write_pdf(applied / '2026-07-20-cat-saved_jd-acme_job.pdf', date.today())
+
+    class FakePage:
+        def extract_text(self):
+            return 'Acme is hiring a Staff AI Engineer'
+
+    class FakeReader:
+        def __init__(self, path):
+            self.pages = [FakePage()]
+
+    monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
+
+    async def fake_extract(text, filename):
+        return {'company': 'Acme', 'job_title': 'Staff AI Engineer', 'is_agency': False, 'end_client': ''}
+
+    monkeypatch.setattr(tools, '_extract_applied_job_metadata', fake_extract)
+
+    index_path = applied / 'index.yaml'
+    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+
+    assert tools._applied_companies == {'Acme': '2026-07-20-cat-saved_jd-acme_job.pdf'}
+    written = yaml_mod.safe_load(index_path.read_text())
+    entry = written['2026-07-20-cat-saved_jd-acme_job.pdf']
+    assert entry['company'] == 'Acme'
+    assert entry['job_title'] == 'Staff AI Engineer'
+    assert entry['applied_date'] == date(2026, 7, 20)
+
+
+async def test_load_applied_jobs_excludes_beyond_horizon(tmp_path, monkeypatch):
+    import yaml as yaml_mod
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    stale_date = date.today() - timedelta(days=tools.APPLIED_JOBS_HORIZON_DAYS + 1)
+    stale = _write_pdf(applied / f'{stale_date.isoformat()}-cat-saved_jd-old_job.pdf', stale_date)
+    fresh = _write_pdf(applied / f'{date.today().isoformat()}-cat-saved_jd-new_job.pdf', date.today())
+
+    index_path = applied / 'index.yaml'
+    index_path.write_text(yaml_mod.dump({
+        stale.name: _index_entry(stale_date, stale.stat().st_mtime, company='OldCorp', text='old text'),
+        fresh.name: _index_entry(date.today(), fresh.stat().st_mtime, company='NewCorp', text='new text'),
+    }))
+
+    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+
+    assert stale.exists(), 'aged-out PDFs are kept on disk, only excluded from use'
+    assert tools._applied_companies == {'NewCorp': fresh.name}
+    assert tools._reference_job_texts == ['new text']
+    assert [j['filename'] for j in tools._applied_jobs] == [fresh.name]
+
+
+async def test_load_applied_jobs_does_not_blocklist_recruiting_agency(tmp_path, monkeypatch):
+    import yaml as yaml_mod
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    pdf = _write_pdf(applied / f'{date.today().isoformat()}-cat-saved_jd-jobgether.pdf', date.today())
+
+    index_path = applied / 'index.yaml'
+    index_path.write_text(yaml_mod.dump({
+        pdf.name: _index_entry(date.today(), pdf.stat().st_mtime, company='Jobgether', is_agency=True),
+    }))
+
+    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+
+    assert tools._applied_companies == {}, 'an agency name must never block its other postings'
+    assert tools._reference_job_texts == ['job description text'], 'still useful as reference signal'
+
+
+async def test_load_applied_jobs_blocklists_end_client_not_agency(tmp_path, monkeypatch):
+    import yaml as yaml_mod
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    pdf = _write_pdf(applied / f'{date.today().isoformat()}-cat-saved_jd-jobgether.pdf', date.today())
+
+    index_path = applied / 'index.yaml'
+    index_path.write_text(yaml_mod.dump({
+        pdf.name: _index_entry(
+            date.today(), pdf.stat().st_mtime,
+            company='Jobgether', is_agency=True, end_client='Acquia',
+        ),
+    }))
+
+    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+
+    assert tools._applied_companies == {'Acquia': pdf.name}
+
+
+def test_applied_jobs_summary_renders_titles_dates_and_agency(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_jobs', [
+        {'filename': 'a.pdf', 'applied_date': date(2026, 5, 13), 'company': 'BMC Software',
+         'job_title': 'Principal Agentic AI Engineer', 'is_agency': False, 'end_client': ''},
+        {'filename': 'b.pdf', 'applied_date': date(2026, 7, 20), 'company': 'Jobgether',
+         'job_title': 'Staff AI Engineer', 'is_agency': True, 'end_client': 'Acquia'},
+    ])
+
+    summary = tools.applied_jobs_summary()
+    lines = summary.splitlines()
+
+    assert lines[0].startswith('- Staff AI Engineer — Jobgether (2026-07-20)'), 'newest first'
+    assert '[via agency]' in lines[0]
+    assert '[hiring company: Acquia]' in lines[0]
+    assert lines[1] == '- Principal Agentic AI Engineer — BMC Software (2026-05-13)'
+
+
+def test_applied_jobs_summary_empty_when_no_jobs(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_jobs', [])
+    assert tools.applied_jobs_summary() == ''
 
 
 # ---------------------------------------------------------------------------
@@ -1501,3 +1728,413 @@ async def test_company_matches_applied_live(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {'BMO Financial Group': 'bmo_job.pdf'})
     result = await tools.company_matches_applied('BMO')
     assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# company normalization / exact-match short circuit
+# ---------------------------------------------------------------------------
+
+def test_normalize_company_strips_suffixes_and_punctuation():
+    assert tools._normalize_company('Datadog, Inc.') == tools._normalize_company('Datadog')
+    assert tools._normalize_company('Acme Technologies Ltd') == 'acme'
+    assert tools._normalize_company('The Vista Group') == 'vista'
+
+
+async def test_company_matches_applied_exact_match_skips_llm(monkeypatch):
+    """The per-listing LLM round trip is the Stage 1b bottleneck; exact matches must not pay it."""
+    monkeypatch.setattr(tools, '_applied_companies', {'Datadog': 'datadog.pdf'})
+    called = []
+
+    async def fail_openrouter(*args, **kwargs):
+        called.append(True)
+        raise AssertionError('should not be called')
+
+    monkeypatch.setattr(tools, '_company_matches_openrouter', fail_openrouter)
+
+    assert await tools.company_matches_applied('Datadog, Inc.') == 'datadog.pdf'
+    assert called == []
+
+
+async def test_company_matches_applied_falls_back_to_anthropic(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify.pdf'})
+    monkeypatch.setattr(tools, 'COMPANY_MATCH_PROVIDER', 'openrouter')
+
+    async def broken_openrouter(candidate, companies_list):
+        raise RuntimeError('OpenRouter MCP server down')
+
+    monkeypatch.setattr(tools, '_company_matches_openrouter', broken_openrouter)
+    _make_sdk_mock(monkeypatch, {'matches': True, 'matched_company_name': 'Shopify'})
+
+    assert await tools.company_matches_applied('Shopify Commerce') == 'shopify.pdf'
+
+
+# ---------------------------------------------------------------------------
+# per-run audit log + un-surfaced pools
+# ---------------------------------------------------------------------------
+
+def _listing(job_id, company, status='new', queued=True, rating=None, outcome='rated', title='Staff AI Engineer'):
+    return {
+        'site': 'linkedin', 'job_id': job_id, 'company': company, 'title': title,
+        'date_posted': '2 days ago', 'check_status': status,
+        'url': tools.job_url('linkedin', job_id),
+        'queued': queued, 'outcome': outcome, 'rating': rating, 'summary': f'{company} summary',
+    }
+
+
+def test_job_url_reconstructs_linkedin_url():
+    assert tools.job_url('linkedin', '12345') == 'https://www.linkedin.com/jobs/view/12345/'
+
+
+def test_record_job_outcome_attaches_result(monkeypatch):
+    records = {('linkedin', '1'): _listing('1', 'Acme', rating=None, outcome='queued')}
+    monkeypatch.setattr(tools, '_listing_records', records)
+    tools.record_job_outcome('linkedin', '1', 'rated', rating=5, summary='great fit')
+    assert records[('linkedin', '1')]['outcome'] == 'rated'
+    assert records[('linkedin', '1')]['rating'] == 5
+    assert records[('linkedin', '1')]['summary'] == 'great fit'
+
+
+def test_unsurfaced_pools_groups_by_drop_reason(monkeypatch):
+    monkeypatch.setattr(tools, '_listing_records', {
+        ('linkedin', '1'): _listing('1', 'TooOld', status='too_old', queued=False, outcome='too_old'),
+        ('linkedin', '2'): _listing('2', 'Applied', status='already_applied', queued=False, outcome='already_applied'),
+        ('linkedin', '3'): _listing('3', 'NeverQueued', status='new', queued=False, outcome='new'),
+        ('linkedin', '4'): _listing('4', 'MidRated', status='new', queued=True, rating=3),
+        ('linkedin', '5'): _listing('5', 'GoodJob', status='new', queued=True, rating=5),
+        ('linkedin', '6'): _listing('6', 'Dupe', status='already_processed', queued=False, outcome='already_processed'),
+    })
+    pools = tools.unsurfaced_pools()
+
+    assert {r['company'] for r in pools['filtered']} == {'TooOld', 'Applied'}
+    assert {r['company'] for r in pools['never_queued']} == {'NeverQueued'}
+    assert {r['company'] for r in pools['mid_rated']} == {'MidRated'}
+    assert 'GoodJob' not in {r['company'] for pool in pools.values() for r in pool}
+
+
+def test_write_run_audit_log_covers_all_four_sections(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {'Acme': 'acme.pdf'})
+    monkeypatch.setattr(tools, '_candidates_per_query', {'Staff AI Engineer': 2})
+    monkeypatch.setattr(tools, '_queries_searched', {'Staff AI Engineer': 7})
+    monkeypatch.setattr(tools, '_listing_records', {
+        ('linkedin', '1'): _listing('1', 'GoodCorp', rating=5),
+        ('linkedin', '2'): _listing('2', 'MehCorp', rating=2),
+    })
+
+    path = tools.write_run_audit_log(
+        queries=['Staff AI Engineer', 'Principal AI Engineer'],
+        applied_jobs_in_horizon=30, applied_jobs_total=43,
+        funnel={'listings_seen': 2}, run_dir=tmp_path,
+        timestamp=datetime(2026, 7, 28, 17, 5, 0),
+    )
+
+    assert path.name == 'audit-2026Jul28-170500.md'
+    text = path.read_text()
+    assert '30' in text and '43' in text, 'applied-job counts missing'
+    assert 'Staff AI Engineer' in text
+    # A query that was generated but never searched must be visibly distinct from one that
+    # ran and found nothing -- that ambiguity is what hid the truncated-scraper bug.
+    assert 'NEVER SEARCHED' in text
+    assert 'https://www.linkedin.com/jobs/view/1/' in text
+    assert 'GoodCorp' in text and 'MehCorp' in text
+    assert 'GoodCorp summary' in text
+
+
+def test_write_run_audit_log_includes_opus_findings(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {})
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {'q': 1})
+    monkeypatch.setattr(tools, '_listing_records', {})
+
+    path = tools.write_run_audit_log(
+        queries=['q'], applied_jobs_in_horizon=1, applied_jobs_total=1, funnel={},
+        audit_findings=[{
+            'pool': 'filtered', 'company': 'MissedCorp', 'title': 'Principal AI Engineer',
+            'url': 'https://example.com/1', 'opus_rating': 5,
+            'verdict': 'FALSE NEGATIVE', 'reasoning': 'strong match on agentic AI',
+        }],
+        run_dir=tmp_path, timestamp=datetime(2026, 7, 28, 17, 5, 0),
+    )
+
+    text = path.read_text()
+    assert 'Opus audit' in text
+    assert 'FALSE NEGATIVE' in text
+    assert 'MissedCorp' in text
+    assert 'strong match on agentic AI' in text
+
+
+# ---------------------------------------------------------------------------
+# query generation: provider chain, cap, IC-only instructions
+# ---------------------------------------------------------------------------
+
+def test_query_instructions_exclude_managerial_titles():
+    text = agent.QUERY_GENERATION_INSTRUCTIONS
+    assert 'INDIVIDUAL CONTRIBUTOR' in text
+    for managerial in ('Manager', 'Head of', 'Director', 'VP'):
+        assert managerial in text, f'{managerial} should be named as an exclusion'
+    assert str(agent.MAX_SEARCH_QUERIES) in text
+
+
+async def test_generate_search_queries_uses_openrouter(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, 'QUERY_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'load_resume', lambda: 'resume text')
+    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'missing.md')
+    monkeypatch.setattr(tools, 'applied_jobs_summary', lambda: '- Staff AI Engineer — Acme (2026-07-01)')
+
+    async def fake_chat(prompt, **kwargs):
+        assert 'Staff AI Engineer — Acme' in prompt, 'applied jobs must reach the prompt'
+        return '{"queries": ["Principal AI Engineer", "Staff AI Engineer"]}', 0.01
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_chat)
+    stage_stats = {'cost': 0.0}
+
+    queries = await agent.generate_search_queries(stage_stats)
+
+    assert queries == ['Principal AI Engineer', 'Staff AI Engineer']
+    assert stage_stats['cost'] == 0.01
+
+
+async def test_generate_search_queries_enforces_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, 'QUERY_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MAX_SEARCH_QUERIES', 3)
+    monkeypatch.setattr(agent, 'load_resume', lambda: 'resume')
+    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'missing.md')
+    monkeypatch.setattr(tools, 'applied_jobs_summary', lambda: '')
+
+    async def fake_chat(prompt, **kwargs):
+        return '{"queries": ["a", "b", "c", "d", "e"]}', 0.0
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_chat)
+
+    queries = await agent.generate_search_queries({'cost': 0.0})
+
+    assert queries == ['a', 'b', 'c'], 'every extra query costs two live LinkedIn searches'
+
+
+async def test_generate_search_queries_falls_back_to_anthropic(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, 'QUERY_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'load_resume', lambda: 'resume')
+    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'missing.md')
+    monkeypatch.setattr(tools, 'applied_jobs_summary', lambda: '')
+
+    async def broken_chat(prompt, **kwargs):
+        raise RuntimeError('OpenRouter MCP server down')
+
+    monkeypatch.setattr(agent, 'chat_openrouter', broken_chat)
+
+    # The Anthropic fallback path submits queries via an MCP tool call, which this stub does
+    # not emulate — so it yields nothing and the function must raise rather than return [].
+    called = {}
+
+    async def fake_sdk_query(prompt, options):
+        called['prompt'] = prompt
+        return
+        yield  # make it an async generator
+
+    monkeypatch.setattr(agent, 'sdk_query', fake_sdk_query)
+
+    with pytest.raises(ValueError, match='no queries on any provider'):
+        await agent.generate_search_queries({'cost': 0.0})
+
+    assert 'Call the submit_search_queries tool' in called['prompt'], 'Anthropic fallback was attempted'
+
+
+# ---------------------------------------------------------------------------
+# run_scraper: per-query requests on a single shared session
+# ---------------------------------------------------------------------------
+
+class _FakeScraperClient:
+    """Records each query() call so we can assert on request boundaries."""
+
+    def __init__(self, listings_per_query=None):
+        self.requests = []
+        self.listings_per_query = listings_per_query or {}
+
+    async def query(self, instruction):
+        self.requests.append(instruction)
+        # Simulate the scraper inspecting listings for whichever query this request names.
+        for name, count in self.listings_per_query.items():
+            if f'"{name}"' in instruction:
+                for i in range(count):
+                    key = f'{name}-{len(tools._check_status_counts)}-{i}'
+                    tools._check_status_counts[key] = 1
+                break
+
+    async def receive_response(self):
+        return
+        yield
+
+
+async def test_run_scraper_sends_one_request_per_query(monkeypatch):
+    """Each query needs its own turn budget; a shared request starves the later ones."""
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+
+    queries = ['Principal AI Engineer', 'Staff AI Engineer', 'Lead AI Engineer']
+    client = _FakeScraperClient({q: 3 for q in queries})
+
+    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+
+    assert len(client.requests) == 3, 'one request per query'
+    for q in queries:
+        assert any(f'"{q}"' in r for r in client.requests), f'{q} was never searched'
+        assert tools._queries_searched[q] == 3
+
+
+async def test_run_scraper_retries_empty_query_then_continues(monkeypatch):
+    """A query that comes back empty gets one retry, and must not abort the remaining queries."""
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+
+    queries = ['Empty Query', 'Good Query']
+    client = _FakeScraperClient({'Good Query': 2})
+
+    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+
+    empty_requests = [r for r in client.requests if '"Empty Query"' in r]
+    assert len(empty_requests) == 2, 'empty query should be retried once'
+    assert any('WITHOUT the `sortBy=DD`' in r for r in empty_requests), 'retry drops the date sort'
+    assert tools._queries_searched['Empty Query'] == 0
+    assert tools._queries_searched['Good Query'] == 2, 'later queries still run'
+
+
+async def test_run_scraper_survives_a_failing_query(monkeypatch):
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+
+    class ExplodingClient(_FakeScraperClient):
+        async def query(self, instruction):
+            if '"Bad Query"' in instruction:
+                raise RuntimeError('session died')
+            await super().query(instruction)
+
+    client = ExplodingClient({'Good Query': 1})
+    await agent.run_scraper(client, ['Bad Query', 'Good Query'], {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+
+    assert tools._queries_searched['Bad Query'] == 'error'
+    assert tools._queries_searched['Good Query'] == 1, 'a failed query must not abort the rest'
+
+
+# ---------------------------------------------------------------------------
+# run lock: concurrent-run detection
+# ---------------------------------------------------------------------------
+
+def test_read_run_lock_none_when_absent(tmp_path):
+    assert tools.read_run_lock(tmp_path / 'nolock.json') is None
+
+
+def test_acquire_and_release_run_lock_roundtrip(tmp_path):
+    lock = tmp_path / 'lock.json'
+    assert tools.acquire_run_lock('non-interactive', lock_path=lock) is None
+
+    active = tools.read_run_lock(lock)
+    assert active['pid'] == os.getpid()
+    assert active['mode'] == 'non-interactive'
+
+    tools.release_run_lock(lock)
+    assert not lock.exists()
+    assert tools.read_run_lock(lock) is None
+
+
+def test_acquire_run_lock_reports_conflict(tmp_path, monkeypatch):
+    """A second run must be told who holds the lock, not silently proceed."""
+    lock = tmp_path / 'lock.json'
+    lock.write_text(json.dumps({
+        'pid': os.getpid(), 'started_at': '2026-07-28T21:05:00',
+        'mode': 'non-interactive', 'argv': 'job-search -n',
+    }))
+
+    conflict = tools.acquire_run_lock('non-interactive', lock_path=lock)
+
+    assert conflict is not None
+    assert conflict['argv'] == 'job-search -n'
+
+
+def test_stale_lock_from_dead_pid_is_ignored(tmp_path, monkeypatch):
+    """A crashed run must not block every future run with a leftover file."""
+    lock = tmp_path / 'lock.json'
+    lock.write_text(json.dumps({
+        'pid': 999999, 'started_at': '2026-07-28T10:00:00', 'mode': 'non-interactive', 'argv': 'old',
+    }))
+    monkeypatch.setattr(tools, '_pid_alive', lambda pid: pid != 999999)
+
+    assert tools.read_run_lock(lock) is None, 'dead holder means no run is active'
+    assert tools.acquire_run_lock('non-interactive', lock_path=lock) is None, 'stale lock must not block'
+    assert tools.read_run_lock(lock)['pid'] == os.getpid()
+
+
+def test_corrupt_lock_is_treated_as_stale(tmp_path):
+    lock = tmp_path / 'lock.json'
+    lock.write_text('not json at all')
+    assert tools.read_run_lock(lock) is None
+
+
+def test_release_run_lock_does_not_delete_another_runs_lock(tmp_path, monkeypatch):
+    lock = tmp_path / 'lock.json'
+    lock.write_text(json.dumps({'pid': os.getpid() + 1, 'started_at': 'x', 'mode': 'n', 'argv': 'other'}))
+    monkeypatch.setattr(tools, '_pid_alive', lambda pid: True)
+
+    tools.release_run_lock(lock)
+
+    assert lock.exists(), "must never release a lock we do not hold"
+
+
+def test_force_overrides_active_lock(tmp_path, monkeypatch):
+    lock = tmp_path / 'lock.json'
+    lock.write_text(json.dumps({'pid': os.getpid() + 1, 'started_at': 'x', 'mode': 'n', 'argv': 'other'}))
+    monkeypatch.setattr(tools, '_pid_alive', lambda pid: True)
+
+    assert tools.acquire_run_lock('non-interactive', force=True, lock_path=lock) is None
+    assert tools.read_run_lock(lock)['pid'] == os.getpid()
+
+
+def test_describe_run_status_both_states(tmp_path, monkeypatch):
+    lock = tmp_path / 'lock.json'
+    assert 'No job search run is currently active' in tools.describe_run_status(lock)
+
+    tools.acquire_run_lock('non-interactive', lock_path=lock)
+    status = tools.describe_run_status(lock)
+    assert 'A run IS active' in status
+    assert str(os.getpid()) in status
+
+
+def test_describe_run_status_falls_back_to_process_scan(tmp_path, monkeypatch):
+    """A run started before the lock existed still has to be reported as running."""
+    monkeypatch.setattr(tools, 'find_run_processes', lambda: [
+        '13779  /path/.venv/bin/python3 /path/agent_job_search1/.venv/bin/job-search -n'
+    ])
+    status = tools.describe_run_status(tmp_path / 'no_lock.json')
+    assert 'ARE running' in status
+    assert '13779' in status
+
+
+def test_find_run_processes_requires_project_marker(monkeypatch):
+    """An unrelated main.py on the machine must not be mistaken for a job search run."""
+    fake_ps = (
+        '  111 /usr/bin/python3 /some/other/project/main.py\n'
+        '  222 /path/agent_job_search1/.venv/bin/job-search -n\n'
+        '  333 grep job-search\n'
+    )
+
+    class FakeCompleted:
+        stdout = fake_ps
+
+    monkeypatch.setattr(tools.subprocess, 'run', lambda *a, **k: FakeCompleted())
+
+    found = tools.find_run_processes()
+
+    assert len(found) == 1
+    assert found[0].startswith('222')
+
+
+def test_find_run_processes_survives_ps_failure(monkeypatch):
+    def boom(*args, **kwargs):
+        raise OSError('ps unavailable')
+
+    monkeypatch.setattr(tools.subprocess, 'run', boom)
+    assert tools.find_run_processes() == []

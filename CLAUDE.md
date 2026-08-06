@@ -41,6 +41,8 @@ uv sync --group test     # Install test dependencies
 uv lock --upgrade && uv sync  # Update all dependencies to latest versions
 python main.py           # Run in interactive mode
 python main.py -n        # Run in non-interactive mode
+python main.py -n --audit # Non-interactive + re-rate gate-killed jobs to detect false negatives (diagnostic)
+python main.py -n --audit-opus 2  # Non-interactive + re-rate 2 un-surfaced jobs per pool with Opus (diagnostic)
 
 # Tests
 uv run pytest                          # Run all tests (skips live tests if no API key)
@@ -63,15 +65,47 @@ src/agentic_job_search/
   triage.py                       # LLM MCP-server client, local triage, non-Anthropic rating calls
   extract_openrouter.py           # OpenRouter function-calling agent loop for page extraction
   config.py                       # Model/provider constants and Stage 2 tuning
+scripts/
+  migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
 tests/
   test_tools.py                   # Unit tests for all tools
 run_dir/
   JOB_REQUIREMENTS.md             # Agent-managed job preferences (interactive mode)
+  applied_jobs/                   # Applied-job PDFs, date-prefixed, + index.yaml metadata
   saved_jobs-{date}/              # Evaluated job postings (Markdown)
   processed_jobs/                 # Per-job YAML records for deduplication
+  audit_logs/                     # Per-run audit trace (audit-{date}-{time}.md)
   reference_summary_cache.yaml    # Cached distilled ideal-role profile (md5-keyed)
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
 ```
+
+## Applied-job corpus (`run_dir/applied_jobs/`)
+
+Jobs the user has applied to are the strongest available signal of what to search for. PDFs are
+saved to `~/Downloads`, categorized by `categorize_downloads_pdfs()` into `cat-saved_jd-*.pdf`,
+then moved into `run_dir/applied_jobs/` by `ingest_downloads_applied_pdfs()` on every startup,
+renamed to `{YYYY-MM-DD}-{original}.pdf`.
+
+The applied date is carried three ways, most durable first: the filename prefix, the
+`applied_date` in `index.yaml`, and the file mtime (restored via `os.utime` after the move).
+mtime alone is untrustworthy — any copy, backup restore, or rsync rewrites it.
+
+`load_applied_jobs()` reads the corpus into three globals, keyed on `index.yaml` (which caches
+extracted text and metadata per filename by mtime, so the Haiku metadata call only runs for new
+or changed PDFs):
+
+- `_applied_jobs` — feeds `applied_jobs_summary()` into the Stage 1a query prompt
+- `_reference_job_texts` — feeds the ideal-role profile used by the rater
+- `_applied_companies` — the already-applied blocklist used by `check_and_record_job`
+
+Only records within `APPLIED_JOBS_HORIZON_DAYS` (90) populate these; older PDFs stay on disk but
+are never read.
+
+**Recruiters:** `_extract_applied_job_metadata()` returns `is_agency` and `end_client` alongside
+company and title. An agency's own name never enters the blocklist — applying once through an
+aggregator (Jobgether, CNA Search, SearchLabs, Syndesus) would otherwise suppress every other
+company it posts for. The end client is blocklisted instead when the posting names one; agency
+postings still contribute reference and query signal.
 
 ## Architecture
 
@@ -79,16 +113,18 @@ The project uses the **[Claude Agent SDK](https://platform.claude.com/docs/en/ag
 
 ### Model tiers and providers (`config.py`)
 
-- `MODEL_NAME_MEDIUM` (`claude-sonnet-5`) — default rating call
-- `MODEL_NAME_LOW` (`claude-haiku-4-5`) — query generation, scraping, and page extraction
-- `RATING_PROVIDER` — `'anthropic'` (default) | `'openrouter'` (`OPENROUTER_MODEL`, `z-ai/glm-5.2`) | `'ollama'` (`LOCAL_MODEL`) — selects who makes the final rating call
+- `MODEL_NAME_HIGH` (`claude-opus-5`) — audit reference standard only (`--audit-opus`); never used in the normal pipeline
+- `MODEL_NAME_MEDIUM` (`claude-sonnet-5`) — Anthropic fallback for query generation and rating
+- `MODEL_NAME_LOW` (`claude-haiku-4-5`) — scraping, page extraction, and applied-job metadata
+- `OPENROUTER_MODEL` (`z-ai/glm-5.2`) — **default** for query generation (`QUERY_PROVIDER`), company matching (`COMPANY_MATCH_PROVIDER`), and rating (`RATING_PROVIDER`). Each falls back to Anthropic if the OpenRouter MCP server is down
+- `RATING_PROVIDER` — `'openrouter'` (default, `z-ai/glm-5.2`) | `'anthropic'` (`MODEL_NAME_MEDIUM`) | `'ollama'` (`LOCAL_MODEL`) — selects who makes the final rating call
 - `EXTRACTOR_PROVIDER` — `'anthropic'` (default, Haiku agentic session) | `'openrouter'` (function-calling agent loop in `extract_openrouter.py`: glm-5.2 drives the browser tools via the OpenRouter MCP server's `chat` tool with OpenAI-style `tools`; capped at `EXTRACTOR_OPENROUTER_MAX_ITERATIONS`, tool results truncated to `EXTRACTOR_TOOL_RESULT_MAX_CHARS`). The deterministic Haiku fallback covers failures of either provider
 - Non-Anthropic models are reached via the LLM MCP tool servers (`LLM_OPENROUTER_MCP_URL` :8006, `LLM_LOCAL_MCP_URL` :8002) using `call_mcp_tool()` in `triage.py`
 
 ### Non-interactive pipeline (`run_non_interactive` in `agent.py`)
 
-1. **Stage 1a — Query generation** (Haiku): `generate_search_queries()` derives 2–6 short LinkedIn search queries from resume + `JOB_REQUIREMENTS.md`
-2. **Stage 1b — Scraping** (Haiku): `run_scraper()` runs queries on LinkedIn, calls `check_and_record_job` + `queue_candidate` for each result listing without navigating to individual job pages
+1. **Stage 1a — Query generation** (glm, Anthropic fallback): `generate_search_queries()` derives at most `MAX_SEARCH_QUERIES` (6) LinkedIn search queries from resume + `JOB_REQUIREMENTS.md` + the in-horizon applied-job titles (`applied_jobs_summary()`). Individual-contributor titles only — people-management titles are explicitly excluded
+2. **Stage 1b — Scraping** (Haiku): `run_scraper()` issues **one request per query on a single shared session** (`SCRAPER_MAX_TURNS_PER_QUERY` turns each), calling `check_and_record_job` + `queue_candidate` for each result listing without navigating to individual job pages. Both halves are load-bearing: batching all queries into one request lets the first few exhaust the turn budget so the rest are never searched (while still reporting `0 jobs`); opening a fresh client per query makes later ones fail with "browser is in use" against the shared Playwright context, which looks identical to an auth wall in the logs
 3. **Stage 2 — Evaluation** (`evaluate_all_candidates()`), per candidate:
    - **2a Extract** (Haiku, agentic): `extract_job_page()` navigates to the job URL, expands the description, and submits a condensed extract via `submit_job_extract` (nav chrome and boilerplate stripped). If the session ends without submitting (Haiku can exhaust its turn budget hunting through truncated snapshots of large pages), `extract_job_page_direct()` falls back to a deterministic path: navigate + wait + snapshot (+ one "… more" expand click) driven directly over the Playwright MCP session, then one non-agentic Haiku call condenses the full snapshot — same browser and logged-in profile, so bot-detection exposure is identical
    - **2b Hard rules** ($0, deterministic): `apply_hard_rules()` auto-rates 1 for closed postings, postings > `JOB_STALE_AGE_DAYS` (30) days old, US jobs without explicit sponsorship, and jobs with an explicit non-English language requirement (from the extract's `language_requirement` field). A required relocation (`relocation` field) does NOT reject — it is flagged as "relocation required: <location>" in the saved job and the Telegram notification, and the evaluator is instructed not to penalize EU relocation. Every rejection is logged with its reason (console + `run_dir/logs/run-*.log`)
@@ -147,7 +183,8 @@ At runtime, `check_and_record_job` enforces:
 
 - **Resume** — user's CV stored as Markdown in `run_dir/`
 - **JOB_REQUIREMENTS.md** — agent-managed preference file; read-only in non-interactive mode
-- **Search Query** — short LinkedIn search string derived from Resume and JOB_REQUIREMENTS.md (2–6 per run)
+- **Search Query** — short LinkedIn search string derived from Resume, JOB_REQUIREMENTS.md, and Applied Job Records
+- **Applied Job Record** — a job the User applied to: a date-prefixed PDF in `run_dir/applied_jobs/` plus its `index.yaml` metadata (applied date, company, job title, recruiting-agency flag, end client). Active for 3 months; older records are retained but unused
 - **Job Posting** — a LinkedIn listing with company, title, description, URL, job_id, date_posted, and a 1–5 rating
 - **Processed Job Record** — `processed_jobs/*.yaml` keyed by `(site, job_id)`; drives deduplication across runs
 - **Saved Job** — evaluated posting stored as `saved_jobs-{date}/job_posting-{id}-rating_{n}-*.md`
@@ -162,16 +199,22 @@ At runtime, `check_and_record_job` enforces:
 
 **Scheduler**
 - **Run autonomous search**: discover and rate Job Postings without user interaction
+  - includes: Ingest Applied Jobs
   - includes: Generate Search Queries
   - includes: Scrape Job Postings
   - includes: Evaluate Job Fit
 
 **System** (invoked via includes)
-- **Generate Search Queries**: derive Search Queries from Resume and JOB_REQUIREMENTS.md
-- **Scrape Job Postings**: execute Search Queries on LinkedIn and collect candidate Job Postings
+- **Ingest Applied Jobs**: move categorized applied-job PDFs from Downloads into `run_dir/applied_jobs/`, stamping each filename with its applied date and preserving mtime; already-dated files are a no-op, so it is safe on every run
+  - includes: Flag Recruiting Agency
+- **Flag Recruiting Agency**: record whether an Applied Job Record's poster is a staffing firm or aggregator rather than the hiring employer, along with the end client if named; agency names are never added to the already-applied blocklist
+- **Generate Search Queries**: derive at most `MAX_SEARCH_QUERIES` (6) Search Queries from Resume, JOB_REQUIREMENTS.md, and the Applied Job Records within the 3-month horizon (glm, Anthropic fallback), covering both the titles already applied to and adjacent titles. Individual-contributor titles only — people-management titles (Manager / Head of / Director / VP) are excluded
+- **Write Run Audit Log**: at the end of every run, write `run_dir/audit_logs/audit-{date}-{time}.md` tracing applied-job counts, every Search Query and whether it was actually searched, listings and candidates per query, and the outcome of every individual Job Posting with its URL and summary
+- **Audit Un-surfaced Jobs**: (`--audit-opus N`) sample N Job Postings from each of three un-surfaced pools — filtered at Stage 1, seen but never queued, and rated 2–3 — re-rate each with Opus, and report any the strong model scores ≥4 as a false negative. Diagnostic only; nothing is saved or notified
+- **Scrape Job Postings**: execute Search Queries on LinkedIn (newest-first) and collect candidate Job Postings. Search URLs always carry `f_WT=2` (remote), `f_E=4%2C5%2C6` (experience level Mid-Senior/Director/Executive — keeps entry-level/associate/junior noise out of the funnel), and `sortBy=DD`. A query returning zero results is retried without the date sort before being counted as empty. If the whole first scraper pass inspects **zero** listings (auth-wall / block / empty-shell signature, distinct from "seen but deduped"), `run_scraper` automatically runs one code-enforced recovery pass with the date-sort and location filters dropped before giving up
   - includes: Deduplicate Job Posting
   - includes: Filter Stale Job Posting
-- **Deduplicate Job Posting**: skip a Job Posting already present in Processed Job Records
+- **Deduplicate Job Posting**: skip a Job Posting already present in Processed Job Records, or whose company is on the already-applied blocklist derived from in-horizon Applied Job Records
 - **Filter Stale Job Posting**: skip a Job Posting whose scraped date is > 21 days old
 - **Summarize Reference Jobs**: distill Reference Job PDFs into a compact ideal-role profile via provider chain (OpenRouter → Local LLM → Anthropic), cached until the PDFs change
 - **Evaluate Job Fit**: extract, filter, triage, and rate a candidate Job Posting, saving it as a Saved Job
@@ -190,10 +233,14 @@ At runtime, `check_and_record_job` enforces:
 
 ### Non-functional Requirements
 
-- **Cost efficiency** — Haiku for query generation, scraping, and page extraction; the agentic browser work never runs on Sonnet. Hard rules and local triage reject clear non-fits for $0 before any paid rating call. The rating call is a single non-agentic structured-output call (provider configurable; Sonnet pinned explicitly by default, never the CLI default model). Reference jobs are distilled once into a ~2.5K-char cached profile instead of a ~60K-char block; the evaluator prompt is built once per run and reused across all jobs to maximise prompt-cache hits; the extractor is capped at 8 turns and restricted to the browser tools it needs
-- **Observability** — per-job logs of extract compression (input tokens → condensed chars), hard-rule short-circuits, triage score vs. final rating, and rating provider; per-stage costs (`reference_summary`, `extraction`, `rating`) in `cost_log.jsonl`
+- **Cost efficiency** — Haiku for scraping, page extraction, and applied-job metadata; the agentic browser work never runs on Sonnet. Query generation is the one deliberate exception: a single Sonnet call per run (~$0.33), because top-of-funnel query relevance is the pipeline bottleneck and everything downstream is gated by it. Applied-job metadata is cached in `index.yaml` by mtime, so the extraction cost is paid once per PDF. Hard rules and local triage reject clear non-fits for $0 before any paid rating call. The rating call is a single non-agentic structured-output call (provider configurable; Sonnet pinned explicitly by default, never the CLI default model). Reference jobs are distilled once into a ~2.5K-char cached profile instead of a ~60K-char block; the evaluator prompt is built once per run and reused across all jobs to maximise prompt-cache hits; the extractor is capped at 8 turns and restricted to the browser tools it needs
+- **Observability** — the generated Search Queries are logged; every `check_and_record_job` outcome is logged (`new`/`already_processed`/`already_applied`/`too_old`/`auth_required`) so seen-but-deduped is distinguishable from never-seen; per-job logs of the extract signal (`date_posted`/`location`/`closed`/`language_requirement`/`relocation`), extract compression, hard-rule short-circuits, triage score vs. final rating, and rating provider. Each run emits a single `Run funnel: {...}` line (queries → listings seen → check-status counts → candidates → extract ok/failed → hard-ruled by reason → triaged-out → rated 1–5), also written to `cost_log.jsonl` under `funnel`. Per-stage costs (`reference_summary`, `extraction`, `rating`) in `cost_log.jsonl`. Third-party HTTP transport logging (`httpx` / `httpcore` / `mcp.client.streamable_http`, one line per MCP tool call) is suppressed to WARNING so the run log stays the run's own audit trail; set `HTTP_LOG_LEVEL=INFO` to restore it when debugging a tool server
+- **Search coverage** — every generated Search Query must actually be searched. Stage 1b sends one request per query (own turn budget) on one shared session (one browser attachment); the run audit log distinguishes "never searched" from "searched, found nothing", which a single `0 jobs` count cannot
+- **Rejection auditability** — `python main.py -n --audit` runs normally but additionally re-rates every gate-killed Job Posting (hard-ruled or triaged-out) with the strong rater, logging any **false negative** (gate dropped it but the strong rater scores ≥3) plus a run-end count. Diagnostic only — saving/notification behaviour is unchanged
 - **Resilience** — the LLM MCP tool servers are optional: summarization falls through its provider chain (last resort: full reference block), triage fails open to the rating call
-- **Idempotency** — processed-job records persist across runs so jobs are never evaluated twice
+- **Idempotency** — processed-job records persist across runs so jobs are never evaluated twice; applied-job ingest is a no-op for already-dated files
+- **Applied-date durability** — an Applied Job Record's date is carried by the filename prefix, `index.yaml`, and mtime independently, so it survives a move, copy, or backup restore that drops filesystem metadata
+- **Applied-job horizon** — only Applied Job Records from the last `APPLIED_JOBS_HORIZON_DAYS` (90) feed query generation, the ideal-role profile, and the already-applied blocklist; older PDFs are retained on disk, never deleted
 - **Notification latency** — Telegram alerts sent immediately when a job is rated 4 or 5 during evaluation
 - **Rating hard rules (applied deterministically in code before any LLM scoring)**: closed postings → 1; postings > 30 days old → 1; US jobs without explicit sponsorship → 1; explicit non-English language requirement → 1. Required relocation is flagged, never auto-rejected
 

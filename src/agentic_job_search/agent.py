@@ -10,18 +10,25 @@ import sys
 import tempfile
 import time
 from datetime import date, datetime
+from urllib.parse import quote_plus
 import requests
 import yaml
 from pathlib import Path
 from typing import Any
 
 from agentic_job_search.config import (
+    APPLIED_JOBS_HORIZON_DAYS,
+    AUDIT_OPUS_SAMPLE_SIZE,
     EXTRACTOR_PROVIDER,
     JOB_STALE_AGE_DAYS,
     MAX_REFERENCE_JOBS,
+    MAX_SEARCH_QUERIES,
+    MODEL_NAME_HIGH,
     MODEL_NAME_LOW,
     MODEL_NAME_MEDIUM,
+    QUERY_PROVIDER,
     RATING_PROVIDER,
+    SCRAPER_MAX_TURNS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
     THINKING_MAX_CHARS,
     TRIAGE_ENABLED,
@@ -44,6 +51,7 @@ from agentic_job_search.tools_generic import (
 from agentic_job_search.triage import (
     call_mcp_tool,
     chat_openrouter,
+    extract_json_object,
     generate_local,
     mcp_session,
     rate_with_ollama,
@@ -81,6 +89,8 @@ load_env()
 logger = logging.getLogger(__name__)
 
 BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
+# Playwright MCP snapshot/screenshot output — kept out of the repo tree
+PLAYWRIGHT_OUTPUT_DIR = Path(tempfile.gettempdir()) / 'linkedin-agent-playwright-output'
 TELEGRAM_MCP_URL = 'http://localhost:8004/mcp'
 REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
 
@@ -138,21 +148,29 @@ You are fully authorized to call all available tools. Call them directly — do 
 
 The information visible in search results (title, company, snippet, date) is all you need. A separate evaluation agent will visit individual job pages later. Your only job is to queue candidates from what you can see in the results list.
 
-## Location targeting
+## Location and seniority targeting
 
-For each search query, run it against both target regions:
+You are given ONE search query per session. Run that single query against both target regions, then stop — do not invent additional queries:
 
-1. **Canada (remote)**:
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2&sortBy=DD
+1. **Canada (remote, senior+)**:
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
 
-2. **European Union (remote)**:
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2&sortBy=DD
+2. **European Union (remote, senior+)**:
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
 
-(`f_WT=2` = Remote filter. `sortBy=DD` = newest first — critical so fresh postings appear before already-seen ones. URL-encode spaces as `+`. Example for "Principal AI Engineer":
-  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=Canada&f_WT=2&sortBy=DD
-  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=European+Union&f_WT=2&sortBy=DD)
+Filter reference (always include ALL of these on every search URL):
+- `f_WT=2` = Remote only.
+- `f_E=4%2C5%2C6` = experience level Mid-Senior + Director + Executive only. This keeps out internships, entry-level, and associate/junior roles, which are explicit deal-breakers — do NOT drop this filter. (`%2C` is the URL-encoded comma.)
+- `sortBy=DD` = newest first — critical so fresh postings appear before already-seen ones.
+- URL-encode spaces as `+`.
 
-If either location-filtered search returns fewer than 3 new candidates, also run the same query without location filters to catch globally-remote roles that may accept candidates from those regions.
+Example for "Principal AI Engineer":
+  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=Canada&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
+  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=European+Union&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
+
+If a search returns zero job results, re-run the exact same URL with the `sortBy=DD` parameter removed (date-sorted queries sometimes come back empty or with irrelevant results) before concluding there are no jobs for that query. Keep `f_WT=2` and `f_E=4%2C5%2C6` on every retry.
+
+If either location-filtered search returns fewer than 3 new candidates, also run the same query without the `location` parameter (but STILL keep `f_WT=2` and `f_E=4%2C5%2C6`) to catch globally-remote senior roles that may accept candidates from those regions.
 
 For each job visible in the search results:
 1. Call check_and_record_job with site="linkedin", the job ID (from the URL), company, and title. Pass date_posted only if it's visible in the results — it may be relative like "4 days ago", or it may not be shown at all; both are fine.
@@ -274,8 +292,40 @@ def build_scraper_prompt() -> str:
     return "\n\n".join(parts)
 
 
+QUERY_GENERATION_INSTRUCTIONS = (
+    'Generate short LinkedIn job search queries (2–6 words each, like a job title).\n'
+    f'Return AT MOST {MAX_SEARCH_QUERIES} queries — each one costs two live LinkedIn searches, so '
+    'they must be the highest-yield titles, not an exhaustive list of variations.\n'
+    'The jobs I have applied to are the strongest signal of what I want: cover the title space they '
+    'occupy, and include adjacent titles likely to surface similar roles I have not seen yet.\n'
+    'Prefer INDIVIDUAL CONTRIBUTOR titles (Principal / Staff / Lead / Senior engineer and scientist '
+    'roles). Do NOT generate people-management titles — no "Manager", "Head of", "Director", "VP", '
+    'or similar; those are not the roles I want.\n'
+    'Prefer broad, common titles that LinkedIn actually returns results for over narrow or invented '
+    'ones. Queries are job titles, not company names — never search for a company.'
+)
+
+QUERY_JSON_INSTRUCTIONS = (
+    'Respond with ONLY a JSON object: {"queries": ["<query>", "<query>", ...]}'
+)
+
+
+async def _generate_queries_openrouter(prompt: str, stage_stats: dict | None) -> list[str]:
+    """Query generation via the OpenRouter MCP server (glm). Raises on any failure."""
+    content, cost_usd = await chat_openrouter(f'{prompt}\n\n{QUERY_JSON_INSTRUCTIONS}')
+    if stage_stats is not None:
+        stage_stats['cost'] += cost_usd
+    queries = extract_json_object(content).get('queries') or []
+    if not isinstance(queries, list) or not queries:
+        raise ValueError(f'OpenRouter returned no usable queries: {content[:300]!r}')
+    return [str(q).strip() for q in queries if str(q).strip()]
+
+
 async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
-    """Use Sonnet to derive LinkedIn search queries from resume + job requirements."""
+    """Derive LinkedIn search queries from resume + requirements + applied jobs.
+
+    Provider chain: OpenRouter (glm) -> Anthropic tool-call. Capped at MAX_SEARCH_QUERIES.
+    """
     parts = []
     resume = load_resume()
     if resume:
@@ -283,6 +333,12 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
     if JOB_REQUIREMENTS_PATH.exists():
         requirements = JOB_REQUIREMENTS_PATH.read_text(encoding='utf-8')
         parts.append(f'--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---')
+    applied = tools_module.applied_jobs_summary()
+    if applied:
+        parts.append(
+            f'--- JOBS I HAVE APPLIED TO (last {APPLIED_JOBS_HORIZON_DAYS} days) ---\n{applied}\n'
+            '--- END JOBS I HAVE APPLIED TO ---'
+        )
     context = '\n\n'.join(parts)
 
     captured: list[str] = []
@@ -296,7 +352,7 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
                 'queries': {
                     'type': 'array',
                     'items': {'type': 'string'},
-                    'description': '2–6 word LinkedIn search queries, e.g. ["Staff ML Engineer", "Principal AI Engineer"]',
+                    'description': f'At most {MAX_SEARCH_QUERIES} LinkedIn search queries of 2–6 words each, e.g. ["Staff ML Engineer", "Principal AI Engineer"]',
                 },
             },
             'required': ['queries'],
@@ -308,33 +364,43 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
 
     query_server = create_sdk_mcp_server(name='query_generator', version='1.0.0', tools=[_submit])
 
-    prompt = (
-        f'{context}\n\n'
-        'Based on the resume and job requirements above, generate enough short job search queries '
-        '(2–6 words each, like a job title) to get good coverage of the most relevant roles — '
-        'enough to surface diverse results, but not so many that searches become redundant. '
-        'Call the submit_search_queries tool with your list of queries.'
-    )
-    options = ClaudeAgentOptions(
-        tools=[],
-        model=MODEL_NAME_LOW,
-        system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
-        mcp_servers={'query_generator': query_server},
-        allowed_tools=['mcp__query_generator__submit_search_queries'],
-        permission_mode='bypassPermissions',
-        cwd=str(PROJECT_DIR),
-    )
-    try:
-        async for msg in sdk_query(prompt=prompt, options=options):
-            if isinstance(msg, ResultMessage):
-                print_result_stats(msg)
-                if stage_stats is not None:
-                    accumulate_stage_stats(stage_stats, msg)
-    except Exception as ex:
-        raise RuntimeError(f'Stage 1a (query generation) failed: {ex}') from ex
+    prompt = f'{context}\n\n{QUERY_GENERATION_INSTRUCTIONS}'
+
+    provider = ''
+    if QUERY_PROVIDER == 'openrouter':
+        try:
+            captured = await _generate_queries_openrouter(prompt, stage_stats)
+            provider = 'openrouter'
+        except Exception as ex:
+            logger.warning(f'Stage 1a via OpenRouter failed, falling back to Anthropic: {ex}')
 
     if not captured:
-        raise ValueError('LLM did not call submit_search_queries')
+        options = ClaudeAgentOptions(
+            tools=[],
+            model=MODEL_NAME_MEDIUM,
+            system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
+            mcp_servers={'query_generator': query_server},
+            allowed_tools=['mcp__query_generator__submit_search_queries'],
+            permission_mode='bypassPermissions',
+            cwd=str(PROJECT_DIR),
+        )
+        try:
+            async for msg in sdk_query(prompt=f'{prompt}\n\nCall the submit_search_queries tool with your list.', options=options):
+                if isinstance(msg, ResultMessage):
+                    print_result_stats(msg)
+                    if stage_stats is not None:
+                        accumulate_stage_stats(stage_stats, msg)
+            provider = 'anthropic'
+        except Exception as ex:
+            raise RuntimeError(f'Stage 1a (query generation) failed: {ex}') from ex
+
+    if not captured:
+        raise ValueError('Query generation produced no queries on any provider')
+
+    if len(captured) > MAX_SEARCH_QUERIES:
+        logger.info(f'Stage 1a: trimming {len(captured)} queries to the {MAX_SEARCH_QUERIES} cap: dropped {captured[MAX_SEARCH_QUERIES:]}')
+        captured = captured[:MAX_SEARCH_QUERIES]
+    logger.info(f'Stage 1a: generated {len(captured)} search queries via {provider}: {captured}')
     return captured
 
 
@@ -551,16 +617,32 @@ def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
     return num_evaluated, num_high_rated
 
 
+def _listings_seen() -> int:
+    """Total job listings the scraper has inspected this run (any check_and_record_job outcome)."""
+    return sum(tools_module._check_status_counts.values())
+
+
 async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: dict) -> None:
-    """Stage 1: haiku scraper collects candidates from LinkedIn search results."""
-    query_list = "\n".join(f'- "{q}"' for q in queries)
-    try:
-        await client.query(
-            f"Begin scraping LinkedIn now. Use these search queries:\n{query_list}\n\n"
-            "For each query, call check_and_record_job and queue_candidate for each new job found "
-            "in the results list. Do not ask for permission — call the tools directly. "
-            "Do not navigate to individual job pages. Stop when done."
-        )
+    """Stage 1: haiku scraper collects candidates from LinkedIn search results.
+
+    ONE REQUEST PER QUERY, on a SINGLE shared session. Two constraints have to hold at once:
+
+    - max_turns applies per request, not per session. Sending every query in one request
+      lets the first few exhaust the budget (each check_and_record_job / queue_candidate
+      call burns a turn) so the rest are never searched at all — while still being reported
+      as "0 jobs", indistinguishable from "searched and found nothing". One request per
+      query gives each its own turn budget.
+    - The Playwright browser must not be re-attached per query. Opening a fresh
+      ClaudeSDKClient for each query makes later sessions fail with "browser is in use"
+      against the shared browser context, which looks exactly like an auth wall in the logs.
+
+    Discovery resilience: if a query inspects ZERO listings (the signature of a LinkedIn
+    auth wall, block page, or empty results shell — not the same as 'listings seen but all
+    deduped'), retry that query once with the date-sort and location filters dropped before
+    recording it as empty.
+    """
+    async def run_pass(instruction: str) -> None:
+        await client.query(instruction)
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
@@ -571,8 +653,54 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
             elif isinstance(msg, ResultMessage):
                 print_result_stats(msg)
                 accumulate_stage_stats(stage_stats, msg)
-    except Exception as ex:
-        raise RuntimeError(f'Stage 1b (scraper) failed: {ex}') from ex
+
+    for i, query in enumerate(queries, 1):
+        console.print(f"[cyan]Stage 1b: query {i}/{len(queries)} — \"{query}\"[/cyan]")
+        before = _listings_seen()
+        try:
+            await run_pass(
+                f'Search LinkedIn for this ONE query only: "{query}"\n\n'
+                "Run it against Canada (remote) and the European Union (remote) as described in your "
+                "instructions. Call check_and_record_job and queue_candidate for each new job found in "
+                "the results list. Do not ask for permission — call the tools directly. Do not navigate "
+                "to individual job pages. Stop as soon as you have processed both regions for this query."
+            )
+        except Exception as ex:
+            # One failed query must not abort the remaining ones.
+            logger.warning(f'Stage 1b: query "{query}" failed: {ex}')
+            tools_module._queries_searched[query] = 'error'
+            continue
+
+        seen = _listings_seen() - before
+        if seen == 0:
+            logger.warning(
+                f'Stage 1b: query "{query}" inspected 0 listings — retrying once without the date sort '
+                'and location filters (possible auth wall, block page, or empty results shell).'
+            )
+            try:
+                await run_pass(
+                    f'That search surfaced no job listings at all for "{query}" — the results list was '
+                    'empty or you hit a sign-in / verification wall. Retry now: load the LinkedIn search '
+                    'WITHOUT the `sortBy=DD` parameter and WITHOUT the `location` parameter, but KEEP '
+                    f'`f_WT=2` and `f_E=4%2C5%2C6`, i.e. '
+                    f'https://www.linkedin.com/jobs/search/?keywords={quote_plus(query)}&f_WT=2&f_E=4%2C5%2C6 . '
+                    'Call check_and_record_job and queue_candidate for each new job in the results. '
+                    'If you STILL see a sign-in wall or genuinely zero results, state that explicitly and stop.'
+                )
+            except Exception as ex:
+                logger.warning(f'Stage 1b: recovery pass for "{query}" failed: {ex}')
+            seen = _listings_seen() - before
+
+        tools_module._queries_searched[query] = seen
+        logger.info(
+            f'Stage 1b: query "{query}" inspected {seen} listing(s), '
+            f'{tools_module._candidates_per_query.get(query, 0)} queued'
+        )
+
+    logger.info(
+        f'Stage 1b complete: {len(queries)} quer(ies) searched, {_listings_seen()} listing(s) inspected, '
+        f'{len(tools_module._candidates)} candidate(s) queued'
+    )
 
 
 async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: dict) -> dict | None:
@@ -786,12 +914,54 @@ async def _save_and_notify(
         )
 
 
+def _hard_rule_category(reason: str) -> str:
+    """Bucket a hard-rule reason string for the funnel summary."""
+    if 'closed' in reason:
+        return 'hard_ruled_closed'
+    if 'older than' in reason:
+        return 'hard_ruled_stale'
+    if 'sponsorship' in reason:
+        return 'hard_ruled_us_auth'
+    if 'language' in reason:
+        return 'hard_ruled_language'
+    return 'hard_ruled_other'
+
+
 async def evaluate_all_candidates(
     candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str,
-    profile_block: str, stage_stats: dict,
+    profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
 ) -> None:
     """Stage 2: per candidate — Haiku extract, deterministic hard rules, local triage,
-    then one configurable-model rating call. All sharing one browser."""
+    then one configurable-model rating call. All sharing one browser.
+
+    When ``audit`` is set, gate-killed candidates (hard-ruled / triaged-out) are STILL
+    sent through the strong rater so we can detect false negatives (gate dropped it but
+    the strong model rates it >=3). Normal saving/notification behaviour is unchanged.
+    ``funnel`` (if provided) accumulates per-stage drop counts for the run summary.
+    """
+    if funnel is None:
+        funnel = {}
+
+    def bump(key: str) -> None:
+        funnel[key] = funnel.get(key, 0) + 1
+
+    async def audit_gate(candidate: dict, extract_text: str, gate_label: str, gate_detail: str) -> None:
+        """In audit mode, re-rate a gate-killed job with the strong rater and flag false negatives."""
+        if not audit:
+            return
+        try:
+            result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
+            strong = result['rating']
+            verdict = 'FALSE NEGATIVE' if strong >= 3 else 'confirmed drop'
+            if strong >= 3:
+                bump('audit_false_negatives')
+            logger.info(
+                f"AUDIT [{gate_label}] {candidate['company']} — {candidate['title']}: "
+                f"gate dropped ({gate_detail}) but strong rater says {strong}/5 → {verdict} — {result['reasoning']}"
+            )
+        except Exception as ex:
+            logger.warning(f"AUDIT rating failed for {candidate['company']} — {candidate['title']}: {ex}")
+
     for candidate in candidates:
         console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
         try:
@@ -804,16 +974,33 @@ async def evaluate_all_candidates(
             if extract is None:
                 extract = await extract_job_page_direct(candidate, playwright_mcp['url'], stage_stats['extraction'])
             if extract is None:
+                bump('extract_failed')
+                tools_module.record_job_outcome(
+                    candidate['site'], candidate['job_id'], 'extract_failed', summary='page extraction failed'
+                )
+                logger.warning(f"Extract failed (both paths): {candidate['company']} — {candidate['title']}")
                 continue
+            bump('extract_ok')
             extract_text = format_extract_text(candidate, extract)
+            logger.info(
+                f"Extract signal: {candidate['company']} — {candidate['title']}: "
+                f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
+                f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
+                f"relocation={extract.get('relocation')!r}"
+            )
 
             hard_rule_reason = apply_hard_rules(candidate, extract)
             if hard_rule_reason:
+                bump(_hard_rule_category(hard_rule_reason))
                 logger.info(f"Hard rule: {candidate['company']} — {candidate['title']}: rated 1 ({hard_rule_reason})")
                 await _save_and_notify(
                     candidate, rating=1, summary=f"auto rejected {hard_rule_reason}",
                     content=f"# Auto-rated 1 — {hard_rule_reason}\n\n{extract_text}", notify=False,
                 )
+                tools_module.record_job_outcome(
+                    candidate['site'], candidate['job_id'], 'hard_ruled', rating=1, summary=hard_rule_reason
+                )
+                await audit_gate(candidate, extract_text, 'hard_rule', hard_rule_reason)
                 continue
 
             triage_result = None
@@ -825,6 +1012,7 @@ async def evaluate_all_candidates(
                         f"score {triage_result['score']} ({triage_result['reason']})"
                     )
                 if triage_rejects(triage_result):
+                    bump('triaged_out')
                     await _save_and_notify(
                         candidate, rating=triage_result['score'],
                         summary=f"triaged out {triage_result['reason']}",
@@ -834,9 +1022,17 @@ async def evaluate_all_candidates(
                         ),
                         notify=False,
                     )
+                    tools_module.record_job_outcome(
+                        candidate['site'], candidate['job_id'], 'triaged_out',
+                        rating=triage_result['score'], summary=triage_result['reason'],
+                    )
+                    await audit_gate(
+                        candidate, extract_text, 'triage', f"local score {triage_result['score']}"
+                    )
                     continue
 
             result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
+            bump(f"rated_{result['rating']}")
             triage_note = f" (triage said {triage_result['score']})" if triage_result else ''
             logger.info(
                 f"Rating: {candidate['company']} — {candidate['title']}: "
@@ -850,12 +1046,102 @@ async def evaluate_all_candidates(
                 + (f"Triage score (local): {triage_result['score']}\n" if triage_result else '')
                 + f"\n{extract_text}"
             )
+            tools_module.record_job_outcome(
+                candidate['site'], candidate['job_id'], 'rated',
+                rating=result['rating'], summary=result['reasoning'],
+            )
             await _save_and_notify(
                 candidate, rating=result['rating'], summary=result['summary'],
                 content=content, flags=relocation_flag,
             )
         except Exception as ex:
+            bump('eval_error')
+            tools_module.record_job_outcome(
+                candidate['site'], candidate['job_id'], 'eval_error', summary=str(ex)[:200]
+            )
             console.print(f"[red]Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}[/red]")
+            logger.warning(f"Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}")
+
+
+async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
+    """One non-agentic Opus rating call — the reference standard for audits only."""
+    options = ClaudeAgentOptions(
+        tools=[],
+        system_prompt=evaluator_prompt,
+        permission_mode='bypassPermissions',
+        model=MODEL_NAME_HIGH,
+        output_format={
+            'type': 'json_schema',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'rating': {'type': 'integer', 'description': 'Fit rating 1-5'},
+                    'company': {'type': 'string'},
+                    'title': {'type': 'string'},
+                    'reasoning': {'type': 'string', 'description': '2-3 sentences on the fit'},
+                    'summary': {'type': 'string'},
+                },
+                'required': ['rating', 'company', 'title', 'reasoning', 'summary'],
+            },
+        },
+        cwd=str(PROJECT_DIR),
+    )
+    async for msg in sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options):
+        if isinstance(msg, ResultMessage):
+            accumulate_stage_stats(stage_stats, msg)
+            if msg.structured_output:
+                return msg.structured_output
+    raise RuntimeError('Opus audit rating returned no structured output')
+
+
+async def audit_unsurfaced_with_opus(
+    playwright_mcp: dict, evaluator_prompt: str, stage_stats: dict, sample_size: int,
+) -> list[dict]:
+    """Sample jobs the pipeline never surfaced and re-rate them with Opus.
+
+    Three pools (filtered at Stage 1, seen but never queued, mid-rated 2-3). A high Opus
+    rating on any of them is a FALSE NEGATIVE: a job the funnel should have delivered.
+    Diagnostic only — nothing is saved or notified.
+    """
+    pools = tools_module.unsurfaced_pools()
+    findings: list[dict] = []
+
+    for pool_name, records in pools.items():
+        sample = records[:sample_size]
+        if not sample:
+            logger.info(f'Opus audit: pool {pool_name!r} is empty, nothing to sample')
+            continue
+        logger.info(f'Opus audit: sampling {len(sample)} of {len(records)} job(s) from pool {pool_name!r}')
+        for record in sample:
+            candidate = {
+                'site': record['site'], 'job_id': record['job_id'], 'url': record['url'],
+                'title': record['title'], 'company': record['company'],
+                'date_posted': record.get('date_posted') or '', 'snippet': record.get('snippet', ''),
+            }
+            try:
+                extract = await extract_job_page_direct(candidate, playwright_mcp['url'], stage_stats['extraction'])
+                if extract is None:
+                    logger.warning(f'Opus audit: extract failed for {record["company"]} — {record["title"]}')
+                    continue
+                result = await _rate_with_opus(evaluator_prompt, format_extract_text(candidate, extract), stage_stats['rating'])
+            except Exception as ex:
+                logger.warning(f'Opus audit failed for {record["company"]} — {record["title"]}: {ex}')
+                continue
+
+            verdict = 'FALSE NEGATIVE' if result['rating'] >= 4 else 'confirmed drop'
+            findings.append({
+                'pool': pool_name, 'company': record['company'], 'title': record['title'],
+                'url': record['url'], 'opus_rating': result['rating'],
+                'verdict': verdict, 'reasoning': result['reasoning'],
+            })
+            logger.info(
+                f'Opus audit [{pool_name}] {record["company"]} — {record["title"]}: '
+                f'Opus rates {result["rating"]}/5 → {verdict} — {result["reasoning"]}'
+            )
+
+    false_negatives = sum(1 for f in findings if f['verdict'] == 'FALSE NEGATIVE')
+    logger.info(f'Opus audit summary: {len(findings)} job(s) re-rated, {false_negatives} false negative(s)')
+    return findings
 
 
 def find_free_port() -> int:
@@ -870,6 +1156,7 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
         '--port', str(port),
         '--user-data-dir', str(BROWSER_PROFILE_DIR),
         '--shared-browser-context',
+        '--output-dir', str(PLAYWRIGHT_OUTPUT_DIR),
     ]
     tmp_config: str | None = None
     if browser_mode == 'headless':
@@ -902,10 +1189,17 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
     return proc
 
 
-async def run_non_interactive(browser_mode: str = 'headless') -> None:
+async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0) -> None:
     tools_module._candidates = []
     tools_module._candidates_per_query = {}
     tools_module._job_extracts = []
+    tools_module._check_status_counts = {}
+    tools_module._listing_records = {}
+    tools_module._queries_searched = {}
+    funnel: dict[str, int] = {}
+    audit_findings: list[dict] = []
+    if audit:
+        console.print('[bold magenta]AUDIT mode: gate-killed jobs will still be re-rated to detect false negatives.[/bold magenta]')
 
     console.print("[bold cyan]Job Search Agent — Non-interactive Mode[/bold cyan]")
     console.print("[cyan]" + "=" * 40 + "[/cyan]")
@@ -954,7 +1248,7 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
             permission_mode="bypassPermissions",
             cwd=str(PROJECT_DIR),
             model=MODEL_NAME_LOW,
-            max_turns=40,
+            max_turns=SCRAPER_MAX_TURNS_PER_QUERY,
         )
         async with ClaudeSDKClient(scraper_options) as scraper:
             await run_scraper(scraper, queries, stage_stats["scraping"])
@@ -974,9 +1268,16 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
             console.print("[red]Error: 0 jobs returned across all searches.[/red]")
             elapsed_mins = (time.time() - start_time) / 60
             total_cost = sum(s["cost"] for s in stage_stats.values())
+            # check_status distinguishes dedup-saturation (all already_processed) from an
+            # authwall/empty-page (nothing seen at all) — the two zero-candidate root causes.
+            check_status_counts = dict(tools_module._check_status_counts)
+            logger.warning(
+                f"Run funnel (0 candidates): listings_seen={sum(check_status_counts.values())} "
+                f"check_status={json.dumps(check_status_counts)}"
+            )
             query_lines = "\n".join(f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' for q in queries)
             await _send_pipeline_notification(
-                f"Job search run FAILED\n• Error: 0 candidates found\n• Queries ({len(queries)}):\n{query_lines}\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}"
+                f"Job search run FAILED\n• Error: 0 candidates found\n• Queries ({len(queries)}):\n{query_lines}\n• Listings seen: {sum(check_status_counts.values())} {check_status_counts}\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}"
             )
             log_run_cost({
                 "timestamp": datetime.now().isoformat(),
@@ -984,8 +1285,23 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
                 "status": "failed_no_candidates",
                 "stage_stats": stage_stats,
                 "total_cost": total_cost,
+                "check_status": check_status_counts,
                 "elapsed_minutes": elapsed_mins,
             })
+            # A zero-candidate run is exactly when the trace matters most — it distinguishes
+            # "no query was ever searched" from "searched, everything deduped".
+            audit_log_path = tools_module.write_run_audit_log(
+                queries=queries,
+                applied_jobs_in_horizon=len(tools_module._applied_jobs),
+                applied_jobs_total=len(list(tools_module.APPLIED_JOBS_DIR.glob('*.pdf'))),
+                funnel={
+                    "queries_generated": len(queries),
+                    "listings_seen": sum(check_status_counts.values()),
+                    "check_status": check_status_counts,
+                    "candidates_queued": 0,
+                },
+            )
+            console.print(f"[dim]Run audit log: {audit_log_path}[/dim]")
             return
 
         # Stage 2: all evaluations share the same browser via the SSE server
@@ -993,7 +1309,18 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
         reference_block = await build_reference_summary(stage_stats["reference_summary"])
         evaluator_prompt = build_evaluator_prompt(reference_block)
         profile_block = build_profile_block(reference_block)
-        await evaluate_all_candidates(candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats)
+        await evaluate_all_candidates(
+            candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats,
+            funnel=funnel, audit=audit,
+        )
+        if audit_opus:
+            console.print(f"[bold magenta]Opus audit: sampling up to {audit_opus} un-surfaced job(s) per pool ...[/bold magenta]")
+            audit_findings = await audit_unsurfaced_with_opus(
+                playwright_mcp, evaluator_prompt, stage_stats, audit_opus
+            )
+            funnel['audit_opus_false_negatives'] = sum(
+                1 for f in audit_findings if f['verdict'] == 'FALSE NEGATIVE'
+            )
     finally:
         playwright_proc.terminate()
         await playwright_proc.wait()
@@ -1001,6 +1328,27 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
     elapsed_mins = (time.time() - start_time) / 60
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
     total_cost = sum(s["cost"] for s in stage_stats.values())
+
+    check_status_counts = dict(tools_module._check_status_counts)
+    funnel_summary = {
+        "queries_generated": len(queries),
+        "listings_seen": sum(check_status_counts.values()),
+        "check_status": check_status_counts,
+        "candidates_queued": len(candidates),
+        **funnel,
+    }
+    logger.info(f"Run funnel: {json.dumps(funnel_summary)}")
+    audit_log_path = tools_module.write_run_audit_log(
+        queries=queries,
+        applied_jobs_in_horizon=len(tools_module._applied_jobs),
+        applied_jobs_total=len(list(tools_module.APPLIED_JOBS_DIR.glob('*.pdf'))),
+        funnel=funnel_summary,
+        audit_findings=audit_findings,
+    )
+    console.print(f"[dim]Run audit log: {audit_log_path}[/dim]")
+    if audit:
+        logger.info(f"AUDIT summary: {funnel.get('audit_false_negatives', 0)} false negative(s) "
+                    "(gate-dropped but strong rater >=3)")
 
     query_lines = "\n".join(
         f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' + (' ⚠' if candidates_per_query.get(q, 0) == 0 else '')
@@ -1031,6 +1379,7 @@ async def run_non_interactive(browser_mode: str = 'headless') -> None:
         "candidates_found": len(candidates),
         "jobs_saved": num_evaluated,
         "jobs_rated_high": num_high_rated,
+        "funnel": funnel_summary,
         "elapsed_minutes": elapsed_mins,
     })
 
@@ -1047,6 +1396,11 @@ async def main() -> None:
         handlers=[logging.StreamHandler(), logging.FileHandler(run_log_path)],
     )
     logging.getLogger('claude_agent_sdk').setLevel(logging.WARNING)
+    # One 'HTTP Request: ...' line per MCP tool call drowns out our own logging; set
+    # HTTP_LOG_LEVEL=INFO to get the transport chatter back when debugging a tool server.
+    http_log_level = os.environ.get('HTTP_LOG_LEVEL', 'WARNING')
+    for noisy_logger_name in ('httpx', 'httpcore', 'mcp.client.streamable_http'):
+        logging.getLogger(noisy_logger_name).setLevel(http_log_level)
     logger.info(f'Logging to {run_log_path}')
     parser = argparse.ArgumentParser(description="Job Search Agent")
     parser.add_argument(
@@ -1060,35 +1414,91 @@ async def main() -> None:
         default="headless",
         help="Browser display mode for non-interactive runs (default: headless)",
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Report whether a job search run is currently active, then exit",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Start even if another run holds the run lock (concurrent runs steal each other's jobs)",
+    )
+    parser.add_argument(
+        "--audit-opus",
+        nargs="?",
+        type=int,
+        const=AUDIT_OPUS_SAMPLE_SIZE,
+        default=0,
+        metavar="N",
+        help=f"Diagnostic: sample N jobs (default {AUDIT_OPUS_SAMPLE_SIZE}) from each un-surfaced pool "
+             "(filtered at Stage 1 / seen but never queued / rated 2-3) and re-rate them with Opus "
+             "to find jobs the funnel should have delivered",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Diagnostic: re-rate gate-killed jobs with the strong rater to detect false negatives "
+             "(non-interactive mode only; saving/notification behaviour unchanged)",
+    )
     args = parser.parse_args()
     interactive = not args.non_interactive
+
+    if args.status:
+        console.print(tools_module.describe_run_status())
+        return
+
+    # Concurrent runs share processed_jobs/ and one browser profile: the first run to see a
+    # listing marks it processed, so the second dedups it away and neither evaluates it.
+    conflict = tools_module.acquire_run_lock(
+        mode='interactive' if interactive else 'non-interactive', force=args.force,
+    )
+    if conflict:
+        console.print(
+            f"[red]A job search run is already active (pid {conflict['pid']}, started "
+            f"{conflict['started_at']}, {conflict['mode']}).[/red]\n"
+            f"[red]Command: {conflict['argv']}[/red]\n"
+            "[yellow]Concurrent runs steal each other's jobs via processed_jobs/ and fight over "
+            "the browser. Wait for it to finish, or re-run with --force to override.[/yellow]"
+        )
+        sys.exit(1)
 
     if not interactive and not JOB_REQUIREMENTS_PATH.exists():
         console.print("[red]Error: JOB_REQUIREMENTS.md not found. Non-interactive mode requires it.[/red]")
         sys.exit(1)
 
-    load_processed_jobs()
-    await tools_module.categorize_downloads_pdfs()
-    await tools_module.load_downloads_applied_pdfs()
+    # Release on every exit path — a lock left behind by a crash would block the next run
+    # until someone noticed the stale file (read_run_lock also treats a dead PID as stale).
+    try:
+        load_processed_jobs()
+        await tools_module.categorize_downloads_pdfs()
+        await tools_module.ingest_downloads_applied_pdfs()
+        await tools_module.load_applied_jobs()
 
-    if interactive:
-        options = ClaudeAgentOptions(
-            system_prompt=build_system_prompt(interactive=True),
-            mcp_servers={
-                "playwright": {
-                    "type": "stdio",
-                    "command": "npx",
-                    "args": ["@playwright/mcp@latest", "--user-data-dir", str(BROWSER_PROFILE_DIR)],
+        if interactive:
+            options = ClaudeAgentOptions(
+                system_prompt=build_system_prompt(interactive=True),
+                mcp_servers={
+                    "playwright": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": [
+                            "@playwright/mcp@latest",
+                            "--user-data-dir", str(BROWSER_PROFILE_DIR),
+                            "--output-dir", str(PLAYWRIGHT_OUTPUT_DIR),
+                        ],
+                    },
+                    "job_search": make_job_search_server(interactive=True),
                 },
-                "job_search": make_job_search_server(interactive=True),
-            },
-            permission_mode="acceptEdits",
-            cwd=str(PROJECT_DIR),
-        )
-        async with ClaudeSDKClient(options) as client:
-            await run_interactive(client)
-    else:
-        await run_non_interactive(browser_mode=args.browser)
+                permission_mode="acceptEdits",
+                cwd=str(PROJECT_DIR),
+            )
+            async with ClaudeSDKClient(options) as client:
+                await run_interactive(client)
+        else:
+            await run_non_interactive(browser_mode=args.browser, audit=args.audit, audit_opus=args.audit_opus)
+    finally:
+        tools_module.release_run_lock()
 
 
 def cli() -> None:

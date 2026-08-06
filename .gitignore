@@ -27,3 +27,6 @@ saved_jobs-*/
 JOB_REQUIREMENTS.md
 
 run_dir/
+
+# Project-scoped uv package cache
+.uv-cache/
