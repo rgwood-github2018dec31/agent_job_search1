@@ -6,8 +6,10 @@ import os
 from datetime import date, datetime, timedelta
 
 import pytest
+from claude_agent_sdk import ResultMessage
 
 from agentic_job_search import agent
+from agentic_job_search import config
 from agentic_job_search import extract_openrouter
 from agentic_job_search import tools_generic as tools
 from agentic_job_search import triage
@@ -185,25 +187,24 @@ def test_new_stage_stats_zeroed():
         "output_tokens": 0,
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0,
+        "session_costs": {},
     }
 
 
 def test_accumulate_stage_stats_sums_usage_and_cost():
-    class FakeResultMessage:
-        usage = {
-            "input_tokens": 100,
-            "output_tokens": 50,
-            "cache_read_input_tokens": 10,
-            "cache_creation_input_tokens": 5,
-        }
-        total_cost_usd = 0.01
-
+    """Two independent requests (separate sessions) sum in both usage and cost."""
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 5,
+    }
     stats = agent.new_stage_stats()
-    agent.accumulate_stage_stats(stats, FakeResultMessage())
-    agent.accumulate_stage_stats(stats, FakeResultMessage())
+    agent.accumulate_stage_stats(stats, _result_msg("req-1", 0.01, **usage))
+    agent.accumulate_stage_stats(stats, _result_msg("req-2", 0.01, **usage))
 
-    assert stats == {
-        "cost": 0.02,
+    assert agent.public_stage_stats({"s": stats})["s"] == {
+        "cost": pytest.approx(0.02),
         "input_tokens": 200,
         "output_tokens": 100,
         "cache_read_input_tokens": 20,
@@ -2138,3 +2139,132 @@ def test_find_run_processes_survives_ps_failure(monkeypatch):
 
     monkeypatch.setattr(tools.subprocess, 'run', boom)
     assert tools.find_run_processes() == []
+
+
+# ---------------------------------------------------------------------------
+# stage cost accounting
+# ---------------------------------------------------------------------------
+
+def _result_msg(session_id: str, cost: float | None, **usage) -> ResultMessage:
+    return ResultMessage(
+        subtype='success', duration_ms=1, duration_api_ms=1, is_error=False,
+        num_turns=1, session_id=session_id, total_cost_usd=cost,
+        usage=usage or None,
+    )
+
+
+def test_cost_charged_once_for_cumulative_session():
+    """Stage 1b sends one request per query on ONE shared session, and total_cost_usd is
+    cumulative for that session. Naive summation billed 1+2+3 instead of 3."""
+    stats = agent.new_stage_stats()
+    for cumulative in (1.0, 2.5, 6.6):
+        agent.accumulate_stage_stats(stats, _result_msg('sess-a', cumulative))
+    assert stats['cost'] == pytest.approx(6.6)
+
+
+def test_cost_accumulates_across_distinct_sessions():
+    """Extraction opens a fresh session per job; each session's total is its own charge,
+    even when a later session reports a smaller cumulative figure than an earlier one."""
+    stats = agent.new_stage_stats()
+    agent.accumulate_stage_stats(stats, _result_msg('job-1', 0.03))
+    agent.accumulate_stage_stats(stats, _result_msg('job-2', 0.01))
+    agent.accumulate_stage_stats(stats, _result_msg('job-3', 0.05))
+    assert stats['cost'] == pytest.approx(0.09)
+
+
+def test_cost_interleaved_sessions_billed_independently():
+    stats = agent.new_stage_stats()
+    agent.accumulate_stage_stats(stats, _result_msg('a', 1.0))
+    agent.accumulate_stage_stats(stats, _result_msg('b', 10.0))
+    agent.accumulate_stage_stats(stats, _result_msg('a', 3.0))   # +2.0
+    agent.accumulate_stage_stats(stats, _result_msg('b', 12.0))  # +2.0
+    assert stats['cost'] == pytest.approx(15.0)
+
+
+def test_accumulate_returns_charged_delta():
+    stats = agent.new_stage_stats()
+    assert agent.accumulate_stage_stats(stats, _result_msg('s', 2.0)) == pytest.approx(2.0)
+    assert agent.accumulate_stage_stats(stats, _result_msg('s', 5.0)) == pytest.approx(3.0)
+
+
+def test_cost_decrease_within_session_charges_zero(caplog):
+    """Defensive: total_cost_usd is expected to be non-decreasing within a session."""
+    stats = agent.new_stage_stats()
+    agent.accumulate_stage_stats(stats, _result_msg('s', 5.0))
+    with caplog.at_level('WARNING'):
+        agent.accumulate_stage_stats(stats, _result_msg('s', 2.0))
+    assert stats['cost'] == pytest.approx(5.0)
+    assert 'lower cumulative cost' in caplog.text
+    # the high-water mark is kept, so a later genuine increase is charged from 5.0 not 2.0
+    agent.accumulate_stage_stats(stats, _result_msg('s', 6.0))
+    assert stats['cost'] == pytest.approx(6.0)
+
+
+def test_missing_session_id_treated_as_per_request():
+    stats = agent.new_stage_stats()
+    agent.accumulate_stage_stats(stats, _result_msg('', 1.0))
+    agent.accumulate_stage_stats(stats, _result_msg('', 1.0))
+    assert stats['cost'] == pytest.approx(2.0)
+
+
+def test_none_cost_is_a_noop():
+    stats = agent.new_stage_stats()
+    assert agent.accumulate_stage_stats(stats, _result_msg('s', None)) == 0.0
+    assert stats['cost'] == 0.0
+
+
+def test_usage_counters_still_summed_per_request():
+    """Usage is a per-request delta and must keep summing, unlike cost."""
+    stats = agent.new_stage_stats()
+    for _ in range(3):
+        agent.accumulate_stage_stats(
+            stats, _result_msg('sess-a', 1.0, input_tokens=10, cache_read_input_tokens=100)
+        )
+    assert stats['input_tokens'] == 30
+    assert stats['cache_read_input_tokens'] == 300
+
+
+def test_public_stage_stats_strips_bookkeeping_keys():
+    """cost_log.jsonl serializes stage_stats directly; its schema must not gain keys."""
+    stats = agent.new_stage_stats()
+    agent.accumulate_stage_stats(stats, _result_msg('s', 1.0))
+    public = agent.public_stage_stats({'scraping': stats})
+    assert 'session_costs' not in public['scraping']
+    assert public['scraping']['cost'] == pytest.approx(1.0)
+    assert set(public['scraping']) == {
+        'cost', 'input_tokens', 'output_tokens',
+        'cache_read_input_tokens', 'cache_creation_input_tokens',
+    }
+    json.dumps(public)  # must stay JSON-serializable for log_run_cost
+
+
+# ---------------------------------------------------------------------------
+# scraper browser-tool restriction
+# ---------------------------------------------------------------------------
+
+def test_required_browser_tools_are_never_disallowed():
+    """Measured on a live LinkedIn results page: browser_evaluate is the only working scroll
+    (inner container lazy-loads 7 -> 10 listings) and browser_click drives pagination. Removing
+    either silently cuts discovery rather than raising, so guard the list."""
+    overlap = set(config.SCRAPER_REQUIRED_BROWSER_TOOLS) & set(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)
+    assert not overlap, f'these are load-bearing for discovery: {sorted(overlap)}'
+
+
+def test_scraper_keeps_obstacle_handling_tools():
+    """Scraping is not a deterministic problem: pages change and add bot protection, so the
+    tools needed to get past a dialog, consent banner, or login form stay available."""
+    obstacle_tools = (
+        'fill_form', 'type', 'hover', 'select_option', 'handle_dialog', 'console_messages',
+        # take_screenshot is the only way to SEE a block page / CAPTCHA / consent overlay that
+        # the accessibility tree renders uninformatively; find and press_key help work a
+        # restructured page. A silent zero-listing run costs more than the turns these burn.
+        'take_screenshot', 'find', 'press_key',
+    )
+    for tool in obstacle_tools:
+        assert f'mcp__playwright__browser_{tool}' not in config.SCRAPER_DISALLOWED_BROWSER_TOOLS
+
+
+def test_disallowed_browser_tools_are_well_formed():
+    for name in config.SCRAPER_DISALLOWED_BROWSER_TOOLS:
+        assert name.startswith('mcp__playwright__browser_'), name
+    assert len(set(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)) == len(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)

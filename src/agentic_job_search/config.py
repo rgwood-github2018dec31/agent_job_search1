@@ -26,7 +26,57 @@ OPENROUTER_MODEL = 'z-ai/glm-5.2'
 MAX_SEARCH_QUERIES = 6  # hard cap; every query costs two LinkedIn searches (Canada + EU)
 # Turn budget PER QUERY. Each check_and_record_job / queue_candidate call burns a turn, so a
 # budget shared across all queries silently starves the later ones (see run_scraper).
-SCRAPER_MAX_TURNS_PER_QUERY = 40
+#
+# Every query now runs FOUR searches (Canada + EU, each date-sorted and relevance-sorted), so
+# this has to cover roughly double what it did at two searches. Measured at two searches: 42
+# turns for 14 listings. Starvation is silent — the model simply stops and the run reports
+# "N listings inspected" with no error — so this is set with headroom rather than tuned tight.
+SCRAPER_MAX_TURNS_PER_QUERY = 90
+
+# Playwright MCP tools removed from the scraper's context.
+#
+# `allowed_tools` does NOT do this: it only auto-grants permission, and under
+# permission_mode='bypassPermissions' permission is already granted, so it is inert (measured:
+# with allowed_tools set to 4 tools the model still saw all 24). `disallowed_tools` is the only
+# option that removes a tool from the model's context.
+#
+# This list is deliberately conservative. Scraping is NOT a deterministic problem — see the
+# "Scrape Job Postings" use case in CLAUDE.md — so anything the model might need to get past a
+# changing page, a consent dialog, a login wall, or a bot check stays available. Measured on a
+# live LinkedIn search-results page:
+#   - browser_evaluate is REQUIRED: scrolling the inner results container lazy-loads more
+#     listings (7 -> 10, +43%). Body-level PageDown reveals nothing, so evaluate is the only
+#     working scroll. Removing it silently cuts discovery.
+#   - browser_click is REQUIRED: the Next button yields a fully fresh page of listings.
+#   - Kept for obstacle handling even though unused in the happy path: fill_form, type, hover,
+#     select_option, handle_dialog, console_messages.
+#   - Kept for diagnosing and working around a changed or hostile page: take_screenshot (the
+#     only way to SEE a block page, CAPTCHA, or consent overlay that the a11y tree renders
+#     uninformatively), find, press_key. These cost turns when the model over-uses them, but
+#     the cost of not having them is a silent zero-listing run.
+# Removed below: tools with no role in reading a results list, plus run_code_unsafe, which is
+# fully covered by browser_evaluate.
+SCRAPER_DISALLOWED_BROWSER_TOOLS = [
+    'mcp__playwright__browser_file_upload',
+    'mcp__playwright__browser_drag',
+    'mcp__playwright__browser_drop',
+    'mcp__playwright__browser_resize',
+    'mcp__playwright__browser_tabs',
+    'mcp__playwright__browser_network_request',
+    'mcp__playwright__browser_network_requests',
+    'mcp__playwright__browser_navigate_back',
+    'mcp__playwright__browser_close',
+    'mcp__playwright__browser_run_code_unsafe',
+]
+# Never remove these — measured as load-bearing for discovery (guarded by a unit test).
+SCRAPER_REQUIRED_BROWSER_TOOLS = [
+    'mcp__playwright__browser_navigate',
+    'mcp__playwright__browser_snapshot',
+    'mcp__playwright__browser_click',
+    'mcp__playwright__browser_wait_for',
+    'mcp__playwright__browser_evaluate',
+]
+
 QUERY_PROVIDER = 'openrouter'  # 'openrouter' (glm) | 'anthropic'; falls back to Anthropic on failure
 COMPANY_MATCH_PROVIDER = 'openrouter'  # 'openrouter' (glm) | 'anthropic'; falls back to Anthropic on failure
 

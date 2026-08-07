@@ -28,6 +28,7 @@ from agentic_job_search.config import (
     MODEL_NAME_MEDIUM,
     QUERY_PROVIDER,
     RATING_PROVIDER,
+    SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_MAX_TURNS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
     THINKING_MAX_CHARS,
@@ -150,25 +151,32 @@ The information visible in search results (title, company, snippet, date) is all
 
 ## Location and seniority targeting
 
-You are given ONE search query per session. Run that single query against both target regions, then stop — do not invent additional queries:
+You are given ONE search query per session. Run that single query as FOUR searches — both target regions, each in BOTH sort orders — then stop. Do not invent additional queries:
 
-1. **Canada (remote, senior+)**:
+1. **Canada, newest first**:
    https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
 
-2. **European Union (remote, senior+)**:
+2. **Canada, most relevant** (identical URL, `sortBy` omitted entirely):
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2&f_E=4%2C5%2C6
+
+3. **European Union, newest first**:
    https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
+
+4. **European Union, most relevant** (identical URL, `sortBy` omitted entirely):
+   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2&f_E=4%2C5%2C6
+
+Run ALL FOUR every time. The two sort orders surface different jobs and both are wanted:
+- `sortBy=DD` (newest first) catches fresh postings before anyone else, but LinkedIn's date sort ignores relevance, so it returns a lot of loosely-matching noise.
+- Default sort (no `sortBy`) is LinkedIn's own relevance ranking, which reliably surfaces the BEST-matching roles — but they are often older and therefore already seen.
+
+Expect the relevance-sorted searches to return many `already_processed` results. **That is expected and correct — do not treat it as a failure or a reason to skip the search.** The few new jobs they surface are the most relevant ones you will find all run.
 
 Filter reference (always include ALL of these on every search URL):
 - `f_WT=2` = Remote only.
 - `f_E=4%2C5%2C6` = experience level Mid-Senior + Director + Executive only. This keeps out internships, entry-level, and associate/junior roles, which are explicit deal-breakers — do NOT drop this filter. (`%2C` is the URL-encoded comma.)
-- `sortBy=DD` = newest first — critical so fresh postings appear before already-seen ones.
 - URL-encode spaces as `+`.
 
-Example for "Principal AI Engineer":
-  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=Canada&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
-  https://www.linkedin.com/jobs/search/?keywords=Principal+AI+Engineer&location=European+Union&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
-
-If a search returns zero job results, re-run the exact same URL with the `sortBy=DD` parameter removed (date-sorted queries sometimes come back empty or with irrelevant results) before concluding there are no jobs for that query. Keep `f_WT=2` and `f_E=4%2C5%2C6` on every retry.
+If a search returns zero job results, re-run that exact URL once more before concluding there are no jobs for it. Keep `f_WT=2` and `f_E=4%2C5%2C6` on every retry.
 
 If either location-filtered search returns fewer than 3 new candidates, also run the same query without the `location` parameter (but STILL keep `f_WT=2` and `f_E=4%2C5%2C6`) to catch globally-remote senior roles that may accept candidates from those regions.
 
@@ -179,7 +187,7 @@ For each job visible in the search results:
 
 Only pass information that is directly visible in the search results listing. Do not infer or fabricate missing fields. Stage 2 will navigate to the job page and fill in any missing details.
 
-Run the provided search queries and scan 1–2 pages of results each. Then stop.
+Scan the FIRST page of results for each of the four searches. Do not paginate — with four searches per query, page 1 of all four is a better use of your turn budget than two pages of one. Then stop.
 Do not evaluate jobs, do not click job titles, do not open job detail pages — just collect candidates from the search results list.
 """
 
@@ -387,9 +395,8 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
         try:
             async for msg in sdk_query(prompt=f'{prompt}\n\nCall the submit_search_queries tool with your list.', options=options):
                 if isinstance(msg, ResultMessage):
-                    print_result_stats(msg)
-                    if stage_stats is not None:
-                        accumulate_stage_stats(stage_stats, msg)
+                    cost_delta = accumulate_stage_stats(stage_stats, msg) if stage_stats is not None else None
+                    print_result_stats(msg, cost_delta)
             provider = 'anthropic'
         except Exception as ex:
             raise RuntimeError(f'Stage 1a (query generation) failed: {ex}') from ex
@@ -537,7 +544,7 @@ def print_thinking(text: str) -> None:
     console.print(f"\n[dim italic]Thinking: {display}[/dim italic]\n")
 
 
-def print_result_stats(msg: ResultMessage) -> None:
+def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> None:
     parts = []
     if msg.usage:
         parts.append(f"in={msg.usage.get('input_tokens', 0)} out={msg.usage.get('output_tokens', 0)}")
@@ -547,8 +554,28 @@ def print_result_stats(msg: ResultMessage) -> None:
             parts.append(f"cache_read={cache_read} cache_write={cache_write}")
     if msg.total_cost_usd is not None:
         parts.append(f"cost=${msg.total_cost_usd:.4f}")
+        if cost_delta is not None and abs(cost_delta - msg.total_cost_usd) > 1e-9:
+            parts.append(f"delta=${cost_delta:.4f}")
     if parts:
         console.print(f"[dim]{' · '.join(parts)}[/dim]")
+    # The console output above is rich-only and never reaches run_dir/logs/run-*.log, which is
+    # why a 13x scraping cost regression went unnoticed for nine runs. Mirror it to the log,
+    # with the session identity and turn count needed to tell a cumulative cost field from a
+    # per-request one.
+    usage = msg.usage or {}
+    logger.info(
+        f'Result stats: session={msg.session_id} turns={msg.num_turns} '
+        f'in={usage.get("input_tokens", 0)} out={usage.get("output_tokens", 0)} '
+        f'cache_read={usage.get("cache_read_input_tokens", 0)} '
+        f'cache_write={usage.get("cache_creation_input_tokens", 0)} '
+        f'cost_reported={msg.total_cost_usd} '
+        f'cost_charged={cost_delta if cost_delta is not None else msg.total_cost_usd}'
+    )
+
+
+# Keys that are internal bookkeeping, not reported metrics. stage_stats dicts are serialized
+# straight into cost_log.jsonl, so these are stripped before logging to keep its schema stable.
+_PRIVATE_STAGE_STAT_KEYS = ('session_costs',)
 
 
 def new_stage_stats() -> dict:
@@ -558,17 +585,60 @@ def new_stage_stats() -> dict:
         "output_tokens": 0,
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0,
+        # session_id -> highest total_cost_usd seen for that session (see accumulate_stage_stats)
+        "session_costs": {},
     }
 
 
-def accumulate_stage_stats(stats: dict, msg: ResultMessage) -> None:
+def public_stage_stats(stage_stats: dict) -> dict:
+    """Strip internal bookkeeping keys so cost_log.jsonl keeps its existing stage schema."""
+    return {
+        stage: {k: v for k, v in stats.items() if k not in _PRIVATE_STAGE_STAT_KEYS}
+        for stage, stats in stage_stats.items()
+    }
+
+
+def accumulate_stage_stats(stats: dict, msg: ResultMessage) -> float:
+    """Fold a ResultMessage into a stage's totals. Returns the cost actually charged."""
     if msg.usage:
         stats["input_tokens"] += msg.usage.get("input_tokens", 0)
         stats["output_tokens"] += msg.usage.get("output_tokens", 0)
         stats["cache_read_input_tokens"] += msg.usage.get("cache_read_input_tokens", 0)
         stats["cache_creation_input_tokens"] += msg.usage.get("cache_creation_input_tokens", 0)
-    if msg.total_cost_usd is not None:
-        stats["cost"] += msg.total_cost_usd
+    delta = cost_delta_for(stats, msg)
+    stats["cost"] += delta
+    return delta
+
+
+def cost_delta_for(stats: dict, msg: ResultMessage) -> float:
+    """Charge for a ResultMessage, recording it against its session.
+
+    ``total_cost_usd`` is cumulative for the life of a session, so a stage that issues several
+    requests on one shared ClaudeSDKClient (Stage 1b sends one request per search query) would
+    be billed 1+2+...+N times over by naive summation. Charging only the increase over what
+    that session has already reported bills each session exactly once.
+
+    The bookkeeping is per session_id rather than a single running high-water mark because
+    stages differ: Stage 1b shares one session across queries, while extraction opens a fresh
+    session per job whose cumulative totals are unrelated to the previous job's.
+    """
+    if msg.total_cost_usd is None:
+        return 0.0
+    # No session id => nothing to correlate against, so treat the value as already per-request.
+    if not msg.session_id:
+        return msg.total_cost_usd
+    session_costs = stats.setdefault("session_costs", {})
+    previous = session_costs.get(msg.session_id, 0.0)
+    delta = msg.total_cost_usd - previous
+    if delta < 0:
+        logger.warning(
+            f'Session {msg.session_id} reported a lower cumulative cost '
+            f'({msg.total_cost_usd}) than previously seen ({previous}); charging 0 for this '
+            'request. total_cost_usd was expected to be non-decreasing within a session.'
+        )
+        delta = 0.0
+    session_costs[msg.session_id] = max(msg.total_cost_usd, previous)
+    return delta
 
 
 async def run_interactive(client: ClaudeSDKClient) -> None:
@@ -651,8 +721,8 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
                     elif isinstance(block, TextBlock):
                         print(block.text, flush=True)
             elif isinstance(msg, ResultMessage):
-                print_result_stats(msg)
-                accumulate_stage_stats(stage_stats, msg)
+                cost_delta = accumulate_stage_stats(stage_stats, msg)
+                print_result_stats(msg, cost_delta)
 
     for i, query in enumerate(queries, 1):
         console.print(f"[cyan]Stage 1b: query {i}/{len(queries)} — \"{query}\"[/cyan]")
@@ -743,8 +813,8 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
                     elif isinstance(block, TextBlock):
                         print(block.text, flush=True)
             elif isinstance(msg, ResultMessage):
-                print_result_stats(msg)
-                accumulate_stage_stats(stage_stats, msg)
+                cost_delta = accumulate_stage_stats(stage_stats, msg)
+                print_result_stats(msg, cost_delta)
                 if msg.usage:
                     session_tokens_in = (
                         msg.usage.get('input_tokens', 0)
@@ -800,8 +870,8 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
     structured: dict | None = None
     async for msg in sdk_query(prompt=prompt, options=options):
         if isinstance(msg, ResultMessage):
-            print_result_stats(msg)
-            accumulate_stage_stats(stage_stats, msg)
+            cost_delta = accumulate_stage_stats(stage_stats, msg)
+            print_result_stats(msg, cost_delta)
             if msg.structured_output:
                 structured = msg.structured_output
     if structured is None:
@@ -880,8 +950,8 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
     structured: dict | None = None
     async for msg in sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options):
         if isinstance(msg, ResultMessage):
-            print_result_stats(msg)
-            accumulate_stage_stats(stage_stats, msg)
+            cost_delta = accumulate_stage_stats(stage_stats, msg)
+            print_result_stats(msg, cost_delta)
             if msg.structured_output:
                 structured = msg.structured_output
     if structured is None:
@@ -1230,7 +1300,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 "timestamp": datetime.now().isoformat(),
                 "mode": "non-interactive",
                 "status": "failed_no_queries",
-                "stage_stats": stage_stats,
+                "stage_stats": public_stage_stats(stage_stats),
                 "total_cost": sum(s["cost"] for s in stage_stats.values()),
                 "elapsed_minutes": (time.time() - start_time) / 60,
             })
@@ -1246,6 +1316,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 "job_scraper": make_scraper_server(),
             },
             permission_mode="bypassPermissions",
+            # Removes these from the model's context entirely. allowed_tools would NOT — it only
+            # auto-grants permission, which bypassPermissions already does. See the constant.
+            disallowed_tools=SCRAPER_DISALLOWED_BROWSER_TOOLS,
             cwd=str(PROJECT_DIR),
             model=MODEL_NAME_LOW,
             max_turns=SCRAPER_MAX_TURNS_PER_QUERY,
@@ -1283,7 +1356,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 "timestamp": datetime.now().isoformat(),
                 "mode": "non-interactive",
                 "status": "failed_no_candidates",
-                "stage_stats": stage_stats,
+                "stage_stats": public_stage_stats(stage_stats),
                 "total_cost": total_cost,
                 "check_status": check_status_counts,
                 "elapsed_minutes": elapsed_mins,
@@ -1374,7 +1447,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         "timestamp": datetime.now().isoformat(),
         "mode": "non-interactive",
         "status": "complete",
-        "stage_stats": stage_stats,
+        "stage_stats": public_stage_stats(stage_stats),
         "total_cost": total_cost,
         "candidates_found": len(candidates),
         "jobs_saved": num_evaluated,
