@@ -5,11 +5,11 @@ description = "Autonomous job search agent built on the Claude Agent SDK"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "claude-agent-sdk>=0.1.56",
-    "requests>=2.32",
-    "pypdf>=5.0",
+    "claude-agent-sdk>=0.2.132",
+    "requests>=2.34",
+    "pypdf>=6.15",
     "pyyaml>=6.0",
-    "rich>=13.0",
+    "rich>=15.0",
 ]
 
 [project.scripts]
