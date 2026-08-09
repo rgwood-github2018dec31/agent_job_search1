@@ -921,12 +921,14 @@ async def do_submit_job_extract(
     location: str | None = None, date_posted: str | None = None,
     closed: bool = False, salary: str | None = None, sponsorship_note: str | None = None,
     language_requirement: str | None = None, relocation: str | None = None,
+    workplace_type: str | None = None,
 ) -> dict:
     _job_extracts.append({
         'title': title, 'company': company, 'description': description,
         'location': location or '', 'date_posted': date_posted or '',
         'closed': closed, 'salary': salary or '', 'sponsorship_note': sponsorship_note or '',
         'language_requirement': language_requirement or '', 'relocation': relocation or '',
+        'workplace_type': (workplace_type or '').strip().lower(),
     })
     return {"content": [{"type": "text", "text": "Extract submitted."}]}
 
@@ -1025,14 +1027,18 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
     "Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), comma-separated "
     "lowercase, e.g. 'english, german'; omit if no language requirement is stated. "
     "Pass relocation with the country/city if the posting requires relocating to or residing in a "
-    "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles.",
+    "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles. "
+    "Pass workplace_type as exactly 'remote', 'hybrid', or 'onsite' when the page states the work "
+    "arrangement; omit only if the page genuinely does not say. Any mention of required days in "
+    "the office (e.g. '2-3 days onsite') is 'hybrid', not 'remote'.",
     {
         'type': 'object',
         'properties': {
             'title': {'type': 'string'},
             'company': {'type': 'string'},
             'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
-            'location': {'type': 'string'},
+            'location': {'type': 'string', 'description': 'Location including workplace type as shown, e.g. "Bucharest, Romania (Remote within country)"'},
+            'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
             'date_posted': {'type': 'string'},
             'closed': {'type': 'boolean'},
             'salary': {'type': 'string'},
@@ -1050,6 +1056,7 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
         closed=args.get("closed", False), salary=args.get("salary"),
         sponsorship_note=args.get("sponsorship_note"),
         language_requirement=args.get("language_requirement"), relocation=args.get("relocation"),
+        workplace_type=args.get("workplace_type"),
     )
 
 

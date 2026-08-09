@@ -20,6 +20,8 @@ from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_OPUS_SAMPLE_SIZE,
     EXTRACTOR_PROVIDER,
+    HYBRID_ACCEPTABLE_LOCATIONS,
+    HYBRID_RATING_CAP,
     JOB_STALE_AGE_DAYS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
@@ -204,6 +206,7 @@ If you have a title, company, and any description text, calling submit_job_extra
 Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or "no longer accepting applications" statements. In the location field, always include the workplace type shown on the page (Remote / Hybrid / On-site), e.g. "Bucharest, Romania (Remote within country)". Strip navigation chrome, footers, "similar jobs" lists, and marketing boilerplate.
 
 Also capture:
+- workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
 - language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
 - relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
 
@@ -215,8 +218,15 @@ EVALUATOR_INSTRUCTIONS = """You are evaluating a single job posting. A condensed
 ## Hard rule — US jobs without visa sponsorship
 If the job is located in the United States and the posting does NOT explicitly state that visa sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", "willing to sponsor"), rate it **1**.
 
-## Relocation
-Relocation to (or residing in) an EU country is acceptable — do NOT reject or heavily penalize a job for requiring it. Treat it as a minor consideration, mention it in your reasoning, and rate primarily on role fit.
+## Relocation (applies to REMOTE roles only)
+For a **remote** role, relocating to or residing in an EU country is acceptable — do NOT reject or heavily penalize it. Treat it as a minor consideration and rate primarily on role fit. This does NOT excuse mandatory office days; see below.
+
+## Workplace type
+Check the `Workplace:` and `Location:` lines. Any requirement to be in an office some days a week is **hybrid**, even if the listing is badged "Remote".
+
+- **Remote** — the expectation. No penalty.
+- **Hybrid or on-site** — always a negative. Rate **4 or 5 only if BOTH**: (a) the location is southern/Mediterranean Europe (Spain, Portugal, Italy, Greece, Malta, Cyprus, Croatia, southern France), Vancouver/BC, or the United States; **and** (b) the role is strong in other respects, notably compensation well above target. If either fails, rate **3 at most**.
+- Hybrid or on-site in northern/central Europe (Netherlands, Germany, Nordics, Poland, Belgium, Austria, Ireland, Czechia…) is **not a fit** — a non-English-native country plus mandatory office days is a deal-breaker however well the role itself matches. Never rate these 4 or 5.
 
 Rate the job 1–5 based on the requirements below:
 - 1 — Poor fit (missing key requirements or deal-breakers)
@@ -225,7 +235,11 @@ Rate the job 1–5 based on the requirements below:
 - 4 — Good fit (strong match on most criteria)
 - 5 — Excellent fit (matches nearly everything)
 
-Also produce a 2–3 sentence reasoning and a short label summarising the job (used in the saved filename).
+Also produce:
+- reasoning: 2–3 sentences on the fit
+- summary: a short label summarising the job (used in the saved filename)
+- pros: 2–4 short bullet phrases (~100 chars each) naming the concrete strengths — matching tech, seniority, compensation, domain
+- warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — hybrid/on-site, contract vs full-time, salary below target, missing salary, stack mismatch, language expectations. Every conflict you notice MUST appear here, even when you still rate the job highly.
 """
 
 EXTRACT_OUTPUT_SCHEMA = {
@@ -235,6 +249,7 @@ EXTRACT_OUTPUT_SCHEMA = {
         'company': {'type': 'string'},
         'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
         'location': {'type': 'string', 'description': 'Location including workplace type (Remote / Hybrid / On-site)'},
+        'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
         'date_posted': {'type': 'string', 'description': 'As shown on the page, absolute or relative'},
         'closed': {'type': 'boolean', 'description': 'True if the page shows "No longer accepting applications"'},
         'salary': {'type': 'string'},
@@ -253,8 +268,16 @@ RATING_OUTPUT_SCHEMA = {
         'title': {'type': 'string', 'description': 'Job title'},
         'reasoning': {'type': 'string', 'description': '2-3 sentences on the fit'},
         'summary': {'type': 'string', 'description': 'Short label for the job, used in the saved filename'},
+        'pros': {
+            'type': 'array', 'items': {'type': 'string'},
+            'description': '2-4 short bullet phrases naming concrete strengths of the role',
+        },
+        'warnings': {
+            'type': 'array', 'items': {'type': 'string'},
+            'description': '0-4 short bullet phrases naming anything conflicting with the requirements',
+        },
     },
-    'required': ['rating', 'company', 'title', 'reasoning', 'summary'],
+    'required': ['rating', 'company', 'title', 'reasoning', 'summary', 'pros', 'warnings'],
 }
 
 
@@ -885,12 +908,52 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         'sponsorship_note': structured.get('sponsorship_note', ''),
         'language_requirement': structured.get('language_requirement', ''),
         'relocation': structured.get('relocation', ''),
+        'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
     }
     logger.info(
         f"Extract fallback: {candidate['company']} — {candidate['title']}: "
         f"{len(snapshot)} snapshot chars → {len(extract['description'])} chars condensed"
     )
     return extract
+
+
+_ONSITE_RE = re.compile(r'\bon[\s-]?site\b|\bin[\s-]?office\b|\bin[\s-]?person\b', re.IGNORECASE)
+# "N days" wording is the tell for hybrid and must beat the on-site check: a posting saying
+# "on site 3 days per week" is hybrid, and one saying "2-3 days onsite" often also carries a
+# "Remote" badge from the job board's own filter.
+_HYBRID_RE = re.compile(
+    r'\bhybrid\b'
+    r'|\b\d\s*(?:-\s*\d\s*)?days?\s+(?:a|per)\s+week\b'
+    r'|\b\d\s*(?:-\s*\d\s*)?days?\s+(?:in|at|on)[\s-]?(?:the\s+|our\s+)?(?:office|site)\b'
+    r'|\b\d\s*(?:-\s*\d\s*)?days?\s+on[\s-]?site\b',
+    re.IGNORECASE,
+)
+_REMOTE_RE = re.compile(r'\b(?:fully\s+)?remote\b|\bwork\s+from\s+(?:home|anywhere)\b', re.IGNORECASE)
+
+
+def derive_workplace_type(extract: dict) -> str:
+    """'remote' | 'hybrid' | 'onsite' | '' — the extractor's structured value when it set one,
+    otherwise inferred from the free-text location/description.
+
+    The inference matters: workplace_type is new and the extractors do not always fill it, but the
+    workplace wording has always leaked into `location` (e.g. 'Netherlands (Hybrid - 2-3 days
+    onsite)'). Hybrid is checked before remote — postings routinely say both, and a posting that
+    mentions any required office days is hybrid regardless of a 'Remote' badge.
+    """
+    explicit = str(extract.get('workplace_type') or '').strip().lower()
+    if explicit in {'remote', 'hybrid', 'onsite'}:
+        return explicit
+    if explicit in {'on-site', 'on site', 'in-office', 'in office'}:
+        return 'onsite'
+
+    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')[:2000]}"
+    if _HYBRID_RE.search(haystack):
+        return 'hybrid'
+    if _ONSITE_RE.search(haystack):
+        return 'onsite'
+    if _REMOTE_RE.search(haystack):
+        return 'remote'
+    return ''
 
 
 def format_extract_text(candidate: dict, extract: dict) -> str:
@@ -901,6 +964,9 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         f"Posted: {extract['date_posted'] or candidate['date_posted']}",
         f"URL: {candidate['url']}",
     ]
+    workplace_type = derive_workplace_type(extract)
+    if workplace_type:
+        lines.insert(3, f"Workplace: {workplace_type}")
     if candidate['snippet']:
         lines.append(f"Search-result snippet: {candidate['snippet']}")
     if extract['salary']:
@@ -937,6 +1003,102 @@ def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     return None
 
 
+def hybrid_location_is_acceptable(location: str) -> bool:
+    """True if a hybrid/on-site role in this location is one the user would actually take."""
+    haystack = (location or '').lower()
+    return any(token in haystack for token in HYBRID_ACCEPTABLE_LOCATIONS)
+
+
+def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
+    """Deterministic post-rating ceiling. Returns (rating, reason) — reason is '' if uncapped.
+
+    A cap is not a rejection: the job is still saved and still appears in the audit log, it just
+    never crosses the >=4 notification threshold. This backstops the evaluator prompt, which has
+    demonstrably rated a hybrid Netherlands role 4/5 while naming the hybrid location as a drawback
+    in its own reasoning.
+    """
+    workplace_type = derive_workplace_type(extract)
+    if workplace_type in {'hybrid', 'onsite'} and not hybrid_location_is_acceptable(extract.get('location', '')):
+        if rating > HYBRID_RATING_CAP:
+            location = extract.get('location') or 'unspecified location'
+            return HYBRID_RATING_CAP, f'{workplace_type} in {location} (not an acceptable hybrid location)'
+    return rating, ''
+
+
+_CONTRACT_RE = re.compile(
+    r'\bcontract(?:or)?\b|\bfreelance\b|\bday\s*rate\b|\b\d+\s*-\s*\d+\s*months?\b|\bfixed[\s-]term\b',
+    re.IGNORECASE,
+)
+
+
+def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
+    """Warnings derived in code from the extract, independent of what the rater chose to report.
+
+    The rater cannot be trusted to surface these on its own — it saw 'Hybrid - 2-3 days onsite'
+    for the DevologyX posting and still rated it 4/5 without warning.
+    """
+    warnings: list[str] = []
+
+    workplace_type = derive_workplace_type(extract)
+    if workplace_type in {'hybrid', 'onsite'}:
+        label = 'Hybrid' if workplace_type == 'hybrid' else 'On-site'
+        location = extract.get('location') or 'location not stated'
+        warning = f'{label} — {location}'
+        if not hybrid_location_is_acceptable(extract.get('location', '')):
+            warning += ' (not an acceptable hybrid location)'
+        warnings.append(warning)
+
+    if extract.get('relocation'):
+        warnings.append(f"Relocation required: {extract['relocation']}")
+
+    if _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')[:3000]}"):
+        warnings.append('Contract role — full-time preferred')
+
+    if not extract.get('salary'):
+        warnings.append('No salary listed')
+
+    return warnings
+
+
+def merge_warnings(deterministic: list[str], llm_warnings: list[str]) -> list[str]:
+    """Deterministic warnings first, then the rater's, dropping case-insensitive duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for warning in [*deterministic, *llm_warnings]:
+        text = str(warning).strip()
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            merged.append(text)
+    return merged
+
+
+def _bullet_block(heading: str, items: list[str]) -> str:
+    """A heading plus '• ' bullets, or '' when there is nothing to show."""
+    if not items:
+        return ''
+    bullets = '\n'.join(f'• {item}' for item in items)
+    return f'{heading}\n{bullets}'
+
+
+def format_job_notification(
+    candidate: dict, extract: dict, rating: int, pros: list[str], warnings: list[str]
+) -> str:
+    """The Telegram job-match message. Plain text — _send_pipeline_notification sends no
+    parse_mode, so this uses bullets and emoji rather than Markdown."""
+    header = f"⭐ {rating}/5 — {candidate['company']} — {candidate['title']}"
+    location = extract.get('location', '').strip()
+    workplace_type = derive_workplace_type(extract)
+    if location and workplace_type and workplace_type not in location.lower():
+        location = f'{location} — {workplace_type}'
+    sections = [f'{header}\n📍 {location}' if location else header]
+    for block in (_bullet_block('✅ Good:', pros), _bullet_block('⚠️ Warnings:', warnings)):
+        if block:
+            sections.append(block)
+    sections.append(candidate['url'])
+    return '\n\n'.join(sections)
+
+
 async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
     options = ClaudeAgentOptions(
         model=MODEL_NAME_MEDIUM,
@@ -971,16 +1133,16 @@ async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) 
 
 
 async def _save_and_notify(
-    candidate: dict, rating: int, summary: str, content: str, notify: bool = True, flags: str = ''
+    candidate: dict, rating: int, summary: str, content: str, notify: bool = True,
+    extract: dict | None = None, pros: list[str] | None = None, warnings: list[str] | None = None,
 ) -> None:
     await tools_module.do_save_job_posting(
         company=candidate['company'], description=summary, rating=rating,
         content=content, job_id=candidate['job_id'],
     )
     if notify and rating >= 4:
-        flags_line = f"\n⚠ {flags}" if flags else ''
         await _send_pipeline_notification(
-            f"⭐ Job match ({rating}/5): {candidate['company']} — {candidate['title']}\n{summary}{flags_line}\n{candidate['url']}"
+            format_job_notification(candidate, extract or {}, rating, pros or [], warnings or [])
         )
 
 
@@ -1102,27 +1264,40 @@ async def evaluate_all_candidates(
                     continue
 
             result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
-            bump(f"rated_{result['rating']}")
+            rating, cap_reason = apply_rating_caps(extract, result['rating'])
+            if cap_reason:
+                bump('rating_capped')
+                logger.info(
+                    f"Rating capped: {candidate['company']} — {candidate['title']}: "
+                    f"{result['rating']} → {rating} ({cap_reason})"
+                )
+            bump(f'rated_{rating}')
             triage_note = f" (triage said {triage_result['score']})" if triage_result else ''
             logger.info(
                 f"Rating: {candidate['company']} — {candidate['title']}: "
-                f"{result['rating']}/5 via {RATING_PROVIDER}{triage_note} — {result['reasoning']}"
+                f"{rating}/5 via {RATING_PROVIDER}{triage_note} — {result['reasoning']}"
             )
-            relocation_flag = f"relocation required: {extract['relocation']}" if extract.get('relocation') else ''
+            pros = [str(p) for p in (result.get('pros') or [])]
+            warnings = merge_warnings(
+                build_deterministic_warnings(candidate, extract),
+                [str(w) for w in (result.get('warnings') or [])],
+            )
             content = (
-                f"# {result['title']} at {result['company']} — rating {result['rating']}/5\n\n"
-                + (f"⚠ {relocation_flag}\n" if relocation_flag else '')
+                f"# {result['title']} at {result['company']} — rating {rating}/5\n\n"
+                + (f"⚠ rating capped from {result['rating']}: {cap_reason}\n\n" if cap_reason else '')
+                + (_bullet_block('## Good', pros) + '\n\n' if pros else '')
+                + (_bullet_block('## Warnings', warnings) + '\n\n' if warnings else '')
                 + f"Reasoning: {result['reasoning']}\n"
                 + (f"Triage score (local): {triage_result['score']}\n" if triage_result else '')
                 + f"\n{extract_text}"
             )
             tools_module.record_job_outcome(
                 candidate['site'], candidate['job_id'], 'rated',
-                rating=result['rating'], summary=result['reasoning'],
+                rating=rating, summary=result['reasoning'],
             )
             await _save_and_notify(
-                candidate, rating=result['rating'], summary=result['summary'],
-                content=content, flags=relocation_flag,
+                candidate, rating=rating, summary=result['summary'], content=content,
+                extract=extract, pros=pros, warnings=warnings,
             )
         except Exception as ex:
             bump('eval_error')
@@ -1150,6 +1325,10 @@ async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats:
                     'title': {'type': 'string'},
                     'reasoning': {'type': 'string', 'description': '2-3 sentences on the fit'},
                     'summary': {'type': 'string'},
+                    # Optional here: the audit path reads only rating/reasoning, but the shared
+                    # evaluator prompt asks for these, so the schema must allow them.
+                    'pros': {'type': 'array', 'items': {'type': 'string'}},
+                    'warnings': {'type': 'array', 'items': {'type': 'string'}},
                 },
                 'required': ['rating', 'company', 'title', 'reasoning', 'summary'],
             },

@@ -2268,3 +2268,168 @@ def test_disallowed_browser_tools_are_well_formed():
     for name in config.SCRAPER_DISALLOWED_BROWSER_TOOLS:
         assert name.startswith('mcp__playwright__browser_'), name
     assert len(set(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)) == len(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)
+
+
+# ---------------------------------------------------------------------------
+# Workplace type, rating caps, and notification bullets
+#
+# Regression origin: LinkedIn job 4442818316 (DevologyX Senior AI Engineer, Contract) was
+# rated 4/5 and notified on 2026-08-04. It is hybrid, 2-3 days on-site in the Netherlands,
+# on a 6-12 month contract. The rater named the hybrid location as a drawback in its own
+# reasoning and still rated it 4; the Telegram message showed neither the location nor the
+# hybrid arrangement.
+# ---------------------------------------------------------------------------
+
+def test_derive_workplace_type_prefers_explicit_field():
+    extract = _make_extract(workplace_type='hybrid', location='Canada (Remote)')
+    assert agent.derive_workplace_type(extract) == 'hybrid'
+
+
+def test_derive_workplace_type_normalizes_explicit_variants():
+    assert agent.derive_workplace_type(_make_extract(workplace_type='On-Site')) == 'onsite'
+    assert agent.derive_workplace_type(_make_extract(workplace_type=' REMOTE ')) == 'remote'
+
+
+def test_derive_workplace_type_infers_hybrid_from_location():
+    """The extractors do not always fill workplace_type, but the wording has always leaked
+    into the free-text location string."""
+    extract = _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
+    assert agent.derive_workplace_type(extract) == 'hybrid'
+
+
+def test_derive_workplace_type_hybrid_beats_remote_mention():
+    """LinkedIn's own snippet said 'Netherlands (Remote)' for a job needing 2-3 office days."""
+    extract = _make_extract(
+        location='Netherlands (Remote)',
+        description='Remote-friendly team. You will be on site 3 days per week in our Amsterdam office.',
+    )
+    assert agent.derive_workplace_type(extract) == 'hybrid'
+
+
+def test_derive_workplace_type_empty_when_unstated():
+    extract = _make_extract(location='Berlin, Germany', description='Build AI systems.')
+    assert agent.derive_workplace_type(extract) == ''
+
+
+def test_hybrid_location_acceptable():
+    assert agent.hybrid_location_is_acceptable('Barcelona, Spain (Hybrid)')
+    assert agent.hybrid_location_is_acceptable('Vancouver, BC')
+    assert not agent.hybrid_location_is_acceptable('Netherlands (Hybrid - 2-3 days onsite)')
+    assert not agent.hybrid_location_is_acceptable('')
+
+
+def test_apply_rating_caps_caps_hybrid_in_northern_eu():
+    extract = _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
+    rating, reason = agent.apply_rating_caps(extract, 4)
+    assert rating == config.HYBRID_RATING_CAP
+    assert 'not an acceptable hybrid location' in reason
+
+
+def test_apply_rating_caps_allows_hybrid_in_southern_eu():
+    extract = _make_extract(location='Barcelona, Spain (Hybrid)')
+    assert agent.apply_rating_caps(extract, 4) == (4, '')
+
+
+def test_apply_rating_caps_allows_hybrid_in_vancouver():
+    extract = _make_extract(location='Vancouver, BC (Hybrid)')
+    assert agent.apply_rating_caps(extract, 5) == (5, '')
+
+
+def test_apply_rating_caps_leaves_remote_alone():
+    assert agent.apply_rating_caps(_make_extract(), 5) == (5, '')
+
+
+def test_apply_rating_caps_does_not_raise_a_low_rating():
+    """A cap is a ceiling, never a floor — a 2 stays a 2."""
+    extract = _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
+    assert agent.apply_rating_caps(extract, 2) == (2, '')
+
+
+def test_build_deterministic_warnings_flags_hybrid_contract_and_missing_salary():
+    extract = _make_extract(
+        title='Senior AI Engineer (Contract)',
+        location='Netherlands (Hybrid - 2-3 days onsite)',
+        description='Contract Length: 6-12 Months. Build RAG pipelines in Python.',
+        salary='',
+    )
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert any('Hybrid' in w and 'not an acceptable hybrid location' in w for w in warnings)
+    assert any('Contract role' in w for w in warnings)
+    assert 'No salary listed' in warnings
+
+
+def test_build_deterministic_warnings_quiet_for_clean_remote_job():
+    extract = _make_extract(salary='CAD 220,000')
+    assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
+
+
+def test_build_deterministic_warnings_includes_relocation():
+    extract = _make_extract(relocation='Portugal', salary='EUR 100,000')
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert 'Relocation required: Portugal' in warnings
+
+
+def test_merge_warnings_dedupes_case_insensitively_and_keeps_order():
+    merged = agent.merge_warnings(['Hybrid — Netherlands'], ['hybrid — netherlands', 'Below salary target'])
+    assert merged == ['Hybrid — Netherlands', 'Below salary target']
+
+
+def test_format_job_notification_has_both_bullet_sections():
+    extract = _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
+    message = agent.format_job_notification(
+        _make_candidate(), extract, 4, ['Python/FastAPI, RAG'], ['Hybrid — Netherlands'],
+    )
+    assert '⭐ 4/5 — Acme — Staff AI Engineer' in message
+    assert '📍 Netherlands (Hybrid - 2-3 days onsite)' in message
+    assert '✅ Good:\n• Python/FastAPI, RAG' in message
+    assert '⚠️ Warnings:\n• Hybrid — Netherlands' in message
+    assert message.endswith('https://example.com/job/123')
+
+
+def test_format_job_notification_omits_empty_sections():
+    message = agent.format_job_notification(_make_candidate(), _make_extract(), 5, [], [])
+    assert '✅ Good:' not in message
+    assert '⚠️ Warnings:' not in message
+
+
+def test_format_job_notification_appends_workplace_when_location_omits_it():
+    extract = _make_extract(location='Amsterdam, Netherlands', workplace_type='hybrid')
+    message = agent.format_job_notification(_make_candidate(), extract, 4, [], [])
+    assert '📍 Amsterdam, Netherlands — hybrid' in message
+
+
+def test_format_extract_text_surfaces_workplace_line():
+    text = agent.format_extract_text(
+        _make_candidate(), _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
+    )
+    assert 'Workplace: hybrid' in text
+
+
+def test_devologyx_regression_end_to_end():
+    """The exact posting that was wrongly surfaced as a 4: capped to 3 (so never notified)
+    and carrying hybrid + contract warnings."""
+    candidate = _make_candidate(
+        job_id='4442818316', company='DevologyX', title='Senior AI Engineer (Contract)',
+        url='https://www.linkedin.com/jobs/view/4442818316/', snippet='Netherlands (Remote)',
+    )
+    extract = _make_extract(
+        title='Senior AI Engineer (Contract)', company='DevologyX',
+        location='Netherlands (Hybrid - 2-3 days onsite)',
+        description=(
+            'Senior AI Engineer (Contract) for a large-scale AI transformation programme. '
+            'Contract Length: 6-12 Months (Extension Possible). Rate: EUR 700-900/day.'
+        ),
+        salary='€700-€900/day (DOE)', date_posted='1 week ago', language_requirement='english',
+    )
+    assert agent.apply_hard_rules(candidate, extract) is None  # not a hard reject — it is a cap
+
+    rating, cap_reason = agent.apply_rating_caps(extract, 4)
+    assert rating == 3
+    assert rating < 4, 'a capped job must fall below the >=4 notification threshold'
+    assert 'hybrid' in cap_reason
+
+    warnings = agent.merge_warnings(
+        agent.build_deterministic_warnings(candidate, extract), ['Contract, not full-time'],
+    )
+    assert any('Hybrid' in w for w in warnings)
+    assert any('Contract role' in w for w in warnings)

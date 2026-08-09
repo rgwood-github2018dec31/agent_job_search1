@@ -77,7 +77,9 @@ OPENROUTER_EXTRACT_TOOLS = [
             'description': (
                 'Submit the condensed extract of the job posting. Call exactly once when done. '
                 'Set closed=true if the page shows "No longer accepting applications". '
-                'Include the workplace type (Remote / Hybrid / On-site) in location. '
+                'Include the workplace type (Remote / Hybrid / On-site) in location, and also pass '
+                "workplace_type as exactly 'remote', 'hybrid', or 'onsite'. Any mention of required "
+                "days in the office (e.g. '2-3 days onsite') is 'hybrid', not 'remote'. "
                 'Pass sponsorship_note with any visa/work-authorization statement, verbatim. '
                 'Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), '
                 "comma-separated lowercase, e.g. 'english, german'; omit if none stated. "
@@ -91,6 +93,7 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'company': {'type': 'string'},
                     'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
                     'location': {'type': 'string'},
+                    'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
                     'date_posted': {'type': 'string'},
                     'closed': {'type': 'boolean'},
                     'salary': {'type': 'string'},
@@ -115,6 +118,7 @@ def _extract_from_submit_args(args: dict) -> dict:
         'sponsorship_note': args.get('sponsorship_note', ''),
         'language_requirement': args.get('language_requirement', ''),
         'relocation': args.get('relocation', ''),
+        'workplace_type': str(args.get('workplace_type') or '').strip().lower(),
     }
 
 

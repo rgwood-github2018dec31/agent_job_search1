@@ -16,6 +16,26 @@ THINKING_MAX_CHARS = 1000
 # on disk but never read.
 APPLIED_JOBS_HORIZON_DAYS = 90
 
+# Hybrid / on-site roles are only acceptable in these locations (see the Location section of
+# JOB_REQUIREMENTS.md). Anywhere else, a hybrid or on-site posting is capped at
+# HYBRID_RATING_CAP no matter how well the role itself fits — a non-English-native country
+# plus mandatory office days is a deal-breaker. Matched as lowercase substrings of the
+# extract's location, so both countries and their major cities are listed.
+HYBRID_ACCEPTABLE_LOCATIONS = (
+    # Southern / Mediterranean Europe
+    'spain', 'portugal', 'italy', 'greece', 'malta', 'cyprus', 'croatia',
+    'barcelona', 'madrid', 'valencia', 'malaga', 'seville',
+    'lisbon', 'lisboa', 'porto',
+    'milan', 'milano', 'rome', 'roma', 'turin', 'bologna',
+    'athens', 'thessaloniki',
+    'nice', 'marseille', 'montpellier', 'toulouse',  # southern France only
+    # Canada
+    'vancouver', 'british columbia',
+    # US (still subject to the existing sponsorship hard rule)
+    'united states', 'usa', 'u.s.',
+)
+HYBRID_RATING_CAP = 3  # highest rating a hybrid/on-site job outside those locations can receive
+
 # Local/remote LLM MCP tool servers (started via their scripts/start-tool-server.sh)
 LLM_LOCAL_MCP_URL = 'http://127.0.0.1:8002/mcp'
 LLM_OPENROUTER_MCP_URL = 'http://127.0.0.1:8006/mcp'
