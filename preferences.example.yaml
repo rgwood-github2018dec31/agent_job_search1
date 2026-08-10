@@ -1,0 +1,55 @@
+# Personal job-search preferences — copy to run_dir/preferences.yaml and edit.
+#
+# run_dir/ is gitignored, so nothing personal about you ends up in version control. This example
+# file IS tracked, so keep it generic: placeholder values only, never your real situation.
+#
+# Every field is optional. Omitted fields fall back to the neutral defaults in preferences.py,
+# which apply no gate at all — an unconfigured run searches without a location filter and rejects
+# nothing on work authorization, language, or education.
+
+# Regions to search on LinkedIn. Each entry becomes four searches (two sort orders x this region).
+# `linkedin_location` is passed as the `location` URL parameter. An empty list searches globally.
+search_regions:
+  - name: Example Country
+    linkedin_location: Example Country
+
+# Locations (lowercase substrings, matched against the posting's location) where you would need
+# visa sponsorship. A job there that does not explicitly offer sponsorship is auto-rated 1.
+# Leave empty if you are authorized everywhere you search.
+sponsorship_required_in: []
+
+# Languages you can work in, lowercase. A posting that explicitly REQUIRES any other language is
+# auto-rated 1. Leave empty to disable the language gate.
+languages:
+  - english
+
+# Degree levels that auto-reject when a posting states them as a HARD requirement.
+# Valid values: master, phd. Leave empty if an advanced degree is not a blocker for you.
+# Note: only hard requirements reject — "MSc preferred" or "Master's or equivalent experience"
+# never does.
+reject_required_degrees: []
+
+hybrid:
+  # Highest rating a hybrid/on-site job outside `acceptable_locations` can receive. This is a
+  # ceiling, not a rejection: the job is still saved and auditable, it just cannot reach the
+  # notification threshold of 4.
+  rating_cap: 3
+  # Places where you would actually accept commuting to an office, as lowercase substrings.
+  # List both countries and their major cities. Empty caps every hybrid/on-site job.
+  acceptable_locations: []
+
+titles:
+  # Free text appended to the query-generation prompt describing the kind of role you want.
+  prefer: >-
+    Prefer INDIVIDUAL CONTRIBUTOR titles (Principal / Staff / Lead / Senior engineer and
+    scientist roles).
+  # Title words that must never appear in a generated search query.
+  exclude:
+    - Manager
+    - Head of
+    - Director
+    - VP
+
+# Free text shown to the evaluator about relocation you would consider. Empty means the evaluator
+# is given no relocation guidance and judges the role on its own merits.
+relocation_note: ''

@@ -44,9 +44,10 @@ Requires the `tools_telegram` MCP server to be running on port 8004 for job-matc
 Stage 2 also uses two LLM MCP tool servers for cheap inference (reference summarization, triage, and optionally the rating call): `tools_llm_remote_openrouter` on port 8006 and `tools_llm_local` (Ollama) on port 8002. Both are optional — a down server is treated as a provider failure and the pipeline falls back (summary chain falls through to Anthropic; triage fails open).
 
 ```bash
-bash /Users/rgwood/repos2022feb22v1/tools_telegram/scripts/start-tool-server.sh &
-bash /Users/rgwood/repos2022feb22v1/tools_llm_remote_openrouter/scripts/start-tool-server.sh &
-bash /Users/rgwood/repos2022feb22v1/tools_llm_local/scripts/start-tool-server.sh &
+# $TOOLS_DIR is wherever the sibling tool-server repos are checked out
+bash "$TOOLS_DIR/tools_telegram/scripts/start-tool-server.sh" &
+bash "$TOOLS_DIR/tools_llm_remote_openrouter/scripts/start-tool-server.sh" &
+bash "$TOOLS_DIR/tools_llm_local/scripts/start-tool-server.sh" &
 python main.py --non-interactive   # or: python main.py -n
 ```
 
@@ -81,7 +82,8 @@ src/agentic_job_search/
   tools_generic.py                # Tool implementations and MCP server factories
   triage.py                       # LLM MCP-server client, local triage, non-Anthropic rating calls
   extract_openrouter.py           # OpenRouter function-calling agent loop for page extraction
-  config.py                       # Model/provider constants and Stage 2 tuning
+  config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
+  preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
 scripts/
   migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
 tests/
@@ -93,7 +95,9 @@ run_dir/
   processed_jobs/                 # Per-job YAML records for deduplication
   audit_logs/                     # Per-run audit trace (audit-{date}-{time}.md)
   reference_summary_cache.yaml    # Cached distilled ideal-role profile (md5-keyed)
+  preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
+preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
 ```
 
 ## Applied-job corpus (`run_dir/applied_jobs/`)
@@ -119,9 +123,8 @@ Only records within `APPLIED_JOBS_HORIZON_DAYS` (90) populate these; older PDFs 
 are never read.
 
 **Recruiters:** `_extract_applied_job_metadata()` returns `is_agency` and `end_client` alongside
-company and title. An agency's own name never enters the blocklist — applying once through an
-aggregator (Jobgether, CNA Search, SearchLabs, Syndesus) would otherwise suppress every other
-company it posts for. The end client is blocklisted instead when the posting names one; agency
+company and title. An agency's own name never enters the blocklist — applying once through a
+staffing firm or job aggregator would otherwise suppress every other company it posts for. The end client is blocklisted instead when the posting names one; agency
 postings still contribute reference and query signal.
 
 ## Architecture
@@ -144,7 +147,7 @@ The project uses the **[Claude Agent SDK](https://platform.claude.com/docs/en/ag
 2. **Stage 1b — Scraping** (Haiku): `run_scraper()` issues **one request per query on a single shared session** (`SCRAPER_MAX_TURNS_PER_QUERY` turns each), calling `check_and_record_job` + `queue_candidate` for each result listing without navigating to individual job pages. Both halves are load-bearing: batching all queries into one request lets the first few exhaust the turn budget so the rest are never searched (while still reporting `0 jobs`); opening a fresh client per query makes later ones fail with "browser is in use" against the shared Playwright context, which looks identical to an auth wall in the logs
 3. **Stage 2 — Evaluation** (`evaluate_all_candidates()`), per candidate:
    - **2a Extract** (Haiku, agentic): `extract_job_page()` navigates to the job URL, expands the description, and submits a condensed extract via `submit_job_extract` (nav chrome and boilerplate stripped). If the session ends without submitting (Haiku can exhaust its turn budget hunting through truncated snapshots of large pages), `extract_job_page_direct()` falls back to a deterministic path: navigate + wait + snapshot (+ one "… more" expand click) driven directly over the Playwright MCP session, then one non-agentic Haiku call condenses the full snapshot — same browser and logged-in profile, so bot-detection exposure is identical
-   - **2b Hard rules** ($0, deterministic): `apply_hard_rules()` auto-rates 1 for closed postings, postings > `JOB_STALE_AGE_DAYS` (30) days old, US jobs without explicit sponsorship, jobs with an explicit non-English language requirement (from the extract's `language_requirement` field), and jobs that hard-require a Master's or PhD (from the extract's `education_requirement` field, backed by `derive_education_requirement()`). A required relocation (`relocation` field) does NOT reject — it is flagged as "relocation required: <location>" in the saved job and the Telegram notification, and the evaluator is instructed not to penalize EU relocation. Every rejection is logged with its reason (console + `run_dir/logs/run-*.log`)
+   - **2b Hard rules** ($0, deterministic): `apply_hard_rules()` auto-rates 1 for closed postings, postings > `JOB_STALE_AGE_DAYS` (30) days old, jobs in a `sponsorship_required_in` location without explicit sponsorship, jobs requiring a language outside `languages` (from the extract's `language_requirement` field), and jobs that hard-require a degree listed in `reject_required_degrees` (from the extract's `education_requirement` field, backed by `derive_education_requirement()`). The three location/language/education gates are **preference-driven** — each is off when its preference list is empty. A required relocation (`relocation` field) does NOT reject — it is flagged as "relocation required: <location>" in the saved job and the Telegram notification, and the evaluator is given `relocation_note` as guidance. Every rejection is logged with its reason (console + `run_dir/logs/run-*.log`)
    - **2c Triage** ($0, local LLM): `triage_job_fit()` scores fit 1–5 with Ollama; scores ≤ `TRIAGE_THRESHOLD` (1) are saved with the triage score and skip the rating call; fails open if the server is down
    - **2d Rating** (configurable): `rate_job()` makes one non-agentic structured-output call, saves via `do_save_job_posting()`, and sends a Telegram notification for ratings ≥ 4
 
@@ -195,15 +198,16 @@ Stage 1**, not the evaluation pipeline. Every competing hypothesis was disproven
 (25/25 succeeded), and over-aggressive gates — the audit re-rated every gate-killed job with the
 strong rater and found **0 false negatives**.
 
-The real problem is that LinkedIn queries surface a noisy pool (junior, non-English EU,
-wrong-stack, PM/DevOps/frontend). Only ~12% (3/25) were strong 4/5 matches. "Not finding jobs" is a
-low base rate plus high variance — some runs land 0–1 fours — and notifications only fire at ≥4.
+The real problem is that LinkedIn queries surface a pool that is mostly off-target — wrong
+seniority, wrong discipline, wrong stack relative to the configured preferences. Only ~12% (3/25)
+scored 4/5. "Not finding jobs" is a low base rate plus high variance — some runs land 0–1 fours —
+and notifications only fire at ≥4.
 
 **Do not loosen the gates in response to a quiet run.** The audit confirmed they are accurate. The
 leverage is all in Stage 1: better LinkedIn URL filters and query yield. Fixes already applied on
 2026-07-23: the `f_E=4%2C5%2C6` seniority filter on scraper URLs, the code-enforced recovery pass on
 a zero-listing scrape, full funnel instrumentation, and `--audit` mode. Offered but deprioritized:
-the year-off date-clamp bug, tightening the US-sponsor rule, and more queries / more result pages.
+the year-off date-clamp bug, tightening the sponsorship rule, and more queries / more result pages.
 
 ## Requirements
 
@@ -219,6 +223,7 @@ the year-off date-clamp bug, tightening the US-sponsor rule, and more queries / 
 ### Business Object Model
 
 - **Resume** — user's CV stored as Markdown in `run_dir/`
+- **Preferences** — `run_dir/preferences.yaml` (gitignored), loaded by `preferences.py`: search regions, sponsorship-required locations, languages, rejected degree levels, hybrid cap and acceptable locations, target/excluded titles, relocation note. This is the **only** home for facts about the person running the agent; tracked source must stay neutral. `preferences.example.yaml` in the project root documents the format with placeholder values
 - **JOB_REQUIREMENTS.md** — agent-managed preference file; read-only in non-interactive mode
 - **Search Query** — short LinkedIn search string derived from Resume, JOB_REQUIREMENTS.md, and Applied Job Records
 - **Applied Job Record** — a job the User applied to: a date-prefixed PDF in `run_dir/applied_jobs/` plus its `index.yaml` metadata (applied date, company, job title, recruiting-agency flag, end client). Active for 3 months; older records are retained but unused
@@ -249,7 +254,7 @@ the year-off date-clamp bug, tightening the US-sponsor rule, and more queries / 
 - **Generate Search Queries**: derive at most `MAX_SEARCH_QUERIES` (6) Search Queries from Resume, JOB_REQUIREMENTS.md, and the Applied Job Records within the 3-month horizon (glm, Anthropic fallback), covering both the titles already applied to and adjacent titles. Individual-contributor titles only — people-management titles (Manager / Head of / Director / VP) are excluded
 - **Write Run Audit Log**: at the end of every run, write `run_dir/audit_logs/audit-{date}-{time}.md` tracing applied-job counts, every Search Query and whether it was actually searched, listings and candidates per query, and the outcome of every individual Job Posting with its URL and summary
 - **Audit Un-surfaced Jobs**: (`--audit-opus N`) sample N Job Postings from each of three un-surfaced pools — filtered at Stage 1, seen but never queued, and rated 2–3 — re-rate each with Opus, and report any the strong model scores ≥4 as a false negative. Diagnostic only; nothing is saved or notified
-- **Scrape Job Postings**: execute Search Queries on LinkedIn and collect candidate Job Postings. Every Search Query runs as **four searches** — Canada and European Union, each in **both sort orders** — and all four run every time:
+- **Scrape Job Postings**: execute Search Queries on LinkedIn and collect candidate Job Postings. Every Search Query runs as **two searches per configured region** (see Preferences `search_regions`) — each region in **both sort orders** — and all of them run every time:
   - `sortBy=DD` (newest first) catches fresh postings early, but LinkedIn's date sort ignores relevance and returns a lot of loosely-matching noise
   - **default sort** (`sortBy` omitted) is LinkedIn's own relevance ranking, which surfaces the best-matching roles; these are usually older and so mostly already seen
 
@@ -280,7 +285,7 @@ the year-off date-clamp bug, tightening the US-sponsor rule, and more queries / 
   - includes: Rate Job Fit
   - includes: Notify User of Match
 - **Extract Job Posting**: navigate to Job Posting URL and capture a condensed, information-dense extract of the page; provider configurable — cheap Anthropic model (agentic session, default) or OpenRouter model via a function-calling loop
-- **Apply Hard Rules**: deterministically ($0) force rating to 1 if the Job Posting is closed ("No longer accepting applications"), > 30 days old, US-located without explicit visa sponsorship, explicitly requires a non-English language, or hard-requires a Master's/PhD; every rejection is logged with its reason
+- **Apply Hard Rules**: deterministically ($0) force rating to 1 if the Job Posting is closed ("No longer accepting applications"), > 30 days old, located where the user needs sponsorship but none is offered, explicitly requires a language the user does not have, or hard-requires a degree the user does not hold. The last three read their thresholds from Preferences and are inactive when unconfigured; every rejection is logged with its reason
   - includes: Detect Advanced Degree Requirement
 - **Detect Advanced Degree Requirement**: resolve whether the Job Posting hard-requires a Master's or PhD, via the extract's structured `education_requirement` field or, when the extractor leaves it empty, `derive_education_requirement()` — a sentence-level scan requiring a degree token **and** a requirement word **and** no softener (`preferred`, `or equivalent`, a Bachelor's alternative) and no negation (`No PhD required`). Only hard requirements resolve to `master`/`phd`; preferred or experience-substitutable degrees resolve to empty and never reject. Invoked by Apply Hard Rules
 - **Flag Workplace Type**: capture the work arrangement as a structured `workplace_type` field (`remote` / `hybrid` / `onsite`) rather than as free text inside the location; when the extractor omits it, `derive_workplace_type()` infers it from the location and description. Any required office days are `hybrid`, even when the board badges the listing "Remote" — LinkedIn's `f_WT=2` filter is not reliable. Extends Extract Job Posting
@@ -288,7 +293,7 @@ the year-off date-clamp bug, tightening the US-sponsor rule, and more queries / 
 - **Triage Job Posting**: score fit 1–5 with the Local LLM; clear low fits (score ≤ 1) are saved with the triage score and skip Rate Job Fit; fails open if the Local LLM is unavailable
 - **Extract Job Posting (fallback)**: when the agentic extractor fails to submit, deterministically fetch the page snapshot over the shared Playwright session and condense it with one non-agentic cheap-model call; extends Extract Job Posting
 - **Rate Job Fit**: one non-agentic structured-output call scoring fit 1–5 against JOB_REQUIREMENTS.md and the ideal-role profile, also returning **pros** and **warnings** bullet lists; provider configurable (Anthropic Sonnet default, OpenRouter `z-ai/glm-5.2`, or Local LLM). `apply_rating_caps()` then applies the deterministic hybrid ceiling below
-- **Cap Hybrid Rating**: after rating, deterministically cap a `hybrid`/`onsite` Job Posting at `HYBRID_RATING_CAP` (3) unless its location matches `HYBRID_ACCEPTABLE_LOCATIONS`. A cap is not a rejection — the job is still saved and still appears in the audit log, it just falls below the ≥ 4 notification threshold; extends Rate Job Fit
+- **Cap Hybrid Rating**: after rating, deterministically cap a `hybrid`/`onsite` Job Posting at the Preferences `hybrid.rating_cap` unless its location matches `hybrid.acceptable_locations`. A cap is not a rejection — the job is still saved and still appears in the audit log, it just falls below the ≥ 4 notification threshold; extends Rate Job Fit
 - **Notify User of Match**: send Telegram notification when a Saved Job has rating ≥ 4. The message carries the rating, company, title, a `📍` location line including workplace type, a bulleted **✅ Good** list (from the rater's `pros`) and a bulleted **⚠️ Warnings** list (deterministic warnings first, then the rater's, de-duplicated), and the URL. Sent as plain text — no `parse_mode` — so it uses bullets and emoji, never Markdown. The Saved Job reuses the same bullet block so file and message agree
 - **Build Deterministic Warnings**: derive warnings in code independent of the rater — hybrid/on-site (with "not an acceptable hybrid location" where it applies), required relocation, contract-vs-full-time, and missing salary. The rater cannot be trusted to self-report these: it once saw "Hybrid - 2-3 days onsite" and rated the job 4/5 without warning. Salary-below-target is deliberately left to the LLM, since parsing multi-currency day rates into a CAD annual figure is too brittle for a deterministic rule
 
@@ -304,9 +309,10 @@ the year-off date-clamp bug, tightening the US-sponsor rule, and more queries / 
 - **Applied-date durability** — an Applied Job Record's date is carried by the filename prefix, `index.yaml`, and mtime independently, so it survives a move, copy, or backup restore that drops filesystem metadata
 - **Applied-job horizon** — only Applied Job Records from the last `APPLIED_JOBS_HORIZON_DAYS` (90) feed query generation, the ideal-role profile, and the already-applied blocklist; older PDFs are retained on disk, never deleted
 - **Notification latency** — Telegram alerts sent immediately when a job is rated 4 or 5 during evaluation
-- **Rating hard rules (applied deterministically in code before any LLM scoring)**: closed postings → 1; postings > 30 days old → 1; US jobs without explicit sponsorship → 1; explicit non-English language requirement → 1; hard Master's/PhD requirement → 1. Required relocation is flagged, never auto-rejected. The degree rule fires **only on hard requirements** — "MSc preferred", "Master's or equivalent experience", and "Bachelor's or Master's" all survive, because an auto-reject is unappealable and a posting that would accept experience instead must never be killed
-- **Rating cap (applied deterministically in code AFTER LLM scoring)**: a `hybrid` or `onsite` Job Posting whose location is not in `HYBRID_ACCEPTABLE_LOCATIONS` is capped at `HYBRID_RATING_CAP` (3). This is a **ceiling, not a rejection or a floor** — the job is saved, recorded, and auditable, and a rating already ≤ 3 is untouched; it simply cannot reach the ≥ 4 notification threshold. The cap exists because the prompt alone is not sufficient: the evaluator rated a hybrid Netherlands role 4/5 while naming the hybrid location as a drawback in its own reasoning. Every cap is logged (`Rating capped: … 4 → 3 (reason)`) and counted in the run funnel as `rating_capped`
-- **Knowledge locality** — project decisions, diagnoses, and conventions live in tracked repo files. Machine-local paths (including `~/.claude` and its per-project memory directory) are never used for project knowledge, because they do not reach another machine. `run_dir/` is the one deliberate exception: gitignored because it holds personal data (resume, applied-job PDFs, saved postings, `JOB_REQUIREMENTS.md`)
+- **Rating hard rules (applied deterministically in code before any LLM scoring)**: closed postings → 1; postings > 30 days old → 1; jobs in a `sponsorship_required_in` location with no sponsorship offered → 1; a required language outside `languages` → 1; a hard requirement for a degree in `reject_required_degrees` → 1. The last three are preference-driven and disabled when their lists are empty. Required relocation is flagged, never auto-rejected. The degree rule fires **only on hard requirements** — "MSc preferred", "Master's or equivalent experience", and "Bachelor's or Master's" all survive, because an auto-reject is unappealable and a posting that would accept experience instead must never be killed
+- **Rating cap (applied deterministically in code AFTER LLM scoring)**: a `hybrid` or `onsite` Job Posting whose location is not in the Preferences `hybrid.acceptable_locations` is capped at `hybrid.rating_cap`. This is a **ceiling, not a rejection or a floor** — the job is saved, recorded, and auditable, and a rating already at or below the cap is untouched; it simply cannot reach the ≥ 4 notification threshold. The cap exists because the prompt alone is not sufficient: the evaluator rated a hybrid role in an unacceptable location 4/5 while naming the hybrid location as a drawback in its own reasoning. Every cap is logged (`Rating capped: … 4 → 3 (reason)`) and counted in the run funnel as `rating_capped`
+- **Knowledge locality** — project decisions, diagnoses, and conventions live in tracked repo files. Machine-local paths (including `~/.claude` and its per-project memory directory) are never used for project knowledge, because they do not reach another machine. `run_dir/` is the one deliberate exception: gitignored because it holds personal data (resume, applied-job PDFs, saved postings, `JOB_REQUIREMENTS.md`, `preferences.yaml`)
+- **No personal information in tracked files** — nothing in git may identify or describe whoever is running the agent: no home location, work-authorization or immigration status, languages, education, employers or recruiters dealt with, compensation targets, or absolute paths containing a username. Every such fact is a **preference**, and preferences live only in `run_dir/preferences.yaml`. Tracked code reads them through `preferences.py` and must behave sanely when they are absent — the defaults are neutral, so an unconfigured checkout applies no work-authorization, language, or education gate rather than inheriting someone else's situation. Tests pin their own fixed preferences in `tests/conftest.py` and must never read the real file. When adding a rule that encodes a personal fact, add a preference key; do not hardcode the fact
 
 ## Git conventions
 

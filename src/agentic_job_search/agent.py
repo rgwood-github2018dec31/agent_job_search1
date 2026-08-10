@@ -20,8 +20,6 @@ from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_OPUS_SAMPLE_SIZE,
     EXTRACTOR_PROVIDER,
-    HYBRID_ACCEPTABLE_LOCATIONS,
-    HYBRID_RATING_CAP,
     JOB_STALE_AGE_DAYS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
@@ -37,6 +35,7 @@ from agentic_job_search.config import (
     TRIAGE_ENABLED,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
+import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
 from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
@@ -107,7 +106,7 @@ async def _send_pipeline_notification(text: str) -> None:
 
 # --- Prompt construction ---
 
-AGENT_INSTRUCTIONS_COMMON = """You are a personal job search agent.
+AGENT_INSTRUCTIONS_COMMON_TEMPLATE = """You are a personal job search agent.
 
 Do not write files directly to disk. Use the save_job_posting tool to persist job data — it is the only way you should store anything.
 
@@ -118,9 +117,7 @@ When browsing LinkedIn:
 
 The user's LinkedIn session is persisted so they should already be logged in. If not, ask them to log in via the browser.
 
-## Hard rule — US jobs without visa sponsorship
-If the job is located in the United States, check whether the posting explicitly states that visa sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", "willing to sponsor"). If it does NOT explicitly mention visa sponsorship, rate it **1** immediately.
-
+{sponsorship_section}
 ## Rating jobs
 
 Rate every job you evaluate on a 1–5 scale:
@@ -131,7 +128,7 @@ Rate every job you evaluate on a 1–5 scale:
 - 5 — Excellent fit (matches nearly everything)
 """
 
-AGENT_INSTRUCTIONS_INTERACTIVE = AGENT_INSTRUCTIONS_COMMON + """
+AGENT_INSTRUCTIONS_INTERACTIVE_TEMPLATE = AGENT_INSTRUCTIONS_COMMON_TEMPLATE + """
 ## Interactive mode
 
 Your job is to:
@@ -143,7 +140,32 @@ Your job is to:
 Present each job clearly, then ask the user if it's a good fit and why.
 """
 
-SCRAPER_INSTRUCTIONS = """You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation queue.
+
+def _sponsorship_prompt_section() -> str:
+    """The visa-sponsorship hard rule, or '' when no sponsorship-required location is configured.
+
+    Where the user needs sponsorship is personal (see preferences.py), so it is injected rather
+    than written into the prompt text.
+    """
+    locations = preferences.sponsorship_required_in()
+    if not locations:
+        return ''
+    joined = ', '.join(loc.title() for loc in locations)
+    return (
+        '\n## Hard rule — jobs requiring visa sponsorship\n'
+        f'If the job is located in {joined} and the posting does NOT explicitly state that visa '
+        'sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", '
+        '"willing to sponsor"), rate it **1**.\n'
+    )
+
+
+def build_interactive_instructions() -> str:
+    """Interactive-mode system prompt with the configured sponsorship rule injected."""
+    return AGENT_INSTRUCTIONS_INTERACTIVE_TEMPLATE.format(
+        sponsorship_section=_sponsorship_prompt_section()
+    )
+
+SCRAPER_INSTRUCTIONS_TEMPLATE = """You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation queue.
 
 You are fully authorized to call all available tools. Call them directly — do not ask for permission.
 
@@ -153,21 +175,11 @@ The information visible in search results (title, company, snippet, date) is all
 
 ## Location and seniority targeting
 
-You are given ONE search query per session. Run that single query as FOUR searches — both target regions, each in BOTH sort orders — then stop. Do not invent additional queries:
+You are given ONE search query per session. Run that single query as {search_count} searches — every target region below, each in BOTH sort orders — then stop. Do not invent additional queries:
 
-1. **Canada, newest first**:
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
+{search_list}
 
-2. **Canada, most relevant** (identical URL, `sortBy` omitted entirely):
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=Canada&f_WT=2&f_E=4%2C5%2C6
-
-3. **European Union, newest first**:
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2&f_E=4%2C5%2C6&sortBy=DD
-
-4. **European Union, most relevant** (identical URL, `sortBy` omitted entirely):
-   https://www.linkedin.com/jobs/search/?keywords=<QUERY>&location=European+Union&f_WT=2&f_E=4%2C5%2C6
-
-Run ALL FOUR every time. The two sort orders surface different jobs and both are wanted:
+Run ALL {search_count} every time. The two sort orders surface different jobs and both are wanted:
 - `sortBy=DD` (newest first) catches fresh postings before anyone else, but LinkedIn's date sort ignores relevance, so it returns a lot of loosely-matching noise.
 - Default sort (no `sortBy`) is LinkedIn's own relevance ranking, which reliably surfaces the BEST-matching roles — but they are often older and therefore already seen.
 
@@ -180,7 +192,7 @@ Filter reference (always include ALL of these on every search URL):
 
 If a search returns zero job results, re-run that exact URL once more before concluding there are no jobs for it. Keep `f_WT=2` and `f_E=4%2C5%2C6` on every retry.
 
-If either location-filtered search returns fewer than 3 new candidates, also run the same query without the `location` parameter (but STILL keep `f_WT=2` and `f_E=4%2C5%2C6`) to catch globally-remote senior roles that may accept candidates from those regions.
+If a location-filtered search returns fewer than 3 new candidates, also run the same query without the `location` parameter (but STILL keep `f_WT=2` and `f_E=4%2C5%2C6`) to catch globally-remote senior roles that may accept candidates from those regions.
 
 For each job visible in the search results:
 1. Call check_and_record_job with site="linkedin", the job ID (from the URL), company, and title. Pass date_posted only if it's visible in the results — it may be relative like "4 days ago", or it may not be shown at all; both are fine.
@@ -189,7 +201,7 @@ For each job visible in the search results:
 
 Only pass information that is directly visible in the search results listing. Do not infer or fabricate missing fields. Stage 2 will navigate to the job page and fill in any missing details.
 
-Scan the FIRST page of results for each of the four searches. Do not paginate — with four searches per query, page 1 of all four is a better use of your turn budget than two pages of one. Then stop.
+Scan the FIRST page of results for each of the {search_count} searches. Do not paginate — with {search_count} searches per query, page 1 of all of them is a better use of your turn budget than two pages of one. Then stop.
 Do not evaluate jobs, do not click job titles, do not open job detail pages — just collect candidates from the search results list.
 """
 
@@ -214,21 +226,14 @@ Also capture:
 Do not rate the job. Do not browse other pages. Extract this one posting, submit it, then stop.
 """
 
-EVALUATOR_INSTRUCTIONS = """You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not need to browse anywhere.
-
-## Hard rule — US jobs without visa sponsorship
-If the job is located in the United States and the posting does NOT explicitly state that visa sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", "willing to sponsor"), rate it **1**.
-
-## Relocation (applies to REMOTE roles only)
-For a **remote** role, relocating to or residing in an EU country is acceptable — do NOT reject or heavily penalize it. Treat it as a minor consideration and rate primarily on role fit. This does NOT excuse mandatory office days; see below.
-
+EVALUATOR_INSTRUCTIONS_TEMPLATE = """You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not need to browse anywhere.
+{sponsorship_section}{relocation_section}
 ## Workplace type
 Check the `Workplace:` and `Location:` lines. Any requirement to be in an office some days a week is **hybrid**, even if the listing is badged "Remote".
 
 - **Remote** — the expectation. No penalty.
-- **Hybrid or on-site** — always a negative. Rate **4 or 5 only if BOTH**: (a) the location is southern/Mediterranean Europe (Spain, Portugal, Italy, Greece, Malta, Cyprus, Croatia, southern France), Vancouver/BC, or the United States; **and** (b) the role is strong in other respects, notably compensation well above target. If either fails, rate **3 at most**.
-- Hybrid or on-site in northern/central Europe (Netherlands, Germany, Nordics, Poland, Belgium, Austria, Ireland, Czechia…) is **not a fit** — a non-English-native country plus mandatory office days is a deal-breaker however well the role itself matches. Never rate these 4 or 5.
-
+- **Hybrid or on-site** — always a negative. Rate **4 or 5 only if BOTH**: (a) the location is one of the acceptable hybrid locations listed below; **and** (b) the role is strong in other respects, notably compensation well above target. If either fails, rate **3 at most**.
+{hybrid_locations_section}
 Rate the job 1–5 based on the requirements below:
 - 1 — Poor fit (missing key requirements or deal-breakers)
 - 2 — Weak fit (some relevant aspects but significant gaps)
@@ -242,6 +247,59 @@ Also produce:
 - pros: 2–4 short bullet phrases (~100 chars each) naming the concrete strengths — matching tech, seniority, compensation, domain
 - warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — hybrid/on-site, contract vs full-time, salary below target, missing salary, stack mismatch, language expectations. Every conflict you notice MUST appear here, even when you still rate the job highly.
 """
+
+
+def build_scraper_instructions() -> str:
+    """Scraper prompt with the configured search regions injected.
+
+    Regions are a personal preference (see preferences.py), so the URL list is generated rather
+    than hardcoded. With no regions configured, the query runs unfiltered in both sort orders.
+    """
+    regions = preferences.search_regions()
+    base_url = 'https://www.linkedin.com/jobs/search/?keywords=<QUERY>'
+    filters = '&f_WT=2&f_E=4%2C5%2C6'
+    entries: list[str] = []
+    if regions:
+        for region in regions:
+            name = region.get('name') or region.get('linkedin_location', '')
+            location = str(region.get('linkedin_location', '')).replace(' ', '+')
+            url = f'{base_url}&location={location}{filters}'
+            entries.append(f'**{name}, newest first**:\n   {url}&sortBy=DD')
+            entries.append(f'**{name}, most relevant** (identical URL, `sortBy` omitted entirely):\n   {url}')
+    else:
+        url = f'{base_url}{filters}'
+        entries.append(f'**Newest first**:\n   {url}&sortBy=DD')
+        entries.append(f'**Most relevant** (identical URL, `sortBy` omitted entirely):\n   {url}')
+
+    search_list = '\n\n'.join(f'{i}. {entry}' for i, entry in enumerate(entries, start=1))
+    return SCRAPER_INSTRUCTIONS_TEMPLATE.format(search_count=len(entries), search_list=search_list)
+
+
+def build_evaluator_instructions() -> str:
+    """Evaluator prompt with the configured sponsorship, relocation, and hybrid rules injected."""
+    sponsorship_section = _sponsorship_prompt_section()
+    note = preferences.relocation_note()
+    relocation_section = f'\n## Relocation (applies to REMOTE roles only)\n{note}\n' if note else ''
+
+    locations = preferences.hybrid_acceptable_locations()
+    if locations:
+        joined = ', '.join(loc.title() for loc in locations)
+        hybrid_locations_section = (
+            f'- Acceptable hybrid/on-site locations: {joined}.\n'
+            '- Hybrid or on-site anywhere else is **not a fit** however well the role itself '
+            'matches. Never rate those 4 or 5.\n'
+        )
+    else:
+        hybrid_locations_section = (
+            '- No hybrid/on-site location is acceptable: rate every hybrid or on-site role '
+            '**3 at most**.\n'
+        )
+
+    return EVALUATOR_INSTRUCTIONS_TEMPLATE.format(
+        sponsorship_section=sponsorship_section,
+        relocation_section=relocation_section,
+        hybrid_locations_section=hybrid_locations_section,
+    )
 
 EXTRACT_OUTPUT_SCHEMA = {
     'type': 'object',
@@ -310,7 +368,7 @@ def build_system_prompt(interactive: bool) -> str:
         requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
         parts.append(f"--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---")
 
-    parts.append(AGENT_INSTRUCTIONS_INTERACTIVE)
+    parts.append(build_interactive_instructions())
 
     return "\n\n".join(parts)
 
@@ -321,22 +379,34 @@ def build_scraper_prompt() -> str:
     if JOB_REQUIREMENTS_PATH.exists():
         requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
         parts.append(f"--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---")
-    parts.append(SCRAPER_INSTRUCTIONS)
+    parts.append(build_scraper_instructions())
     return "\n\n".join(parts)
 
 
-QUERY_GENERATION_INSTRUCTIONS = (
-    'Generate short LinkedIn job search queries (2–6 words each, like a job title).\n'
-    f'Return AT MOST {MAX_SEARCH_QUERIES} queries — each one costs two live LinkedIn searches, so '
-    'they must be the highest-yield titles, not an exhaustive list of variations.\n'
-    'The jobs I have applied to are the strongest signal of what I want: cover the title space they '
-    'occupy, and include adjacent titles likely to surface similar roles I have not seen yet.\n'
-    'Prefer INDIVIDUAL CONTRIBUTOR titles (Principal / Staff / Lead / Senior engineer and scientist '
-    'roles). Do NOT generate people-management titles — no "Manager", "Head of", "Director", "VP", '
-    'or similar; those are not the roles I want.\n'
-    'Prefer broad, common titles that LinkedIn actually returns results for over narrow or invented '
-    'ones. Queries are job titles, not company names — never search for a company.'
-)
+def build_query_generation_instructions() -> str:
+    """Query-generation prompt with the configured title preferences injected."""
+    lines = [
+        'Generate short LinkedIn job search queries (2–6 words each, like a job title).',
+        f'Return AT MOST {MAX_SEARCH_QUERIES} queries — each one costs two live LinkedIn searches, '
+        'so they must be the highest-yield titles, not an exhaustive list of variations.',
+        'The jobs I have applied to are the strongest signal of what I want: cover the title space '
+        'they occupy, and include adjacent titles likely to surface similar roles I have not seen yet.',
+    ]
+    preferred = preferences.preferred_titles_note()
+    if preferred:
+        lines.append(preferred)
+    excluded = preferences.excluded_title_words()
+    if excluded:
+        joined = ', '.join(f'"{word}"' for word in excluded)
+        lines.append(
+            f'Do NOT generate titles containing any of these — {joined}, or similar; those are not '
+            'the roles I want.'
+        )
+    lines.append(
+        'Prefer broad, common titles that LinkedIn actually returns results for over narrow or '
+        'invented ones. Queries are job titles, not company names — never search for a company.'
+    )
+    return '\n'.join(lines)
 
 QUERY_JSON_INSTRUCTIONS = (
     'Respond with ONLY a JSON object: {"queries": ["<query>", "<query>", ...]}'
@@ -397,7 +467,7 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
 
     query_server = create_sdk_mcp_server(name='query_generator', version='1.0.0', tools=[_submit])
 
-    prompt = f'{context}\n\n{QUERY_GENERATION_INSTRUCTIONS}'
+    prompt = f'{context}\n\n{build_query_generation_instructions()}'
 
     provider = ''
     if QUERY_PROVIDER == 'openrouter':
@@ -454,7 +524,7 @@ def build_evaluator_prompt(reference_block: str = '') -> str:
     profile = build_profile_block(reference_block)
     if profile:
         parts.append(profile)
-    parts.append(EVALUATOR_INSTRUCTIONS)
+    parts.append(build_evaluator_instructions())
     # The system prompt is passed to the CLI as a subprocess argument; a stray
     # null byte anywhere in it makes every session fail to spawn.
     return "\n\n".join(parts).replace('\x00', '')
@@ -755,10 +825,10 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
         try:
             await run_pass(
                 f'Search LinkedIn for this ONE query only: "{query}"\n\n'
-                "Run it against Canada (remote) and the European Union (remote) as described in your "
-                "instructions. Call check_and_record_job and queue_candidate for each new job found in "
+                "Run every search URL listed in your instructions (all regions, both sort orders). "
+                "Call check_and_record_job and queue_candidate for each new job found in "
                 "the results list. Do not ask for permission — call the tools directly. Do not navigate "
-                "to individual job pages. Stop as soon as you have processed both regions for this query."
+                "to individual job pages. Stop as soon as you have processed all of them for this query."
             )
         except Exception as ex:
             # One failed query must not abort the remaining ones.
@@ -1059,17 +1129,23 @@ def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     posted = parse_posting_date(extract['date_posted'] or candidate['date_posted'])
     if posted and (date.today() - posted).days > JOB_STALE_AGE_DAYS:
         return f'posting older than {JOB_STALE_AGE_DAYS} days ({posted.isoformat()})'
-    us_located = 'united states' in extract['location'].lower()
-    if _requires_current_us_auth(full_text) or (us_located and 'sponsor' not in full_text.lower()):
-        return 'US job without explicit visa sponsorship'
-    non_english = [
-        lang.strip() for lang in re.split(r'[,;/]', extract.get('language_requirement', ''))
-        if lang.strip() and 'english' not in lang.lower()
-    ]
-    if non_english:
-        return f'requires non-English language: {", ".join(non_english)}'
+    sponsorship_locations = preferences.sponsorship_required_in()
+    location = extract['location'].lower()
+    needs_sponsorship = any(loc in location for loc in sponsorship_locations)
+    if sponsorship_locations and (
+        _requires_current_us_auth(full_text) or (needs_sponsorship and 'sponsor' not in full_text.lower())
+    ):
+        return 'job without explicit visa sponsorship'
+    known_languages = preferences.languages()
+    if known_languages:
+        unsupported = [
+            lang.strip() for lang in re.split(r'[,;/]', extract.get('language_requirement', ''))
+            if lang.strip() and not any(known in lang.lower() for known in known_languages)
+        ]
+        if unsupported:
+            return f'requires unsupported language: {", ".join(unsupported)}'
     degree = derive_education_requirement(extract)
-    if degree:
+    if degree and degree in preferences.rejected_degrees():
         return f'requires advanced degree: {degree}'
     return None
 
@@ -1077,7 +1153,7 @@ def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
 def hybrid_location_is_acceptable(location: str) -> bool:
     """True if a hybrid/on-site role in this location is one the user would actually take."""
     haystack = (location or '').lower()
-    return any(token in haystack for token in HYBRID_ACCEPTABLE_LOCATIONS)
+    return any(token in haystack for token in preferences.hybrid_acceptable_locations())
 
 
 def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
@@ -1085,14 +1161,15 @@ def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
 
     A cap is not a rejection: the job is still saved and still appears in the audit log, it just
     never crosses the >=4 notification threshold. This backstops the evaluator prompt, which has
-    demonstrably rated a hybrid Netherlands role 4/5 while naming the hybrid location as a drawback
-    in its own reasoning.
+    demonstrably rated a hybrid role in an unacceptable location 4/5 while naming the hybrid
+    location as a drawback in its own reasoning.
     """
     workplace_type = derive_workplace_type(extract)
+    cap = preferences.hybrid_rating_cap()
     if workplace_type in {'hybrid', 'onsite'} and not hybrid_location_is_acceptable(extract.get('location', '')):
-        if rating > HYBRID_RATING_CAP:
+        if rating > cap:
             location = extract.get('location') or 'unspecified location'
-            return HYBRID_RATING_CAP, f'{workplace_type} in {location} (not an acceptable hybrid location)'
+            return cap, f'{workplace_type} in {location} (not an acceptable hybrid location)'
     return rating, ''
 
 

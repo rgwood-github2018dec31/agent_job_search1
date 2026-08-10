@@ -1,3 +1,6 @@
+# macOS metadata (leaks directory listings; never useful in git)
+.DS_Store
+
 # Python-generated files
 __pycache__/
 *.py[oc]

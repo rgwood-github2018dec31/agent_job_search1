@@ -88,8 +88,8 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
                         'type': 'boolean',
                         'description': (
                             'True if the poster is a staffing firm, recruiting agency, or job aggregator '
-                            '(e.g. Jobgether, Robert Half, a search firm) reposting on behalf of another '
-                            'company, rather than the employer that would actually hire.'
+                            'reposting on behalf of another company, rather than the employer that '
+                            'would actually hire.'
                         ),
                     },
                     'end_client_name': {

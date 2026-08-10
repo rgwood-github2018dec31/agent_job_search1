@@ -16,25 +16,10 @@ THINKING_MAX_CHARS = 1000
 # on disk but never read.
 APPLIED_JOBS_HORIZON_DAYS = 90
 
-# Hybrid / on-site roles are only acceptable in these locations (see the Location section of
-# JOB_REQUIREMENTS.md). Anywhere else, a hybrid or on-site posting is capped at
-# HYBRID_RATING_CAP no matter how well the role itself fits — a non-English-native country
-# plus mandatory office days is a deal-breaker. Matched as lowercase substrings of the
-# extract's location, so both countries and their major cities are listed.
-HYBRID_ACCEPTABLE_LOCATIONS = (
-    # Southern / Mediterranean Europe
-    'spain', 'portugal', 'italy', 'greece', 'malta', 'cyprus', 'croatia',
-    'barcelona', 'madrid', 'valencia', 'malaga', 'seville',
-    'lisbon', 'lisboa', 'porto',
-    'milan', 'milano', 'rome', 'roma', 'turin', 'bologna',
-    'athens', 'thessaloniki',
-    'nice', 'marseille', 'montpellier', 'toulouse',  # southern France only
-    # Canada
-    'vancouver', 'british columbia',
-    # US (still subject to the existing sponsorship hard rule)
-    'united states', 'usa', 'u.s.',
-)
-HYBRID_RATING_CAP = 3  # highest rating a hybrid/on-site job outside those locations can receive
+# NOTE: personal preferences — search regions, acceptable hybrid locations, the hybrid rating cap,
+# work-authorization/language/education gates, and target titles — deliberately do NOT live here.
+# They are loaded from the gitignored run_dir/preferences.yaml via preferences.py, so this repo
+# carries no information about whoever is running it. See preferences.example.yaml.
 
 # Local/remote LLM MCP tool servers (started via their scripts/start-tool-server.sh)
 LLM_LOCAL_MCP_URL = 'http://127.0.0.1:8002/mcp'
@@ -43,14 +28,15 @@ LOCAL_MODEL = 'qwen3.6:latest'
 OPENROUTER_MODEL = 'z-ai/glm-5.2'
 
 # Stage 1 (discovery) configuration
-MAX_SEARCH_QUERIES = 6  # hard cap; every query costs two LinkedIn searches (Canada + EU)
+MAX_SEARCH_QUERIES = 6  # hard cap; every query costs two LinkedIn searches per configured region
 # Turn budget PER QUERY. Each check_and_record_job / queue_candidate call burns a turn, so a
 # budget shared across all queries silently starves the later ones (see run_scraper).
 #
-# Every query now runs FOUR searches (Canada + EU, each date-sorted and relevance-sorted), so
-# this has to cover roughly double what it did at two searches. Measured at two searches: 42
-# turns for 14 listings. Starvation is silent — the model simply stops and the run reports
-# "N listings inspected" with no error — so this is set with headroom rather than tuned tight.
+# Every query runs two searches per configured region (date-sorted and relevance-sorted), so at
+# the usual two regions this has to cover roughly double what it did at two searches total.
+# Measured at two searches: 42 turns for 14 listings. Starvation is silent — the model simply
+# stops and the run reports "N listings inspected" with no error — so this is set with headroom
+# rather than tuned tight.
 SCRAPER_MAX_TURNS_PER_QUERY = 90
 
 # Playwright MCP tools removed from the scraper's context.

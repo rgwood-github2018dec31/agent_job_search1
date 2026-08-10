@@ -6,11 +6,13 @@ import os
 from datetime import date, datetime, timedelta
 
 import pytest
+import yaml
 from claude_agent_sdk import ResultMessage
 
 from agentic_job_search import agent
 from agentic_job_search import config
 from agentic_job_search import extract_openrouter
+from agentic_job_search import preferences
 from agentic_job_search import tools_generic as tools
 from agentic_job_search import triage
 
@@ -779,11 +781,11 @@ async def test_load_applied_jobs_does_not_blocklist_recruiting_agency(tmp_path, 
     import yaml as yaml_mod
     _no_legacy_cache(monkeypatch, tmp_path)
     applied = tmp_path / 'applied_jobs'
-    pdf = _write_pdf(applied / f'{date.today().isoformat()}-cat-saved_jd-jobgether.pdf', date.today())
+    pdf = _write_pdf(applied / f'{date.today().isoformat()}-cat-saved_jd-agencycorp.pdf', date.today())
 
     index_path = applied / 'index.yaml'
     index_path.write_text(yaml_mod.dump({
-        pdf.name: _index_entry(date.today(), pdf.stat().st_mtime, company='Jobgether', is_agency=True),
+        pdf.name: _index_entry(date.today(), pdf.stat().st_mtime, company='AgencyCorp', is_agency=True),
     }))
 
     await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
@@ -796,35 +798,35 @@ async def test_load_applied_jobs_blocklists_end_client_not_agency(tmp_path, monk
     import yaml as yaml_mod
     _no_legacy_cache(monkeypatch, tmp_path)
     applied = tmp_path / 'applied_jobs'
-    pdf = _write_pdf(applied / f'{date.today().isoformat()}-cat-saved_jd-jobgether.pdf', date.today())
+    pdf = _write_pdf(applied / f'{date.today().isoformat()}-cat-saved_jd-agencycorp.pdf', date.today())
 
     index_path = applied / 'index.yaml'
     index_path.write_text(yaml_mod.dump({
         pdf.name: _index_entry(
             date.today(), pdf.stat().st_mtime,
-            company='Jobgether', is_agency=True, end_client='Acquia',
+            company='AgencyCorp', is_agency=True, end_client='EndClientCo',
         ),
     }))
 
     await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
 
-    assert tools._applied_companies == {'Acquia': pdf.name}
+    assert tools._applied_companies == {'EndClientCo': pdf.name}
 
 
 def test_applied_jobs_summary_renders_titles_dates_and_agency(monkeypatch):
     monkeypatch.setattr(tools, '_applied_jobs', [
         {'filename': 'a.pdf', 'applied_date': date(2026, 5, 13), 'company': 'BMC Software',
          'job_title': 'Principal Agentic AI Engineer', 'is_agency': False, 'end_client': ''},
-        {'filename': 'b.pdf', 'applied_date': date(2026, 7, 20), 'company': 'Jobgether',
-         'job_title': 'Staff AI Engineer', 'is_agency': True, 'end_client': 'Acquia'},
+        {'filename': 'b.pdf', 'applied_date': date(2026, 7, 20), 'company': 'AgencyCorp',
+         'job_title': 'Staff AI Engineer', 'is_agency': True, 'end_client': 'EndClientCo'},
     ])
 
     summary = tools.applied_jobs_summary()
     lines = summary.splitlines()
 
-    assert lines[0].startswith('- Staff AI Engineer — Jobgether (2026-07-20)'), 'newest first'
+    assert lines[0].startswith('- Staff AI Engineer — AgencyCorp (2026-07-20)'), 'newest first'
     assert '[via agency]' in lines[0]
-    assert '[hiring company: Acquia]' in lines[0]
+    assert '[hiring company: EndClientCo]' in lines[0]
     assert lines[1] == '- Principal Agentic AI Engineer — BMC Software (2026-05-13)'
 
 
@@ -1134,7 +1136,7 @@ def test_apply_hard_rules_explicit_no_auth_statement():
 def test_apply_hard_rules_non_english_language_requirement():
     extract = _make_extract(language_requirement='dutch')
     reason = agent.apply_hard_rules(_make_candidate(), extract)
-    assert reason is not None and 'dutch' in reason and 'non-English' in reason
+    assert reason is not None and 'dutch' in reason and 'language' in reason
 
 
 def test_apply_hard_rules_english_plus_other_language_rejects():
@@ -1225,7 +1227,7 @@ def test_apply_hard_rules_derives_degree_from_description():
 
 def test_hard_rule_category_buckets_education():
     assert agent._hard_rule_category('requires advanced degree: master') == 'hard_ruled_education'
-    assert agent._hard_rule_category('requires non-English language: dutch') == 'hard_ruled_language'
+    assert agent._hard_rule_category('requires unsupported language: dutch') == 'hard_ruled_language'
 
 
 # ---------------------------------------------------------------------------
@@ -1937,7 +1939,7 @@ def test_write_run_audit_log_includes_opus_findings(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_query_instructions_exclude_managerial_titles():
-    text = agent.QUERY_GENERATION_INSTRUCTIONS
+    text = agent.build_query_generation_instructions()
     assert 'INDIVIDUAL CONTRIBUTOR' in text
     for managerial in ('Manager', 'Head of', 'Director', 'VP'):
         assert managerial in text, f'{managerial} should be named as an exclusion'
@@ -2381,26 +2383,32 @@ def test_derive_workplace_type_empty_when_unstated():
 
 
 def test_hybrid_location_acceptable():
-    assert agent.hybrid_location_is_acceptable('Barcelona, Spain (Hybrid)')
-    assert agent.hybrid_location_is_acceptable('Vancouver, BC')
+    # Locations come from the pinned test preferences in conftest, not from anyone's real config.
+    assert agent.hybrid_location_is_acceptable('Exampleton, Testland (Hybrid)')
+    assert agent.hybrid_location_is_acceptable('Testville, Testland')
     assert not agent.hybrid_location_is_acceptable('Netherlands (Hybrid - 2-3 days onsite)')
     assert not agent.hybrid_location_is_acceptable('')
 
 
-def test_apply_rating_caps_caps_hybrid_in_northern_eu():
+def test_hybrid_location_unacceptable_when_no_locations_configured(monkeypatch):
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ())
+    assert not agent.hybrid_location_is_acceptable('Exampleton, Testland (Hybrid)')
+
+
+def test_apply_rating_caps_caps_hybrid_in_unacceptable_location():
     extract = _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
     rating, reason = agent.apply_rating_caps(extract, 4)
-    assert rating == config.HYBRID_RATING_CAP
+    assert rating == preferences.hybrid_rating_cap()
     assert 'not an acceptable hybrid location' in reason
 
 
-def test_apply_rating_caps_allows_hybrid_in_southern_eu():
-    extract = _make_extract(location='Barcelona, Spain (Hybrid)')
+def test_apply_rating_caps_allows_hybrid_in_acceptable_location():
+    extract = _make_extract(location='Exampleton, Testland (Hybrid)')
     assert agent.apply_rating_caps(extract, 4) == (4, '')
 
 
-def test_apply_rating_caps_allows_hybrid_in_vancouver():
-    extract = _make_extract(location='Vancouver, BC (Hybrid)')
+def test_apply_rating_caps_allows_hybrid_in_other_acceptable_location():
+    extract = _make_extract(location='Testville, Testland (Hybrid)')
     assert agent.apply_rating_caps(extract, 5) == (5, '')
 
 
@@ -2502,3 +2510,77 @@ def test_devologyx_regression_end_to_end():
     )
     assert any('Hybrid' in w for w in warnings)
     assert any('Contract role' in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# preferences: neutral defaults, so an unconfigured checkout inherits nobody's situation
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def neutral_preferences(monkeypatch):
+    """Preferences as a fresh clone with no run_dir/preferences.yaml sees them."""
+    defaults = preferences._deep_merge(preferences.DEFAULT_PREFERENCES, {})
+    monkeypatch.setattr(preferences, '_cache', defaults)
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: defaults)
+    return defaults
+
+
+def test_default_preferences_apply_no_personal_gates(neutral_preferences):
+    assert preferences.sponsorship_required_in() == ()
+    assert preferences.languages() == ()
+    assert preferences.rejected_degrees() == ()
+    assert preferences.hybrid_acceptable_locations() == ()
+    assert preferences.search_regions() == []
+
+
+def test_hard_rules_reject_nothing_without_preferences(neutral_preferences):
+    """The three personal gates must be inert when unconfigured — not silently inherited."""
+    extract = _make_extract(
+        location='United States (Remote)',
+        description='PhD in Machine Learning is required. Fluent Dutch is required.',
+        language_requirement='dutch',
+        education_requirement='phd',
+    )
+    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+def test_hard_rules_still_reject_impersonal_conditions(neutral_preferences):
+    """Closed and stale are properties of the posting, not the person — always on."""
+    assert 'closed' in agent.apply_hard_rules(_make_candidate(), _make_extract(closed=True))
+    old = (date.today() - timedelta(days=45)).isoformat()
+    assert 'older than' in agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
+
+
+def test_prompts_omit_personal_sections_without_preferences(neutral_preferences):
+    evaluator = agent.build_evaluator_instructions()
+    assert 'visa sponsorship' not in evaluator
+    assert 'No hybrid/on-site location is acceptable' in evaluator
+    assert 'visa sponsorship' not in agent.build_interactive_instructions()
+    scraper = agent.build_scraper_instructions()
+    assert '&location=' not in scraper, 'no region configured means an unfiltered search'
+
+
+def test_missing_preferences_file_falls_back_to_defaults(tmp_path, monkeypatch, real_load_preferences):
+    monkeypatch.setattr(preferences, '_cache', None)
+    monkeypatch.setattr(preferences, 'PREFERENCES_PATH', tmp_path / 'absent.yaml')
+    assert real_load_preferences(force_reload=True) == preferences.DEFAULT_PREFERENCES
+
+
+def test_malformed_preferences_file_raises_with_context(tmp_path, monkeypatch, real_load_preferences):
+    path = tmp_path / 'preferences.yaml'
+    path.write_text('- not: a mapping\n', encoding='utf-8')
+    monkeypatch.setattr(preferences, '_cache', None)
+    monkeypatch.setattr(preferences, 'PREFERENCES_PATH', path)
+    with pytest.raises(ValueError, match='must contain a YAML mapping'):
+        real_load_preferences(force_reload=True)
+
+
+def test_example_preferences_file_is_neutral():
+    """The tracked example must never carry a real person's settings."""
+    text = preferences.EXAMPLE_PREFERENCES_PATH.read_text(encoding='utf-8')
+    loaded = yaml.safe_load(text)
+    assert loaded['sponsorship_required_in'] == []
+    assert loaded['reject_required_degrees'] == []
+    assert loaded['hybrid']['acceptable_locations'] == []
+    for region in loaded['search_regions']:
+        assert 'Example' in region['name'] or 'Test' in region['name']
