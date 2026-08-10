@@ -1,5 +1,0 @@
-{
-  "env": {
-    "UV_CACHE_DIR": "${CLAUDE_PROJECT_DIR}/.uv-cache"
-  }
-}

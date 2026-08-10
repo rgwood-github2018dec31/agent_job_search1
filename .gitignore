@@ -30,3 +30,6 @@ run_dir/
 
 # Project-scoped uv package cache
 .uv-cache/
+
+# Claude Code harness config (machine-local)
+.claude/
