@@ -1056,6 +1056,7 @@ async def test_submit_job_extract_defaults(monkeypatch):
     assert extract['sponsorship_note'] == ''
     assert extract['language_requirement'] == ''
     assert extract['relocation'] == ''
+    assert extract['education_requirement'] == ''
 
 
 # ---------------------------------------------------------------------------
@@ -1068,7 +1069,7 @@ def _make_extract(**overrides) -> dict:
         'description': 'Build agentic AI systems in Python. Remote within Canada.',
         'location': 'Canada (Remote)', 'date_posted': '3 days ago',
         'closed': False, 'salary': '', 'sponsorship_note': '',
-        'language_requirement': '', 'relocation': '',
+        'language_requirement': '', 'relocation': '', 'education_requirement': '',
     }
     extract.update(overrides)
     return extract
@@ -1153,10 +1154,78 @@ def test_apply_hard_rules_relocation_does_not_reject():
 
 
 def test_format_extract_text_includes_language_and_relocation():
-    extract = _make_extract(language_requirement='english, german', relocation='Berlin, Germany')
+    extract = _make_extract(
+        language_requirement='english, german', relocation='Berlin, Germany',
+        education_requirement='phd',
+    )
     text = agent.format_extract_text(_make_candidate(), extract)
     assert 'Language requirement: english, german' in text
     assert 'Relocation required: Berlin, Germany' in text
+    assert 'Education requirement: phd' in text
+
+
+# ---------------------------------------------------------------------------
+# derive_education_requirement / advanced-degree hard rule
+# ---------------------------------------------------------------------------
+
+def test_apply_hard_rules_explicit_phd_requirement():
+    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(education_requirement='phd'))
+    assert reason is not None and 'degree' in reason and 'phd' in reason
+
+
+def test_apply_hard_rules_explicit_masters_requirement():
+    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(education_requirement='master'))
+    assert reason is not None and 'degree' in reason and 'master' in reason
+
+
+def test_apply_hard_rules_empty_education_requirement_passes():
+    assert agent.apply_hard_rules(_make_candidate(), _make_extract()) is None
+
+
+def test_apply_hard_rules_bachelors_requirement_passes():
+    extract = _make_extract(education_requirement='bachelor')
+    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+@pytest.mark.parametrize('description, expected', [
+    ('PhD in Machine Learning is required.', 'phd'),
+    ('Requirements: MSc in Computer Science.', 'master'),
+    ("A Master's degree is a must.", 'master'),
+    ('Minimum: Ph.D. in Statistics', 'phd'),
+    ('You must hold a doctorate in a quantitative field.', 'phd'),
+])
+def test_derive_education_requirement_detects_hard_requirements(description, expected):
+    assert agent.derive_education_requirement(_make_extract(description=description)) == expected
+
+
+@pytest.mark.parametrize('description', [
+    'MSc preferred.',
+    "Master's degree or equivalent practical experience required.",
+    "Bachelor's or Master's in Computer Science required.",
+    'PhD a plus.',
+    'A doctorate is nice to have.',
+    "Bachelor's degree required.",
+    'You will master the art of distributed systems.',
+    'PhD-level colleagues work here; degrees are not required.',
+    'No PhD required.',
+    'No advanced degree required — we hire on experience.',
+    "A Master's degree is not required for this role.",
+    'We do not require a PhD.',
+    'Senior engineers without a PhD are encouraged to apply; experience is what is required.',
+])
+def test_derive_education_requirement_ignores_soft_and_irrelevant_mentions(description):
+    assert agent.derive_education_requirement(_make_extract(description=description)) == ''
+
+
+def test_apply_hard_rules_derives_degree_from_description():
+    extract = _make_extract(description='Build agents in Python. A PhD in AI is required.')
+    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'requires advanced degree: phd' in reason
+
+
+def test_hard_rule_category_buckets_education():
+    assert agent._hard_rule_category('requires advanced degree: master') == 'hard_ruled_education'
+    assert agent._hard_rule_category('requires non-English language: dutch') == 'hard_ruled_language'
 
 
 # ---------------------------------------------------------------------------

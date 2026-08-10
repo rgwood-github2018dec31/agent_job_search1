@@ -84,7 +84,10 @@ OPENROUTER_EXTRACT_TOOLS = [
                 'Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), '
                 "comma-separated lowercase, e.g. 'english, german'; omit if none stated. "
                 'Pass relocation with the country/city if the posting requires relocating to or '
-                'residing in a specific place; omit for work-from-anywhere roles.'
+                'residing in a specific place; omit for work-from-anywhere roles. '
+                "Pass education_requirement as 'master' or 'phd' ONLY if an advanced degree is a hard "
+                "requirement (e.g. 'MSc required', 'PhD is a must'); omit it when the degree is merely "
+                'preferred, when equivalent experience is accepted, or when only a Bachelor\'s is required.'
             ),
             'parameters': {
                 'type': 'object',
@@ -100,6 +103,7 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'sponsorship_note': {'type': 'string'},
                     'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase"},
                     'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if required'},
+                    'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
                 },
                 'required': ['title', 'company', 'description'],
             },
@@ -119,6 +123,7 @@ def _extract_from_submit_args(args: dict) -> dict:
         'language_requirement': args.get('language_requirement', ''),
         'relocation': args.get('relocation', ''),
         'workplace_type': str(args.get('workplace_type') or '').strip().lower(),
+        'education_requirement': str(args.get('education_requirement') or '').strip().lower(),
     }
 
 

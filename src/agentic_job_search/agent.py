@@ -209,6 +209,7 @@ Also capture:
 - workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
 - language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
 - relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
+- education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required.
 
 Do not rate the job. Do not browse other pages. Extract this one posting, submit it, then stop.
 """
@@ -256,6 +257,7 @@ EXTRACT_OUTPUT_SCHEMA = {
         'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
         'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
         'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
+        'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement (e.g. 'MSc required', 'PhD is a must'); empty when merely preferred, when equivalent experience is accepted, or when only a Bachelor's is required"},
     },
     'required': ['title', 'company', 'description'],
 }
@@ -909,6 +911,7 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         'language_requirement': structured.get('language_requirement', ''),
         'relocation': structured.get('relocation', ''),
         'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
+        'education_requirement': (structured.get('education_requirement') or '').strip().lower(),
     }
     logger.info(
         f"Extract fallback: {candidate['company']} — {candidate['title']}: "
@@ -956,6 +959,69 @@ def derive_workplace_type(extract: dict) -> str:
     return ''
 
 
+_PHD_RE = re.compile(r"\bph\.?\s?d\.?\b|\bdoctorates?\b|\bdoctoral\s+degree\b", re.IGNORECASE)
+_MASTERS_RE = re.compile(
+    r"\bmasters?'?s?\s+degree\b|\bmaster's\b|\bmasters\b|\bm\.?sc\.?\b"
+    r"|\bmaster\s+of\s+(?:science|engineering|arts)\b|\bm\.?s\.?\s+in\b|\bm\.?a\.?\s+in\b",
+    re.IGNORECASE,
+)
+_DEGREE_REQUIRED_RE = re.compile(
+    r"\brequired\b|\brequirements?\b|\brequires?\b|\bmust\s+(?:have|hold|possess)\b"
+    r"|\bis\s+a\s+must\b|\bmandatory\b|\bminimum\b",
+    re.IGNORECASE,
+)
+# Any of these in the same sentence means the degree is not a hard gate: it is preferred, one of
+# several accepted options, or substitutable with experience. A bachelor's mention counts as a
+# softener because an advanced degree cannot be mandatory if a bachelor's is also acceptable.
+_DEGREE_SOFTENER_RE = re.compile(
+    r"\bpreferr?ed\b|\bpreferabl[ey]\b|\bor\s+equivalent\b|\bequivalent\s+(?:practical\s+)?experience\b"
+    r"|\bnice\s+to\s+have\b|\ba\s+plus\b|\bbonus\b|\bideally\b|\bdesirable\b|\badvantage\b"
+    r"|\bbachelor'?s?\b|\bb\.?sc\.?\b",
+    re.IGNORECASE,
+)
+# Negations are as disqualifying as softeners: postings routinely advertise "No PhD required" as a
+# selling point, and the rater's own prose ("degrees are not required") lands in the same text.
+_DEGREE_NEGATION_RE = re.compile(
+    r"\bno\s+(?:\w+\s+){0,2}(?:degree|phd|ph\.?\s?d\.?|master'?s?|requirements?)\b"
+    r"|\bnot\s+(?:strictly\s+)?(?:required|mandatory|a\s+requirement)\b"
+    r"|\bwithout\s+(?:a\s+)?(?:phd|ph\.?\s?d\.?|master'?s?|degree)\b"
+    r"|\bdegrees?\s+(?:are\s+)?not\b"
+    r"|\bdo(?:es)?\s+not\s+require\b",
+    re.IGNORECASE,
+)
+# Split on sentence-final periods only (followed by whitespace or end), so 'Ph.D.' survives intact.
+_SENTENCE_SPLIT_RE = re.compile(r'[;•\n\r]|\.(?=\s|$)|(?<=[a-z])\s*[-–—]\s+')
+
+
+def derive_education_requirement(extract: dict) -> str:
+    """'master' | 'phd' | '' — the advanced degree the posting states as a HARD requirement.
+
+    The extractor's structured value wins when it set one. Otherwise the description is scanned
+    sentence by sentence, and a sentence only counts when it names a degree AND a requirement word
+    AND carries no softener ('preferred', 'or equivalent', a bachelor's alternative) and no negation
+    ('No PhD required'). Those two checks are the load-bearing part: an advanced-degree rule is an
+    unappealable auto-reject, so a posting that would take experience instead must never match.
+    """
+    explicit = str(extract.get('education_requirement') or '').strip().lower()
+    if explicit:
+        if _PHD_RE.search(explicit):
+            return 'phd'
+        if _MASTERS_RE.search(explicit) or explicit in {'master', 'ms', 'ma'}:
+            return 'master'
+
+    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')[:4000]}"
+    for sentence in _SENTENCE_SPLIT_RE.split(haystack):
+        if not _DEGREE_REQUIRED_RE.search(sentence):
+            continue
+        if _DEGREE_SOFTENER_RE.search(sentence) or _DEGREE_NEGATION_RE.search(sentence):
+            continue
+        if _MASTERS_RE.search(sentence):
+            return 'master'
+        if _PHD_RE.search(sentence):
+            return 'phd'
+    return ''
+
+
 def format_extract_text(candidate: dict, extract: dict) -> str:
     lines = [
         f"Title: {extract['title']}",
@@ -977,6 +1043,8 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Language requirement: {extract['language_requirement']}")
     if extract.get('relocation'):
         lines.append(f"Relocation required: {extract['relocation']}")
+    if extract.get('education_requirement'):
+        lines.append(f"Education requirement: {extract['education_requirement']}")
     if extract['closed']:
         lines.append("Status: no longer accepting applications")
     lines.append(f"\n{extract['description']}")
@@ -1000,6 +1068,9 @@ def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     ]
     if non_english:
         return f'requires non-English language: {", ".join(non_english)}'
+    degree = derive_education_requirement(extract)
+    if degree:
+        return f'requires advanced degree: {degree}'
     return None
 
 
@@ -1156,6 +1227,8 @@ def _hard_rule_category(reason: str) -> str:
         return 'hard_ruled_us_auth'
     if 'language' in reason:
         return 'hard_ruled_language'
+    if 'degree' in reason:
+        return 'hard_ruled_education'
     return 'hard_ruled_other'
 
 
@@ -1218,7 +1291,8 @@ async def evaluate_all_candidates(
                 f"Extract signal: {candidate['company']} — {candidate['title']}: "
                 f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
                 f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
-                f"relocation={extract.get('relocation')!r}"
+                f"relocation={extract.get('relocation')!r} "
+                f"education_requirement={extract.get('education_requirement')!r}"
             )
 
             hard_rule_reason = apply_hard_rules(candidate, extract)

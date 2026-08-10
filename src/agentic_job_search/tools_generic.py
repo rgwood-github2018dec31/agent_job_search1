@@ -921,7 +921,7 @@ async def do_submit_job_extract(
     location: str | None = None, date_posted: str | None = None,
     closed: bool = False, salary: str | None = None, sponsorship_note: str | None = None,
     language_requirement: str | None = None, relocation: str | None = None,
-    workplace_type: str | None = None,
+    workplace_type: str | None = None, education_requirement: str | None = None,
 ) -> dict:
     _job_extracts.append({
         'title': title, 'company': company, 'description': description,
@@ -929,6 +929,7 @@ async def do_submit_job_extract(
         'closed': closed, 'salary': salary or '', 'sponsorship_note': sponsorship_note or '',
         'language_requirement': language_requirement or '', 'relocation': relocation or '',
         'workplace_type': (workplace_type or '').strip().lower(),
+        'education_requirement': (education_requirement or '').strip().lower(),
     })
     return {"content": [{"type": "text", "text": "Extract submitted."}]}
 
@@ -1030,7 +1031,11 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
     "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles. "
     "Pass workplace_type as exactly 'remote', 'hybrid', or 'onsite' when the page states the work "
     "arrangement; omit only if the page genuinely does not say. Any mention of required days in "
-    "the office (e.g. '2-3 days onsite') is 'hybrid', not 'remote'.",
+    "the office (e.g. '2-3 days onsite') is 'hybrid', not 'remote'. "
+    "Pass education_requirement as 'master' or 'phd' ONLY if the posting states an advanced degree "
+    "as a hard requirement (e.g. 'MSc in Computer Science required', 'PhD is a must'); omit it when "
+    "the degree is merely preferred, when equivalent experience is accepted (\"Master's or equivalent "
+    "practical experience\", 'MSc a plus', \"Bachelor's or Master's\"), or when only a Bachelor's is required.",
     {
         'type': 'object',
         'properties': {
@@ -1045,6 +1050,7 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
             'sponsorship_note': {'type': 'string'},
             'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
             'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
+            'education_requirement': {'type': 'string', 'description': "'master' or 'phd' if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
         },
         'required': ['title', 'company', 'description'],
     },
@@ -1057,6 +1063,7 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
         sponsorship_note=args.get("sponsorship_note"),
         language_requirement=args.get("language_requirement"), relocation=args.get("relocation"),
         workplace_type=args.get("workplace_type"),
+        education_requirement=args.get("education_requirement"),
     )
 
 
