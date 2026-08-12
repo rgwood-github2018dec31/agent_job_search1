@@ -3,6 +3,8 @@ import os
 import pytest
 
 import agentic_job_search.preferences as preferences
+import agentic_job_search.tools_generic as tools
+from agentic_job_search import agent
 from agentic_job_search.agent import load_env
 load_env()
 
@@ -47,6 +49,34 @@ def _fixed_preferences(monkeypatch):
         preferences, 'load_preferences',
         lambda force_reload=False: merged,
     )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_human_pacing(monkeypatch):
+    """Zero the scraper's human-emulation delays for every test.
+
+    The real values are tens of seconds per query — deliberately, since they protect a live
+    LinkedIn account — which would make the suite take minutes and look like a hang. Zeroing
+    them here rather than in each test means a newly added pacing pause can never silently
+    stall the suite.
+    """
+    for name in (
+        'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
+        'SCRAPER_INTER_QUERY_DELAY_SECONDS',
+    ):
+        monkeypatch.setattr(agent, name, (0.0, 0.0))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_scraper_run_state(monkeypatch):
+    """Clear Stage 1b module state that run_scraper writes, so tests cannot leak into each other.
+
+    run_scraper sets tools._current_query as it goes; a test that ran it left the last query set,
+    and a later queue_candidate test then attributed its candidate to that stale value.
+    """
+    monkeypatch.setattr(tools, '_current_query', None)
     yield
 
 

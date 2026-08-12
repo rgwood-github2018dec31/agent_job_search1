@@ -28,16 +28,54 @@ LOCAL_MODEL = 'qwen3.6:latest'
 OPENROUTER_MODEL = 'z-ai/glm-5.2'
 
 # Stage 1 (discovery) configuration
-MAX_SEARCH_QUERIES = 6  # hard cap; every query costs two LinkedIn searches per configured region
+MAX_SEARCH_QUERIES = 6  # hard cap; every query costs one LinkedIn search per configured region
 # Turn budget PER QUERY. Each check_and_record_job / queue_candidate call burns a turn, so a
 # budget shared across all queries silently starves the later ones (see run_scraper).
 #
-# Every query runs two searches per configured region (date-sorted and relevance-sorted), so at
-# the usual two regions this has to cover roughly double what it did at two searches total.
-# Measured at two searches: 42 turns for 14 listings. Starvation is silent — the model simply
-# stops and the run reports "N listings inspected" with no error — so this is set with headroom
-# rather than tuned tight.
-SCRAPER_MAX_TURNS_PER_QUERY = 90
+# Sized for the post-2026-08-11 access pattern: every listing must be SELECTED to reveal its job
+# id, so one job costs roughly a click + a URL read + check_and_record_job + queue_candidate + a
+# pause. At SCRAPER_MAX_LISTINGS_PER_SEARCH (12) across the usual two regions that is ~120 turns
+# before overhead. Starvation is silent — the model simply stops and the run reports "N listings
+# inspected" with no error — so this is set with headroom rather than tuned tight. Turns are cheap
+# here; account safety is not (see the Account safety requirement in CLAUDE.md).
+SCRAPER_MAX_TURNS_PER_QUERY = 180
+
+# Floor below which a query clearly bailed before finishing one harvest cycle (navigate, snapshot,
+# scroll, evaluate, then a record call per listing). Absolute, NOT a fraction of the budget above:
+# the budget is sized for the worst case, so a fraction fired on every healthy query once
+# harvesting replaced click-to-reveal (a good query legitimately runs ~50 of 180 turns), and a
+# warning that fires on success trains the reader to ignore it.
+SCRAPER_MIN_TURNS_PER_QUERY = 12
+
+# Human-emulation pacing for Stage 1b.
+#
+# The scraper drives a REAL logged-in LinkedIn account through the shared Playwright profile.
+# Getting that account flagged or banned costs incomparably more than a slow run, so discovery is
+# paced rather than run at machine speed.
+#
+# Only page-level pacing remains. There was a per-selection delay when the scraper had to click
+# each card to reveal its job id; that design is gone — the id is read straight off the card's
+# `componentkey` attribute (see the 2026-08-11 entry in CLAUDE.md), so a search is now one page
+# load plus one read-only evaluate, with no interaction burst to disguise.
+#
+# Ranges are (min, max) seconds; a value is drawn uniformly per pause, because a fixed interval is
+# itself a robotic signature. Never replace these with constants.
+SCRAPER_INTER_SEARCH_DELAY_SECONDS = (2.5, 6.0)    # between searches within one query
+SCRAPER_INTER_QUERY_DELAY_SECONDS = (8.0, 18.0)    # between queries (code-enforced, not prompted)
+
+# Listings recorded per search. Now that harvesting is a single read-only call rather than N
+# clicks, taking the whole first page costs nothing extra in account exposure — the cap is just a
+# sanity bound on how many check_and_record_job turns one search can burn.
+SCRAPER_MAX_LISTINGS_PER_SEARCH = 25
+
+# Below this many listings, a query is retried rather than recorded as a real result.
+#
+# Healthy runs inspect ~27 listings per query. A single-digit count means the searches did not
+# actually run. The trigger used to be `seen == 0`, which missed the 2026-08-11 collapse: every
+# query returned exactly ONE listing — the only one the AI-powered UI exposes an id for without
+# selecting it — and the run reported itself a success. Must be >= 1 or recovery is disabled.
+SCRAPER_MIN_LISTINGS_PER_QUERY = 5
+
 
 # Playwright MCP tools removed from the scraper's context.
 #

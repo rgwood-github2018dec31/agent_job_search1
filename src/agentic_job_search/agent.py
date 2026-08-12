@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import socket
 import sys
@@ -29,7 +30,12 @@ from agentic_job_search.config import (
     QUERY_PROVIDER,
     RATING_PROVIDER,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
+    SCRAPER_INTER_QUERY_DELAY_SECONDS,
+    SCRAPER_INTER_SEARCH_DELAY_SECONDS,
+    SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_MAX_TURNS_PER_QUERY,
+    SCRAPER_MIN_TURNS_PER_QUERY,
+    SCRAPER_MIN_LISTINGS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
     THINKING_MAX_CHARS,
     TRIAGE_ENABLED,
@@ -165,44 +171,157 @@ def build_interactive_instructions() -> str:
         sponsorship_section=_sponsorship_prompt_section()
     )
 
+# Read-only harvest of every job card on a LinkedIn AI-powered results page.
+#
+# Kept out of SCRAPER_INSTRUCTIONS_TEMPLATE and injected as {harvest_js}: the JS is full of braces,
+# which str.format() would read as placeholders. Raw string so the regex escapes survive.
+#
+# The job id is the `componentkey` suffix, which is why the scraper never has to click a card —
+# and must not, since the only real <button> in a row is Dismiss. Cards appear twice in the DOM,
+# hence the dedupe; each label is rendered twice (a visually-hidden copy carrying "(Verified job)"
+# plus the visible one), hence `clean`.
+SCRAPER_HARVEST_JS = r"""() => {
+  const box = document.querySelector('div[componentkey="SearchResultsMainContent"]');
+  if (!box) return {error: 'results container not found'};
+  const seen = new Set(), out = [];
+  const clean = el => {
+    const parts = [...new Set([...el.childNodes]
+      .map(n => (n.textContent || '').trim().replace(/\s+/g, ' ')).filter(Boolean))];
+    return (parts.length ? parts[parts.length - 1] : (el.textContent || ''))
+      .replace(/\s*\(Verified job\)\s*/i, '').replace(/\s+/g, ' ').trim();
+  };
+  for (const card of box.querySelectorAll('div[componentkey^="job-card-component-ref-"]')) {
+    const id = (card.getAttribute('componentkey') || '').replace('job-card-component-ref-', '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const ps = [...card.querySelectorAll('p')].map(clean).filter(Boolean);
+    const meta = ps.slice(3);
+    out.push({id, title: ps[0] || '', company: ps[1] || '', location: ps[2] || '',
+      posted: (meta.find(t => /ago|Posted|Reposted/i.test(t)) || '')
+        .replace(/^Posted\s*/i, '').replace(/(.+?)\1$/, '$1')});
+  }
+  return {count: out.length, jobs: out};
+}"""
+
 SCRAPER_INSTRUCTIONS_TEMPLATE = """You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation queue.
 
 You are fully authorized to call all available tools. Call them directly — do not ask for permission.
 
-## CRITICAL RULE: Only use search results pages. NEVER click through to individual job pages.
+## MOST IMPORTANT RULE: you are driving a real person's real LinkedIn account
 
-The information visible in search results (title, company, snippet, date) is all you need. A separate evaluation agent will visit individual job pages later. Your only job is to queue candidates from what you can see in the results list.
+Every action you take happens in a logged-in session belonging to an actual job seeker. If that
+account gets rate-limited, flagged, or banned, the entire job search ends — permanently, and with
+consequences well beyond this run. **A slow, incomplete run is always better than an aggressive
+one.** When in doubt, do less and pause longer.
 
-## Location and seniority targeting
+This means, without exception:
 
-You are given ONE search query per session. Run that single query as {search_count} searches — every target region below, each in BOTH sort orders — then stop. Do not invent additional queries:
+- **NEVER click anything in the job results list.** Not a card, not a title, not a logo. The only
+  real button in each row is **Dismiss**, and the accessibility tree disguises it as the card
+  itself (see below). A single stray click permanently removes a job from the user's feed. You do
+  not need to click: everything you need is read out of the DOM in Step 3.
+- **Do not apply to anything, ever**, and do not save, follow, or dismiss.
+- **Pause between searches.** Wait {search_delay_min}–{search_delay_max} seconds between one
+  search and the next, using browser_wait_for. Vary it — never the same interval twice.
+- **JavaScript may read the page, never drive it.** Use browser_evaluate to extract data and to
+  scroll. Never write JavaScript that clicks, submits, or dispatches events.
+- **Read before you act**, as a person would: take a snapshot, look at what is there, then act.
+- **Stop immediately** if you see a CAPTCHA, "unusual activity", a verification challenge, or a
+  forced re-login. Do not attempt to solve or work around it. Say clearly what you saw and stop
+  the whole query. Being blocked once is recoverable; pushing through it is not.
+- **Cap your effort**: at most {max_listings} listings per search. The tail of a results page is
+  mostly already-seen or off-target, and is not worth the extra account exposure.
+
+Take as long as you need and use as many words as you like reasoning about the page — verbosity
+costs nothing here. Speed is the only thing that is expensive.
+
+## How LinkedIn's job search works now (this changed on 2026-08-11)
+
+This account is on LinkedIn's **AI-powered job search**. The page says so: *"You're now using
+AI-powered job search. Some filters may no longer be available, but you can type them into search
+to refine your results."* Two consequences drive everything below.
+
+**1. Filters no longer exist as URL parameters or as chips.** `location`, `f_WT`, `f_E` and
+`sortBy` are all stripped from the URL, and the old filter-chip row is gone. The search box is now
+a natural-language field labelled "Describe the job you want". **Filters go into the query text**,
+exactly as LinkedIn instructs — e.g. `Staff AI Engineer, remote, Canada, senior level`.
+
+**2. The accessibility tree is a trap on this page — read job ids from the DOM instead.** Result
+cards have no `<a href>`, and the only real `<button>` in each row is its **Dismiss** control,
+whose `aria-label` is "Dismiss <job title> job". Because accessible names concatenate row text,
+each card appears in a snapshot as one button labelled like
+`button "Staff ML Engineer ... Samsara ... Dismiss ... job"`. **Clicking that ref clicks Dismiss**
+— it removes the job from the user's feed and teaches LinkedIn to stop recommending similar roles.
+An earlier version of this scraper destroyed three real jobs that way in under two minutes.
+
+**So: never click anything in the results list.** You do not need to. The job id is already in
+the DOM.
+
+### Step 1 — open the results page
+
+Navigate to:
+
+   https://www.linkedin.com/jobs/search-results/?keywords=<QUERY+TEXT>&f_SAL=
+
+`keywords` is the only parameter still honoured. The empty `f_SAL=` clears a leftover salary
+filter that persists between sessions and otherwise silently narrows every search.
+
+### Step 2 — confirm what you are actually looking at, and say so
+
+Take a snapshot and state in your reply: the result count and the query text the search box
+actually contains (LinkedIn rewrites it). If you see a sign-in wall, a challenge, or zero results,
+say that explicitly and stop.
+
+This read-back is the record of whether the search was real. Do not skip it.
+
+### Step 3 — harvest every listing in ONE read-only call
+
+The results container is `div[componentkey="SearchResultsMainContent"]`, and each job card is a
+`div[componentkey="job-card-component-ref-<jobId>"]` inside it — **the job id is the attribute
+suffix**. Scroll the results list to load the cards, then run exactly this with browser_evaluate:
+
+```js
+{harvest_js}
+```
+
+Cards are duplicated in the DOM, so the `seen` dedupe matters. This is the one place JavaScript is
+correct here: it *reads* the page, it does not drive it.
+
+### Step 4 — record what you harvested
+
+State how many jobs came back. Then for each, up to {max_listings}:
+
+1. Call **check_and_record_job** with site="linkedin", the harvested `id`, `company` and `title`.
+   Pass `date_posted` from `posted` when present (e.g. "4 days ago"); omit it otherwise.
+2. If it returns **"new"**, call **queue_candidate** with the URL
+   `https://www.linkedin.com/jobs/view/<id>/`, plus title, company, the `location` as the snippet,
+   date_posted if known, and query set to the search query string currently being processed.
+3. If it returns "already_processed", "too_old", "already_applied", or "auth_required", move on.
+
+If the harvest returns `{{error: ...}}` or zero jobs while the page visibly shows results, LinkedIn
+has changed the markup. **Say so explicitly** — do not fall back to clicking the list. Do not
+navigate to individual job pages and do not apply to anything; a separate evaluation agent visits
+the job pages later.
+
+## Search coverage
+
+You are given ONE search query per session. Run it as {search_count} searches — one per target
+region below — then stop. Do not invent additional queries:
 
 {search_list}
 
-Run ALL {search_count} every time. The two sort orders surface different jobs and both are wanted:
-- `sortBy=DD` (newest first) catches fresh postings before anyone else, but LinkedIn's date sort ignores relevance, so it returns a lot of loosely-matching noise.
-- Default sort (no `sortBy`) is LinkedIn's own relevance ranking, which reliably surfaces the BEST-matching roles — but they are often older and therefore already seen.
+Expect many `already_processed` results, especially on later searches. **That is expected and
+correct — it is not a failure, and not a reason to skip the rest of a search.** The few new jobs
+that come back are usually the best-matching ones you will find.
 
-Expect the relevance-sorted searches to return many `already_processed` results. **That is expected and correct — do not treat it as a failure or a reason to skip the search.** The few new jobs they surface are the most relevant ones you will find all run.
+**But if two searches return the IDENTICAL list of jobs, the region text did not take effect.**
+That is a failure, not a sign the query is exhausted. Say so explicitly rather than stopping
+early.
 
-Filter reference (always include ALL of these on every search URL):
-- `f_WT=2` = Remote only.
-- `f_E=4%2C5%2C6` = experience level Mid-Senior + Director + Executive only. This keeps out internships, entry-level, and associate/junior roles, which are explicit deal-breakers — do NOT drop this filter. (`%2C` is the URL-encoded comma.)
-- URL-encode spaces as `+`.
+If a search returns zero results, wait, then re-run it once before concluding there are none.
 
-If a search returns zero job results, re-run that exact URL once more before concluding there are no jobs for it. Keep `f_WT=2` and `f_E=4%2C5%2C6` on every retry.
-
-If a location-filtered search returns fewer than 3 new candidates, also run the same query without the `location` parameter (but STILL keep `f_WT=2` and `f_E=4%2C5%2C6`) to catch globally-remote senior roles that may accept candidates from those regions.
-
-For each job visible in the search results:
-1. Call check_and_record_job with site="linkedin", the job ID (from the URL), company, and title. Pass date_posted only if it's visible in the results — it may be relative like "4 days ago", or it may not be shown at all; both are fine.
-2. If it returns "new", call queue_candidate immediately with whatever is visible: URL, title, company, snippet, date_posted if shown, and query set to the search query string currently being processed (e.g. "Staff ML Engineer").
-3. If it returns "already_processed", "too_old", "already_applied", or "auth_required", skip it.
-
-Only pass information that is directly visible in the search results listing. Do not infer or fabricate missing fields. Stage 2 will navigate to the job page and fill in any missing details.
-
-Scan the FIRST page of results for each of the {search_count} searches. Do not paginate — with {search_count} searches per query, page 1 of all of them is a better use of your turn budget than two pages of one. Then stop.
-Do not evaluate jobs, do not click job titles, do not open job detail pages — just collect candidates from the search results list.
+Only pass information directly visible on the card. Do not infer or fabricate missing fields —
+Stage 2 will fill in the details from the job page.
 """
 
 EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. Navigate to the job URL provided and capture a condensed extract of the posting.
@@ -252,27 +371,38 @@ Also produce:
 def build_scraper_instructions() -> str:
     """Scraper prompt with the configured search regions injected.
 
-    Regions are a personal preference (see preferences.py), so the URL list is generated rather
-    than hardcoded. With no regions configured, the query runs unfiltered in both sort orders.
+    Regions are a personal preference (see preferences.py), so the search list is generated
+    rather than hardcoded. With no regions configured, the query runs unfiltered in both
+    sort orders.
+
+    Regions become *query text*, not URL parameters or filter chips. LinkedIn's AI-powered job
+    search strips `location`/`f_WT`/`f_E`/`sortBy` from the URL and has no filter-chip row; its
+    own guidance is to type filters into the search box (see the 2026-08-11 entry in CLAUDE.md).
+
+    Sort order is no longer a coverage axis — the AI-powered UI exposes no sort control, so the
+    former "each region in both sort orders" fan-out would just be the same search run twice.
+    Region is the one axis that still varies the result set.
     """
     regions = preferences.search_regions()
-    base_url = 'https://www.linkedin.com/jobs/search/?keywords=<QUERY>'
-    filters = '&f_WT=2&f_E=4%2C5%2C6'
     entries: list[str] = []
     if regions:
         for region in regions:
             name = region.get('name') or region.get('linkedin_location', '')
-            location = str(region.get('linkedin_location', '')).replace(' ', '+')
-            url = f'{base_url}&location={location}{filters}'
-            entries.append(f'**{name}, newest first**:\n   {url}&sortBy=DD')
-            entries.append(f'**{name}, most relevant** (identical URL, `sortBy` omitted entirely):\n   {url}')
+            location = str(region.get('linkedin_location', ''))
+            entries.append(f'**{name}** — search text: `<QUERY>, remote, {location}, senior level`')
     else:
-        url = f'{base_url}{filters}'
-        entries.append(f'**Newest first**:\n   {url}&sortBy=DD')
-        entries.append(f'**Most relevant** (identical URL, `sortBy` omitted entirely):\n   {url}')
+        entries.append('**Unfiltered** — search text: `<QUERY>, remote, senior level`')
 
-    search_list = '\n\n'.join(f'{i}. {entry}' for i, entry in enumerate(entries, start=1))
-    return SCRAPER_INSTRUCTIONS_TEMPLATE.format(search_count=len(entries), search_list=search_list)
+    search_list = '\n'.join(f'{i}. {entry}' for i, entry in enumerate(entries, start=1))
+    search_min, search_max = SCRAPER_INTER_SEARCH_DELAY_SECONDS
+    return SCRAPER_INSTRUCTIONS_TEMPLATE.format(
+        search_count=len(entries),
+        search_list=search_list,
+        search_delay_min=search_min,
+        search_delay_max=search_max,
+        max_listings=SCRAPER_MAX_LISTINGS_PER_SEARCH,
+        harvest_js=SCRAPER_HARVEST_JS,
+    )
 
 
 def build_evaluator_instructions() -> str:
@@ -639,6 +769,21 @@ def print_thinking(text: str) -> None:
     console.print(f"\n[dim italic]Thinking: {display}[/dim italic]\n")
 
 
+def log_agent_text(stage: str, text: str) -> None:
+    """Mirror an agent TextBlock to the run log.
+
+    The agent loops print() their text blocks, which reaches the terminal only. That is where
+    the scraper reports what it actually saw — 'these two searches returned identical
+    results', 'the Remote filter did not stick', 'sign-in wall'. On 2026-08-11 a run collapsed
+    from 166 listings to 7 and the model's own account of why was discarded, leaving only
+    counters to diagnose from. Thinking blocks stay console-only; they are long and the
+    findings live in the text blocks.
+    """
+    for line in text.strip().splitlines():
+        if line.strip():
+            logger.info(f'{stage}: {line.strip()}')
+
+
 def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> None:
     parts = []
     if msg.usage:
@@ -755,6 +900,7 @@ async def run_interactive(client: ClaudeSDKClient) -> None:
                         print_thinking(block.thinking)
                     elif isinstance(block, TextBlock):
                         print(block.text, flush=True)
+                        log_agent_text('Interactive', block.text)
             elif isinstance(msg, ResultMessage):
                 print_result_stats(msg)
 
@@ -787,6 +933,33 @@ def _listings_seen() -> int:
     return sum(tools_module._check_status_counts.values())
 
 
+async def _human_pause(delay_range: tuple[float, float], reason: str) -> None:
+    """Sleep a randomised interval to keep the scraper's access pattern human-shaped.
+
+    Enforced in CODE, not in the prompt: within-query pacing depends on the model choosing to
+    call browser_wait_for, and a model under turn pressure will skip it. Between queries there is
+    no such ambiguity, so this is the one pause that always happens. The interval is drawn
+    uniformly because a fixed delay is itself a robotic signature.
+    """
+    seconds = random.uniform(*delay_range)
+    logger.info(f'Pausing {seconds:.1f}s before {reason} (human-emulation pacing)')
+    await asyncio.sleep(seconds)
+
+
+def _check_status_snapshot() -> dict[str, int]:
+    """Copy of the global check_status counters, for before/after per-query diffing."""
+    return dict(tools_module._check_status_counts)
+
+
+def _check_status_delta(before: dict[str, int]) -> dict[str, int]:
+    """Per-status counts accrued since `before`; zero-delta statuses are omitted."""
+    return {
+        status: count - before.get(status, 0)
+        for status, count in tools_module._check_status_counts.items()
+        if count - before.get(status, 0) > 0
+    }
+
+
 async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: dict) -> None:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results.
 
@@ -801,12 +974,23 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
       ClaudeSDKClient for each query makes later sessions fail with "browser is in use"
       against the shared browser context, which looks exactly like an auth wall in the logs.
 
-    Discovery resilience: if a query inspects ZERO listings (the signature of a LinkedIn
-    auth wall, block page, or empty results shell — not the same as 'listings seen but all
-    deduped'), retry that query once with the date-sort and location filters dropped before
-    recording it as empty.
+    Discovery resilience: if a query inspects fewer than SCRAPER_MIN_LISTINGS_PER_QUERY
+    listings, retry it once. The two failure shapes need opposite corrections:
+
+    - ZERO listings is the signature of an auth wall, block page, or empty results shell.
+      Retry with the region text dropped.
+    - A HANDFUL of listings means the page loaded but the listings were never walked. On
+      2026-08-11 every query returned exactly one listing: LinkedIn's AI-powered results list
+      exposes no job ids, so only the preselected card was identifiable, and the model stopped
+      after 10 of 90 turns. A `seen == 0` trigger sails straight past that.
+
+    Pacing: queries are separated by a randomised pause. This is a real logged-in account, and
+    a flagged or banned account ends the whole job search — so pacing is enforced here in code
+    rather than left to the model, which under turn pressure will skip a prompted wait.
     """
-    async def run_pass(instruction: str) -> None:
+    async def run_pass(instruction: str) -> int | None:
+        """Run one scraper request; returns the turn count the SDK reported, if any."""
+        num_turns: int | None = None
         await client.query(instruction)
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
@@ -815,20 +999,31 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
                         print_thinking(block.thinking)
                     elif isinstance(block, TextBlock):
                         print(block.text, flush=True)
+                        log_agent_text('Stage 1b', block.text)
             elif isinstance(msg, ResultMessage):
                 cost_delta = accumulate_stage_stats(stage_stats, msg)
                 print_result_stats(msg, cost_delta)
+                num_turns = msg.num_turns
+        return num_turns
 
     for i, query in enumerate(queries, 1):
         console.print(f"[cyan]Stage 1b: query {i}/{len(queries)} — \"{query}\"[/cyan]")
-        before = _listings_seen()
+        if i > 1:
+            await _human_pause(SCRAPER_INTER_QUERY_DELAY_SECONDS, f'query {i}/{len(queries)}')
+        tools_module._current_query = query
+        before = _check_status_snapshot()
         try:
-            await run_pass(
+            turns = await run_pass(
                 f'Search LinkedIn for this ONE query only: "{query}"\n\n'
-                "Run every search URL listed in your instructions (all regions, both sort orders). "
-                "Call check_and_record_job and queue_candidate for each new job found in "
-                "the results list. Do not ask for permission — call the tools directly. Do not navigate "
-                "to individual job pages. Stop as soon as you have processed all of them for this query."
+                "Run every search listed in your instructions (one per region), putting the region "
+                "and the filter words into the search text. Report the result count and the query "
+                "text the search box actually contains. Then harvest the whole results list with "
+                "the single read-only browser_evaluate from your instructions, and call "
+                "check_and_record_job (and queue_candidate for new jobs) for each harvested "
+                "listing. Never click anything in the results list — the card and its Dismiss "
+                "button are indistinguishable to you, and a stray click destroys a real job. Do "
+                "not ask for permission — call the tools directly. Do not navigate to individual "
+                "job pages. Stop when you have worked through the searches for this query."
             )
         except Exception as ex:
             # One failed query must not abort the remaining ones.
@@ -836,29 +1031,75 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
             tools_module._queries_searched[query] = 'error'
             continue
 
-        seen = _listings_seen() - before
-        if seen == 0:
-            logger.warning(
-                f'Stage 1b: query "{query}" inspected 0 listings — retrying once without the date sort '
-                'and location filters (possible auth wall, block page, or empty results shell).'
-            )
-            try:
-                await run_pass(
-                    f'That search surfaced no job listings at all for "{query}" — the results list was '
-                    'empty or you hit a sign-in / verification wall. Retry now: load the LinkedIn search '
-                    'WITHOUT the `sortBy=DD` parameter and WITHOUT the `location` parameter, but KEEP '
-                    f'`f_WT=2` and `f_E=4%2C5%2C6`, i.e. '
-                    f'https://www.linkedin.com/jobs/search/?keywords={quote_plus(query)}&f_WT=2&f_E=4%2C5%2C6 . '
-                    'Call check_and_record_job and queue_candidate for each new job in the results. '
-                    'If you STILL see a sign-in wall or genuinely zero results, state that explicitly and stop.'
+        delta = _check_status_delta(before)
+        seen = sum(delta.values())
+        if seen < SCRAPER_MIN_LISTINGS_PER_QUERY:
+            if seen == 0:
+                logger.warning(
+                    f'Stage 1b: query "{query}" inspected 0 listings — retrying once with the '
+                    'region text dropped (possible auth wall, block page, or empty results shell).'
                 )
+                retry_instruction = (
+                    f'That search surfaced no job listings at all for "{query}" — the results list was '
+                    'empty or you hit a sign-in / verification wall.\n\n'
+                    'If it was a CAPTCHA, a verification challenge, or an "unusual activity" notice: do '
+                    'NOT retry. Say what you saw and stop — pushing through a block is the one thing '
+                    'that can end this account.\n\n'
+                    'Otherwise retry once: load '
+                    f'https://www.linkedin.com/jobs/search-results/?keywords={quote_plus(query)}&f_SAL= '
+                    'with NO region words in the search text (keep "remote" and "senior level"), state '
+                    'the result count you actually see, then walk the listings as instructed. If you '
+                    'STILL see a wall or genuinely zero results, say so explicitly and stop.'
+                )
+            else:
+                logger.warning(
+                    f'Stage 1b: query "{query}" inspected only {seen} listing(s) '
+                    f'(below {SCRAPER_MIN_LISTINGS_PER_QUERY}) — retrying once; the results list was '
+                    'likely never harvested.'
+                )
+                retry_instruction = (
+                    f'The query "{query}" inspected only {seen} job listing(s). A real search returns '
+                    'roughly 25 on the first page, so the results list was not actually harvested.\n\n'
+                    'Retry now: scroll the results list to load the cards, then run the single '
+                    'read-only browser_evaluate harvest from your instructions — the one reading '
+                    'div[componentkey^="job-card-component-ref-"] inside '
+                    'div[componentkey="SearchResultsMainContent"], where the job id is the attribute '
+                    'suffix. Report how many jobs it returned, then call check_and_record_job for '
+                    'EVERY one, including those you expect to be already processed.\n\n'
+                    'Do NOT click anything in the results list to work around this. The card and its '
+                    'Dismiss button are the same element to you, and clicking destroys a real job. If '
+                    'the harvest returns an error or zero jobs while results are visible on screen, '
+                    'the markup has changed — say so and stop.\n\n'
+                    'Stop immediately if a challenge or verification page appears. If two searches '
+                    'return the identical list of jobs, the region text is not applying — say so '
+                    'explicitly rather than treating the query as exhausted.'
+                )
+            await _human_pause(SCRAPER_INTER_SEARCH_DELAY_SECONDS, 'the recovery pass')
+            try:
+                await run_pass(retry_instruction)
             except Exception as ex:
                 logger.warning(f'Stage 1b: recovery pass for "{query}" failed: {ex}')
-            seen = _listings_seen() - before
+            delta = _check_status_delta(before)
+            seen = sum(delta.values())
 
         tools_module._queries_searched[query] = seen
+        tools_module._check_status_per_query[query] = delta
+        # Too few turns means the scraper bailed before completing even one harvest cycle
+        # (navigate, snapshot, scroll, evaluate, then a record call per listing).
+        #
+        # This is an ABSOLUTE floor, not a fraction of the budget. A fraction was wrong: the
+        # budget is sized for the worst case, so `budget // 3` fired on every healthy query once
+        # harvesting replaced click-to-reveal and a full query legitimately took ~50 of 180 turns.
+        # A warning that fires on success trains the reader to ignore it.
+        if turns is not None and turns < SCRAPER_MIN_TURNS_PER_QUERY:
+            logger.warning(
+                f'Stage 1b: query "{query}" used only {turns} turns on its first pass (expected at '
+                f'least {SCRAPER_MIN_TURNS_PER_QUERY}) — it stopped before completing a harvest '
+                'cycle, which usually means it treated repeated or empty results as "done".'
+            )
         logger.info(
-            f'Stage 1b: query "{query}" inspected {seen} listing(s), '
+            f'Stage 1b: query "{query}" inspected {seen} listing(s) '
+            f'[{tools_module.format_status_counts(delta)}], '
             f'{tools_module._candidates_per_query.get(query, 0)} queued'
         )
 
@@ -907,6 +1148,7 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
                         print_thinking(block.thinking)
                     elif isinstance(block, TextBlock):
                         print(block.text, flush=True)
+                        log_agent_text('Stage 2a', block.text)
             elif isinstance(msg, ResultMessage):
                 cost_delta = accumulate_stage_stats(stage_stats, msg)
                 print_result_stats(msg, cost_delta)
@@ -1596,6 +1838,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._check_status_counts = {}
     tools_module._listing_records = {}
     tools_module._queries_searched = {}
+    tools_module._check_status_per_query = {}
+    tools_module._queue_skipped_counts = {}
+    tools_module._current_query = None
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -1701,6 +1946,8 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                     "queries_generated": len(queries),
                     "listings_seen": sum(check_status_counts.values()),
                     "check_status": check_status_counts,
+                    "check_status_per_query": dict(tools_module._check_status_per_query),
+                    "queue_skipped": dict(tools_module._queue_skipped_counts),
                     "candidates_queued": 0,
                 },
             )
@@ -1737,6 +1984,8 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         "queries_generated": len(queries),
         "listings_seen": sum(check_status_counts.values()),
         "check_status": check_status_counts,
+        "check_status_per_query": dict(tools_module._check_status_per_query),
+        "queue_skipped": dict(tools_module._queue_skipped_counts),
         "candidates_queued": len(candidates),
         **funnel,
     }

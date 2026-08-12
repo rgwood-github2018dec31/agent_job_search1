@@ -1,7 +1,9 @@
 """Tests for the job search agent."""
 
 from pathlib import Path
+import asyncio
 import json
+import logging
 import os
 from datetime import date, datetime, timedelta
 
@@ -978,11 +980,64 @@ async def test_queue_candidate_tracks_query_count(monkeypatch):
         'linkedin', '222', 'https://example.com/2', 'Principal Engineer', 'Corp', 'snippet', query='Staff ML Engineer'
     )
     await tools.do_queue_candidate(
-        'linkedin', '333', 'https://example.com/3', 'Head of Eng', 'BigCo', 'snippet', query='Head of Engineering'
+        'linkedin', '333', 'https://example.com/3', 'Lead ML Engineer', 'BigCo', 'snippet', query='Lead ML Engineer'
     )
 
     assert tools._candidates_per_query['Staff ML Engineer'] == 2
-    assert tools._candidates_per_query['Head of Engineering'] == 1
+    assert tools._candidates_per_query['Lead ML Engineer'] == 1
+
+
+async def test_queue_candidate_attributes_to_the_running_query_not_the_model_string(monkeypatch):
+    """Attribution is the caller's to know, not the model's to remember.
+
+    Region and filter words now live in the search text, so the model passes back the full string
+    ("Principal AI Engineer, remote, Canada, senior level") while run_scraper keys on the base
+    query. The keys never matched and every per-query candidate count read 0 while queueing
+    itself worked fine.
+    """
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queue_skipped_counts', {})
+    monkeypatch.setattr(tools, '_listing_records', {})
+    monkeypatch.setattr(tools, '_current_query', 'Principal AI Engineer')
+
+    await tools.do_queue_candidate(
+        'linkedin', '1', 'https://example.com', 'Staff Engineer', 'Acme', 'snip',
+        query='Principal AI Engineer, remote, Canada, senior level',
+    )
+
+    assert tools._candidates_per_query == {'Principal AI Engineer': 1}
+
+
+async def test_run_scraper_sets_the_current_query(monkeypatch):
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(tools, '_current_query', None)
+
+    seen = []
+
+    class _RecordingClient(_FakeScraperClient):
+        async def query(self, instruction):
+            seen.append(tools._current_query)
+            await super().query(instruction)
+
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+    queries = ['Alpha', 'Beta']
+    await agent.run_scraper(_RecordingClient({q: healthy for q in queries}), queries,
+                            {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+
+    assert seen == ['Alpha', 'Beta'], 'each request runs with its own base query set'
+
+
+def test_min_turns_floor_is_absolute_not_a_budget_fraction():
+    """A fraction of the (worst-case) budget fired on every healthy query once harvesting replaced
+    click-to-reveal, and a warning that fires on success gets ignored."""
+    assert config.SCRAPER_MIN_TURNS_PER_QUERY >= 1
+    assert config.SCRAPER_MIN_TURNS_PER_QUERY < config.SCRAPER_MAX_TURNS_PER_QUERY // 3, \
+        'must sit below a healthy query\'s turn count, not scale with the budget'
 
 
 async def test_queue_candidate_without_query_does_not_track(monkeypatch):
@@ -1911,6 +1966,42 @@ def test_write_run_audit_log_covers_all_four_sections(tmp_path, monkeypatch):
     assert 'GoodCorp summary' in text
 
 
+def test_write_run_audit_log_breaks_down_check_status_per_query(tmp_path, monkeypatch):
+    """Per-query dedup columns: 'saturated' and 'barely ran' must not look alike.
+
+    A run-global check_status cannot separate them, which is why a run that inspected 7
+    listings instead of 166 read as ordinary dedup saturation.
+    """
+    monkeypatch.setattr(tools, '_applied_companies', {})
+    monkeypatch.setattr(tools, '_candidates_per_query', {'Saturated': 3})
+    monkeypatch.setattr(tools, '_queries_searched', {'Saturated': 28, 'Starved': 1, 'Broken': 'error'})
+    monkeypatch.setattr(tools, '_check_status_per_query', {
+        'Saturated': {'already_processed': 25, 'new': 3},
+        'Starved': {'already_processed': 1},
+        # 'Broken' errored, so it has no entry at all -- its row must still render.
+    })
+    monkeypatch.setattr(tools, '_listing_records', {})
+
+    path = tools.write_run_audit_log(
+        queries=['Saturated', 'Starved', 'Broken', 'Never'],
+        applied_jobs_in_horizon=1, applied_jobs_total=1,
+        funnel={}, run_dir=tmp_path, timestamp=datetime(2026, 8, 11, 14, 16, 39),
+    )
+    rows = {
+        line.split('|')[1].strip(): [cell.strip() for cell in line.split('|')[2:-1]]
+        for line in path.read_text().splitlines()
+        if line.startswith('| ') and '---' not in line
+    }
+
+    # columns: Listings inspected | New | Already processed | Already applied | Too old | Queued
+    assert rows['Saturated'] == ['28', '3', '25', '0', '0', '3']
+    assert rows['Starved'] == ['1', '0', '1', '0', '0', '0']
+    assert rows['Broken'] == ['error', '0', '0', '0', '0', '0'], 'an errored query still renders'
+    assert rows['Never'] == ['never searched', '0', '0', '0', '0', '0']
+    # Section 2 carries the same breakdown inline.
+    assert 'already_processed 25, new 3' in path.read_text()
+
+
 def test_write_run_audit_log_includes_opus_findings(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {})
     monkeypatch.setattr(tools, '_candidates_per_query', {})
@@ -2042,16 +2133,18 @@ async def test_run_scraper_sends_one_request_per_query(monkeypatch):
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
 
     queries = ['Principal AI Engineer', 'Staff AI Engineer', 'Lead AI Engineer']
-    client = _FakeScraperClient({q: 3 for q in queries})
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+    client = _FakeScraperClient({q: healthy for q in queries})
 
     await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
 
-    assert len(client.requests) == 3, 'one request per query'
+    assert len(client.requests) == 3, 'one request per query, no retries at a healthy yield'
     for q in queries:
         assert any(f'"{q}"' in r for r in client.requests), f'{q} was never searched'
-        assert tools._queries_searched[q] == 3
+        assert tools._queries_searched[q] == healthy
 
 
 async def test_run_scraper_retries_empty_query_then_continues(monkeypatch):
@@ -2060,17 +2153,110 @@ async def test_run_scraper_retries_empty_query_then_continues(monkeypatch):
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
 
     queries = ['Empty Query', 'Good Query']
-    client = _FakeScraperClient({'Good Query': 2})
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+    client = _FakeScraperClient({'Good Query': healthy})
 
     await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
 
-    empty_requests = [r for r in client.requests if '"Empty Query"' in r]
+    empty_requests = [r for r in client.requests if 'Empty' in r]
     assert len(empty_requests) == 2, 'empty query should be retried once'
-    assert any('WITHOUT the `sortBy=DD`' in r for r in empty_requests), 'retry drops the date sort'
+    retry = empty_requests[1]
+    assert 'NO region words' in retry, 'retry drops the region text'
+    # A block page must never be retried into -- that is what risks the account.
+    assert 'do NOT retry' in retry and 'CAPTCHA' in retry
     assert tools._queries_searched['Empty Query'] == 0
-    assert tools._queries_searched['Good Query'] == 2, 'later queries still run'
+    assert tools._queries_searched['Good Query'] == healthy, 'later queries still run'
+
+
+async def test_no_scraper_prompt_ever_instructs_clicking_the_results_list(monkeypatch):
+    """Covers the per-query and recovery prompts, not just the system prompt.
+
+    The system prompt said "never click the results list" while the recovery prompt still said
+    "select them one at a time with browser_click" — exactly the instruction that dismissed three
+    of the user's real jobs. Every prompt the scraper can receive has to agree.
+    """
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+
+    # 0 listings and 1 listing exercise both recovery branches; a healthy query the normal path.
+    client = _FakeScraperClient({'Healthy': agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20, 'Starved': 1})
+    await agent.run_scraper(
+        client, ['Empty', 'Starved', 'Healthy'],
+        {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0},
+    )
+
+    prompts = client.requests + [agent.build_scraper_instructions()]
+    assert len(client.requests) == 5, 'two retries plus three initial passes'
+    for prompt in prompts:
+        assert 'currentJobId' not in prompt, f'click-to-reveal leaked into a prompt: {prompt[:120]}'
+        lowered = prompt.lower()
+        if 'browser_click' in lowered:
+            assert 'never click' in lowered or 'do not click' in lowered, \
+                f'a prompt mentions browser_click without forbidding it: {prompt[:160]}'
+
+
+async def test_run_scraper_retries_low_yield_query_keeping_filters(monkeypatch):
+    """A query returning a handful of listings is retried too, not just one returning zero.
+
+    This is the 2026-08-11 signature: LinkedIn stopped honouring filter params in the search
+    URL, every search resolved to the same page, and each query inspected exactly ONE listing.
+    A `seen == 0` trigger sails straight past that and the run reports itself a success.
+    """
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+
+    queries = ['Starved Query']
+    client = _FakeScraperClient({'Starved Query': 1})
+
+    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+
+    assert len(client.requests) == 2, 'a 1-listing query must be retried'
+    retry = client.requests[1]
+    assert 'inspected only 1 job listing' in retry
+    assert 'identical list of jobs' in retry, 'retry names the repeated-results failure mode'
+    # Unlike the zero-listing case, the page loaded — filters must be re-applied, not dropped.
+    assert 'clear the Location filter' not in retry
+
+
+async def test_run_scraper_records_per_query_check_status(monkeypatch):
+    """Per-query dedup counts: a saturated query must be distinguishable from a starved one."""
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+
+    class _StatusClient:
+        """Records real check_and_record_job statuses rather than opaque unique keys."""
+
+        def __init__(self):
+            self.requests = []
+
+        async def query(self, instruction):
+            self.requests.append(instruction)
+            if '"Saturated"' in instruction:
+                tools._check_status_counts['already_processed'] = (
+                    tools._check_status_counts.get('already_processed', 0) + 25
+                )
+                tools._check_status_counts['new'] = tools._check_status_counts.get('new', 0) + 3
+
+        async def receive_response(self):
+            return
+            yield
+
+    await agent.run_scraper(_StatusClient(), ['Saturated'], {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+
+    assert tools._check_status_per_query['Saturated'] == {'already_processed': 25, 'new': 3}
+    assert tools._queries_searched['Saturated'] == 28
 
 
 async def test_run_scraper_survives_a_failing_query(monkeypatch):
@@ -2078,6 +2264,7 @@ async def test_run_scraper_survives_a_failing_query(monkeypatch):
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
 
     class ExplodingClient(_FakeScraperClient):
         async def query(self, instruction):
@@ -2085,11 +2272,13 @@ async def test_run_scraper_survives_a_failing_query(monkeypatch):
                 raise RuntimeError('session died')
             await super().query(instruction)
 
-    client = ExplodingClient({'Good Query': 1})
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+    client = ExplodingClient({'Good Query': healthy})
     await agent.run_scraper(client, ['Bad Query', 'Good Query'], {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
 
     assert tools._queries_searched['Bad Query'] == 'error'
-    assert tools._queries_searched['Good Query'] == 1, 'a failed query must not abort the rest'
+    assert tools._queries_searched['Good Query'] == healthy, 'a failed query must not abort the rest'
+    assert 'Bad Query' not in tools._check_status_per_query, 'an errored query records no counts'
 
 
 # ---------------------------------------------------------------------------
@@ -2339,6 +2528,200 @@ def test_disallowed_browser_tools_are_well_formed():
     for name in config.SCRAPER_DISALLOWED_BROWSER_TOOLS:
         assert name.startswith('mcp__playwright__browser_'), name
     assert len(set(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)) == len(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)
+
+
+# ---------------------------------------------------------------------------
+# scraper instructions: filters are UI actions, not URL parameters
+# ---------------------------------------------------------------------------
+
+def test_scraper_instructions_do_not_rely_on_url_filter_params():
+    """LinkedIn strips location/f_WT/f_E/sortBy from job-search URLs (2026-08-11), keeping only
+    `keywords`. Emitting them as URL params produced a search that looked right and silently
+    returned the wrong jobs, so the prompt must drive the filter chips instead."""
+    text = agent.build_scraper_instructions()
+    for dead_param in ('f_WT=2', 'f_E=4%2C5%2C6', 'sortBy=DD', '&location='):
+        assert dead_param not in text, f'{dead_param} is ignored by LinkedIn; set it via the UI'
+    assert 'search-results' in text, 'the /jobs/search/ path redirects'
+    assert 'f_SAL=' in text, 'the empty salary param is what clears sticky filter state'
+
+
+def test_scraper_instructions_cover_every_configured_region_as_query_text():
+    """Region is now the only axis that varies the result set: the AI-powered UI has no sort
+    control, so the former 'each region in both sort orders' would run the same search twice."""
+    text = agent.build_scraper_instructions()
+    for region in ('Testland', 'Test Union'):  # pinned in tests/conftest.py
+        assert f'**{region}** — search text:' in text
+        assert f'{region}, senior level' in text, 'region goes in the query text, not a filter'
+    assert 'as 2 searches' in text, 'one search per region'
+
+
+def test_scraper_instructions_reject_identical_results_as_a_failure():
+    """The converse of 'expect many already_processed': two searches returning the SAME jobs
+    means the region text did not apply. Treating that as 'query exhausted' is what let the
+    2026-08-11 collapse stop after 10 of 90 turns."""
+    text = agent.build_scraper_instructions()
+    assert 'IDENTICAL' in text
+    assert 'it is not a failure' in text, 'the already_processed guidance must survive'
+
+
+def test_scraper_instructions_harvest_job_ids_from_componentkey():
+    """Job ids come off the DOM, not off the accessibility tree and not from clicking.
+
+    Each card is div[componentkey="job-card-component-ref-<jobId>"], so one read-only evaluate
+    yields every listing on the page. This replaced a click-to-reveal design that read ids from
+    `currentJobId` after selecting each card.
+    """
+    text = agent.build_scraper_instructions()
+    assert 'SearchResultsMainContent' in text, 'the results container selector must be given'
+    assert 'job-card-component-ref-' in text, 'the id-bearing attribute must be given'
+    assert 'browser_evaluate' in text
+
+
+def test_scraper_instructions_forbid_clicking_the_results_list():
+    """The hard safety invariant. The only real <button> in a result row is Dismiss, and the
+    accessibility tree labels it with the whole card's text -- so clicking what looks like the
+    card clicks Dismiss, permanently removing the job from the user's feed. That destroyed three
+    real jobs in under two minutes before the harvest approach replaced it."""
+    text = agent.build_scraper_instructions()
+    assert 'NEVER click anything in the job results list' in text
+    assert 'Dismiss' in text, 'the destructive control must be named'
+    # The prompt must not tell the model to click its way to an id any more.
+    assert 'currentJobId' not in text, 'click-to-reveal is gone; ids come from componentkey'
+    assert 'never drive it' in text, 'JS may read the page but never click/submit'
+
+
+# ---------------------------------------------------------------------------
+# human-emulation pacing (protects a real logged-in LinkedIn account)
+# ---------------------------------------------------------------------------
+
+def test_pacing_delays_are_ranges_not_constants():
+    """A fixed interval is itself a robotic signature, so every delay must be a (min, max)
+    range that _human_pause draws from uniformly."""
+    for name in (
+        'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
+        'SCRAPER_INTER_QUERY_DELAY_SECONDS',
+    ):
+        low, high = getattr(config, name)
+        assert 0 < low < high, f'{name} must be a non-degenerate (min, max) range, got {(low, high)}'
+
+
+async def test_human_pause_draws_from_the_range(monkeypatch):
+    slept = []
+    real_sleep = asyncio.sleep  # capture before patching -- agent.asyncio IS this module
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(agent.asyncio, 'sleep', fake_sleep)
+    for _ in range(20):
+        await agent._human_pause((2.0, 5.0), 'test')
+    assert all(2.0 <= s <= 5.0 for s in slept), slept
+    assert len(set(slept)) > 1, 'a constant delay is a robotic signature'
+
+
+async def test_run_scraper_pauses_between_queries(monkeypatch):
+    """Inter-query pacing is enforced in CODE, not prompted: a model under turn pressure will
+    skip a prompted wait, and a flagged account ends the whole job search."""
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0.01, 0.02))
+
+    pauses = []
+    real_pause = agent._human_pause
+
+    async def spy(delay_range, reason):
+        pauses.append(reason)
+        await real_pause(delay_range, reason)
+
+    monkeypatch.setattr(agent, '_human_pause', spy)
+
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+    queries = ['One', 'Two', 'Three']
+    client = _FakeScraperClient({q: healthy for q in queries})
+    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+
+    # A pause before every query except the first -- no point waiting before any work is done.
+    assert len(pauses) == 2, pauses
+
+
+def test_scraper_instructions_forbid_pushing_through_blocks():
+    """Retrying into a challenge page converts 'this session looks odd' into a confirmed evasion
+    pattern, which is what escalates to a restricted account. Backing off keeps it a blip."""
+    text = agent.build_scraper_instructions()
+    assert 'CAPTCHA' in text and 'Stop immediately' in text
+    assert 'Do not apply to anything' in text
+    assert str(config.SCRAPER_MAX_LISTINGS_PER_SEARCH) in text, 'the per-search cap must be stated'
+
+
+def test_min_listings_threshold_keeps_the_recovery_pass_enabled():
+    """At 0 the low-yield retry silently never fires, which is the bug it exists to catch."""
+    assert config.SCRAPER_MIN_LISTINGS_PER_QUERY >= 1
+    assert config.SCRAPER_MIN_LISTINGS_PER_QUERY < config.SCRAPER_MAX_TURNS_PER_QUERY
+
+
+# ---------------------------------------------------------------------------
+# queue-time title guard ($0 replacement for LinkedIn's dropped f_E filter)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('title, expect_skip', [
+    ('Junior AI Engineer', True),
+    ('AI Engineering Intern', True),
+    ('Machine Learning Engineer (Entry-Level)', True),
+    ('Engineering Manager, ML Platform', True),
+    ('Head of Data Science', True),
+    ('VP of Engineering', True),
+    # Must NOT skip: substring collisions and senior titles that merely contain a token.
+    ('Staff AI/ML Engineer', False),
+    ('Principal Applied Scientist', False),
+    ('Internal Tools Engineer', False),        # 'intern' is a substring, not a word
+    ('VPN Infrastructure Engineer', False),    # 'VP' is a substring, not a word
+    ('Associate Principal Scientist', False),  # 'associate' is senior in many orgs
+    ('Graduate Research Scientist', False),    # bare 'graduate' is too ambiguous to reject
+])
+def test_title_rejection_reason(title, expect_skip):
+    reason = tools.title_rejection_reason(title)
+    assert (reason is not None) == expect_skip, f'{title!r} -> {reason!r}'
+
+
+async def test_queue_candidate_skips_below_seniority_titles(monkeypatch):
+    """LinkedIn no longer enforces f_E server-side, so junk reaches the queue -- and each queued
+    job costs a Stage 2a extract plus a rating call. The skip is $0 and must be auditable."""
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queue_skipped_counts', {})
+    monkeypatch.setattr(tools, '_listing_records', {
+        ('linkedin', '111'): _listing('111', 'BigCo'),
+    })
+
+    await tools.do_queue_candidate(
+        'linkedin', '111', 'https://example.com', 'Junior ML Engineer', 'BigCo', 'snip', query='Q'
+    )
+    await tools.do_queue_candidate(
+        'linkedin', '222', 'https://example.com/2', 'Staff ML Engineer', 'Acme', 'snip', query='Q'
+    )
+
+    assert [c['title'] for c in tools._candidates] == ['Staff ML Engineer']
+    assert tools._candidates_per_query['Q'] == 1, 'skipped listings are not counted as queued'
+    assert sum(tools._queue_skipped_counts.values()) == 1
+    assert tools._listing_records[('linkedin', '111')]['outcome'] == 'queue_skipped'
+
+
+# ---------------------------------------------------------------------------
+# agent narration reaches the run log
+# ---------------------------------------------------------------------------
+
+def test_log_agent_text_mirrors_each_line_to_the_log(caplog):
+    """print() reaches the terminal only. On 2026-08-11 the scraper's own account of why it
+    found nothing was discarded, leaving only counters to diagnose a 166 -> 7 collapse."""
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        agent.log_agent_text('Stage 1b', '  Remote filter did not stick.\n\n  Only 1 result.  \n')
+
+    messages = [r.message for r in caplog.records]
+    assert messages == ['Stage 1b: Remote filter did not stick.', 'Stage 1b: Only 1 result.']
 
 
 # ---------------------------------------------------------------------------

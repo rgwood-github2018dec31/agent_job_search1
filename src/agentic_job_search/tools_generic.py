@@ -21,6 +21,7 @@ from agentic_job_search.config import (
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_LOW,
 )
+import agentic_job_search.preferences as preferences
 from agentic_job_search.triage import chat_openrouter, extract_json_object
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -64,6 +65,55 @@ _check_status_counts: dict[str, int] = {}  # status -> count (new/already_proces
 _listing_records: dict[tuple[str, str], dict] = {}
 # query -> listings inspected, so "never searched" is distinguishable from "searched, found nothing"
 _queries_searched: dict[str, Any] = {}
+# query -> {status: count}: per-query breakdown of check_and_record_job outcomes, so a
+# dedup-saturated query is distinguishable from one that barely ran. The run-global
+# _check_status_counts cannot make that distinction, which is why a run that inspected 7
+# listings instead of 166 read as ordinary dedup.
+_check_status_per_query: dict[str, dict[str, int]] = {}
+# The base Search Query Stage 1b is currently running, set by run_scraper. Candidates are
+# attributed to this rather than to the query string the model passes back, which is the full
+# search text and so never matches.
+_current_query: str | None = None
+
+
+# queue-time skip reason -> count; folded into the run funnel.
+_queue_skipped_counts: dict[str, int] = {}
+
+# Titles that are unambiguously below the target seniority. LinkedIn used to enforce this
+# server-side via `f_E=4%2C5%2C6`, but it now ignores filter params in the search URL, so these
+# reach the queue and would each cost a Stage 2a extract plus a rating call.
+#
+# Deliberately conservative — an auto-skip is unappealable, and the search card gives only a
+# title. 'associate' and bare 'graduate' are NOT here: "Associate Director" and "Graduate
+# Research Scientist" are senior in many orgs. Work arrangement is not filtered here at all;
+# CLAUDE.md records that workplace type must be resolved from the job page, not the card.
+_JUNIOR_TITLE_RE = re.compile(
+    r'\b(intern|interns|internship|junior|jr|entry[ -]level|new grad(uate)?|'
+    r'apprentice|trainee|co[ -]op|working student)\b',
+    re.IGNORECASE,
+)
+
+
+def format_status_counts(counts: dict[str, int]) -> str:
+    """e.g. 'already_processed 19, new 8' — for the Stage 1b log line and the audit log."""
+    return ', '.join(f'{status} {n}' for status, n in sorted(counts.items())) or 'none'
+
+
+def title_rejection_reason(title: str) -> str | None:
+    """Why this listing title should not enter the paid Stage 2 path, or None to proceed.
+
+    A $0 check on text already captured from the search card. Both rules replace filtering
+    LinkedIn no longer does: `f_E` for seniority, and the user's own excluded-title
+    preference for people-management roles.
+    """
+    if not title:
+        return None
+    if (match := _JUNIOR_TITLE_RE.search(title)):
+        return f'below target seniority ({match.group(0).lower()!r} in title)'
+    for word in preferences.excluded_title_words():
+        if re.search(rf'\b{re.escape(word)}\b', title, re.IGNORECASE):
+            return f'excluded title word ({word!r})'
+    return None
 
 
 async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
@@ -669,18 +719,25 @@ def write_run_audit_log(
             elif searched == 'error':
                 status = '**FAILED**'
             else:
-                status = f'{searched} listing(s) inspected'
+                breakdown = format_status_counts(_check_status_per_query.get(q, {}))
+                status = f'{searched} listing(s) inspected ({breakdown})'
             lines.append(f'- `{q}` — {status}')
     else:
         lines.append('_No queries generated._')
 
     lines += ['', '## 3. Jobs found per query', '']
     if queries:
-        lines += ['| Query | Listings inspected | Candidates queued |', '|---|---|---|']
+        statuses = ('new', 'already_processed', 'already_applied', 'too_old')
+        lines += [
+            '| Query | Listings inspected | New | Already processed | Already applied | Too old | Candidates queued |',
+            '|---|---|---|---|---|---|---|',
+        ]
         for q in queries:
             searched = _queries_searched.get(q)
             seen = 'never searched' if searched is None else searched
-            lines.append(f'| {q} | {seen} | {_candidates_per_query.get(q, 0)} |')
+            per_status = _check_status_per_query.get(q, {})
+            cells = ' | '.join(str(per_status.get(status, 0)) for status in statuses)
+            lines.append(f'| {q} | {seen} | {cells} | {_candidates_per_query.get(q, 0)} |')
     else:
         lines.append('_n/a_')
 
@@ -938,20 +995,36 @@ async def do_queue_candidate(
     site: str, job_id: str, url: str, title: str, company: str,
     snippet: str, date_posted: str | None = None, query: str | None = None,
 ) -> dict:
+    if (reason := title_rejection_reason(title)):
+        _queue_skipped_counts[reason] = _queue_skipped_counts.get(reason, 0) + 1
+        if (record := _listing_records.get((site, job_id))) is not None:
+            record['outcome'] = 'queue_skipped'
+            record['query'] = query
+            record['url'] = url or record['url']
+            record['summary'] = reason
+        logger.info(f'queue_candidate: SKIPPED {company} — {title} [{site}/{job_id}]: {reason}')
+        return {"content": [{"type": "text", "text": f"Skipped (not queued): {reason}. Continue with the next listing."}]}
     _candidates.append({
         "site": site, "job_id": job_id, "url": url,
         "title": title, "company": company,
         "date_posted": date_posted or "", "snippet": snippet,
     })
-    if query:
-        _candidates_per_query[query] = _candidates_per_query.get(query, 0) + 1
+    # Attribute to the query run_scraper is actually on, not the string the model echoed back.
+    # Since the region and filter words moved into the search text, the model passes the full
+    # search string ("Principal AI Engineer, remote, Canada, senior level") while run_scraper
+    # keys everything on the base query ("Principal AI Engineer"). The keys never matched, so
+    # every per-query candidate count read 0. Attribution is the caller's to know, not the
+    # model's to remember.
+    attributed = _current_query or query
+    if attributed:
+        _candidates_per_query[attributed] = _candidates_per_query.get(attributed, 0) + 1
     else:
-        logger.warning(f'queue_candidate called without a query for {company} — {title}; '
+        logger.warning(f'queue_candidate called with no active query for {company} — {title}; '
                        'per-query counts will be understated')
     record = _listing_records.get((site, job_id))
     if record is not None:
         record['queued'] = True
-        record['query'] = query
+        record['query'] = attributed
         record['url'] = url or record['url']
         record['snippet'] = snippet
         record['outcome'] = 'queued'
