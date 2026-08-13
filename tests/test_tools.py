@@ -2829,6 +2829,121 @@ def test_build_deterministic_warnings_includes_relocation():
     assert 'Relocation required: Portugal' in warnings
 
 
+# ---------------------------------------------------------------------------
+# recruiter / agency postings on the scraped side
+# ---------------------------------------------------------------------------
+
+def test_derive_agency_posting_trusts_the_extractor_including_a_false():
+    """A False from the extractor is a judgement, not a gap: a model that looked at the page and
+    said 'not an agency' must not be overridden by a name regex."""
+    assert agent.derive_agency_posting(_make_extract(company='CyberCoders', is_agency=True)) is True
+    assert agent.derive_agency_posting(_make_extract(company='Motion Recruitment', is_agency=False)) is False
+
+
+@pytest.mark.parametrize('extract_kwargs', [
+    {'company': 'Motion Recruitment'},
+    {'company': 'Insight Global Staffing'},
+    {'company': 'Acme Talent Solutions'},
+    {'description': 'Our client is a leading fintech scaling its AI platform.'},
+    {'description': 'We are recruiting on behalf of a confidential client in healthcare.'},
+])
+def test_derive_agency_posting_fallback_detects_recruiters(extract_kwargs):
+    assert agent.derive_agency_posting(_make_extract(**extract_kwargs)) is True
+
+
+@pytest.mark.parametrize('extract_kwargs', [
+    {},
+    # A real product company whose NAME contains 'Agency' -- present in the historical corpus.
+    {'company': 'AgencyAnalytics'},
+    # 'client' in the work itself is not 'our client is'.
+    {'description': 'You will present findings to clients and iterate on their feedback.'},
+    {'description': 'Build client-facing dashboards for enterprise customers.'},
+])
+def test_derive_agency_posting_fallback_does_not_overmatch(extract_kwargs):
+    assert agent.derive_agency_posting(_make_extract(**extract_kwargs)) is False
+
+
+def test_agency_warning_names_the_end_client_when_known():
+    extract = _make_extract(company='CyberCoders', is_agency=True,
+                            end_client='Automotive Martech Inc', salary='CAD 250,000')
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert 'Posted by a recruiting agency — hiring company: Automotive Martech Inc' in warnings
+
+
+def test_agency_warning_says_so_when_the_client_is_anonymous():
+    """The common case: agencies anonymise. CyberCoders' real posting said 'undisclosed automotive
+    martech firm', and 0 of 10 agency-posted applied records named a client."""
+    extract = _make_extract(company='CyberCoders', is_agency=True, end_client='', salary='CAD 250,000')
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert 'Posted by a recruiting agency — actual hiring company not named' in warnings
+
+
+def test_no_agency_warning_for_a_direct_employer():
+    extract = _make_extract(salary='CAD 220,000')
+    assert not any('agency' in w.lower() for w in agent.build_deterministic_warnings(_make_candidate(), extract))
+
+
+def test_agency_status_never_changes_the_rating():
+    """The user's explicit constraint, and the most likely thing a later change breaks: an agency
+    posting is warned about, never penalised. CyberCoders rated 5/5 on the 2026-08-11 run."""
+    direct = _make_extract(workplace_type='remote', salary='CAD 250,000')
+    agency = _make_extract(workplace_type='remote', salary='CAD 250,000',
+                           company='CyberCoders', is_agency=True, end_client='')
+    for rating in (1, 3, 4, 5):
+        assert agent.apply_rating_caps(agency, rating) == agent.apply_rating_caps(direct, rating), \
+            f'agency status changed the rating at {rating}'
+    # And specifically: a 5/5 agency posting still reaches the notification threshold.
+    assert agent.apply_rating_caps(agency, 5) == (5, '')
+
+
+def test_agency_posting_is_not_hard_ruled():
+    """Agency status must never reject a job -- only warn. An auto-reject is unappealable."""
+    extract = _make_extract(company='Quik Hire Staffing', is_agency=True, end_client='',
+                            description='Our client is a leading AI lab. Build agents in Python.')
+    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+@pytest.mark.parametrize('company, end_client, expected', [
+    ('CyberCoders', 'Automotive Martech Inc', 'Automotive Martech Inc'),
+    ('CyberCoders', '', ''),
+    # Measured on real jobs: glm echoes the poster back as end_client for direct postings.
+    ('lululemon', 'lululemon', ''),
+    ('Workday', 'Workday, Inc.', ''),
+])
+def test_derive_end_client_ignores_the_poster_echoed_back(company, end_client, expected):
+    assert agent.derive_end_client(_make_extract(company=company, end_client=end_client)) == expected
+
+
+def test_direct_posting_does_not_get_a_redundant_hiring_company_line():
+    extract = _make_extract(company='lululemon', end_client='lululemon', is_agency=False)
+    assert 'Hiring company' not in agent.format_extract_text(_make_candidate(), extract)
+
+
+def test_extract_text_surfaces_the_hiring_company():
+    extract = _make_extract(company='CyberCoders', is_agency=True, end_client='Automotive Martech Inc')
+    text = agent.format_extract_text(_make_candidate(), extract)
+    assert 'Hiring company: Automotive Martech Inc' in text
+
+
+def test_extract_schemas_stay_in_sync_across_both_providers():
+    """A field added to one extractor and not the other silently returns empty for that provider,
+    which looks identical to 'the posting did not say'."""
+    # The SDK @tool decorator keeps the raw schema on the wrapped function.
+    anthropic_schema = tools.submit_job_extract.input_schema['properties']
+    openrouter_schema = next(
+        t['function']['parameters']['properties']
+        for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
+        if t['function']['name'] == 'submit_job_extract'
+    )
+    assert set(anthropic_schema) == set(openrouter_schema), (
+        'extract schemas drifted: '
+        f'anthropic-only={sorted(set(anthropic_schema) - set(openrouter_schema))}, '
+        f'openrouter-only={sorted(set(openrouter_schema) - set(anthropic_schema))}'
+    )
+    for field in ('is_agency', 'end_client'):
+        assert field in anthropic_schema and field in openrouter_schema
+
+
 def test_merge_warnings_dedupes_case_insensitively_and_keeps_order():
     merged = agent.merge_warnings(['Hybrid — Netherlands'], ['hybrid — netherlands', 'Below salary target'])
     assert merged == ['Hybrid — Netherlands', 'Below salary target']

@@ -979,6 +979,7 @@ async def do_submit_job_extract(
     closed: bool = False, salary: str | None = None, sponsorship_note: str | None = None,
     language_requirement: str | None = None, relocation: str | None = None,
     workplace_type: str | None = None, education_requirement: str | None = None,
+    is_agency: bool | None = None, end_client: str | None = None,
 ) -> dict:
     _job_extracts.append({
         'title': title, 'company': company, 'description': description,
@@ -987,6 +988,10 @@ async def do_submit_job_extract(
         'language_requirement': language_requirement or '', 'relocation': relocation or '',
         'workplace_type': (workplace_type or '').strip().lower(),
         'education_requirement': (education_requirement or '').strip().lower(),
+        # None (not False) when the extractor said nothing, so derive_agency_posting() can tell
+        # "the model judged this not an agency" from "the model did not answer".
+        'is_agency': is_agency,
+        'end_client': (end_client or '').strip(),
     })
     return {"content": [{"type": "text", "text": "Extract submitted."}]}
 
@@ -1108,7 +1113,11 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
     "Pass education_requirement as 'master' or 'phd' ONLY if the posting states an advanced degree "
     "as a hard requirement (e.g. 'MSc in Computer Science required', 'PhD is a must'); omit it when "
     "the degree is merely preferred, when equivalent experience is accepted (\"Master's or equivalent "
-    "practical experience\", 'MSc a plus', \"Bachelor's or Master's\"), or when only a Bachelor's is required.",
+    "practical experience\", 'MSc a plus', \"Bachelor's or Master's\"), or when only a Bachelor's is required. "
+    "Pass is_agency=true if the poster is a staffing firm, recruiting agency, or job aggregator "
+    "reposting on behalf of another company rather than the employer that would actually hire, and "
+    "pass end_client with that hiring company's name if the posting names it (agencies usually keep "
+    "it anonymous, e.g. 'our client, a leading fintech' — leave end_client empty in that case).",
     {
         'type': 'object',
         'properties': {
@@ -1124,6 +1133,20 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
             'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
             'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
             'education_requirement': {'type': 'string', 'description': "'master' or 'phd' if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
+            # Wording mirrors _extract_applied_job_metadata's is_recruiting_agency/end_client_name
+            # so the applied-job and scraped sides classify a poster identically.
+            'is_agency': {
+                'type': 'boolean',
+                'description': (
+                    'True if the poster is a staffing firm, recruiting agency, or job aggregator '
+                    'reposting on behalf of another company, rather than the employer that '
+                    'would actually hire.'
+                ),
+            },
+            'end_client': {
+                'type': 'string',
+                'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
+            },
         },
         'required': ['title', 'company', 'description'],
     },
@@ -1137,6 +1160,8 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
         language_requirement=args.get("language_requirement"), relocation=args.get("relocation"),
         workplace_type=args.get("workplace_type"),
         education_requirement=args.get("education_requirement"),
+        is_agency=args.get("is_agency"),
+        end_client=args.get("end_client"),
     )
 
 

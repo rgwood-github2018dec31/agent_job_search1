@@ -365,6 +365,8 @@ Also produce:
 - summary: a short label summarising the job (used in the saved filename)
 - pros: 2–4 short bullet phrases (~100 chars each) naming the concrete strengths — matching tech, seniority, compensation, domain
 - warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — hybrid/on-site, contract vs full-time, salary below target, missing salary, stack mismatch, language expectations. Every conflict you notice MUST appear here, even when you still rate the job highly.
+
+Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
 """
 
 
@@ -1334,6 +1336,73 @@ def derive_education_requirement(extract: dict) -> str:
     return ''
 
 
+# Recruiter language in a job description. Deliberately PHRASES, not bare keywords: the historical
+# corpus contains "AgencyAnalytics" (a real product company) and plenty of ordinary postings that
+# mention "clients" in the work itself ("you will present to clients"). A phrase like "our client
+# is" only shows up when someone is posting on another company's behalf.
+_AGENCY_PHRASE_RE = re.compile(
+    r'\b(on behalf of (?:our|a|the) client'
+    r'|our client(?: is| are|,|\'s)'
+    r'|my client(?: is| are|,)'
+    r'|the client(?: is| are) (?:a|an|one)'
+    r'|confidential (?:client|search)'
+    r'|we are (?:recruiting|hiring) (?:for|on behalf of)'
+    r'|recruiting on behalf of'
+    r'|(?:our|a) (?:leading|major|well-known|prestigious) client)\b',
+    re.IGNORECASE,
+)
+
+# Agency markers in the POSTER'S NAME. Anchored to word boundaries and to multi-word forms where a
+# single word would over-match: "talent" alone hits "Talent.com" and product companies, and "search"
+# alone hits half the AI industry.
+_AGENCY_COMPANY_RE = re.compile(
+    r'\b(recruit(?:ing|ment|ers?)?'
+    r'|staffing'
+    r'|talent (?:solutions|partners|acquisition|group|advisory)'
+    r'|executive search'
+    r'|headhunt(?:ing|ers?)'
+    r'|manpower'
+    r'|consultants?)\b',
+    re.IGNORECASE,
+)
+
+
+def derive_end_client(extract: dict) -> str:
+    """The hiring company behind a posting, '' when it is just the poster under another name.
+
+    Extractors routinely echo the poster back as the end client for ordinary direct postings —
+    measured on real jobs, glm returned end_client='lululemon' for a lululemon posting. Taken
+    literally that would print a redundant "Hiring company: lululemon" beside "Company: lululemon"
+    and spend an already-applied lookup re-checking a name Stage 1b already cleared. An end client
+    is only interesting when it differs from who posted.
+    """
+    end_client = str(extract.get('end_client') or '').strip()
+    if not end_client:
+        return ''
+    if tools_module._normalize_company(end_client) == tools_module._normalize_company(str(extract.get('company') or '')):
+        return ''
+    return end_client
+
+
+def derive_agency_posting(extract: dict) -> bool:
+    """True when the posting is by a staffing firm / recruiter / aggregator, not the employer.
+
+    The extractor's structured `is_agency` wins whenever it answered at all — including a `False`,
+    which is a judgement and not a gap. Only when it is None do we fall back to scanning, so a
+    model that looked at the page and said "no" is never overridden by a regex.
+
+    Conservative by design, but the cost of being wrong is asymmetric and small: this drives a
+    WARNING only. It never rejects a job and never changes a rating (see the Account of decisions
+    in CLAUDE.md) — so a false positive is a stray bullet in a notification, not a lost job.
+    """
+    explicit = extract.get('is_agency')
+    if explicit is not None:
+        return bool(explicit)
+    if _AGENCY_COMPANY_RE.search(str(extract.get('company') or '')):
+        return True
+    return bool(_AGENCY_PHRASE_RE.search(str(extract.get('description') or '')[:4000]))
+
+
 def format_extract_text(candidate: dict, extract: dict) -> str:
     lines = [
         f"Title: {extract['title']}",
@@ -1345,6 +1414,9 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     workplace_type = derive_workplace_type(extract)
     if workplace_type:
         lines.insert(3, f"Workplace: {workplace_type}")
+    # Who would actually hire, when a recruiter names them — the poster's name is not the employer.
+    if end_client := derive_end_client(extract):
+        lines.insert(2, f"Hiring company: {end_client}")
     if candidate['snippet']:
         lines.append(f"Search-result snippet: {candidate['snippet']}")
     if extract['salary']:
@@ -1446,6 +1518,17 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
 
     if not extract.get('salary'):
         warnings.append('No salary listed')
+
+    # Who is actually hiring changes how you apply, and the rater reports it only by luck: on the
+    # 2026-08-11 run it flagged CyberCoders and Jobgether but not Hire Feed or Genius Innovation
+    # Lab — 2 of the 4 agency postings that triggered a notification said nothing. Same reasoning
+    # as the hybrid warning: a structural fact cannot be left to the rater's discretion.
+    if derive_agency_posting(extract):
+        end_client = derive_end_client(extract)
+        warnings.append(
+            f'Posted by a recruiting agency — hiring company: {end_client}' if end_client
+            else 'Posted by a recruiting agency — actual hiring company not named'
+        )
 
     return warnings
 
@@ -1611,8 +1694,43 @@ async def evaluate_all_candidates(
                 f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
                 f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
                 f"relocation={extract.get('relocation')!r} "
-                f"education_requirement={extract.get('education_requirement')!r}"
+                f"education_requirement={extract.get('education_requirement')!r} "
+                f"is_agency={derive_agency_posting(extract)} end_client={extract.get('end_client')!r}"
             )
+
+            # Already-applied, checked against the END CLIENT only.
+            #
+            # Stage 1b's check ran against the poster's name, which for a recruiter is the agency —
+            # so a recruiter reposting a role at a company the user already applied to directly
+            # sails through. The end client is only knowable after the extract, hence here.
+            #
+            # Deliberately NOT extended to the agency's own name: applying once through a staffing
+            # firm must never suppress every other company it posts for. That is the whole reason
+            # load_applied_jobs() keeps agency names out of _applied_companies
+            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status also
+            # never changes the rating and never rejects on its own.
+            end_client = derive_end_client(extract)
+            if end_client:
+                if matched_pdf := await tools_module.company_matches_applied(end_client):
+                    bump('end_client_already_applied')
+                    logger.info(
+                        f"Already applied via end client: {candidate['company']} — "
+                        f"{candidate['title']}: hiring company {end_client!r} matches {matched_pdf}"
+                    )
+                    await _save_and_notify(
+                        candidate, rating=1,
+                        summary=f"already applied to end client {end_client}",
+                        content=(
+                            f"# Already applied — posted by {candidate['company']} on behalf of "
+                            f"{end_client}\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"
+                        ),
+                        notify=False,
+                    )
+                    tools_module.record_job_outcome(
+                        candidate['site'], candidate['job_id'], 'already_applied', rating=1,
+                        summary=f'end client {end_client} already applied to',
+                    )
+                    continue
 
             hard_rule_reason = apply_hard_rules(candidate, extract)
             if hard_rule_reason:

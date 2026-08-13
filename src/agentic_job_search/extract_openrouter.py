@@ -87,7 +87,12 @@ OPENROUTER_EXTRACT_TOOLS = [
                 'residing in a specific place; omit for work-from-anywhere roles. '
                 "Pass education_requirement as 'master' or 'phd' ONLY if an advanced degree is a hard "
                 "requirement (e.g. 'MSc required', 'PhD is a must'); omit it when the degree is merely "
-                'preferred, when equivalent experience is accepted, or when only a Bachelor\'s is required.'
+                'preferred, when equivalent experience is accepted, or when only a Bachelor\'s is required. '
+                'Pass is_agency=true if the poster is a staffing firm, recruiting agency, or job '
+                'aggregator reposting on behalf of another company rather than the employer that would '
+                "actually hire, and pass end_client with that hiring company's name if the posting "
+                "names it (agencies usually keep it anonymous, e.g. 'our client, a leading fintech' — "
+                'leave end_client empty in that case).'
             ),
             'parameters': {
                 'type': 'object',
@@ -104,6 +109,20 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase"},
                     'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if required'},
                     'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
+                    # Must stay in sync with submit_job_extract in tools_generic.py — a field added
+                    # to one extractor and not the other silently returns empty for that provider.
+                    'is_agency': {
+                        'type': 'boolean',
+                        'description': (
+                            'True if the poster is a staffing firm, recruiting agency, or job aggregator '
+                            'reposting on behalf of another company, rather than the employer that '
+                            'would actually hire.'
+                        ),
+                    },
+                    'end_client': {
+                        'type': 'string',
+                        'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
+                    },
                 },
                 'required': ['title', 'company', 'description'],
             },
@@ -124,6 +143,10 @@ def _extract_from_submit_args(args: dict) -> dict:
         'relocation': args.get('relocation', ''),
         'workplace_type': str(args.get('workplace_type') or '').strip().lower(),
         'education_requirement': str(args.get('education_requirement') or '').strip().lower(),
+        # None (not False) when the model said nothing, so derive_agency_posting() can tell
+        # "judged not an agency" from "did not answer".
+        'is_agency': args.get('is_agency'),
+        'end_client': str(args.get('end_client') or '').strip(),
     }
 
 
