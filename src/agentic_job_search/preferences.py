@@ -12,10 +12,13 @@ situation.
 '''
 
 import logging
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +42,17 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
         'exclude': [],   # title words that must never appear in a generated query
     },
     'relocation_note': '',  # free text for the evaluator on acceptable relocation
+    'companies': {
+        # [{'name': ..., 'reason': ..., 'added': 'YYYY-MM-DD'}]; empty = no company is blocked
+        'blacklist': [],
+    },
 }
 
 _cache: dict[str, Any] | None = None
+
+# Names already warned about this process, so an expired or undated entry is reported once per
+# run rather than once per candidate job.
+_warned_blacklist_entries: set[str] = set()
 
 
 def load_preferences(force_reload: bool = False) -> dict[str, Any]:
@@ -131,3 +142,78 @@ def excluded_title_words() -> tuple[str, ...]:
 
 def relocation_note() -> str:
     return str(load_preferences()['relocation_note'] or '')
+
+
+def _parse_added_date(raw: Any) -> date | None:
+    '''Parse a blacklist entry's `added` field. Returns None if absent or unparseable.'''
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw).strip(), '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+
+def _blacklist_entries() -> list[tuple[str, str, date | None]]:
+    '''Normalize the raw blacklist into (name, reason, added_date) triples.
+
+    Accepts either a mapping per entry or a bare string (a name with no reason and no date), so a
+    hand-edited list of plain names still works. Names are returned **as written** — the match is
+    case-sensitive, unlike every other preference accessor here.
+    '''
+    entries: list[tuple[str, str, date | None]] = []
+    for raw in load_preferences()['companies']['blacklist']:
+        if isinstance(raw, dict):
+            name = str(raw.get('name') or '').strip()
+            reason = str(raw.get('reason') or '').strip()
+            added = _parse_added_date(raw.get('added'))
+        else:
+            name, reason, added = str(raw or '').strip(), '', None
+        if name:
+            entries.append((name, reason, added))
+    return entries
+
+
+def blacklisted_companies() -> tuple[tuple[str, str], ...]:
+    '''(name, reason) pairs for unexpired blacklist entries. Empty means no blacklist gate.
+
+    An entry with a missing or unparseable `added` date stays **active** and is warned about. An
+    auto-reject is unappealable, so a typo in a date must not silently switch the rule off; the
+    warning is how the typo gets noticed.
+    '''
+    active: list[tuple[str, str]] = []
+    for name, reason, added in _blacklist_entries():
+        if added is None:
+            if name not in _warned_blacklist_entries:
+                _warned_blacklist_entries.add(name)
+                logger.warning(
+                    f'Blacklist entry {name!r} has no valid `added` date (expected YYYY-MM-DD) — '
+                    f'treating it as active. Add a date in {PREFERENCES_PATH} so it can expire.'
+                )
+            active.append((name, reason))
+            continue
+        age_days = (date.today() - added).days
+        if age_days > COMPANY_BLACKLIST_EXPIRY_DAYS:
+            if name not in _warned_blacklist_entries:
+                _warned_blacklist_entries.add(name)
+                logger.warning(
+                    f'Blacklist entry {name!r} EXPIRED (added {added.isoformat()}, '
+                    f'{age_days} days ago > {COMPANY_BLACKLIST_EXPIRY_DAYS}) — it no longer rejects '
+                    f'anything. Bump its `added` date in {PREFERENCES_PATH} to renew it, or delete it.'
+                )
+            continue
+        active.append((name, reason))
+    return tuple(active)
+
+
+def expired_blacklist_entries() -> tuple[tuple[str, str], ...]:
+    '''(name, added-date) pairs past COMPANY_BLACKLIST_EXPIRY_DAYS. Reported, never enforced.'''
+    return tuple(
+        (name, added.isoformat())
+        for name, _reason, added in _blacklist_entries()
+        if added is not None and (date.today() - added).days > COMPANY_BLACKLIST_EXPIRY_DAYS
+    )

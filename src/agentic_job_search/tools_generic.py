@@ -252,6 +252,108 @@ async def company_matches_applied(candidate: str) -> str | None:
     return _applied_companies.get(matched, '<unknown PDF>')
 
 
+def _blacklist_confirm_prompt(company: str, entry_name: str, reason: str, context: str) -> str:
+    return (
+        f'A job posting lists its company as "{company}".\n\n'
+        f'The user has blacklisted an organization they refer to as "{entry_name}"'
+        + (f' (their reason: {reason})' if reason else '')
+        + '.\n\n'
+        'Is the organization in this posting the SAME organization the user blacklisted, or a '
+        'different one that happens to share the name?\n\n'
+        f'Posting context:\n{context or "(none available)"}\n\n'
+        'Respond with ONLY a JSON object: {"same_organization": <true|false>}'
+    )
+
+
+async def _blacklist_confirms_openrouter(prompt: str) -> dict:
+    """Confirm a blacklist name hit via the OpenRouter MCP server (glm). Raises on any failure."""
+    content, _cost = await chat_openrouter(prompt)
+    return extract_json_object(content)
+
+
+async def company_blacklist_reason(company: str, context: str = '') -> str | None:
+    """Return the blacklist reason if this posting is from a blacklisted company, else None.
+
+    Deliberately does NOT reuse ``company_matches_applied``: that one matches on a normalized,
+    lowercased name and fuzzy-matches by default, both of which are wrong for a standing
+    user-authored blacklist. Here the trigger is a **case-sensitive exact** name match, which
+    costs nothing and cannot over-block, followed by one cheap LLM call to confirm the posting is
+    really that organization rather than a same-named one ("Cohere" the AI lab is not Cohere
+    Health). No name hit means no LLM call at all, so the gate is free on almost every posting.
+
+    Ambiguity resolves toward rejecting: if the confirmation call fails for any reason, the exact
+    name match stands and the job is rejected. A blacklist is an explicit user decision, and an
+    unrelated tool-server outage must not quietly let a blacklisted company back through.
+    """
+    entries = preferences.blacklisted_companies()
+    if not entries or not company or not company.strip():
+        return None
+
+    candidate = company.strip()
+    matched = next(((name, reason) for name, reason in entries if name == candidate), None)
+    if matched is None:
+        return None
+    entry_name, reason = matched
+    label = reason or 'blacklisted'
+
+    prompt = _blacklist_confirm_prompt(candidate, entry_name, reason, context)
+    structured: dict | None = None
+
+    if COMPANY_MATCH_PROVIDER == 'openrouter':
+        try:
+            structured = await _blacklist_confirms_openrouter(prompt)
+        except Exception as ex:
+            logger.warning(f'Blacklist confirmation via OpenRouter failed for {candidate!r}, falling back to Anthropic: {ex}')
+
+    if structured is None:
+        options = ClaudeAgentOptions(
+            model=MODEL_NAME_LOW,
+            tools=[],
+            permission_mode='bypassPermissions',
+            output_format={
+                'type': 'json_schema',
+                'schema': {
+                    'type': 'object',
+                    'properties': {
+                        'same_organization': {
+                            'type': 'boolean',
+                            'description': 'True if the posting is from the blacklisted organization',
+                        },
+                    },
+                    'required': ['same_organization'],
+                },
+            },
+            cwd=str(PROJECT_DIR),
+        )
+        try:
+            async for msg in sdk_query(prompt=prompt, options=options):
+                if isinstance(msg, ResultMessage) and msg.structured_output:
+                    structured = msg.structured_output
+        except Exception as ex:
+            logger.warning(
+                f'Blacklist confirmation failed for {candidate!r} ({ex}) — rejecting on the exact '
+                f'name match alone.'
+            )
+            return label
+
+    if structured is None:
+        logger.warning(
+            f'Blacklist confirmation returned no structured output for {candidate!r} — rejecting '
+            f'on the exact name match alone.'
+        )
+        return label
+
+    if not structured.get('same_organization'):
+        logger.info(
+            f'Blacklist name collision: {candidate!r} matches blacklist entry {entry_name!r} by '
+            f'name but was confirmed to be a different organization — not rejecting.'
+        )
+        return None
+
+    logger.info(f'Blacklisted company confirmed: {candidate!r} ({label})')
+    return label
+
+
 async def _categorize_pdf_text(text: str, filename: str) -> str:
     """Use agent SDK to assign a category label to a PDF. Returns a snake_case string."""
     options = ClaudeAgentOptions(
@@ -703,11 +805,19 @@ def write_run_audit_log(
         '',
         f'- In horizon ({APPLIED_JOBS_HORIZON_DAYS} days): **{applied_jobs_in_horizon}**',
         f'- Total on disk: {applied_jobs_total}',
-        f'- Blocklisted companies: {len(_applied_companies)}',
-        '',
-        '## 2. Search queries',
-        '',
+        f'- Blocklisted companies (already applied): {len(_applied_companies)}',
+        f'- Blacklisted companies (user preference, active): {len(preferences.blacklisted_companies())}',
     ]
+
+    # An expired entry silently stops rejecting, which is exactly the kind of change that goes
+    # unnoticed for months. Name it here as well as in the run log.
+    if expired := preferences.expired_blacklist_entries():
+        lines.append(
+            '- **Expired blacklist entries (no longer rejecting):** '
+            + ', '.join(f'{name} (added {added})' for name, added in expired)
+        )
+
+    lines += ['', '## 2. Search queries', '']
 
     if queries:
         lines.append(f'{len(queries)} quer(ies) generated:')

@@ -1,10 +1,12 @@
 import os
+from datetime import date, timedelta
 
 import pytest
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools
 from agentic_job_search import agent
+from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
 from agentic_job_search.agent import load_env
 load_env()
 
@@ -28,6 +30,17 @@ TEST_PREFERENCES = {
         'exclude': ['Manager', 'Head of', 'Director', 'VP'],
     },
     'relocation_note': 'Relocating within the EU is acceptable for a remote role.',
+    'companies': {
+        # Fake companies only. The `added` date is recomputed per run so the active entry never
+        # ages past COMPANY_BLACKLIST_EXPIRY_DAYS and starts silently passing tests.
+        'blacklist': [
+            {'name': 'Blocked Corp', 'reason': 'test entry', 'added': date.today().isoformat()},
+            {
+                'name': 'Lapsed Corp', 'reason': 'expired test entry',
+                'added': (date.today() - timedelta(days=COMPANY_BLACKLIST_EXPIRY_DAYS + 1)).isoformat(),
+            },
+        ],
+    },
 }
 
 
@@ -49,6 +62,9 @@ def _fixed_preferences(monkeypatch):
         preferences, 'load_preferences',
         lambda force_reload=False: merged,
     )
+    # Fresh per test: the warn-once set would otherwise make a warning assertion depend on
+    # whether an earlier test happened to touch the same blacklist entry.
+    monkeypatch.setattr(preferences, '_warned_blacklist_entries', set())
     yield
 
 

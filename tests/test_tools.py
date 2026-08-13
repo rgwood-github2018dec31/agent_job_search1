@@ -1142,72 +1142,72 @@ def _make_candidate(**overrides) -> dict:
     return candidate
 
 
-def test_apply_hard_rules_passes_good_job():
-    assert agent.apply_hard_rules(_make_candidate(), _make_extract()) is None
+async def test_apply_hard_rules_passes_good_job():
+    assert await agent.apply_hard_rules(_make_candidate(), _make_extract()) is None
 
 
-def test_apply_hard_rules_closed_flag():
-    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(closed=True))
+async def test_apply_hard_rules_closed_flag():
+    reason = await agent.apply_hard_rules(_make_candidate(), _make_extract(closed=True))
     assert reason is not None and 'closed' in reason
 
 
-def test_apply_hard_rules_closed_text():
+async def test_apply_hard_rules_closed_text():
     extract = _make_extract(description='This job is no longer accepting applications.')
-    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason is not None and 'closed' in reason
 
 
-def test_apply_hard_rules_stale_posting():
+async def test_apply_hard_rules_stale_posting():
     old = (date.today() - timedelta(days=45)).isoformat()
-    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
+    reason = await agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
     assert reason is not None and 'older than' in reason
 
 
-def test_apply_hard_rules_recent_posting_ok():
+async def test_apply_hard_rules_recent_posting_ok():
     recent = (date.today() - timedelta(days=5)).isoformat()
-    assert agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=recent)) is None
+    assert await agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=recent)) is None
 
 
-def test_apply_hard_rules_us_no_sponsorship():
+async def test_apply_hard_rules_us_no_sponsorship():
     extract = _make_extract(location='United States (Remote)')
-    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason is not None and 'sponsorship' in reason
 
 
-def test_apply_hard_rules_us_with_sponsorship_passes():
+async def test_apply_hard_rules_us_with_sponsorship_passes():
     extract = _make_extract(
         location='United States (Remote)',
         sponsorship_note='We are willing to sponsor H-1B visas.',
     )
-    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
-def test_apply_hard_rules_explicit_no_auth_statement():
+async def test_apply_hard_rules_explicit_no_auth_statement():
     extract = _make_extract(description='Must be authorized to work in the US without sponsorship.')
-    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason is not None and 'sponsorship' in reason
 
 
-def test_apply_hard_rules_non_english_language_requirement():
+async def test_apply_hard_rules_non_english_language_requirement():
     extract = _make_extract(language_requirement='dutch')
-    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason is not None and 'dutch' in reason and 'language' in reason
 
 
-def test_apply_hard_rules_english_plus_other_language_rejects():
+async def test_apply_hard_rules_english_plus_other_language_rejects():
     extract = _make_extract(language_requirement='english, ukrainian')
-    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason is not None and 'ukrainian' in reason
 
 
-def test_apply_hard_rules_english_only_requirement_passes():
-    assert agent.apply_hard_rules(_make_candidate(), _make_extract(language_requirement='english')) is None
-    assert agent.apply_hard_rules(_make_candidate(), _make_extract(language_requirement='english (b2)')) is None
+async def test_apply_hard_rules_english_only_requirement_passes():
+    assert await agent.apply_hard_rules(_make_candidate(), _make_extract(language_requirement='english')) is None
+    assert await agent.apply_hard_rules(_make_candidate(), _make_extract(language_requirement='english (b2)')) is None
 
 
-def test_apply_hard_rules_relocation_does_not_reject():
+async def test_apply_hard_rules_relocation_does_not_reject():
     extract = _make_extract(relocation='Portugal')
-    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
 def test_format_extract_text_includes_language_and_relocation():
@@ -1225,23 +1225,23 @@ def test_format_extract_text_includes_language_and_relocation():
 # derive_education_requirement / advanced-degree hard rule
 # ---------------------------------------------------------------------------
 
-def test_apply_hard_rules_explicit_phd_requirement():
-    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(education_requirement='phd'))
+async def test_apply_hard_rules_explicit_phd_requirement():
+    reason = await agent.apply_hard_rules(_make_candidate(), _make_extract(education_requirement='phd'))
     assert reason is not None and 'degree' in reason and 'phd' in reason
 
 
-def test_apply_hard_rules_explicit_masters_requirement():
-    reason = agent.apply_hard_rules(_make_candidate(), _make_extract(education_requirement='master'))
+async def test_apply_hard_rules_explicit_masters_requirement():
+    reason = await agent.apply_hard_rules(_make_candidate(), _make_extract(education_requirement='master'))
     assert reason is not None and 'degree' in reason and 'master' in reason
 
 
-def test_apply_hard_rules_empty_education_requirement_passes():
-    assert agent.apply_hard_rules(_make_candidate(), _make_extract()) is None
+async def test_apply_hard_rules_empty_education_requirement_passes():
+    assert await agent.apply_hard_rules(_make_candidate(), _make_extract()) is None
 
 
-def test_apply_hard_rules_bachelors_requirement_passes():
+async def test_apply_hard_rules_bachelors_requirement_passes():
     extract = _make_extract(education_requirement='bachelor')
-    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
 @pytest.mark.parametrize('description, expected', [
@@ -1274,9 +1274,9 @@ def test_derive_education_requirement_ignores_soft_and_irrelevant_mentions(descr
     assert agent.derive_education_requirement(_make_extract(description=description)) == ''
 
 
-def test_apply_hard_rules_derives_degree_from_description():
+async def test_apply_hard_rules_derives_degree_from_description():
     extract = _make_extract(description='Build agents in Python. A PhD in AI is required.')
-    reason = agent.apply_hard_rules(_make_candidate(), extract)
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason is not None and 'requires advanced degree: phd' in reason
 
 
@@ -2896,11 +2896,11 @@ def test_agency_status_never_changes_the_rating():
     assert agent.apply_rating_caps(agency, 5) == (5, '')
 
 
-def test_agency_posting_is_not_hard_ruled():
+async def test_agency_posting_is_not_hard_ruled():
     """Agency status must never reject a job -- only warn. An auto-reject is unappealable."""
     extract = _make_extract(company='Quik Hire Staffing', is_agency=True, end_client='',
                             description='Our client is a leading AI lab. Build agents in Python.')
-    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
 @pytest.mark.parametrize('company, end_client, expected', [
@@ -2980,7 +2980,7 @@ def test_format_extract_text_surfaces_workplace_line():
     assert 'Workplace: hybrid' in text
 
 
-def test_devologyx_regression_end_to_end():
+async def test_devologyx_regression_end_to_end():
     """The exact posting that was wrongly surfaced as a 4: capped to 3 (so never notified)
     and carrying hybrid + contract warnings."""
     candidate = _make_candidate(
@@ -2996,7 +2996,7 @@ def test_devologyx_regression_end_to_end():
         ),
         salary='€700-€900/day (DOE)', date_posted='1 week ago', language_requirement='english',
     )
-    assert agent.apply_hard_rules(candidate, extract) is None  # not a hard reject — it is a cap
+    assert await agent.apply_hard_rules(candidate, extract) is None  # not a hard reject — it is a cap
 
     rating, cap_reason = agent.apply_rating_caps(extract, 4)
     assert rating == 3
@@ -3031,7 +3031,7 @@ def test_default_preferences_apply_no_personal_gates(neutral_preferences):
     assert preferences.search_regions() == []
 
 
-def test_hard_rules_reject_nothing_without_preferences(neutral_preferences):
+async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences):
     """The three personal gates must be inert when unconfigured — not silently inherited."""
     extract = _make_extract(
         location='United States (Remote)',
@@ -3039,14 +3039,14 @@ def test_hard_rules_reject_nothing_without_preferences(neutral_preferences):
         language_requirement='dutch',
         education_requirement='phd',
     )
-    assert agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
-def test_hard_rules_still_reject_impersonal_conditions(neutral_preferences):
+async def test_hard_rules_still_reject_impersonal_conditions(neutral_preferences):
     """Closed and stale are properties of the posting, not the person — always on."""
-    assert 'closed' in agent.apply_hard_rules(_make_candidate(), _make_extract(closed=True))
+    assert 'closed' in await agent.apply_hard_rules(_make_candidate(), _make_extract(closed=True))
     old = (date.today() - timedelta(days=45)).isoformat()
-    assert 'older than' in agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
+    assert 'older than' in await agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
 
 
 def test_prompts_omit_personal_sections_without_preferences(neutral_preferences):
@@ -3082,3 +3082,187 @@ def test_example_preferences_file_is_neutral():
     assert loaded['hybrid']['acceptable_locations'] == []
     for region in loaded['search_regions']:
         assert 'Example' in region['name'] or 'Test' in region['name']
+
+
+# ---------------------------------------------------------------------------
+# company_blacklist_reason  (user-authored company blacklist)
+# ---------------------------------------------------------------------------
+
+def _no_llm(monkeypatch):
+    """Make any confirmation call an error, so a test can assert none was attempted."""
+    async def boom_openrouter(prompt):
+        raise AssertionError('blacklist confirmation should not have called OpenRouter')
+
+    async def boom_sdk(**kwargs):
+        raise AssertionError('blacklist confirmation should not have called the Anthropic SDK')
+        yield  # pragma: no cover — make it an async generator
+
+    monkeypatch.setattr(tools, '_blacklist_confirms_openrouter', boom_openrouter)
+    monkeypatch.setattr(tools, 'sdk_query', boom_sdk)
+
+
+def _confirm_llm(monkeypatch, same_organization: bool):
+    """Patch both confirmation providers to answer the same way."""
+    async def fake_openrouter(prompt):
+        return {'same_organization': same_organization}
+
+    monkeypatch.setattr(tools, '_blacklist_confirms_openrouter', fake_openrouter)
+    _make_sdk_mock(monkeypatch, {'same_organization': same_organization})
+
+
+async def test_blacklist_exact_match_confirmed_returns_reason(monkeypatch):
+    _confirm_llm(monkeypatch, True)
+    assert await tools.company_blacklist_reason('Blocked Corp') == 'test entry'
+
+
+async def test_blacklist_name_collision_does_not_reject(monkeypatch):
+    """Same name, different organization — the whole point of the confirmation call."""
+    _confirm_llm(monkeypatch, False)
+    assert await tools.company_blacklist_reason('Blocked Corp') is None
+
+
+async def test_blacklist_match_is_case_sensitive(monkeypatch):
+    _no_llm(monkeypatch)
+    assert await tools.company_blacklist_reason('blocked corp') is None
+    assert await tools.company_blacklist_reason('BLOCKED CORP') is None
+
+
+async def test_blacklist_non_match_makes_no_llm_call(monkeypatch):
+    _no_llm(monkeypatch)
+    assert await tools.company_blacklist_reason('Acme') is None
+    assert await tools.company_blacklist_reason('') is None
+
+
+async def test_blacklist_empty_preference_makes_no_llm_call(monkeypatch):
+    _no_llm(monkeypatch)
+    merged = preferences._deep_merge(preferences.load_preferences(), {'companies': {'blacklist': []}})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    assert await tools.company_blacklist_reason('Blocked Corp') is None
+
+
+async def test_blacklist_confirmation_failure_still_rejects(monkeypatch):
+    """An outage must not quietly let a blacklisted company back through."""
+    async def fail_openrouter(prompt):
+        raise RuntimeError('tool server down')
+
+    async def fail_sdk(**kwargs):
+        raise RuntimeError('anthropic unavailable')
+        yield  # pragma: no cover — make it an async generator
+
+    monkeypatch.setattr(tools, '_blacklist_confirms_openrouter', fail_openrouter)
+    monkeypatch.setattr(tools, 'sdk_query', fail_sdk)
+    assert await tools.company_blacklist_reason('Blocked Corp') == 'test entry'
+
+
+async def test_blacklist_no_structured_output_still_rejects(monkeypatch):
+    async def fail_openrouter(prompt):
+        raise RuntimeError('tool server down')
+
+    async def empty_sdk(**kwargs):
+        return
+        yield  # pragma: no cover — make it an async generator
+
+    monkeypatch.setattr(tools, '_blacklist_confirms_openrouter', fail_openrouter)
+    monkeypatch.setattr(tools, 'sdk_query', empty_sdk)
+    assert await tools.company_blacklist_reason('Blocked Corp') == 'test entry'
+
+
+async def test_blacklist_entry_without_reason_still_rejects(monkeypatch):
+    _confirm_llm(monkeypatch, True)
+    merged = preferences._deep_merge(
+        preferences.load_preferences(), {'companies': {'blacklist': ['Bare Name Corp']}}
+    )
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    assert await tools.company_blacklist_reason('Bare Name Corp') == 'blacklisted'
+
+
+# --- expiry -----------------------------------------------------------------
+
+async def test_expired_blacklist_entry_does_not_reject(monkeypatch):
+    _no_llm(monkeypatch)
+    assert await tools.company_blacklist_reason('Lapsed Corp') is None
+
+
+def test_expired_blacklist_entry_is_reported():
+    names = [name for name, _added in preferences.expired_blacklist_entries()]
+    assert 'Lapsed Corp' in names
+    assert 'Blocked Corp' not in names
+
+
+def test_active_blacklist_entry_excluded_from_expired():
+    assert 'Blocked Corp' in [name for name, _reason in preferences.blacklisted_companies()]
+    assert 'Lapsed Corp' not in [name for name, _reason in preferences.blacklisted_companies()]
+
+
+def test_blacklist_entry_with_unparseable_date_stays_active(monkeypatch, caplog):
+    merged = preferences._deep_merge(
+        preferences.load_preferences(),
+        {'companies': {'blacklist': [{'name': 'Undated Corp', 'reason': 'x', 'added': 'not-a-date'}]}},
+    )
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    with caplog.at_level(logging.WARNING):
+        active = preferences.blacklisted_companies()
+    assert ('Undated Corp', 'x') in active
+    assert 'no valid `added` date' in caplog.text
+
+
+def test_blacklist_expiry_warning_names_the_entry(caplog):
+    with caplog.at_level(logging.WARNING):
+        preferences.blacklisted_companies()
+    assert 'Lapsed Corp' in caplog.text
+    assert 'EXPIRED' in caplog.text
+
+
+async def test_blacklist_yaml_date_object_is_accepted(monkeypatch):
+    """PyYAML parses an unquoted YYYY-MM-DD into a date, not a str."""
+    _confirm_llm(monkeypatch, True)
+    merged = preferences._deep_merge(
+        preferences.load_preferences(),
+        {'companies': {'blacklist': [
+            {'name': 'Dated Corp', 'reason': 'y', 'added': date.today()},
+        ]}},
+    )
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    assert await tools.company_blacklist_reason('Dated Corp') == 'y'
+
+
+# --- integration with apply_hard_rules --------------------------------------
+
+async def test_apply_hard_rules_rejects_blacklisted_poster(monkeypatch):
+    _confirm_llm(monkeypatch, True)
+    reason = await agent.apply_hard_rules(
+        _make_candidate(company='Blocked Corp'), _make_extract(company='Blocked Corp')
+    )
+    assert 'blacklisted company' in reason
+    assert 'Blocked Corp' in reason
+
+
+async def test_apply_hard_rules_rejects_blacklisted_end_client(monkeypatch):
+    """A recruiter reposting a blacklisted company's role must not get around the blacklist."""
+    _confirm_llm(monkeypatch, True)
+    extract = _make_extract(company='Some Recruiters', is_agency=True, end_client='Blocked Corp')
+    reason = await agent.apply_hard_rules(_make_candidate(company='Some Recruiters'), extract)
+    assert 'blacklisted company' in reason
+    assert 'Blocked Corp' in reason
+
+
+async def test_apply_hard_rules_passes_non_blacklisted_company(monkeypatch):
+    _no_llm(monkeypatch)
+    assert await agent.apply_hard_rules(_make_candidate(), _make_extract()) is None
+
+
+async def test_apply_hard_rules_ignores_expired_blacklist_entry(monkeypatch):
+    _no_llm(monkeypatch)
+    assert await agent.apply_hard_rules(
+        _make_candidate(company='Lapsed Corp'), _make_extract(company='Lapsed Corp')
+    ) is None
+
+
+def test_hard_rule_category_buckets_blacklist():
+    assert agent._hard_rule_category('blacklisted company: Blocked Corp (test entry)') == 'hard_ruled_blacklisted'
+
+
+def test_example_preferences_blacklist_is_empty():
+    """The tracked example must not name a real company the user blocked."""
+    loaded = yaml.safe_load(preferences.EXAMPLE_PREFERENCES_PATH.read_text(encoding='utf-8'))
+    assert loaded['companies']['blacklist'] == []

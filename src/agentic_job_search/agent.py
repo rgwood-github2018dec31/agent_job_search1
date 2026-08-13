@@ -1435,9 +1435,27 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     return '\n'.join(lines)
 
 
-def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
-    """Deterministic auto-reject rules; returns the reason, or None if the job survives."""
+async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
+    """Auto-reject rules; returns the reason, or None if the job survives.
+
+    All rules but the first are deterministic and free. The blacklist runs first because it is
+    the most decisive and short-circuits for free when the company name does not match; only an
+    exact name hit costs a (cheap) confirmation call. See company_blacklist_reason().
+    """
     full_text = format_extract_text(candidate, extract)
+
+    # Both the poster and the end client: a recruiting agency can repost a blacklisted company's
+    # role under its own name, which is the same gap end-client dedup closes for applied jobs.
+    blacklist_context = '\n'.join(filter(None, [
+        f"Company: {extract.get('company') or candidate.get('company', '')}",
+        f"Location: {extract.get('location') or ''}",
+        f"Title: {extract.get('title') or candidate.get('title', '')}",
+        (extract.get('description') or '')[:500],
+    ]))
+    for name in (extract.get('company') or candidate.get('company', ''), derive_end_client(extract)):
+        if name and (reason := await tools_module.company_blacklist_reason(name, context=blacklist_context)):
+            return f'blacklisted company: {name} ({reason})'
+
     if extract['closed'] or 'no longer accepting applications' in full_text.lower():
         return 'posting closed (no longer accepting applications)'
     posted = parse_posting_date(extract['date_posted'] or candidate['date_posted'])
@@ -1621,6 +1639,8 @@ async def _save_and_notify(
 
 def _hard_rule_category(reason: str) -> str:
     """Bucket a hard-rule reason string for the funnel summary."""
+    if 'blacklisted' in reason:
+        return 'hard_ruled_blacklisted'
     if 'closed' in reason:
         return 'hard_ruled_closed'
     if 'older than' in reason:
@@ -1732,7 +1752,7 @@ async def evaluate_all_candidates(
                     )
                     continue
 
-            hard_rule_reason = apply_hard_rules(candidate, extract)
+            hard_rule_reason = await apply_hard_rules(candidate, extract)
             if hard_rule_reason:
                 bump(_hard_rule_category(hard_rule_reason))
                 logger.info(f"Hard rule: {candidate['company']} — {candidate['title']}: rated 1 ({hard_rule_reason})")

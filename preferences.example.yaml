@@ -53,3 +53,21 @@ titles:
 # Free text shown to the evaluator about relocation you would consider. Empty means the evaluator
 # is given no relocation guidance and judges the role on its own merits.
 relocation_note: ''
+
+companies:
+  # Companies to always auto-reject, whatever the posting says. Matched on an EXACT,
+  # case-sensitive company name — 'acme' does not match 'Acme' — so list each variant a
+  # company posts under. A name hit is then confirmed by one cheap LLM call, so a different
+  # organization that happens to share the name is not rejected by mistake; if that call
+  # cannot be made, the job is rejected on the name match alone.
+  #
+  # Also checked against the end client, so a recruiting agency reposting the role does not
+  # get around it.
+  #
+  # `added` is required for an entry to expire. An entry stops rejecting 180 days after that
+  # date and is then reported at WARNING and in the run audit log — renew it by bumping the
+  # date, or delete it. An entry with no valid date stays active and is warned about.
+  blacklist: []
+  #   - name: Example Corp
+  #     reason: bad Glassdoor reviews
+  #     added: 2026-01-01

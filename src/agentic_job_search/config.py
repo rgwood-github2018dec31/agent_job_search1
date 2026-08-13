@@ -15,6 +15,10 @@ THINKING_MAX_CHARS = 1000
 # the ideal-role profile, and the already-applied company blocklist. Older PDFs are kept
 # on disk but never read.
 APPLIED_JOBS_HORIZON_DAYS = 90
+# Company blacklist: an entry stops rejecting this many days after its `added` date. A standing
+# "never show me this company" decision goes stale — six months on, the reason for it may not
+# hold any more — so the entry lapses and is reported rather than silently outliving its reason.
+COMPANY_BLACKLIST_EXPIRY_DAYS = 180
 
 # NOTE: personal preferences — search regions, acceptable hybrid locations, the hybrid rating cap,
 # work-authorization/language/education gates, and target titles — deliberately do NOT live here.
