@@ -599,13 +599,13 @@ def _no_legacy_cache(monkeypatch, tmp_path):
 
 async def test_ingest_date_prefixes_from_mtime_and_preserves_it(tmp_path, monkeypatch):
     _no_legacy_cache(monkeypatch, tmp_path)
-    downloads = tmp_path / 'Downloads'
+    save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
     applied_date = date(2026, 5, 13)
-    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', applied_date)
+    source = _write_pdf(save_dir / 'cat-saved_jd-acme_job.pdf', applied_date)
     source_mtime = source.stat().st_mtime
 
-    moved = await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    moved = await tools.ingest_save_dir_applied_pdfs(save_dir=save_dir, applied_to_dir=applied)
 
     assert moved == 1
     assert not source.exists(), 'source PDF should have moved, not been copied'
@@ -617,9 +617,9 @@ async def test_ingest_date_prefixes_from_mtime_and_preserves_it(tmp_path, monkey
 async def test_ingest_rolls_back_partial_move(tmp_path, monkeypatch):
     """A copy that succeeds but whose source unlink fails must not leave a duplicate behind."""
     _no_legacy_cache(monkeypatch, tmp_path)
-    downloads = tmp_path / 'Downloads'
+    save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
-    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 5, 13))
+    source = _write_pdf(save_dir / 'cat-saved_jd-acme_job.pdf', date(2026, 5, 13))
 
     def fake_move(src, dst):
         Path(dst).write_bytes(Path(src).read_bytes())  # copy succeeds, source stays
@@ -627,7 +627,7 @@ async def test_ingest_rolls_back_partial_move(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools.shutil, 'move', fake_move)
 
-    moved = await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    moved = await tools.ingest_save_dir_applied_pdfs(save_dir=save_dir, applied_to_dir=applied)
 
     assert moved == 0
     assert source.exists(), 'source must remain when the move failed'
@@ -636,12 +636,12 @@ async def test_ingest_rolls_back_partial_move(tmp_path, monkeypatch):
 
 async def test_ingest_dry_run_moves_nothing(tmp_path, monkeypatch):
     _no_legacy_cache(monkeypatch, tmp_path)
-    downloads = tmp_path / 'Downloads'
+    save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
-    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 5, 13))
+    source = _write_pdf(save_dir / 'cat-saved_jd-acme_job.pdf', date(2026, 5, 13))
 
-    moved = await tools.ingest_downloads_applied_pdfs(
-        downloads_dir=downloads, applied_dir=applied, dry_run=True
+    moved = await tools.ingest_save_dir_applied_pdfs(
+        save_dir=save_dir, applied_to_dir=applied, dry_run=True
     )
 
     assert moved == 1
@@ -651,16 +651,16 @@ async def test_ingest_dry_run_moves_nothing(tmp_path, monkeypatch):
 
 async def test_ingest_is_idempotent_for_already_prefixed_file(tmp_path, monkeypatch):
     _no_legacy_cache(monkeypatch, tmp_path)
-    downloads = tmp_path / 'Downloads'
+    save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
-    # An already-ingested file re-downloaded into Downloads keeps its original date, and a
+    # An already-ingested file re-saved into the save directory keeps its original date, and a
     # second pass must not re-date it to today.
-    _write_pdf(downloads / '2026-04-13-cat-saved_jd-acme_job.pdf', date(2026, 7, 1))
+    _write_pdf(save_dir / '2026-04-13-cat-saved_jd-acme_job.pdf', date(2026, 7, 1))
 
-    await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    await tools.ingest_save_dir_applied_pdfs(save_dir=save_dir, applied_to_dir=applied)
     assert (applied / '2026-04-13-cat-saved_jd-acme_job.pdf').exists()
 
-    moved_again = await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    moved_again = await tools.ingest_save_dir_applied_pdfs(save_dir=save_dir, applied_to_dir=applied)
     assert moved_again == 0
     assert list(applied.glob('*.pdf')) == [applied / '2026-04-13-cat-saved_jd-acme_job.pdf']
 
@@ -669,31 +669,31 @@ async def test_ingest_prefers_index_date_over_clobbered_mtime(tmp_path, monkeypa
     """The whole point of the manifest: a rewritten mtime must not rewrite the applied date."""
     import yaml as yaml_mod
     _no_legacy_cache(monkeypatch, tmp_path)
-    downloads = tmp_path / 'Downloads'
+    save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
     applied.mkdir(parents=True)
-    _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 7, 25))  # mtime says July
+    _write_pdf(save_dir / 'cat-saved_jd-acme_job.pdf', date(2026, 7, 25))  # mtime says July
     (applied / 'index.yaml').write_text(yaml_mod.dump({
         'cat-saved_jd-acme_job.pdf': {'applied_date': date(2026, 4, 13)},  # index says April
     }))
 
-    await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    await tools.ingest_save_dir_applied_pdfs(save_dir=save_dir, applied_to_dir=applied)
 
     assert (applied / '2026-04-13-cat-saved_jd-acme_job.pdf').exists()
 
 
 async def test_ingest_falls_back_to_legacy_downloads_cache_mtime(tmp_path, monkeypatch):
     import yaml as yaml_mod
-    downloads = tmp_path / 'Downloads'
+    save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
-    source = _write_pdf(downloads / 'cat-saved_jd-acme_job.pdf', date(2026, 7, 25))
+    source = _write_pdf(save_dir / 'cat-saved_jd-acme_job.pdf', date(2026, 7, 25))
 
     legacy = tmp_path / 'downloads_pdf_cache.yaml'
     legacy_ts = datetime.combine(date(2026, 4, 13), datetime.min.time()).timestamp()
     legacy.write_text(yaml_mod.dump({str(source): {'mtime': legacy_ts, 'company': 'Acme'}}))
     monkeypatch.setattr(tools, 'LEGACY_DOWNLOADS_CACHE_PATH', legacy)
 
-    await tools.ingest_downloads_applied_pdfs(downloads_dir=downloads, applied_dir=applied)
+    await tools.ingest_save_dir_applied_pdfs(save_dir=save_dir, applied_to_dir=applied)
 
     assert (applied / '2026-04-13-cat-saved_jd-acme_job.pdf').exists()
 
@@ -717,12 +717,38 @@ async def test_load_applied_jobs_uses_index_without_llm_call(tmp_path, monkeypat
 
     monkeypatch.setattr(tools, '_extract_applied_job_metadata', fake_extract)
 
-    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
     assert extract_called == [], 'LLM should not be called on an index hit'
     assert 'CachedCorp' in tools._applied_companies
     assert tools._reference_job_texts == ['job description text']
     assert len(tools._applied_jobs) == 1
+
+
+async def test_load_applied_jobs_ignores_the_save_dir(tmp_path, monkeypatch):
+    """The corpus and the save directory are separate: an un-ingested PDF is invisible here.
+
+    Pins the split — if load_applied_jobs ever fell back to the save directory, a PDF the user
+    merely saved (but never applied to) would silently join the reference corpus and the
+    already-applied blocklist.
+    """
+    _no_legacy_cache(monkeypatch, tmp_path)
+    save_dir = tmp_path / 'saved_pdfs'
+    applied = tmp_path / 'applied_jobs'
+    applied.mkdir()
+    _write_pdf(save_dir / 'cat-saved_jd-not_yet_ingested.pdf', date.today())
+    monkeypatch.setattr(tools.preferences, 'save_dir', lambda: save_dir)
+
+    async def fake_extract(text, filename):
+        raise AssertionError(f'save-dir PDF must never be read by load_applied_jobs: {filename}')
+
+    monkeypatch.setattr(tools, '_extract_applied_job_metadata', fake_extract)
+
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=applied / 'index.yaml')
+
+    assert tools._applied_companies == {}
+    assert tools._reference_job_texts == []
+    assert tools._applied_jobs == []
 
 
 async def test_load_applied_jobs_extracts_and_writes_index(tmp_path, monkeypatch):
@@ -747,7 +773,7 @@ async def test_load_applied_jobs_extracts_and_writes_index(tmp_path, monkeypatch
     monkeypatch.setattr(tools, '_extract_applied_job_metadata', fake_extract)
 
     index_path = applied / 'index.yaml'
-    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
     assert tools._applied_companies == {'Acme': '2026-07-20-cat-saved_jd-acme_job.pdf'}
     written = yaml_mod.safe_load(index_path.read_text())
@@ -771,7 +797,7 @@ async def test_load_applied_jobs_excludes_beyond_horizon(tmp_path, monkeypatch):
         fresh.name: _index_entry(date.today(), fresh.stat().st_mtime, company='NewCorp', text='new text'),
     }))
 
-    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
     assert stale.exists(), 'aged-out PDFs are kept on disk, only excluded from use'
     assert tools._applied_companies == {'NewCorp': fresh.name}
@@ -790,7 +816,7 @@ async def test_load_applied_jobs_does_not_blocklist_recruiting_agency(tmp_path, 
         pdf.name: _index_entry(date.today(), pdf.stat().st_mtime, company='AgencyCorp', is_agency=True),
     }))
 
-    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
     assert tools._applied_companies == {}, 'an agency name must never block its other postings'
     assert tools._reference_job_texts == ['job description text'], 'still useful as reference signal'
@@ -810,7 +836,7 @@ async def test_load_applied_jobs_blocklists_end_client_not_agency(tmp_path, monk
         ),
     }))
 
-    await tools.load_applied_jobs(applied_dir=applied, index_path=index_path)
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
     assert tools._applied_companies == {'EndClientCo': pdf.name}
 
@@ -884,7 +910,7 @@ def test_build_reference_block_caps_at_max_pdfs(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _categorize_pdf_text and categorize_downloads_pdfs
+# _categorize_pdf_text and categorize_save_dir_pdfs
 # ---------------------------------------------------------------------------
 
 async def test_categorize_pdf_text_saved_jd(monkeypatch):
@@ -903,7 +929,7 @@ async def test_categorize_pdf_text_returns_none_when_tool_not_called(monkeypatch
     assert result is None
 
 
-async def test_categorize_downloads_pdfs_renames_uncategorized(tmp_path, monkeypatch):
+async def test_categorize_save_dir_pdfs_renames_uncategorized(tmp_path, monkeypatch):
     pdf = tmp_path / 'report.pdf'
     pdf.write_bytes(b'%PDF fake')
 
@@ -916,12 +942,12 @@ async def test_categorize_downloads_pdfs_renames_uncategorized(tmp_path, monkeyp
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
-    await tools.categorize_downloads_pdfs(downloads_dir=tmp_path)
+    await tools.categorize_save_dir_pdfs(save_dir=tmp_path)
     assert not pdf.exists()
     assert (tmp_path / 'cat-saved_jd-report.pdf').exists()
 
 
-async def test_categorize_downloads_pdfs_skips_rename_on_error(tmp_path, monkeypatch):
+async def test_categorize_save_dir_pdfs_skips_rename_on_error(tmp_path, monkeypatch):
     pdf = tmp_path / 'report.pdf'
     pdf.write_bytes(b'%PDF fake')
 
@@ -934,11 +960,11 @@ async def test_categorize_downloads_pdfs_skips_rename_on_error(tmp_path, monkeyp
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
-    await tools.categorize_downloads_pdfs(downloads_dir=tmp_path)
+    await tools.categorize_save_dir_pdfs(save_dir=tmp_path)
     assert pdf.exists()  # original file untouched
 
 
-async def test_categorize_downloads_pdfs_skips_already_categorized(tmp_path, monkeypatch):
+async def test_categorize_save_dir_pdfs_skips_already_categorized(tmp_path, monkeypatch):
     pdf = tmp_path / 'cat-other-old_report.pdf'
     pdf.write_bytes(b'%PDF fake')
     sdk_called = []
@@ -948,9 +974,36 @@ async def test_categorize_downloads_pdfs_skips_already_categorized(tmp_path, mon
         return 'other'
 
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
-    await tools.categorize_downloads_pdfs(downloads_dir=tmp_path)
+    await tools.categorize_save_dir_pdfs(save_dir=tmp_path)
     assert not sdk_called
     assert pdf.exists()
+
+
+def test_save_dir_preference_expands_home(monkeypatch):
+    monkeypatch.setattr(
+        preferences, 'load_preferences',
+        lambda force_reload=False: {**preferences.DEFAULT_PREFERENCES, 'save_dir': '~/Elsewhere'},
+    )
+    assert preferences.save_dir() == Path.home() / 'Elsewhere'
+
+
+async def test_categorize_save_dir_pdfs_defaults_to_preference(tmp_path, monkeypatch):
+    """With no argument the save directory comes from preferences, not a hardcoded ~/Downloads."""
+    pdf = tmp_path / 'report.pdf'
+    pdf.write_bytes(b'%PDF fake')
+
+    async def fake_categorize(text, filename):
+        return 'saved_jd'
+
+    monkeypatch.setattr(tools.preferences, 'save_dir', lambda: tmp_path)
+    monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
+    class FakeReader:
+        pages = []
+        def __init__(self, path): pass
+
+    monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
+    await tools.categorize_save_dir_pdfs()
+    assert (tmp_path / 'cat-saved_jd-report.pdf').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1167,21 @@ async def test_submit_job_extract_defaults(monkeypatch):
     assert extract['language_requirement'] == ''
     assert extract['relocation'] == ''
     assert extract['education_requirement'] == ''
+    assert extract['posting_language'] == ''
+    assert extract['local_language'] == ''
+
+
+async def test_submit_job_extract_normalizes_language_fields(monkeypatch):
+    monkeypatch.setattr(tools, '_job_extracts', [])
+
+    await tools.do_submit_job_extract(
+        'Scientifique principal', 'Valtech', 'desc',
+        posting_language=' French ', local_language='FRENCH',
+    )
+
+    extract = tools._job_extracts[0]
+    assert extract['posting_language'] == 'french'
+    assert extract['local_language'] == 'french'
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1195,7 @@ def _make_extract(**overrides) -> dict:
         'location': 'Canada (Remote)', 'date_posted': '3 days ago',
         'closed': False, 'salary': '', 'sponsorship_note': '',
         'language_requirement': '', 'relocation': '', 'education_requirement': '',
+        'posting_language': '', 'local_language': '',
     }
     extract.update(overrides)
     return extract
@@ -1803,7 +1872,7 @@ async def test_triage_job_fit_live():
 
 
 # ---------------------------------------------------------------------------
-# Live tests for Downloads PDF loading
+# Live tests for save-directory PDF loading
 # ---------------------------------------------------------------------------
 
 @pytest.mark.live_agent_claude
@@ -2830,6 +2899,120 @@ def test_build_deterministic_warnings_includes_relocation():
 
 
 # ---------------------------------------------------------------------------
+# posting language and local working language
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('value,expected', [
+    ('french', 'french'),
+    ('FRENCH', 'french'),
+    ('  german  ', 'german'),
+    ('english', ''),
+    ('english (uk)', ''),
+    ('', ''),
+])
+def test_foreign_posting_language(value, expected):
+    assert agent.foreign_posting_language(_make_extract(posting_language=value)) == expected
+
+
+@pytest.mark.parametrize('value,expected', [
+    ('french', 'french'),
+    ('spanish', 'spanish'),
+    ('english', ''),
+    ('', ''),
+])
+def test_foreign_local_language(value, expected):
+    assert agent.foreign_local_language(_make_extract(local_language=value)) == expected
+
+
+def test_apply_rating_caps_caps_foreign_language_posting():
+    extract = _make_extract(posting_language='french')
+    rating, reason = agent.apply_rating_caps(extract, 4)
+    assert rating == preferences.foreign_language_rating_cap()
+    assert 'french' in reason and 'written in' in reason
+
+
+def test_apply_rating_caps_leaves_english_posting_alone():
+    assert agent.apply_rating_caps(_make_extract(posting_language='english'), 5) == (5, '')
+
+
+def test_apply_rating_caps_foreign_language_does_not_raise_a_low_rating():
+    assert agent.apply_rating_caps(_make_extract(posting_language='french'), 2) == (2, '')
+
+
+def test_apply_rating_caps_local_language_alone_never_caps():
+    """A non-English workplace is a warning, not a ceiling — only the JD's own language caps."""
+    assert agent.apply_rating_caps(_make_extract(local_language='french'), 5) == (5, '')
+
+
+def test_apply_rating_caps_applies_lowest_cap_and_reports_every_reason(monkeypatch):
+    monkeypatch.setattr(preferences, 'foreign_language_rating_cap', lambda: 2)
+    extract = _make_extract(
+        location='Netherlands (Hybrid - 2-3 days onsite)', posting_language='dutch',
+    )
+    rating, reason = agent.apply_rating_caps(extract, 5)
+    assert rating == 2
+    assert 'not an acceptable hybrid location' in reason
+    assert 'written in dutch' in reason
+
+
+def test_build_deterministic_warnings_flags_foreign_posting_language():
+    extract = _make_extract(posting_language='french', salary='CAD 200,000')
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert any('Posting written in French' in w for w in warnings)
+
+
+def test_build_deterministic_warnings_flags_non_english_local_language():
+    extract = _make_extract(
+        local_language='french', location='Canada (Remote)', salary='CAD 200,000',
+    )
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert any('Local working language: French' in w and 'Canada (Remote)' in w for w in warnings)
+
+
+@pytest.mark.parametrize('overrides', [
+    {'posting_language': 'english', 'local_language': 'english'},
+    {'posting_language': '', 'local_language': ''},
+])
+def test_build_deterministic_warnings_quiet_for_english_language_fields(overrides):
+    extract = _make_extract(salary='CAD 220,000', **overrides)
+    assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
+
+
+def test_format_extract_text_includes_language_fields():
+    text = agent.format_extract_text(
+        _make_candidate(), _make_extract(posting_language='french', local_language='french'),
+    )
+    assert 'Posting written in: french' in text
+    assert 'Local working language: french' in text
+
+
+def test_format_extract_text_omits_empty_language_fields():
+    text = agent.format_extract_text(_make_candidate(), _make_extract())
+    assert 'Posting written in:' not in text
+    assert 'Local working language:' not in text
+
+
+def test_valtech_regression_french_posting_is_capped_and_warned():
+    """The 2026-08-11 Valtech posting: a French JD ('Scientifique principal des donnees en IA')
+    the extractor handed back as English prose, with location 'Canada (Remote)' and
+    language_requirement 'english'. It was rated 4/5 and notified. It must now cap below the
+    notification threshold and say why."""
+    extract = _make_extract(
+        title='Scientifique principal des donnees en IA', company='Valtech',
+        location='Canada (Remote)', workplace_type='remote',
+        language_requirement='english', posting_language='french', local_language='french',
+        description='Senior individual contributor role in data science and applied AI.',
+    )
+    rating, reason = agent.apply_rating_caps(extract, 4)
+    assert rating < 4
+    assert 'written in french' in reason
+
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert any('Posting written in French' in w for w in warnings)
+    assert any('Local working language: French' in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
 # recruiter / agency postings on the scraped side
 # ---------------------------------------------------------------------------
 
@@ -3040,6 +3223,17 @@ async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences
         education_requirement='phd',
     )
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences):
+    """With no languages configured there is nothing to be foreign to — no cap, no warning."""
+    extract = _make_extract(
+        posting_language='french', local_language='french', salary='CAD 200,000',
+    )
+    assert agent.foreign_posting_language(extract) == ''
+    assert agent.foreign_local_language(extract) == ''
+    assert agent.apply_rating_caps(extract, 5) == (5, '')
+    assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
 
 
 async def test_hard_rules_still_reject_impersonal_conditions(neutral_preferences):

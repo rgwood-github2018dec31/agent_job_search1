@@ -83,6 +83,15 @@ OPENROUTER_EXTRACT_TOOLS = [
                 'Pass sponsorship_note with any visa/work-authorization statement, verbatim. '
                 'Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), '
                 "comma-separated lowercase, e.g. 'english, german'; omit if none stated. "
+                'Pass posting_language with the language the SOURCE PAGE ITSELF IS WRITTEN IN, '
+                "lowercase, e.g. 'english', 'french'. Judge the original page, NOT the condensed "
+                'English text you are writing here — you translate as you condense. The original job '
+                "title is the clearest tell ('Scientifique principal des données en IA' means "
+                "'french'). Omit only if genuinely undeterminable. "
+                "Pass local_language with the dominant local WORKING language of the job's location, "
+                "lowercase, e.g. 'french' for Quebec/Montreal, 'spanish' for Spain, 'english' for "
+                'Toronto or London. Use location references anywhere in the body, not just the '
+                "location field. Omit for work-from-anywhere roles or an unknown location. "
                 'Pass relocation with the country/city if the posting requires relocating to or '
                 'residing in a specific place; omit for work-from-anywhere roles. '
                 "Pass education_requirement as 'master' or 'phd' ONLY if an advanced degree is a hard "
@@ -107,6 +116,8 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'salary': {'type': 'string'},
                     'sponsorship_note': {'type': 'string'},
                     'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase"},
+                    'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output"},
+                    'local_language': {'type': 'string', 'description': "Dominant local working language of the job's location, lowercase e.g. 'french' for Quebec, 'spanish' for Spain; empty for work-from-anywhere or unknown location"},
                     'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if required'},
                     'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
                     # Must stay in sync with submit_job_extract in tools_generic.py — a field added
@@ -140,6 +151,8 @@ def _extract_from_submit_args(args: dict) -> dict:
         'closed': bool(args.get('closed', False)), 'salary': args.get('salary', ''),
         'sponsorship_note': args.get('sponsorship_note', ''),
         'language_requirement': args.get('language_requirement', ''),
+        'posting_language': str(args.get('posting_language') or '').strip().lower(),
+        'local_language': str(args.get('local_language') or '').strip().lower(),
         'relocation': args.get('relocation', ''),
         'workplace_type': str(args.get('workplace_type') or '').strip().lower(),
         'education_requirement': str(args.get('education_requirement') or '').strip().lower(),

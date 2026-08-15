@@ -339,6 +339,8 @@ Condense aggressively: keep the title, company, location, posting date, salary, 
 Also capture:
 - workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
 - language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
+- posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely undeterminable.
+- local_language: the dominant local WORKING/BUSINESS language of the job's location, lowercase English name, e.g. "french" for Quebec/Montreal, "spanish" for Spain, "english" for Toronto or London. Use location references anywhere in the posting body, not just the location field — a remote-Canada role whose text mentions "colleagues outside Quebec" is "french". Leave empty for work-from-anywhere roles or when the location is unknown.
 - relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
 - education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required.
 
@@ -365,6 +367,9 @@ Also produce:
 - summary: a short label summarising the job (used in the saved filename)
 - pros: 2–4 short bullet phrases (~100 chars each) naming the concrete strengths — matching tech, seniority, compensation, domain
 - warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — hybrid/on-site, contract vs full-time, salary below target, missing salary, stack mismatch, language expectations. Every conflict you notice MUST appear here, even when you still rate the job highly.
+
+## Language
+Check the `Posting written in:` and `Local working language:` lines. A posting written in another language, and a workplace whose local working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English. Do not write a warning bullet for either: both are detected deterministically and added for you.
 
 Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
 """
@@ -446,6 +451,8 @@ EXTRACT_OUTPUT_SCHEMA = {
         'salary': {'type': 'string'},
         'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
         'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
+        'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
+        'local_language': {'type': 'string', 'description': "Dominant local working language of the job's location, lowercase e.g. 'french' for Quebec, 'spanish' for Spain; empty for work-from-anywhere or unknown location"},
         'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
         'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement (e.g. 'MSc required', 'PhD is a must'); empty when merely preferred, when equivalent experience is accepted, or when only a Bachelor's is required"},
     },
@@ -474,6 +481,11 @@ RATING_OUTPUT_SCHEMA = {
 
 
 def load_resume() -> str | None:
+    """Newest `*-resume-*.md` in run_dir, or None.
+
+    Markdown only — a PDF resume is not read. The applied-job corpus is the dominant signal for
+    query generation and the ideal-role profile, so converting the PDF has never been worth it.
+    """
     matches = list(RUN_DIR.glob('*-resume-*.md'))
     matches += list(RUN_DIR.glob('*-Resume-*.md'))
     if not matches:
@@ -494,7 +506,7 @@ def build_system_prompt(interactive: bool) -> str:
         if resume:
             parts.append(f"--- RESUME ---\n{resume}\n--- END RESUME ---")
         else:
-            console.print("[yellow]Warning: no resume file found matching *-resume-*.<md|pdf>[/yellow]")
+            console.print("[yellow]Warning: no resume file found matching *-resume-*.md[/yellow]")
 
     if JOB_REQUIREMENTS_PATH.exists():
         requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
@@ -1223,6 +1235,8 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         'closed': structured.get('closed', False), 'salary': structured.get('salary', ''),
         'sponsorship_note': structured.get('sponsorship_note', ''),
         'language_requirement': structured.get('language_requirement', ''),
+        'posting_language': (structured.get('posting_language') or '').strip().lower(),
+        'local_language': (structured.get('local_language') or '').strip().lower(),
         'relocation': structured.get('relocation', ''),
         'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
         'education_requirement': (structured.get('education_requirement') or '').strip().lower(),
@@ -1425,6 +1439,10 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Sponsorship/authorization note: {extract['sponsorship_note']}")
     if extract.get('language_requirement'):
         lines.append(f"Language requirement: {extract['language_requirement']}")
+    if extract.get('posting_language'):
+        lines.append(f"Posting written in: {extract['posting_language']}")
+    if extract.get('local_language'):
+        lines.append(f"Local working language: {extract['local_language']}")
     if extract.get('relocation'):
         lines.append(f"Relocation required: {extract['relocation']}")
     if extract.get('education_requirement'):
@@ -1482,6 +1500,30 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     return None
 
 
+def _unsupported_language(value: str) -> str:
+    """The language named, if it is one the user does not work in; '' otherwise.
+
+    Returns '' when the field is unset and when no languages are configured, so every rule built
+    on this is inert under neutral defaults. Matching is by substring in the same direction as the
+    `language_requirement` gate, so 'english (uk)' counts as english.
+    """
+    known = preferences.languages()
+    text = str(value or '').strip().lower()
+    if not known or not text:
+        return ''
+    return '' if any(lang in text for lang in known) else text
+
+
+def foreign_posting_language(extract: dict) -> str:
+    """The language the posting is WRITTEN IN, when the user does not read it; '' otherwise."""
+    return _unsupported_language(extract.get('posting_language', ''))
+
+
+def foreign_local_language(extract: dict) -> str:
+    """The local working language of the job's location, when it is not one the user speaks."""
+    return _unsupported_language(extract.get('local_language', ''))
+
+
 def hybrid_location_is_acceptable(location: str) -> bool:
     """True if a hybrid/on-site role in this location is one the user would actually take."""
     haystack = (location or '').lower()
@@ -1489,20 +1531,37 @@ def hybrid_location_is_acceptable(location: str) -> bool:
 
 
 def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
-    """Deterministic post-rating ceiling. Returns (rating, reason) — reason is '' if uncapped.
+    """Deterministic post-rating ceilings. Returns (rating, reason) — reason is '' if uncapped.
 
     A cap is not a rejection: the job is still saved and still appears in the audit log, it just
     never crosses the >=4 notification threshold. This backstops the evaluator prompt, which has
     demonstrably rated a hybrid role in an unacceptable location 4/5 while naming the hybrid
-    location as a drawback in its own reasoning.
+    location as a drawback in its own reasoning — and, on the Valtech posting, rated a
+    French-language JD 4/5 after silently translating it into English while condensing.
+
+    Several caps can apply at once; the lowest wins and every applicable reason is reported, so
+    the log line and the saved job say everything that held the rating down.
     """
+    caps: list[tuple[int, str]] = []
+
     workplace_type = derive_workplace_type(extract)
-    cap = preferences.hybrid_rating_cap()
     if workplace_type in {'hybrid', 'onsite'} and not hybrid_location_is_acceptable(extract.get('location', '')):
-        if rating > cap:
-            location = extract.get('location') or 'unspecified location'
-            return cap, f'{workplace_type} in {location} (not an acceptable hybrid location)'
-    return rating, ''
+        location = extract.get('location') or 'unspecified location'
+        caps.append((
+            preferences.hybrid_rating_cap(),
+            f'{workplace_type} in {location} (not an acceptable hybrid location)',
+        ))
+
+    if language := foreign_posting_language(extract):
+        caps.append((
+            preferences.foreign_language_rating_cap(),
+            f'posting written in {language}',
+        ))
+
+    applicable = [(cap, reason) for cap, reason in caps if rating > cap]
+    if not applicable:
+        return rating, ''
+    return min(cap for cap, _ in applicable), '; '.join(reason for _, reason in applicable)
 
 
 _CONTRACT_RE = re.compile(
@@ -1527,6 +1586,17 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
         if not hybrid_location_is_acceptable(extract.get('location', '')):
             warning += ' (not an acceptable hybrid location)'
         warnings.append(warning)
+
+    # Two independent language facts. A posting written in another language gets the first (and a
+    # rating cap); an English posting in a non-English workplace gets only the second. The Valtech
+    # posting — a French JD the extractor handed back as English prose — was rated 4/5 and
+    # notified with neither, which is why neither is left to the rater.
+    if language := foreign_posting_language(extract):
+        warnings.append(f'Posting written in {language.title()} — not English')
+
+    if local_language := foreign_local_language(extract):
+        location = extract.get('location') or 'location not stated'
+        warnings.append(f'Local working language: {local_language.title()} — {location}')
 
     if extract.get('relocation'):
         warnings.append(f"Relocation required: {extract['relocation']}")
@@ -1713,6 +1783,8 @@ async def evaluate_all_candidates(
                 f"Extract signal: {candidate['company']} — {candidate['title']}: "
                 f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
                 f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
+                f"posting_language={extract.get('posting_language')!r} "
+                f"local_language={extract.get('local_language')!r} "
                 f"relocation={extract.get('relocation')!r} "
                 f"education_requirement={extract.get('education_requirement')!r} "
                 f"is_agency={derive_agency_posting(extract)} end_client={extract.get('end_client')!r}"
@@ -2261,8 +2333,8 @@ async def main() -> None:
     # until someone noticed the stale file (read_run_lock also treats a dead PID as stale).
     try:
         load_processed_jobs()
-        await tools_module.categorize_downloads_pdfs()
-        await tools_module.ingest_downloads_applied_pdfs()
+        await tools_module.categorize_save_dir_pdfs()
+        await tools_module.ingest_save_dir_applied_pdfs()
         await tools_module.load_applied_jobs()
 
         if interactive:

@@ -37,13 +37,24 @@ PROJECT_DIR = Path(__file__).parent.parent.parent  # src/agentic_job_search/ -> 
 RUN_DIR = PROJECT_DIR / "run_dir"
 JOB_REQUIREMENTS_PATH = RUN_DIR / "JOB_REQUIREMENTS.md"
 PROCESSED_JOBS_DIR = RUN_DIR / "processed_jobs"
+# Applied-job PDFs travel between TWO DISTINCT DIRECTORIES, and nothing conflates them:
+#
+#   save_dir       — SOURCE. Outside the project, user-controlled, configurable via the
+#                    `save_dir` preference (default ~/Downloads). Where the browser drops a
+#                    saved job posting. The agent only ever globs it and MOVES files OUT.
+#   APPLIED_JOBS_DIR — DESTINATION. Inside run_dir/, agent-owned, never configurable. The
+#                    applied-jobs corpus that feeds query generation, the ideal-role profile,
+#                    and the already-applied blocklist. Files here are date-prefixed and read.
+#
+# Functions that touch both take them as separate parameters named `save_dir` and
+# `applied_to_dir`; a function that names only one directory operates only on that one.
 APPLIED_JOBS_DIR = RUN_DIR / "applied_jobs"
 APPLIED_JOBS_INDEX_PATH = APPLIED_JOBS_DIR / "index.yaml"
 # Legacy per-path cache from when the corpus lived in ~/Downloads; still read during ingest
 # as a fallback source of applied dates if a file's mtime has drifted.
 LEGACY_DOWNLOADS_CACHE_PATH = RUN_DIR / "downloads_pdf_cache.yaml"
 
-# Leading wildcard so an already-date-prefixed PDF landing back in Downloads is still ingested
+# Leading wildcard so an already-date-prefixed PDF landing back in the save directory is ingested
 # (with its original date) rather than silently ignored.
 APPLIED_PDF_GLOB = '*cat-saved_jd-*.pdf'
 _DATE_PREFIX_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})-')
@@ -390,13 +401,17 @@ async def _categorize_pdf_text(text: str, filename: str) -> str:
     return None
 
 
-async def categorize_downloads_pdfs(downloads_dir: Path | None = None) -> None:
-    """Rename uncategorized PDFs in ~/Downloads with a cat-<category>- prefix."""
-    downloads = downloads_dir or Path.home() / 'Downloads'
-    uncategorized = [p for p in downloads.glob('*.pdf') if not p.name.startswith('cat-')]
+async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
+    """Rename uncategorized PDFs in the save directory with a cat-<category>- prefix.
+
+    Touches the SOURCE directory only — files are renamed in place and nothing moves into the
+    applied-jobs corpus here; that is ingest_save_dir_applied_pdfs()'s job.
+    """
+    directory = save_dir or preferences.save_dir()
+    uncategorized = [p for p in directory.glob('*.pdf') if not p.name.startswith('cat-')]
     if not uncategorized:
         return
-    console.print(f'[dim]Categorizing {len(uncategorized)} uncategorized PDF(s) in Downloads...[/dim]')
+    console.print(f'[dim]Categorizing {len(uncategorized)} uncategorized PDF(s) in {directory}...[/dim]')
     for pdf in uncategorized:
         try:
             reader = pypdf.PdfReader(pdf)
@@ -457,33 +472,37 @@ def _resolve_applied_date(pdf: Path, index: dict, legacy_cache: dict) -> date:
     return datetime.fromtimestamp(pdf.stat().st_mtime).date()
 
 
-async def ingest_downloads_applied_pdfs(
-    downloads_dir: Path | None = None,
-    applied_dir: Path | None = None,
+async def ingest_save_dir_applied_pdfs(
+    save_dir: Path | None = None,
+    applied_to_dir: Path | None = None,
     dry_run: bool = False,
 ) -> int:
-    """Move cat-saved_jd-*.pdf out of Downloads into the applied-jobs corpus, date-stamped.
+    """Move cat-saved_jd-*.pdf FROM the save directory INTO the applied-jobs corpus, date-stamped.
+
+    The two directories are separate and never defaulted from each other:
+      save_dir      — source, outside the project (`save_dir` preference, default ~/Downloads)
+      applied_to_dir — destination, the run_dir/applied_jobs/ corpus (APPLIED_JOBS_DIR)
 
     Files are renamed to '{YYYY-MM-DD}-{original name}' so the applied date survives any later
     copy that drops metadata. mtime is restored on the destination as a secondary carrier.
     Already-prefixed files are a no-op, so this is safe to run on every startup and doubles as
     the one-time migration. Returns the number of files moved (or that would move, if dry_run).
     """
-    downloads = downloads_dir or Path.home() / 'Downloads'
-    target_dir = applied_dir or APPLIED_JOBS_DIR
+    save_dir = save_dir or preferences.save_dir()
+    applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
 
-    pdfs = sorted(downloads.glob(APPLIED_PDF_GLOB))
+    pdfs = sorted(save_dir.glob(APPLIED_PDF_GLOB))
     if not pdfs:
         return 0
 
-    index = _read_yaml_mapping(target_dir / 'index.yaml')
+    index = _read_yaml_mapping(applied_to_dir / 'index.yaml')
     legacy_cache = _read_yaml_mapping(LEGACY_DOWNLOADS_CACHE_PATH)
 
     moved = 0
     for pdf in pdfs:
         applied_date = _resolve_applied_date(pdf, index, legacy_cache)
         name = pdf.name if _DATE_PREFIX_RE.match(pdf.name) else f'{applied_date.isoformat()}-{pdf.name}'
-        destination = target_dir / name
+        destination = applied_to_dir / name
 
         if destination.exists():
             console.print(f'[yellow]Skipping {pdf.name} — {destination.name} already in the corpus.[/yellow]')
@@ -495,12 +514,12 @@ async def ingest_downloads_applied_pdfs(
             continue
 
         mtime = pdf.stat().st_mtime
-        target_dir.mkdir(parents=True, exist_ok=True)
+        applied_to_dir.mkdir(parents=True, exist_ok=True)
         try:
             shutil.move(str(pdf), str(destination))
             os.utime(destination, (mtime, mtime))
         except Exception as ex:
-            # shutil.move copies then unlinks; if the unlink failed (e.g. a read-only Downloads)
+            # shutil.move copies then unlinks; if the unlink failed (e.g. a read-only save dir)
             # both copies now exist and the destination-exists check would skip this file
             # forever. Roll the destination back so the next run retries cleanly.
             if pdf.exists() and destination.exists():
@@ -518,12 +537,15 @@ async def ingest_downloads_applied_pdfs(
 
     if moved:
         verb = 'would ingest' if dry_run else 'Ingested'
-        console.print(f'[dim]{verb} {moved} applied-job PDF(s) into {target_dir}.[/dim]')
+        console.print(f'[dim]{verb} {moved} applied-job PDF(s) into {applied_to_dir}.[/dim]')
     return moved
 
 
-async def load_applied_jobs(applied_dir: Path | None = None, index_path: Path | None = None) -> None:
+async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path | None = None) -> None:
     """Load the applied-jobs corpus, populating the in-horizon globals.
+
+    Reads the DESTINATION directory only (run_dir/applied_jobs/) — the save directory is not
+    involved here, and an un-ingested PDF still sitting in it is invisible to this function.
 
     index.yaml caches the extracted text and metadata per filename, keyed on mtime, so the
     metadata LLM call only runs for new or changed PDFs. Records applied to longer ago than
@@ -531,8 +553,8 @@ async def load_applied_jobs(applied_dir: Path | None = None, index_path: Path | 
     """
     global _applied_companies, _reference_job_texts, _applied_jobs
 
-    target_dir = applied_dir or APPLIED_JOBS_DIR
-    index_file = index_path or (target_dir / 'index.yaml')
+    applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
+    index_file = index_path or (applied_to_dir / 'index.yaml')
 
     index = _read_yaml_mapping(index_file)
     legacy_cache = _read_yaml_mapping(LEGACY_DOWNLOADS_CACHE_PATH)
@@ -545,7 +567,7 @@ async def load_applied_jobs(applied_dir: Path | None = None, index_path: Path | 
     total = 0
     aged_out = 0
 
-    for pdf in sorted(target_dir.glob('*.pdf')):
+    for pdf in sorted(applied_to_dir.glob('*.pdf')):
         total += 1
         applied_date = _resolve_applied_date(pdf, index, legacy_cache)
         mtime = pdf.stat().st_mtime
@@ -596,7 +618,7 @@ async def load_applied_jobs(applied_dir: Path | None = None, index_path: Path | 
         jobs.append({'filename': pdf.name, 'applied_date': applied_date, **metadata})
 
     if index_dirty:
-        target_dir.mkdir(parents=True, exist_ok=True)
+        applied_to_dir.mkdir(parents=True, exist_ok=True)
         index_file.write_text(yaml.dump(index, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
     _applied_companies = companies
@@ -793,10 +815,10 @@ def write_run_audit_log(
     Answers, for one run: how many applied jobs fed it, which queries ran, how many jobs each
     query surfaced, and what happened to every individual job (with URL and summary).
     """
-    target_dir = (run_dir or RUN_DIR) / 'audit_logs'
-    target_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir = (run_dir or RUN_DIR) / 'audit_logs'
+    audit_dir.mkdir(parents=True, exist_ok=True)
     stamp = (timestamp or datetime.now()).strftime('%Y%b%d-%H%M%S')
-    path = target_dir / f'audit-{stamp}.md'
+    path = audit_dir / f'audit-{stamp}.md'
 
     lines = [
         f'# Run audit — {(timestamp or datetime.now()).isoformat(timespec="seconds")}',
@@ -1090,12 +1112,15 @@ async def do_submit_job_extract(
     language_requirement: str | None = None, relocation: str | None = None,
     workplace_type: str | None = None, education_requirement: str | None = None,
     is_agency: bool | None = None, end_client: str | None = None,
+    posting_language: str | None = None, local_language: str | None = None,
 ) -> dict:
     _job_extracts.append({
         'title': title, 'company': company, 'description': description,
         'location': location or '', 'date_posted': date_posted or '',
         'closed': closed, 'salary': salary or '', 'sponsorship_note': sponsorship_note or '',
         'language_requirement': language_requirement or '', 'relocation': relocation or '',
+        'posting_language': (posting_language or '').strip().lower(),
+        'local_language': (local_language or '').strip().lower(),
         'workplace_type': (workplace_type or '').strip().lower(),
         'education_requirement': (education_requirement or '').strip().lower(),
         # None (not False) when the extractor said nothing, so derive_agency_posting() can tell
@@ -1215,6 +1240,16 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
     "Pass sponsorship_note with any visa/work-authorization statement, verbatim, if present. "
     "Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), comma-separated "
     "lowercase, e.g. 'english, german'; omit if no language requirement is stated. "
+    "Pass posting_language with the language the SOURCE PAGE ITSELF IS WRITTEN IN, lowercase, e.g. "
+    "'english', 'french'. Judge the original page you read, NOT the condensed English text you are "
+    "writing here — you translate as you condense, so your own output says nothing about the "
+    "original. The original job title is usually the clearest tell (a title like 'Scientifique "
+    "principal des données en IA' means 'french'). Omit only if genuinely undeterminable. "
+    "Pass local_language with the dominant local WORKING language of the job's location, lowercase, "
+    "e.g. 'french' for Quebec/Montreal, 'spanish' for Spain, 'english' for Toronto or London. Use "
+    "location references anywhere in the body, not just the location field — a remote-Canada role "
+    "whose text mentions 'colleagues outside Quebec' is 'french'. Omit for work-from-anywhere roles "
+    "or when the location is unknown. "
     "Pass relocation with the country/city if the posting requires relocating to or residing in a "
     "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles. "
     "Pass workplace_type as exactly 'remote', 'hybrid', or 'onsite' when the page states the work "
@@ -1241,6 +1276,8 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
             'salary': {'type': 'string'},
             'sponsorship_note': {'type': 'string'},
             'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
+            'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
+            'local_language': {'type': 'string', 'description': "Dominant local working language of the job's location, lowercase e.g. 'french' for Quebec, 'spanish' for Spain; empty for work-from-anywhere or unknown location"},
             'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
             'education_requirement': {'type': 'string', 'description': "'master' or 'phd' if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
             # Wording mirrors _extract_applied_job_metadata's is_recruiting_agency/end_client_name
@@ -1272,6 +1309,8 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
         education_requirement=args.get("education_requirement"),
         is_agency=args.get("is_agency"),
         end_client=args.get("end_client"),
+        posting_language=args.get("posting_language"),
+        local_language=args.get("local_language"),
     )
 
 

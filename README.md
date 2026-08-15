@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID=<your chat ID>
 
 The agent uses a persistent browser profile at `~/.linkedin-agent-profile/` so your LinkedIn session is remembered between runs. Log in on first launch when the browser opens.
 
-Place your resume in `run_dir/` matching the pattern `*-resume-*.md` or `*-resume-*.pdf`. The most recently modified file is used.
+Place your resume in `run_dir/` as Markdown, matching the pattern `*-resume-*.md`. The most recently modified match is used. A PDF resume is not read — convert it to Markdown.
 
 ## Usage
 

@@ -21,9 +21,6 @@ wheels/
 # Saved job postings (runtime data)
 saved_jobs-*/
 
-# Playwright browser profile
-.playwright-mcp/
-
 # Python version file (machine-specific)
 .python-version
 

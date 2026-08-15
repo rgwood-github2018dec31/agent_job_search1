@@ -29,9 +29,15 @@ EXAMPLE_PREFERENCES_PATH = PROJECT_DIR / 'preferences.example.yaml'
 
 # Neutral defaults: no personal situation encoded. Every gate that could reject a job is off.
 DEFAULT_PREFERENCES: dict[str, Any] = {
+    # Where saved job-posting PDFs land before categorization and ingest. Not a gate and not a
+    # personal fact, so this defaults to a real path rather than a neutral empty value.
+    'save_dir': '~/Downloads',
     'search_regions': [],           # [{'name': ..., 'linkedin_location': ...}]; empty = unfiltered search
     'sponsorship_required_in': [],  # lowercase location substrings where the user needs visa sponsorship
     'languages': [],                # languages the user works in; empty = no language gate
+    # Ceiling for a posting WRITTEN IN a language outside `languages`. Inert while `languages`
+    # is empty, like every other language rule.
+    'foreign_language_rating_cap': 3,
     'reject_required_degrees': [],  # e.g. ['master', 'phd']; empty = no education gate
     'hybrid': {
         'rating_cap': 3,
@@ -103,6 +109,16 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def save_dir() -> Path:
+    '''Directory where saved job-posting PDFs land, before categorization and ingest.
+
+    This is the SOURCE only — an external, user-controlled folder the agent moves files out of.
+    It is never the applied-jobs corpus, which lives at tools_generic.APPLIED_JOBS_DIR
+    (run_dir/applied_jobs/) and is deliberately not configurable.
+    '''
+    return Path(str(load_preferences()['save_dir'])).expanduser()
+
+
 def search_regions() -> list[dict[str, str]]:
     '''Regions to search, each {'name', 'linkedin_location'}. Empty means one unfiltered search.'''
     return list(load_preferences()['search_regions'])
@@ -116,6 +132,11 @@ def sponsorship_required_in() -> tuple[str, ...]:
 def languages() -> tuple[str, ...]:
     '''Lowercase languages the user works in; a posting requiring any other language is rejected.'''
     return tuple(str(lang).lower() for lang in load_preferences()['languages'])
+
+
+def foreign_language_rating_cap() -> int:
+    '''Highest rating a posting written in a language outside `languages` can receive.'''
+    return int(load_preferences()['foreign_language_rating_cap'])
 
 
 def rejected_degrees() -> tuple[str, ...]:

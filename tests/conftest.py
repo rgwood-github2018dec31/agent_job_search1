@@ -14,12 +14,16 @@ load_env()
 # that file is personal and machine-local, so depending on it would make results differ per
 # developer and silently change when someone edits their own job-search settings.
 TEST_PREFERENCES = {
+    # Deliberately nonexistent: every test passes an explicit directory, and this makes sure a
+    # test that forgets to can never glob or rename PDFs in the developer's own ~/Downloads.
+    'save_dir': '/nonexistent/test-save-dir',
     'search_regions': [
         {'name': 'Testland', 'linkedin_location': 'Testland'},
         {'name': 'Test Union', 'linkedin_location': 'Test Union'},
     ],
     'sponsorship_required_in': ['united states'],
     'languages': ['english'],
+    'foreign_language_rating_cap': 3,
     'reject_required_degrees': ['master', 'phd'],
     'hybrid': {
         'rating_cap': 3,

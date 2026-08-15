@@ -1,12 +1,9 @@
-from datetime import datetime
-
 # Model tier constants
 MODEL_NAME_HIGH = 'claude-opus-5'  # audit reference standard only (--audit-opus)
 MODEL_NAME_MEDIUM = 'claude-sonnet-5'
 MODEL_NAME_LOW = 'claude-haiku-4-5'
 
 # Job search parameters
-JOB_SEARCH_START_DATE = datetime(2026, 4, 1)
 JOB_MAX_AGE_DAYS = 21
 JOB_STALE_AGE_DAYS = 30  # hard rule: postings older than this are auto-rated 1
 MAX_REFERENCE_JOBS = 20

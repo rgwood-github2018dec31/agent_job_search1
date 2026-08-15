@@ -7,6 +7,14 @@
 # which apply no gate at all — an unconfigured run searches without a location filter and rejects
 # nothing on work authorization, language, or education.
 
+# Directory where you save job-posting PDFs out of your browser — the SOURCE the agent moves
+# files out of. On every startup it categorizes uncategorized PDFs here with a `cat-<category>-`
+# prefix, then moves the `cat-saved_jd-*.pdf` ones into the applied-jobs corpus. `~` is expanded.
+#
+# This is NOT the corpus itself. The destination is always run_dir/applied_jobs/ and is not
+# configurable — do not point save_dir at it, or ingest would be moving files onto themselves.
+save_dir: ~/Downloads
+
 # Regions to search on LinkedIn. Each entry becomes four searches (two sort orders x this region).
 # `linkedin_location` is passed as the `location` URL parameter. An empty list searches globally.
 search_regions:
@@ -18,10 +26,19 @@ search_regions:
 # Leave empty if you are authorized everywhere you search.
 sponsorship_required_in: []
 
-# Languages you can work in, lowercase. A posting that explicitly REQUIRES any other language is
-# auto-rated 1. Leave empty to disable the language gate.
+# Languages you can work in, lowercase. This list drives three separate rules, all of them off
+# while it is empty:
+#   1. A posting that explicitly REQUIRES another language is auto-rated 1 (hard rule).
+#   2. A posting WRITTEN IN another language is capped at `foreign_language_rating_cap` below.
+#   3. A job whose location has a different local working language (English JD in Montreal or
+#      Madrid) gets a warning — never a rejection.
 languages:
   - english
+
+# Highest rating a posting written in a language outside `languages` can receive. Like the hybrid
+# cap this is a ceiling, not a rejection: the job is still saved and auditable, it just cannot
+# reach the notification threshold of 4.
+foreign_language_rating_cap: 3
 
 # Degree levels that auto-reject when a posting states them as a HARD requirement.
 # Valid values: master, phd. Leave empty if an advanced degree is not a blocker for you.
