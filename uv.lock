@@ -23,9 +23,9 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", specifier = ">=0.2.132" },
+    { name = "claude-agent-sdk", specifier = ">=0.2.139" },
     { name = "mcp", specifier = ">=1.29" },
-    { name = "pypdf", specifier = ">=6.15" },
+    { name = "pypdf", specifier = ">=6.16.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.34" },
     { name = "rich", specifier = ">=15.0" },
