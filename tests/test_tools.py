@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -15,6 +16,7 @@ from agentic_job_search import agent
 from agentic_job_search import config
 from agentic_job_search import extract_openrouter
 from agentic_job_search import preferences
+from agentic_job_search import scrape_openrouter
 from agentic_job_search import tools_generic as tools
 from agentic_job_search import triage
 
@@ -478,7 +480,15 @@ async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
             "When asked to save a job, use the save_job_posting tool exactly once."
         ),
         mcp_servers={"job_search": tools.make_job_search_server(interactive=False)},
-        permission_mode="acceptEdits",
+        # bypassPermissions, as every non-interactive site in agent.py uses: acceptEdits
+        # auto-approves file edits only, so an in-process MCP tool call is DENIED under it
+        # (verified: the call arrives, then shows up in ResultMessage.permission_denials).
+        permission_mode="bypassPermissions",
+        # Without these the run also loads every global MCP server, burying save_job_posting
+        # among dozens of unrelated tools, plus the repo CLAUDE.md. Same leak as the src sites.
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
     )
 
     async for _ in query(
@@ -493,7 +503,9 @@ async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
 
     saved_dirs = list(tmp_path.glob("saved_jobs-*"))
     assert len(saved_dirs) == 1, "Expected a saved_jobs-* directory to be created"
-    files = list(saved_dirs[0].glob("job_posting-testcorp-*-rating_4-*.md"))
+    # Filename order is job_posting-{id}-rating_{n}-{company}-...; the old glob here had company
+    # before rating and so could never have matched even once the tool was called.
+    files = list(saved_dirs[0].glob("job_posting-*-rating_4-testcorp-*.md"))
     assert len(files) == 1, f"Expected one saved job file, found: {list(saved_dirs[0].iterdir())}"
 
 
@@ -1064,6 +1076,10 @@ async def test_queue_candidate_attributes_to_the_running_query_not_the_model_str
 
 async def test_run_scraper_sets_the_current_query(monkeypatch):
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -1079,7 +1095,7 @@ async def test_run_scraper_sets_the_current_query(monkeypatch):
 
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
     queries = ['Alpha', 'Beta']
-    await agent.run_scraper(_RecordingClient({q: healthy for q in queries}), queries,
+    await _scrape(_RecordingClient({q: healthy for q in queries}), queries,
                             {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
 
     assert seen == ['Alpha', 'Beta'], 'each request runs with its own base query set'
@@ -1832,6 +1848,117 @@ def test_format_extract_text_falls_back_to_candidate_date():
 
 
 # ---------------------------------------------------------------------------
+# Local-model preflight and MCP error unwrapping
+#
+# 2026-08-25: `qwen3.6:latest` stopped being installed and Stage 2c triage failed open on every
+# job for ten days. Nothing looked broken - it fails open by design - and the run log only ever
+# said "unhandled errors in a TaskGroup (1 sub-exception)", because the RuntimeError naming the
+# missing model was nested inside two anyio task groups.
+# ---------------------------------------------------------------------------
+
+def test_unwrap_exception_surfaces_root_cause():
+    """The message must survive ExceptionGroup nesting, which is how every MCP failure arrives."""
+    root = RuntimeError("model 'qwen3.6:latest' not found")
+    inner = ExceptionGroup('unhandled errors in a TaskGroup', [root])
+    outer = ExceptionGroup('unhandled errors in a TaskGroup', [inner])
+
+    message = triage.unwrap_exception(outer)
+
+    assert "model 'qwen3.6:latest' not found" in message
+    assert 'unhandled errors in a TaskGroup' not in message
+
+
+def test_unwrap_exception_follows_cause_chain():
+    root = RuntimeError('ollama said no')
+    try:
+        try:
+            raise root
+        except RuntimeError as ex:
+            raise ValueError('wrapper') from ex
+    except ValueError as ex:
+        message = triage.unwrap_exception(ex)
+
+    assert 'ollama said no' in message
+    assert 'wrapper' in message
+
+
+def _patch_mcp(monkeypatch, generate=None, list_models=None):
+    """Stub call_mcp_tool, dispatching on tool name. Values may be strings or exceptions."""
+    async def fake_call(url, tool_name, args):
+        result = {'generate': generate, 'list_models': list_models}[tool_name]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+
+
+_INSTALLED = json.dumps({'models': [{'name': 'granite4.1:3b'}, {'name': 'gemma4:26b'}]})
+
+
+async def test_generate_local_names_installed_models_when_model_missing(monkeypatch):
+    """A missing tag must produce the fix, not a 404 the reader has to decode."""
+    missing = ExceptionGroup('unhandled errors in a TaskGroup', [
+        RuntimeError("MCP tool 'generate' returned an error: 404 Client Error: Not Found for url: "
+                     "http://localhost:11434/api/generate model 'gone:latest' not found"),
+    ])
+    _patch_mcp(monkeypatch, generate=missing, list_models=_INSTALLED)
+
+    with pytest.raises(triage.LocalModelMissingError) as excinfo:
+        await triage.generate_local('hi', model='gone:latest')
+
+    message = str(excinfo.value)
+    assert 'gone:latest' in message
+    assert 'granite4.1:3b' in message and 'gemma4:26b' in message
+
+
+async def test_generate_local_reraises_other_failures(monkeypatch):
+    """A down server must keep reading as a down server, not as a misconfiguration."""
+    _patch_mcp(monkeypatch, generate=ConnectionRefusedError('connection refused'), list_models=_INSTALLED)
+
+    with pytest.raises(Exception) as excinfo:
+        await triage.generate_local('hi', model='granite4.1:3b')
+
+    assert not isinstance(excinfo.value, triage.LocalModelMissingError)
+
+
+async def test_preflight_local_model_passes_when_installed(monkeypatch):
+    _patch_mcp(monkeypatch, list_models=_INSTALLED)
+    assert await triage.preflight_local_model('granite4.1:3b') is None
+
+
+async def test_preflight_local_model_reports_when_missing(monkeypatch):
+    _patch_mcp(monkeypatch, list_models=_INSTALLED)
+
+    problem = await triage.preflight_local_model('qwen3.6:latest')
+
+    assert problem is not None
+    assert 'qwen3.6:latest' in problem
+    assert 'granite4.1:3b' in problem
+
+
+async def test_preflight_local_model_is_silent_when_server_is_down(monkeypatch):
+    """Fail open quietly: the servers are optional, and crying wolf every run trains it out."""
+    _patch_mcp(monkeypatch, list_models=ConnectionRefusedError('connection refused'))
+    assert await triage.preflight_local_model('granite4.1:3b') is None
+
+
+async def test_configured_local_model_is_a_concrete_tag():
+    """`:latest` is the tag that vanished on a re-pull; pin a concrete one."""
+    assert not config.LOCAL_MODEL.endswith(':latest')
+
+
+def test_local_model_missing_alert_reaches_run_health():
+    """The preflight is worthless if its finding stops at the run log."""
+    alerts = agent.assess_run_health({'ui_alerts': [
+        {'kind': 'local_model_missing', 'query': '(all)', 'region': '(all)',
+         'detail': "Local model 'gone:latest' is not installed"},
+    ]})
+
+    assert any('LOCAL TRIAGE DISABLED' in a and 'gone:latest' in a for a in alerts)
+
+
+# ---------------------------------------------------------------------------
 # Live tests for the LLM MCP tool servers (require servers on :8002/:8006)
 # ---------------------------------------------------------------------------
 
@@ -1847,7 +1974,9 @@ def _require_llm_server(port: int) -> None:
 @pytest.mark.live
 async def test_generate_local_live():
     _require_llm_server(8002)
-    response = await triage.generate_local('Reply with exactly: OK', model='qwen3.6:latest', max_tokens=500)
+    # config.LOCAL_MODEL, never a hardcoded copy: this test's whole job is to catch that tag
+    # going stale, and a test carrying its own duplicate of the value tracks nothing.
+    response = await triage.generate_local('Reply with exactly: OK', model=config.LOCAL_MODEL, max_tokens=500)
     assert response.strip() != ''
 
 
@@ -1876,7 +2005,13 @@ async def test_triage_job_fit_live():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.live_agent_claude
-async def test_extract_company_from_text_live():
+async def test_extract_applied_job_metadata_live():
+    """Successor to test_extract_company_from_text_live.
+
+    `_extract_company_from_text(text) -> str` was replaced by
+    `_extract_applied_job_metadata(text, filename) -> dict` in commit 96bd708, but the old test
+    stayed behind calling the deleted name. It never failed, because the live gate skipped it.
+    """
     text = '''
     Software Engineer — Remote
     Shopify
@@ -1884,9 +2019,28 @@ async def test_extract_company_from_text_live():
     You will work on our e-commerce platform serving millions of merchants.
     Requirements: 5+ years Python, strong distributed systems knowledge.
     '''
-    company = await tools._extract_company_from_text(text)
-    assert company.strip() != ''
-    assert 'shopify' in company.lower()
+    metadata = await tools._extract_applied_job_metadata(text, 'shopify_swe.pdf')
+
+    assert 'shopify' in metadata['company'].lower(), metadata
+    assert 'engineer' in metadata['job_title'].lower(), metadata
+    # Shopify posts its own roles, so this is the employer, not an agency reposting for a client.
+    assert metadata['is_agency'] is False, metadata
+
+
+@pytest.mark.live_agent_claude
+async def test_extract_applied_job_metadata_live_flags_agency():
+    """The agency/end-client split is the field that keeps a staffing firm off the blocklist."""
+    text = '''
+    Staff Machine Learning Engineer
+    Posted by TalentBridge Recruiting — a specialist technology staffing agency.
+    Our client, a global payments company called Northwind Payments, is looking for a
+    Staff Machine Learning Engineer to join their fraud detection team.
+    Requirements: 8+ years Python, production ML systems.
+    '''
+    metadata = await tools._extract_applied_job_metadata(text, 'talentbridge_mle.pdf')
+
+    assert metadata['is_agency'] is True, metadata
+    assert 'northwind' in metadata['end_client'].lower(), metadata
 
 
 @pytest.mark.live_agent_claude
@@ -2174,6 +2328,17 @@ async def test_generate_search_queries_falls_back_to_anthropic(tmp_path, monkeyp
 # run_scraper: per-query requests on a single shared session
 # ---------------------------------------------------------------------------
 
+def _scrape(client, queries, stats=None):
+    """Drive run_scraper's Anthropic path.
+
+    run_scraper now takes a provider-specific `run_pass` so the OpenRouter and Anthropic scrapers
+    share its per-query loop, pacing, region verification and recovery. These tests exercise that
+    shared logic through the Anthropic adapter.
+    """
+    stats = stats if stats is not None else {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0}
+    return agent.run_scraper(agent._anthropic_run_pass(client, stats), queries, stats)
+
+
 class _FakeScraperClient:
     """Records each query() call so we can assert on request boundaries."""
 
@@ -2184,11 +2349,15 @@ class _FakeScraperClient:
     async def query(self, instruction):
         self.requests.append(instruction)
         # Simulate the scraper inspecting listings for whichever query this request names.
+        # Both counters move, exactly as do_check_and_record_job moves them: the CALL count and
+        # the DISTINCT id set. run_scraper's retry decision reads the distinct one, so a fake that
+        # only fed the call count would make every query look like a zero-listing failure.
         for name, count in self.listings_per_query.items():
             if f'"{name}"' in instruction:
                 for i in range(count):
                     key = f'{name}-{len(tools._check_status_counts)}-{i}'
                     tools._check_status_counts[key] = 1
+                    tools._distinct_listing_ids.add(f'linkedin/{name}-{i}')
                 break
 
     async def receive_response(self):
@@ -2199,6 +2368,10 @@ class _FakeScraperClient:
 async def test_run_scraper_sends_one_request_per_query(monkeypatch):
     """Each query needs its own turn budget; a shared request starves the later ones."""
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -2208,7 +2381,7 @@ async def test_run_scraper_sends_one_request_per_query(monkeypatch):
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
     client = _FakeScraperClient({q: healthy for q in queries})
 
-    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+    await _scrape(client, queries)
 
     assert len(client.requests) == 3, 'one request per query, no retries at a healthy yield'
     for q in queries:
@@ -2219,6 +2392,10 @@ async def test_run_scraper_sends_one_request_per_query(monkeypatch):
 async def test_run_scraper_retries_empty_query_then_continues(monkeypatch):
     """A query that comes back empty gets one retry, and must not abort the remaining queries."""
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -2228,12 +2405,12 @@ async def test_run_scraper_retries_empty_query_then_continues(monkeypatch):
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
     client = _FakeScraperClient({'Good Query': healthy})
 
-    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+    await _scrape(client, queries)
 
     empty_requests = [r for r in client.requests if 'Empty' in r]
     assert len(empty_requests) == 2, 'empty query should be retried once'
     retry = empty_requests[1]
-    assert 'NO region words' in retry, 'retry drops the region text'
+    assert 'NO location filter' in retry, 'retry drops the location filter'
     # A block page must never be retried into -- that is what risks the account.
     assert 'do NOT retry' in retry and 'CAPTCHA' in retry
     assert tools._queries_searched['Empty Query'] == 0
@@ -2248,6 +2425,10 @@ async def test_no_scraper_prompt_ever_instructs_clicking_the_results_list(monkey
     of the user's real jobs. Every prompt the scraper can receive has to agree.
     """
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -2255,10 +2436,7 @@ async def test_no_scraper_prompt_ever_instructs_clicking_the_results_list(monkey
 
     # 0 listings and 1 listing exercise both recovery branches; a healthy query the normal path.
     client = _FakeScraperClient({'Healthy': agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20, 'Starved': 1})
-    await agent.run_scraper(
-        client, ['Empty', 'Starved', 'Healthy'],
-        {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0},
-    )
+    await _scrape(client, ['Empty', 'Starved', 'Healthy'])
 
     prompts = client.requests + [agent.build_scraper_instructions()]
     assert len(client.requests) == 5, 'two retries plus three initial passes'
@@ -2278,6 +2456,10 @@ async def test_run_scraper_retries_low_yield_query_keeping_filters(monkeypatch):
     A `seen == 0` trigger sails straight past that and the run reports itself a success.
     """
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -2286,7 +2468,7 @@ async def test_run_scraper_retries_low_yield_query_keeping_filters(monkeypatch):
     queries = ['Starved Query']
     client = _FakeScraperClient({'Starved Query': 1})
 
-    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+    await _scrape(client, queries)
 
     assert len(client.requests) == 2, 'a 1-listing query must be retried'
     retry = client.requests[1]
@@ -2299,6 +2481,10 @@ async def test_run_scraper_retries_low_yield_query_keeping_filters(monkeypatch):
 async def test_run_scraper_records_per_query_check_status(monkeypatch):
     """Per-query dedup counts: a saturated query must be distinguishable from a starved one."""
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -2317,12 +2503,16 @@ async def test_run_scraper_records_per_query_check_status(monkeypatch):
                     tools._check_status_counts.get('already_processed', 0) + 25
                 )
                 tools._check_status_counts['new'] = tools._check_status_counts.get('new', 0) + 3
+                # Distinct ids move too, as do_check_and_record_job moves them. The retry
+                # decision reads the distinct set, not these call counts.
+                for i in range(28):
+                    tools._distinct_listing_ids.add(f'linkedin/saturated-{i}')
 
         async def receive_response(self):
             return
             yield
 
-    await agent.run_scraper(_StatusClient(), ['Saturated'], {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+    await _scrape(_StatusClient(), ['Saturated'])
 
     assert tools._check_status_per_query['Saturated'] == {'already_processed': 25, 'new': 3}
     assert tools._queries_searched['Saturated'] == 28
@@ -2330,6 +2520,10 @@ async def test_run_scraper_records_per_query_check_status(monkeypatch):
 
 async def test_run_scraper_survives_a_failing_query(monkeypatch):
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -2343,7 +2537,7 @@ async def test_run_scraper_survives_a_failing_query(monkeypatch):
 
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
     client = ExplodingClient({'Good Query': healthy})
-    await agent.run_scraper(client, ['Bad Query', 'Good Query'], {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+    await _scrape(client, ['Bad Query', 'Good Query'])
 
     assert tools._queries_searched['Bad Query'] == 'error'
     assert tools._queries_searched['Good Query'] == healthy, 'a failed query must not abort the rest'
@@ -2614,15 +2808,87 @@ def test_scraper_instructions_do_not_rely_on_url_filter_params():
     assert 'f_SAL=' in text, 'the empty salary param is what clears sticky filter state'
 
 
-def test_scraper_instructions_cover_every_configured_region_as_query_text():
-    """Region is now the only axis that varies the result set: the AI-powered UI has no sort
-    control, so the former 'each region in both sort orders' would run the same search twice."""
+def test_scraper_instructions_cover_every_configured_region_as_a_chip_click():
+    """Region is the only axis that varies the result set, and it is applied by CLICKING.
+
+    Typing the region into `keywords` is silently ignored by LinkedIn: for several days every
+    "European Union" search returned the account's home metro, and 12 searches collapsed to 101
+    unique jobs instead of ~300. So each configured region must appear as a location-chip
+    instruction, never as query text.
+    """
     text = agent.build_scraper_instructions()
     for region in ('Testland', 'Test Union'):  # pinned in tests/conftest.py
-        assert f'**{region}** — search text:' in text
-        assert f'{region}, senior level' in text, 'region goes in the query text, not a filter'
+        assert f'**{region}** — search `<QUERY>, remote`' in text
+        assert f'set **Location** to `{region}`' in text, 'region is a chip, not query text'
+        assert f'{region}, senior level' not in text, 'the region must NOT go into the query text'
     assert 'as 2 searches' in text, 'one search per region'
 
+
+def test_scraper_instructions_never_craft_filter_urls():
+    """Filters go in by clicking, never by hand-assembling the URL.
+
+    geoId/f_TPR demonstrably DO work when navigated to directly — that is exactly why this test
+    exists. No human assembles filter parameters by hand, so doing it is a cheap fingerprint for
+    anti-automation, and this drives a real logged-in account.
+    """
+    text = agent.build_scraper_instructions()
+    for forbidden in ('&geoId=', '&f_TPR=', '&f_E=', '&f_WT='):
+        assert forbidden not in text, 'filter params must never appear in a URL to navigate to'
+    assert 'Never put `geoId`' in text, 'the prohibition must be stated explicitly'
+    assert 'clicking the chips' in text
+
+
+def test_scraper_instructions_keep_the_results_list_unclickable_while_chips_are_clicked():
+    """Clicking gained a legitimate use (chips); the results-list ban must survive that.
+
+    The only real <button> in a result card is Dismiss, and one stray click permanently removes a
+    job from the user's feed — this already destroyed three real jobs in under two minutes.
+    """
+    text = agent.build_scraper_instructions()
+    assert 'NEVER click anything in the job results list' in text
+    assert 'is still never clicked' in text, (
+        'introducing chip clicks must restate the boundary, not blur it'
+    )
+
+
+def test_scraper_instructions_require_the_ui_contract_before_harvesting():
+    """The page is checked structurally, and the verdict is code's, not the model's.
+
+    The contract used to be run BY the model, which then passed the report object to report_search.
+    That made the model a courier for data, and on 2026-08-21 it invented an entire page report
+    after its evaluate result was diverted to a file. `run_ui_contract` takes no report: code runs
+    the JS, reads it and judges it, so the check must still come first but the model never carries
+    the finding.
+    """
+    text = agent.build_scraper_instructions()
+    flat = ' '.join(text.split())   # the prompt is hard-wrapped; match on prose, not layout
+    assert 'run_ui_contract' in text, 'the contract check must be instructed'
+    assert 'that judgement is deliberately not yours to make' in flat
+    assert text.index('run_ui_contract') < text.index('harvest_listings'), \
+        'the contract must be checked before harvesting'
+    assert 'report_search' not in text, \
+        'the model must not be asked to hand over the report object — that is the courier bug'
+
+
+def test_scraper_tools_never_accept_page_or_job_data():
+    """The anti-fabrication invariant, asserted structurally.
+
+    A model relaying a payload cannot distinguish copying from producing, so with no data it emits
+    a plausible object rather than failing. Every argument it can send must be a DECISION.
+    """
+    allowed = {'region', 'what_happened'}
+    for tool in scrape_openrouter.LOCAL_TOOL_DEFS:
+        fn = tool['function']
+        props = set((fn['parameters'].get('properties') or {}).keys())
+        assert props <= allowed, (
+            f"{fn['name']} accepts {sorted(props - allowed)}, which the model would have to copy "
+            'from a tool result; code should read that itself')
+        assert fn['parameters'].get('additionalProperties') is False, \
+            f"{fn['name']} lets the model smuggle extra data in"
+        desc = fn['description'].lower()
+        tells = ('verbatim', 'exactly as returned', 'do not edit', 'do not summarise', 'unedited')
+        assert not [t for t in tells if t in desc], \
+            f"{fn['name']} asks for a verbatim relay — a courier argument confessing itself"
 
 def test_scraper_instructions_reject_identical_results_as_a_failure():
     """The converse of 'expect many already_processed': two searches returning the SAME jobs
@@ -2640,10 +2906,16 @@ def test_scraper_instructions_harvest_job_ids_from_componentkey():
     yields every listing on the page. This replaced a click-to-reveal design that read ids from
     `currentJobId` after selecting each card.
     """
+    # The selectors now live in the harvest JS, which CODE runs -- the model neither writes it nor
+    # sees the listings, so it cannot retype it wrongly (it corrupted the contract JS this way on
+    # 2026-08-21) nor invent ids.
+    assert 'SearchResultsMainContent' in agent.SCRAPER_HARVEST_JS, \
+        'the results container selector must be in the harvest JS'
+    assert 'job-card-component-ref-' in agent.SCRAPER_HARVEST_JS, \
+        'the id-bearing attribute must be in the harvest JS'
     text = agent.build_scraper_instructions()
-    assert 'SearchResultsMainContent' in text, 'the results container selector must be given'
-    assert 'job-card-component-ref-' in text, 'the id-bearing attribute must be given'
-    assert 'browser_evaluate' in text
+    assert 'harvest_listings' in text, 'the model must be told to harvest via the tool'
+    assert 'componentkey' in text, 'the prompt must still explain where ids come from'
 
 
 def test_scraper_instructions_forbid_clicking_the_results_list():
@@ -2693,6 +2965,10 @@ async def test_run_scraper_pauses_between_queries(monkeypatch):
     """Inter-query pacing is enforced in CODE, not prompted: a model under turn pressure will
     skip a prompted wait, and a flagged account ends the whole job search."""
     monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queries_searched', {})
@@ -2711,7 +2987,7 @@ async def test_run_scraper_pauses_between_queries(monkeypatch):
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
     queries = ['One', 'Two', 'Three']
     client = _FakeScraperClient({q: healthy for q in queries})
-    await agent.run_scraper(client, queries, {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
+    await _scrape(client, queries)
 
     # A pause before every query except the first -- no point waiting before any work is done.
     assert len(pauses) == 2, pauses
@@ -3460,3 +3736,927 @@ def test_example_preferences_blacklist_is_empty():
     """The tracked example must not name a real company the user blocked."""
     loaded = yaml.safe_load(preferences.EXAMPLE_PREFERENCES_PATH.read_text(encoding='utf-8'))
     assert loaded['companies']['blacklist'] == []
+
+
+# ---------------------------------------------------------------------------
+# UI contract guard and discovery-health alerts
+#
+# The whole point of these: on 2026-08-18 the scraper correctly reported "the EU region filter did
+# not apply" on every single query, and it reached nothing but the run log. A silent degradation
+# looked exactly like "no new jobs today" for four days running.
+# ---------------------------------------------------------------------------
+
+def _sound_report(**overrides):
+    """A structurally healthy search page, as SCRAPER_UI_CONTRACT_JS would report it."""
+    report = {
+        'url': 'https://www.linkedin.com/jobs/search-results/?keywords=X&geoId=91000000&f_TPR=r604800',
+        'search_box': True,
+        'results_container': True,
+        'job_cards': 25,
+        'chip_row': 6,
+        'chips': ['Jobs', 'Past week', 'Senior', 'Gen AI', 'Employment type', 'Company'],
+        'location_pin': 'European Union',
+        'pagination': True,
+        'result_count_text': '99+ results',
+        'body_sample': 'staff ai engineer jobs in the european union',
+    }
+    report.update(overrides)
+    return report
+
+
+def test_sound_page_produces_no_contract_violations():
+    assert tools.evaluate_ui_contract(_sound_report()) == []
+
+
+def test_missing_results_container_is_a_contract_violation():
+    """A renamed container is the change that silently returns zero listings."""
+    violations = tools.evaluate_ui_contract(_sound_report(results_container=False, job_cards=0))
+    assert any('results_container' in v for v in violations)
+
+
+def test_zero_cards_while_the_page_shows_results_is_a_violation():
+    """The exact silent-failure shape: harvest returns nothing, run reports 'no new jobs today'."""
+    violations = tools.evaluate_ui_contract(_sound_report(job_cards=0, result_count_text='99+ results'))
+    assert any('0 job cards' in v for v in violations)
+
+
+def test_block_signature_is_detected_before_any_contract_judgement():
+    """A challenge and a markup change need OPPOSITE responses, so they must not be conflated."""
+    assert tools.detect_block_signature(_sound_report(body_sample='please verify your identity')) == 'verify your identity'
+    assert tools.detect_block_signature(_sound_report(body_sample='we noticed unusual activity')) == 'unusual activity'
+    assert tools.detect_block_signature(_sound_report()) == ''
+
+
+def test_filters_confirmed_from_the_url_the_chips_produced():
+    """We never navigate to geoId/f_TPR, but reading them back proves the clicks landed."""
+    region = {'name': 'European Union', 'linkedin_location': 'European Union', 'geo_id': '91000000'}
+    assert tools.check_filters_applied(_sound_report(), region) == []
+
+
+def test_location_filter_that_did_not_apply_is_caught():
+    """The Aug-18 failure: the search ran, looked fine, and returned the wrong region entirely."""
+    region = {'name': 'European Union', 'linkedin_location': 'European Union', 'geo_id': '91000000'}
+    report = _sound_report(
+        url='https://www.linkedin.com/jobs/search-results/?keywords=X&f_TPR=r604800',
+        location_pin='Greater Vancouver Metropolitan Area',
+    )
+    problems = tools.check_filters_applied(report, region)
+    assert any('geoId=91000000' in p for p in problems)
+
+
+def test_missing_date_and_experience_chips_are_caught():
+    region = {'name': 'Canada', 'linkedin_location': 'Canada'}
+    report = _sound_report(
+        url='https://www.linkedin.com/jobs/search-results/?keywords=X',
+        location_pin='Canada',
+        chips=['Jobs', 'Gen AI'],
+    )
+    problems = tools.check_filters_applied(report, region)
+    assert any('date posted' in p for p in problems)
+    assert any('experience level' in p for p in problems)
+
+
+def test_region_overlap_detects_a_dead_location_axis(monkeypatch):
+    """Two regions returning the same ids means the filter did nothing — not 'query exhausted'."""
+    monkeypatch.setattr(tools, '_search_ids', {
+        ('Staff AI Engineer', 'Canada'): {'1', '2', '3'},
+        ('Staff AI Engineer', 'European Union'): {'1', '2', '3'},
+        ('Principal DS', 'Canada'): {'7', '8'},
+        ('Principal DS', 'European Union'): {'9', '10'},
+    })
+    overlaps = tools.region_overlap_report()
+    assert overlaps['Staff AI Engineer'] == 1.0, 'identical id sets = the location filter is dead'
+    assert overlaps['Principal DS'] == 0.0, 'genuinely distinct regions must not alarm'
+
+
+def test_fingerprint_drift_reports_changed_chips(tmp_path, monkeypatch):
+    """Catches a restructure the run it happens, even when every required element survives."""
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    first = tools.check_fingerprint_drift(_sound_report())
+    assert first == '', 'the first observation is a baseline, not a change'
+    again = tools.check_fingerprint_drift(_sound_report())
+    assert again == '', 'an unchanged page must not alarm'
+    # A STRUCTURAL chip disappearing is a real change and must be reported.
+    drift = tools.check_fingerprint_drift(_sound_report(chips=['Jobs', 'Past week']))
+    assert 'Senior' in drift and 'gone' in drift
+
+
+def test_fingerprint_ignores_linkedins_per_query_topical_chips(tmp_path, monkeypatch):
+    """Gen AI / LLM / AWS / AI-ML / Analytics change with every query by design.
+
+    Fingerprinting the whole chip row made drift fire on ordinary query-to-query variation on the
+    first live run, and a warning that fires on success trains the reader to ignore it.
+    """
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    structural = ['Jobs', 'Past week', 'Senior', 'Employment type', 'Company']
+    tools.check_fingerprint_drift(_sound_report(chips=structural + ['Gen AI', 'AWS']))
+    drift = tools.check_fingerprint_drift(_sound_report(chips=structural + ['AI/ML', 'Analytics']))
+    assert drift == '', 'topical suggestion chips must not count as a UI change'
+
+
+# --- Discovery-health alerts -------------------------------------------------
+
+
+def test_low_yield_alert_fires_on_the_run_that_prompted_all_this():
+    """2026-08-18: 1 new job from 101 distinct listings, no notification, no signal."""
+    alerts = agent.assess_run_health({
+        'listings_distinct': 101, 'check_status': {'new': 1},
+        'region_overlap': {}, 'ui_alerts': [],
+    })
+    assert any('LOW YIELD' in a for a in alerts)
+
+
+def test_low_yield_alert_stays_quiet_on_a_healthy_run():
+    """Aug 14: 26 new from 300. An alert that fires on success trains the reader to ignore it."""
+    alerts = agent.assess_run_health({
+        'listings_distinct': 300, 'check_status': {'new': 26},
+        'region_overlap': {}, 'ui_alerts': [],
+    })
+    assert alerts == []
+
+
+def test_region_overlap_alert_names_the_query():
+    alerts = agent.assess_run_health({
+        'listings_distinct': 101, 'check_status': {'new': 50},
+        'region_overlap': {'Staff AI Engineer': 1.0}, 'ui_alerts': [],
+    })
+    assert any('REGION OVERLAP' in a and 'Staff AI Engineer' in a for a in alerts)
+
+
+def test_block_and_ui_change_alerts_are_distinguishable():
+    """They demand different actions from the user, so they must not read the same."""
+    alerts = agent.assess_run_health({
+        'listings_distinct': 10, 'check_status': {'new': 10}, 'region_overlap': {},
+        'ui_alerts': [
+            {'kind': 'blocked', 'query': 'Q', 'region': 'Canada', 'detail': 'captcha'},
+            {'kind': 'contract', 'query': 'Q2', 'region': 'EU', 'detail': 'results_container missing'},
+        ],
+    })
+    assert any(a.startswith('BLOCKED') and 'did not retry' in a for a in alerts)
+    assert any(a.startswith('UI CHANGED') for a in alerts)
+
+
+def test_contract_js_dedupes_cards_and_chips():
+    """Both are rendered TWICE in the DOM. Verified live on 2026-08-18: a raw count reported 50
+    cards and 44 chips on a page holding 25 jobs and 13 chips, so any count-based threshold built
+    on the raw numbers would be silently wrong."""
+    js = agent.SCRAPER_UI_CONTRACT_JS
+    assert 'new Set' in js, 'cards and chips must be deduped before counting'
+    assert 'cardIds.size' in js, 'the card count must come from the deduped set'
+
+
+def test_contract_js_finds_the_search_box_by_placeholder():
+    """The search box is a plain <input> carrying a PLACEHOLDER and no aria-label — verified live.
+    An aria-label-only selector reported search_box=false on a perfectly healthy page, which would
+    have failed the contract on every single query."""
+    js = agent.SCRAPER_UI_CONTRACT_JS
+    assert 'placeholder' in js
+    assert 'describe the job' in js.lower()
+
+
+def test_contract_js_is_read_only():
+    """Same rule as the harvest JS: JavaScript may read the page, never drive it."""
+    js = agent.SCRAPER_UI_CONTRACT_JS
+    for forbidden in ('.click(', '.submit(', 'dispatchEvent', '.value =', 'location.href ='):
+        assert forbidden not in js, f'the contract probe must never {forbidden}'
+
+
+async def test_a_region_that_was_never_verified_is_reported(monkeypatch):
+    """A search the model never verified is silently unfiltered — the exact failure this guards.
+
+    On the first live chip run, report_search was called 5 times across 12 expected searches and
+    one query searched only one of its two regions, with turn budget to spare (49 of 260). So it
+    was a choice, not starvation, and prompting harder is not the fix: code checks the omission.
+    """
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    # Only one of the two configured regions (conftest pins Testland + Test Union) was verified.
+    monkeypatch.setattr(tools, '_search_reports', [{'query': 'Alpha, remote', 'region': 'Testland'}])
+
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+    await _scrape(_FakeScraperClient({'Alpha': healthy}), ['Alpha'])
+
+    unverified = [a for a in tools._ui_alerts if a['kind'] == 'unverified_search']
+    assert unverified, 'a region with no report_search must raise an alert'
+    assert 'Test Union' in unverified[0]['region']
+    assert 'Testland' not in unverified[0]['region'], 'the verified region must not be flagged'
+
+
+async def test_all_regions_verified_raises_no_coverage_alert(monkeypatch):
+    """An alert that fires on success trains the reader to ignore it."""
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(tools, '_search_reports', [
+        {'query': 'Alpha, remote', 'region': 'Testland'},
+        {'query': 'Alpha, remote', 'region': 'Test Union'},
+    ])
+
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+    await _scrape(_FakeScraperClient({'Alpha': healthy}), ['Alpha'])
+
+    assert [a for a in tools._ui_alerts if a['kind'] == 'unverified_search'] == []
+
+
+def test_report_query_matching_tolerates_the_full_search_text():
+    """The model reports what it typed ("Principal Data Scientist, remote"), not the base query.
+
+    Exact matching would make the coverage check silently never fire — the same shape of bug as
+    the counters it exists to backstop.
+    """
+    assert agent._same_query('Principal Data Scientist, remote', 'Principal Data Scientist')
+    assert agent._same_query('Alpha', 'Alpha')
+    assert not agent._same_query('Beta, remote', 'Alpha')
+    assert not agent._same_query('', 'Alpha')
+
+
+# ---------------------------------------------------------------------------
+# mcp version guard
+# ---------------------------------------------------------------------------
+
+def test_mcp_pinned_below_2():
+    """`mcp_session` in triage.py unpacks three values from `streamable_http_client`; mcp 2.0
+    yields two. That helper is the ONLY path to the OpenRouter and Ollama tool servers, so an
+    unnoticed upgrade takes out triage, the non-Anthropic rating call, the reference summary and
+    the OpenRouter extractor at once -- at runtime, mid-run. Measured 2026-08-21: a bare `uv run`
+    re-resolved `mcp>=1.29` to 2.0.0 and did exactly that."""
+    pyproject = (Path(__file__).parent.parent / 'pyproject.toml').read_text(encoding='utf-8')
+    assert '"mcp>=1.29,<2"' in pyproject, (
+        'the <2 pin on mcp was removed from pyproject.toml. Before lifting it, make '
+        'triage.mcp_session tolerate both the 2- and 3-value yield and verify against a live server.'
+    )
+
+
+def test_installed_mcp_matches_mcp_session_unpack():
+    """The pin above constrains resolution; this asserts the environment actually agrees with the
+    3-tuple unpack in triage.mcp_session, so a stale or force-installed venv fails here rather than
+    on the first tool-server call of a run."""
+    from importlib.metadata import version
+    major = int(version('mcp').split('.')[0])
+    assert major < 2, (
+        f'mcp {version("mcp")} is installed, but triage.mcp_session unpacks three values from '
+        'streamable_http_client and mcp >= 2.0 yields two. Run `uv sync --frozen`.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 1b OpenRouter scraper: anti-fabrication and account safety
+# ---------------------------------------------------------------------------
+
+def _session(browser_reply):
+    """A ScrapeSession whose browser returns a canned response."""
+    async def browser(name, args):
+        return browser_reply
+    return scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer')
+
+
+# playwright-mcp echoes the evaluated SCRIPT after the result, braces included. Fixtures that omit
+# it are unrealistically easy to parse, and did hide a parser bug that made every real harvest
+# return nothing while the tests stayed green.
+_CODE_ECHO = ("\n### Ran Playwright code\n```js\n"
+              "await page.evaluate('() => { return {count: 0, jobs: []}; }');\n```\n")
+
+
+def _two_jobs():
+    return json.dumps({'count': 2, 'jobs': [
+        {'id': '111', 'title': 'Staff AI Engineer', 'company': 'Acme', 'location': 'Canada', 'posted': '2 days ago'},
+        {'id': '222', 'title': 'Principal ML Engineer', 'company': 'Globex', 'location': 'Canada', 'posted': ''},
+    ]})
+
+
+def test_evaluate_parser_ignores_the_echoed_script_block():
+    """Regression: scanning to the LAST '}' runs past the JSON into the echoed source, so every
+    real harvest parsed as None while hand-written fixtures passed."""
+    obj = scrape_openrouter._extract_json('### Result\n' + _two_jobs() + _CODE_ECHO)
+    assert obj is not None and obj['count'] == 2
+    assert [j['id'] for j in obj['jobs']] == ['111', '222']
+
+
+def test_evaluate_parser_handles_braces_inside_strings():
+    payload = json.dumps({'count': 1, 'jobs': [{'id': '1', 'title': 'Eng {x} "q"'}]})
+    obj = scrape_openrouter._extract_json('### Result\n' + payload + _CODE_ECHO)
+    assert obj['jobs'][0]['title'] == 'Eng {x} "q"'
+
+
+def test_click_guard_refuses_the_results_list():
+    """The hard safety invariant, enforced in code rather than by prompt wording: to the model a
+    card and its Dismiss button are the same node, and one stray click destroys a real job."""
+    for args in ({'target': 'job-card-component-ref-4455'},
+                 {'element': 'the Dismiss button', 'target': 'e12'},
+                 {'target': 'div[componentkey="SearchResultsMainContent"] p'}):
+        assert scrape_openrouter._guard_call('browser_click', args) is not None, args
+    assert scrape_openrouter._guard_call('browser_click', {'target': 'e1202'}) is None, \
+        'filter chips sit above the results and must stay clickable'
+
+
+def test_click_guard_refuses_javascript_that_drives_the_page():
+    assert scrape_openrouter._guard_call(
+        'browser_evaluate', {'function': '() => document.querySelector("a").click()'}) is not None
+    assert scrape_openrouter._guard_call(
+        'browser_evaluate', {'function': '() => ({count: 1})'}) is None
+
+
+@pytest.mark.asyncio
+async def test_harvest_error_forbids_invention_and_records_nothing(monkeypatch):
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    session = _session('### Result\n{"error": "results container not found"}' + _CODE_ECHO)
+    out = await session.dispatch_local('harvest_listings', {})
+    assert 'markup has changed' in out and 'invent' in out.lower()
+    assert tools._check_status_counts == {} and tools._candidates == []
+    assert [a['kind'] for a in tools._ui_alerts] == ['empty_harvest']
+
+
+@pytest.mark.asyncio
+async def test_result_diverted_to_a_file_is_reported_not_reconstructed(monkeypatch):
+    """The 2026-08-21 canary: `filename` sent the evaluate result to disk, the model saw only a
+    link, and it invented a page report. Code must say it cannot read the page."""
+    monkeypatch.setattr(tools, '_search_reports', [])
+    session = _session('### Result\n- [Evaluation result](./step3.json)')
+    out = await session.dispatch_local('run_ui_contract', {'region': 'Canada'})
+    assert 'could not read' in out.lower() and 'guess' in out.lower()
+    assert tools._search_reports == [], 'nothing may be recorded from a page code could not read'
+
+
+@pytest.mark.asyncio
+async def test_record_before_harvest_refuses(monkeypatch):
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    out = await _session('').dispatch_local('record_listings', {})
+    assert 'nothing harvested' in out.lower()
+    assert tools._check_status_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_record_listings_ignores_model_supplied_job_data(monkeypatch, tmp_path):
+    """The decisive anti-fabrication test: even when the model sends fabricated listings,
+    record_listings uses CODE's harvest. The guarantee is structural, not behavioural."""
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path)
+    monkeypatch.setattr(tools, '_processed_jobs', set())
+    monkeypatch.setattr(tools, '_listing_records', {})
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queue_skipped_counts', {})
+    monkeypatch.setattr(tools, '_applied_companies', {})
+    session = _session('### Result\n' + _two_jobs() + _CODE_ECHO)
+    await session.dispatch_local('harvest_listings', {})
+    await session.dispatch_local('record_listings', {
+        'jobs': [{'id': '999', 'title': 'Invented', 'company': 'Fabricated Inc'}]})
+    assert {jid for _, jid in tools._listing_records} == {'111', '222'}
+    assert not any(r['company'] == 'Fabricated Inc' for r in tools._listing_records.values())
+
+
+@pytest.mark.asyncio
+async def test_record_listings_caps_in_code(monkeypatch, tmp_path):
+    """SCRAPER_MAX_LISTINGS_PER_SEARCH used to be a prompt suggestion only."""
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path)
+    for name, value in (('_processed_jobs', set()), ('_listing_records', {}),
+                        ('_check_status_counts', {}), ('_distinct_listing_ids', set()),
+                        ('_search_ids', {}), ('_candidates', []), ('_candidates_per_query', {}),
+                        ('_queue_skipped_counts', {}), ('_applied_companies', {})):
+        monkeypatch.setattr(tools, name, value)
+    cap = config.SCRAPER_MAX_LISTINGS_PER_SEARCH
+    jobs = [{'id': str(i), 'title': 'Staff AI Engineer', 'company': f'C{i}'} for i in range(cap + 5)]
+    out = await tools.do_record_listings(jobs, query='Staff AI Engineer')
+    assert f'recorded {cap} (capped from {cap + 5})' in out
+    assert len(tools._distinct_listing_ids) == cap
+
+
+@pytest.mark.asyncio
+async def test_record_listings_returns_counts_not_job_data(monkeypatch, tmp_path):
+    """The return value re-enters the model's context on every later iteration, and echoing job
+    data back would both cost tokens and hand the model something to later 'recall'."""
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path)
+    for name, value in (('_processed_jobs', set()), ('_listing_records', {}),
+                        ('_check_status_counts', {}), ('_distinct_listing_ids', set()),
+                        ('_search_ids', {}), ('_candidates', []), ('_candidates_per_query', {}),
+                        ('_queue_skipped_counts', {}), ('_applied_companies', {})):
+        monkeypatch.setattr(tools, name, value)
+    out = await tools.do_record_listings(json.loads(_two_jobs())['jobs'], query='Staff AI Engineer')
+    assert 'Acme' not in out and 'Globex' not in out and 'Principal ML Engineer' not in out
+    assert len(out) < 400, 'the summary must stay short — it is re-read every iteration'
+
+
+def test_browser_tool_defs_drop_disallowed_and_keep_required():
+    class _T:
+        def __init__(self, name):
+            self.name, self.description, self.inputSchema = name, 'd', {'type': 'object'}
+    names = ['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_wait_for',
+             'browser_evaluate', 'browser_close', 'browser_run_code_unsafe']
+    defs = scrape_openrouter.browser_tool_defs([_T(n) for n in names])
+    exposed = {d['function']['name'] for d in defs}
+    assert 'browser_close' not in exposed and 'browser_run_code_unsafe' not in exposed
+    for required in config.SCRAPER_REQUIRED_BROWSER_TOOLS:
+        assert required.replace('mcp__playwright__', '') in exposed, required
+
+
+# ---------------------------------------------------------------------------
+# API-level error surfacing (_raise_if_result_error / AgentApiError)
+# ---------------------------------------------------------------------------
+
+def _errored_result(api_error_status: int | None = 401, **overrides) -> ResultMessage:
+    """A ResultMessage shaped exactly like the one that produced 'error result: success'.
+
+    The CLI reports an HTTP-level failure as is_error=True with subtype='success' and an empty
+    errors list, which is why the SDK's own fallback text renders the word 'success'.
+    """
+    fields = {
+        'subtype': 'success',
+        'duration_ms': 100,
+        'duration_api_ms': 100,
+        'is_error': True,
+        'num_turns': 1,
+        'session_id': 'fake-session',
+        'api_error_status': api_error_status,
+        'errors': None,
+    }
+    fields.update(overrides)
+    return ResultMessage(**fields)
+
+
+def test_raise_if_result_error_names_the_status_code():
+    """The regression: the status must appear, and the bare word 'success' must not stand alone."""
+    with pytest.raises(tools.AgentApiError) as excinfo:
+        tools._raise_if_result_error(_errored_result(401), 'PDF categorization failed')
+
+    message = str(excinfo.value)
+    assert '401' in message
+    assert 'PDF categorization failed' in message
+    assert excinfo.value.api_error_status == 401
+    # The old message was exactly this and said nothing else.
+    assert message != 'Claude Code returned an error result: success'
+
+
+def test_raise_if_result_error_hints_at_login_for_auth_errors():
+    with pytest.raises(tools.AgentApiError) as excinfo:
+        tools._raise_if_result_error(_errored_result(403), 'ctx')
+    assert 'claude /login' in str(excinfo.value)
+
+
+def test_raise_if_result_error_hints_at_backoff_for_rate_limits():
+    with pytest.raises(tools.AgentApiError) as excinfo:
+        tools._raise_if_result_error(_errored_result(429), 'ctx')
+    assert 'rate limited' in str(excinfo.value)
+
+
+def test_raise_if_result_error_survives_missing_status():
+    """api_error_status is None on older CLIs; the error must still be raised and readable."""
+    with pytest.raises(tools.AgentApiError) as excinfo:
+        tools._raise_if_result_error(_errored_result(None), 'ctx')
+    assert excinfo.value.api_error_status is None
+    assert 'API error' in str(excinfo.value)
+
+
+def test_raise_if_result_error_is_silent_on_success():
+    ok = ResultMessage(
+        subtype='success',
+        duration_ms=100,
+        duration_api_ms=100,
+        is_error=False,
+        num_turns=1,
+        session_id='fake-session',
+        structured_output={'category': 'saved_jd'},
+    )
+    assert tools._raise_if_result_error(ok, 'ctx') is None
+
+
+async def test_categorize_pdf_text_raises_on_api_error(monkeypatch):
+    async def fake_sdk_query(**kwargs):
+        yield _errored_result(429)
+
+    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
+    with pytest.raises(tools.AgentApiError):
+        await tools._categorize_pdf_text('text', 'acme.pdf')
+
+
+async def test_categorize_save_dir_pdfs_aborts_on_api_error(tmp_path, monkeypatch):
+    """One API failure must abort, not spawn a doomed call per PDF."""
+    for name in ('a.pdf', 'b.pdf', 'c.pdf'):
+        (tmp_path / name).write_bytes(b'%PDF fake')
+
+    calls = []
+
+    async def fake_categorize(text, filename):
+        calls.append(filename)
+        raise tools.AgentApiError('PDF categorization failed: API error 401', api_error_status=401)
+
+    monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
+
+    class FakeReader:
+        pages = []
+        def __init__(self, path): pass
+
+    monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
+
+    with pytest.raises(tools.AgentApiError):
+        await tools.categorize_save_dir_pdfs(save_dir=tmp_path)
+
+    assert len(calls) == 1, f'expected abort after the first failure, got {calls}'
+    assert sorted(p.name for p in tmp_path.glob('*.pdf')) == ['a.pdf', 'b.pdf', 'c.pdf']
+
+
+async def test_categorize_save_dir_pdfs_continues_past_per_file_error(tmp_path, monkeypatch):
+    """A per-file fault is recoverable and must not kill the run."""
+    for name in ('bad.pdf', 'good.pdf'):
+        (tmp_path / name).write_bytes(b'%PDF fake')
+
+    async def fake_categorize(text, filename):
+        if filename == 'bad.pdf':
+            raise ValueError('corrupt content')
+        return 'saved_jd'
+
+    monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
+
+    class FakeReader:
+        pages = []
+        def __init__(self, path): pass
+
+    monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
+    await tools.categorize_save_dir_pdfs(save_dir=tmp_path)
+
+    assert (tmp_path / 'cat-saved_jd-good.pdf').exists()
+    assert (tmp_path / 'bad.pdf').exists()
+
+
+async def test_extract_applied_job_metadata_raises_on_api_error(monkeypatch):
+    """This path had no try/except at all, so the raw SDK text reached the user."""
+    async def fake_sdk_query(**kwargs):
+        yield _errored_result(529)
+
+    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
+    with pytest.raises(tools.AgentApiError):
+        await tools._extract_applied_job_metadata('text', 'acme.pdf')
+
+
+async def test_company_matches_applied_raises_on_api_error(monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
+    # Force the Anthropic path: the OpenRouter branch swallows every exception by design, and
+    # a name that normalizes to an exact match would short-circuit before any LLM call at all.
+    monkeypatch.setattr(tools, 'COMPANY_MATCH_PROVIDER', 'anthropic')
+
+    async def fake_sdk_query(**kwargs):
+        yield _errored_result(401)
+
+    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
+    with pytest.raises(tools.AgentApiError):
+        await tools.company_matches_applied('Acme Data Systems')
+
+
+# ---------------------------------------------------------------------------
+# Context-leak guard: every ClaudeAgentOptions site must limit what it loads
+# ---------------------------------------------------------------------------
+
+def test_every_claude_agent_options_site_limits_context():
+    """setting_sources=None loads ALL sources, including this repo's ~78KB CLAUDE.md, and
+    strict_mcp_config=False pulls in every unrelated global MCP server — roughly 50K tokens
+    per call. agent.py was fixed for this in 2026-08; tools_generic.py was missed entirely,
+    which is what this static check exists to stop happening to the next site someone adds.
+    """
+    import ast
+
+    required = {'setting_sources', 'strict_mcp_config', 'skills'}
+    source_dir = Path(tools.__file__).parent
+    offenders = []
+    sites = 0
+
+    for path in sorted(source_dir.glob('*.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, 'id', None) or getattr(node.func, 'attr', None)
+            if name != 'ClaudeAgentOptions':
+                continue
+            sites += 1
+            passed = {kw.arg for kw in node.keywords if kw.arg}
+            if missing := (required - passed):
+                offenders.append(f'{path.name}:{node.lineno} missing {sorted(missing)}')
+
+    assert sites >= 12, f'expected to find the known option sites, found {sites}'
+    assert not offenders, 'ClaudeAgentOptions sites that leak context:\n' + '\n'.join(offenders)
+
+
+@pytest.mark.live_agent_claude
+async def test_live_categorization_options_do_not_load_repo_context():
+    """Measure the leak fix rather than asserting it structurally.
+
+    CLAUDE.md records the original measurement: 45,523 tokens on a bare options object vs 358
+    with setting_sources/strict_mcp_config/skills set. The categorization options set cwd to the
+    project root, so without those flags this loads the repo's ~78KB CLAUDE.md plus every global
+    MCP server.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+    options = ClaudeAgentOptions(
+        model=config.MODEL_NAME_LOW,
+        tools=[],
+        permission_mode='bypassPermissions',
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
+        cwd=str(tools.PROJECT_DIR),
+    )
+
+    async with ClaudeSDKClient(options=options) as client:
+        usage = await client.get_context_usage()
+
+    memory_tokens = sum(f.get('tokens', 0) for f in (usage.get('memoryFiles') or []))
+    mcp_tokens = sum(t.get('tokens', 0) for t in (usage.get('mcpTools') or []))
+
+    assert memory_tokens == 0, f'CLAUDE.md still being loaded: {memory_tokens} tokens'
+    assert mcp_tokens == 0, f'global MCP servers still being loaded: {mcp_tokens} tokens'
+    assert usage['totalTokens'] < 10_000, (
+        f"context still bloated: {usage['totalTokens']} tokens "
+        f'(pre-fix this measured ~45K)'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas: params the description calls optional must actually be optional
+# ---------------------------------------------------------------------------
+
+def test_optional_tool_params_are_not_declared_required():
+    """The {"name": str} shorthand marks EVERY key required.
+
+    claude_agent_sdk/__init__.py:422 builds `"required": list(properties.keys())` from the
+    shorthand, so three tools spent months demanding fields their own descriptions called
+    optional — and `date_posted`, which CLAUDE.md says to "omit if not shown", could not be
+    omitted. That is direct fabrication pressure (see the Anti-fabrication requirement): a model
+    told a field is mandatory and unable to observe it will either refuse the call or invent a
+    value. Measured: the live save_job_posting test failed because the model refused to invent a
+    job_id. Optionality requires the full JSON Schema form, which the SDK passes through as-is.
+    """
+    from claude_agent_sdk import SdkMcpTool
+
+    expected_required = {
+        'save_job_posting': {'company', 'description', 'rating', 'content'},
+        'check_and_record_job': {'site', 'job_id', 'company', 'description'},
+        'queue_candidate': {'site', 'job_id', 'url', 'title', 'company', 'snippet'},
+    }
+
+    found = {}
+    for name in dir(tools):
+        obj = getattr(tools, name)
+        if isinstance(obj, SdkMcpTool) and obj.name in expected_required:
+            schema = obj.input_schema
+            assert isinstance(schema, dict) and 'properties' in schema, (
+                f'{obj.name} uses the shorthand schema form, which forces every param required'
+            )
+            found[obj.name] = set(schema.get('required', []))
+
+    assert found == expected_required, f'{found} != {expected_required}'
+
+
+def test_optional_tool_params_still_declared_as_properties():
+    """Optional does not mean absent: the model must still know the params exist."""
+    from claude_agent_sdk import SdkMcpTool
+
+    optional_by_tool = {
+        'save_job_posting': {'job_id'},
+        'check_and_record_job': {'date_posted', 'url', 'content'},
+        'queue_candidate': {'date_posted', 'query'},
+    }
+
+    for name in dir(tools):
+        obj = getattr(tools, name)
+        if isinstance(obj, SdkMcpTool) and obj.name in optional_by_tool:
+            props = set(obj.input_schema['properties'])
+            missing = optional_by_tool[obj.name] - props
+            assert not missing, f'{obj.name} dropped optional params entirely: {sorted(missing)}'
+
+
+# ---------------------------------------------------------------------------
+# Reference corpus ordering: the ideal-role profile must use the NEWEST applied jobs
+# ---------------------------------------------------------------------------
+
+def _corpus(applied_dir, records):
+    """Build an applied-jobs corpus from (applied_date, text, filename) triples."""
+    import yaml as yaml_mod
+
+    index = {}
+    for applied_date, text, filename in records:
+        pdf = _write_pdf(applied_dir / filename, applied_date)
+        index[pdf.name] = _index_entry(applied_date, pdf.stat().st_mtime, text=text)
+    index_path = applied_dir / 'index.yaml'
+    index_path.write_text(yaml_mod.dump(index))
+    return index_path
+
+
+async def test_reference_texts_keep_the_newest_and_drop_the_oldest(tmp_path, monkeypatch):
+    """The regression: the slice kept the OLDEST MAX_REFERENCE_JOBS, not the newest.
+
+    _reference_job_texts was filled in filename order (date-prefixed, so oldest first) and both
+    consumers slice [:MAX_REFERENCE_JOBS]. With 60 in-horizon records the rater calibrated against
+    the oldest 20 and never saw the user's two most recent months.
+    """
+    from agentic_job_search.config import MAX_REFERENCE_JOBS
+
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    total = MAX_REFERENCE_JOBS + 5
+    # day 0 is the oldest, day `total-1` the newest; all comfortably inside the horizon.
+    records = [
+        (
+            date.today() - timedelta(days=total - 1 - i),
+            f'job text day{i}',
+            f'{(date.today() - timedelta(days=total - 1 - i)).isoformat()}-cat-saved_jd-job{i}.pdf',
+        )
+        for i in range(total)
+    ]
+    index_path = _corpus(applied, records)
+
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
+
+    kept = tools._reference_job_texts[:MAX_REFERENCE_JOBS]
+    assert tools._reference_job_texts[0] == f'job text day{total - 1}', 'newest must come first'
+    assert f'job text day{total - 1}' in kept, 'the newest record must reach the profile'
+    assert 'job text day0' not in kept, 'the oldest record must fall outside the cap'
+    # The five oldest are exactly the ones dropped.
+    for i in range(5):
+        assert f'job text day{i}' not in kept
+
+
+async def test_reference_texts_order_by_applied_date_not_filename(tmp_path, monkeypatch):
+    """Ordering must not rely on filename sort — a legacy file with no date prefix sorts anywhere."""
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    recent = date.today() - timedelta(days=1)
+    old = date.today() - timedelta(days=60)
+    index_path = _corpus(applied, [
+        # Filename sorts FIRST but the record is OLD — so filename order and date order
+        # disagree, and only a date-based sort produces the expected result.
+        (old, 'old text', 'aaa-legacy-no-date-prefix.pdf'),
+        # Filename sorts LAST but the record is RECENT.
+        (recent, 'recent text', 'zzz-legacy-also-no-prefix.pdf'),
+    ])
+
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
+
+    assert tools._reference_job_texts == ['recent text', 'old text']
+
+
+async def test_a_newly_applied_job_changes_the_reference_set(tmp_path, monkeypatch):
+    """Structurally impossible before: new records sorted last and never entered the first N.
+
+    That is why the run logged `Reference summary: cache hit` right after ingesting 8 new PDFs —
+    `combined` was byte-identical, so the md5 matched and the profile never regenerated.
+    """
+    from agentic_job_search.config import MAX_REFERENCE_JOBS
+
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    total = MAX_REFERENCE_JOBS + 5
+    records = [
+        (
+            date.today() - timedelta(days=total - i),
+            f'job text day{i}',
+            f'{(date.today() - timedelta(days=total - i)).isoformat()}-cat-saved_jd-job{i}.pdf',
+        )
+        for i in range(total)
+    ]
+    index_path = _corpus(applied, records)
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
+    before = tools._reference_job_texts[:MAX_REFERENCE_JOBS]
+
+    # Apply to one more job today, on top of an already-full corpus.
+    index_path = _corpus(applied, records + [
+        (date.today(), 'brand new job text', f'{date.today().isoformat()}-cat-saved_jd-newest.pdf'),
+    ])
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
+    after = tools._reference_job_texts[:MAX_REFERENCE_JOBS]
+
+    assert 'brand new job text' in after, 'a new application must be able to reach the profile'
+    assert before != after, 'the reference set must change when a newer job is applied to'
+
+
+async def test_build_reference_block_renders_the_newest_jobs(tmp_path, monkeypatch):
+    """End-to-end through the consumer that the rater actually sees."""
+    from agentic_job_search.config import MAX_REFERENCE_JOBS
+
+    _no_legacy_cache(monkeypatch, tmp_path)
+    applied = tmp_path / 'applied_jobs'
+    total = MAX_REFERENCE_JOBS + 3
+    records = [
+        (
+            date.today() - timedelta(days=total - 1 - i),
+            f'unique-marker-{i}',
+            f'{(date.today() - timedelta(days=total - 1 - i)).isoformat()}-cat-saved_jd-job{i}.pdf',
+        )
+        for i in range(total)
+    ]
+    index_path = _corpus(applied, records)
+    await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
+
+    block = agent.build_reference_block()
+
+    assert block.count('[Reference Job') == MAX_REFERENCE_JOBS
+    assert f'unique-marker-{total - 1}' in block, 'newest applied job must appear'
+    assert 'unique-marker-0' not in block, 'oldest applied job must be dropped'
+
+
+# ---------------------------------------------------------------------------
+# Recovery pass must not turn the distinct counter into a call counter
+# ---------------------------------------------------------------------------
+
+class _DuplicateHarvestClient:
+    """Every pass re-records the SAME listing ids: distinct stays flat while calls keep growing.
+
+    This is the shape of a recovery pass re-harvesting the page it already harvested, which is
+    what four of six queries did on the 2026-08-24 run.
+    """
+
+    def __init__(self, distinct_ids: int, calls_per_pass: int):
+        self.requests = []
+        self.distinct_ids = distinct_ids
+        self.calls_per_pass = calls_per_pass
+
+    async def query(self, instruction):
+        self.requests.append(instruction)
+        for i in range(self.calls_per_pass):
+            tools._check_status_counts[f'call-{len(tools._check_status_counts)}-{i}'] = 1
+        for i in range(self.distinct_ids):
+            tools._distinct_listing_ids.add(f'linkedin/dup-{i}')
+
+    async def receive_response(self):
+        return
+        yield
+
+
+def _reset_scrape_globals(monkeypatch):
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+
+
+async def test_recovery_pass_keeps_seen_a_distinct_count(monkeypatch, caplog):
+    """The regression: the recovery branch reassigned `seen` to sum(delta.values()) — a CALL
+    count — and never refreshed `calls`, producing "100 distinct listing(s) of 50 checked".
+
+    Distinct can never exceed checked. `seen` also feeds _queries_searched, so a recovered query
+    reported a call count where every other query reports distinct listings — inflating coverage
+    for exactly the queries that needed rescuing.
+    """
+    _reset_scrape_globals(monkeypatch)
+    distinct = 3  # below SCRAPER_MIN_LISTINGS_PER_QUERY, so a recovery pass is triggered
+    assert distinct < agent.SCRAPER_MIN_LISTINGS_PER_QUERY
+    client = _DuplicateHarvestClient(distinct_ids=distinct, calls_per_pass=25)
+
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _scrape(client, ['Staff AI Engineer'])
+
+    assert len(client.requests) == 2, 'expected a first pass plus one recovery pass'
+    # The whole point: after recovery this is still the DISTINCT count, not 50 calls.
+    assert tools._queries_searched['Staff AI Engineer'] == distinct
+
+    line = next(
+        (r.message for r in caplog.records if 'distinct listing(s) of' in r.message), None
+    )
+    assert line is not None, 'expected the per-query summary line'
+    match = re.search(r'inspected (\d+) distinct listing\(s\) of (\d+) checked', line)
+    assert match, f'unexpected summary format: {line}'
+    reported_distinct, reported_checked = int(match.group(1)), int(match.group(2))
+    assert reported_distinct == distinct
+    assert reported_distinct <= reported_checked, (
+        f'distinct must never exceed checked, got {reported_distinct} > {reported_checked}: {line}'
+    )
+
+
+async def test_duplicate_listing_line_makes_no_region_claim(monkeypatch, caplog):
+    """`calls - seen` cannot tell cross-region duplication from a recovery re-harvest.
+
+    The old wording asserted the duplicates "were surfaced by more than one region", which is an
+    inference the number does not support — and it manufactured a false diagnosis (a collapsed
+    location filter) on a run where region_overlap correctly reported 0.0.
+    """
+    _reset_scrape_globals(monkeypatch)
+    client = _DuplicateHarvestClient(distinct_ids=3, calls_per_pass=25)
+
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _scrape(client, ['Staff AI Engineer'])
+
+    dup_lines = [r.message for r in caplog.records if 'but only' in r.message and 'distinct' in r.message]
+    assert dup_lines, 'expected the duplicate-listing line'
+    for line in dup_lines:
+        assert 'more than one region' not in line, (
+            f'the line must not attribute duplicates to regions: {line}'
+        )

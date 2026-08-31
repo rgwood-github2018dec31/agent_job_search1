@@ -19,6 +19,15 @@ default memory behaviour.
 postings, and `JOB_REQUIREMENTS.md`. That data is intentionally machine-local; knowledge *about the
 project* is not.
 
+## Running the agent on this machine
+
+**Never launch the browser in `visible` mode unless the user has explicitly asked to watch the
+page.** A Chromium window appearing unannounced, and stealing focus at unpredictable moments
+during a 40-minute run, makes the machine hard to use. `python main.py -n` already defaults to
+`--browser headless`; use `--browser minimized` when a real window is needed (e.g. a profile that
+misbehaves headless), and `visible` only for a POC the user is actively watching. The scratchpad
+POC harness defaults to `minimized` and takes `PW_BROWSER_MODE` to override.
+
 ## Project Purpose
 
 This is a personal autonomous job search agent built on the Claude Agent SDK. It:
@@ -126,7 +135,7 @@ extracted text and metadata per filename by mtime, so the Haiku metadata call on
 or changed PDFs):
 
 - `_applied_jobs` — feeds `applied_jobs_summary()` into the Stage 1a query prompt
-- `_reference_job_texts` — feeds the ideal-role profile used by the rater
+- `_reference_job_texts` — feeds the ideal-role profile used by the rater. Ordered **newest applied first**, sorted by `applied_date` rather than filename, because both consumers cap it at `MAX_REFERENCE_JOBS` (20) and taking the oldest 20 meant a newly applied job could never influence the profile (see the 2026-08-25 entry)
 - `_applied_companies` — the already-applied blocklist used by `check_and_record_job`
 
 Only records within `APPLIED_JOBS_HORIZON_DAYS` (90) populate these; older PDFs stay on disk but
@@ -139,29 +148,30 @@ postings still contribute reference and query signal.
 
 ## Architecture
 
-The project uses the **[Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview)** (`claude-agent-sdk>=0.1.56`) as its foundation with **MCP (Model Context Protocol)** for tool use.
+The project uses the **[Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview)** (`claude-agent-sdk>=0.2.139`) as its foundation with **MCP (Model Context Protocol)** for tool use.
 
 ### Model tiers and providers (`config.py`)
 
 - `MODEL_NAME_HIGH` (`claude-opus-5`) — audit reference standard only (`--audit-opus`); never used in the normal pipeline
 - `MODEL_NAME_MEDIUM` (`claude-sonnet-5`) — Anthropic fallback for query generation and rating
-- `MODEL_NAME_LOW` (`claude-haiku-4-5`) — scraping, page extraction, and applied-job metadata
+- `MODEL_NAME_LOW` (`claude-haiku-4-5`) — page extraction and applied-job metadata; **Stage 1b scraping only as the `SCRAPER_PROVIDER='anthropic'` fallback**
 - `OPENROUTER_MODEL` (`z-ai/glm-5.2`) — **default** for query generation (`QUERY_PROVIDER`), company matching (`COMPANY_MATCH_PROVIDER`), and rating (`RATING_PROVIDER`). Each falls back to Anthropic if the OpenRouter MCP server is down
 - `RATING_PROVIDER` — `'openrouter'` (default, `z-ai/glm-5.2`) | `'anthropic'` (`MODEL_NAME_MEDIUM`) | `'ollama'` (`LOCAL_MODEL`) — selects who makes the final rating call
+- `SCRAPER_PROVIDER` — `'openrouter'` (**default**, `SCRAPER_OPENROUTER_MODEL` = `deepseek/deepseek-v4-flash`, via the function-calling loop in `scrape_openrouter.py`) | `'anthropic'` (the original `ClaudeSDKClient` scraper, kept intact as the rollback path and used automatically if OpenRouter fails). Measured 2026-08-21 on one live search: **$0.0287 vs $0.4330** for identical traffic on Haiku (**9.3x**), because deepseek-v4-flash caches implicitly (~88% hit rate) and has **no cache-write fee** — cache writes were 42% of the Haiku bill. Capped at `SCRAPER_OPENROUTER_MAX_ITERATIONS`, tool results truncated to `SCRAPER_TOOL_RESULT_MAX_CHARS`. **Do not point this at `OPENROUTER_MODEL` (`z-ai/glm-5.2`)**: at $0.1932/M cache-read it is ~2x Haiku's rate and costs *more* than what it replaces — the same trap applies to `deepseek-v4-pro` and `qwen3.8-max`. The win is specific to the flash tier
 - `EXTRACTOR_PROVIDER` — `'anthropic'` (default, Haiku agentic session) | `'openrouter'` (function-calling agent loop in `extract_openrouter.py`: glm-5.2 drives the browser tools via the OpenRouter MCP server's `chat` tool with OpenAI-style `tools`; capped at `EXTRACTOR_OPENROUTER_MAX_ITERATIONS`, tool results truncated to `EXTRACTOR_TOOL_RESULT_MAX_CHARS`). The deterministic Haiku fallback covers failures of either provider
 - Non-Anthropic models are reached via the LLM MCP tool servers (`LLM_OPENROUTER_MCP_URL` :8006, `LLM_LOCAL_MCP_URL` :8002) using `call_mcp_tool()` in `triage.py`. **Always route OpenRouter/Ollama inference through these servers, never the raw HTTP APIs** — that is where keys, config, and per-call `cost_usd` tracking live. Note the local Ollama `generate` tool has **no default model configured**, so always pass `model` explicitly
 
 ### Non-interactive pipeline (`run_non_interactive` in `agent.py`)
 
 1. **Stage 1a — Query generation** (glm, Anthropic fallback): `generate_search_queries()` derives at most `MAX_SEARCH_QUERIES` (6) LinkedIn search queries from resume + `JOB_REQUIREMENTS.md` + the in-horizon applied-job titles (`applied_jobs_summary()`). Individual-contributor titles only — people-management titles are explicitly excluded
-2. **Stage 1b — Scraping** (Haiku): `run_scraper()` issues **one request per query on a single shared session** (`SCRAPER_MAX_TURNS_PER_QUERY` turns each), calling `check_and_record_job` + `queue_candidate` for each result listing without navigating to individual job pages. Both halves are load-bearing: batching all queries into one request lets the first few exhaust the turn budget so the rest are never searched (while still reporting `0 jobs`); opening a fresh client per query makes later ones fail with "browser is in use" against the shared Playwright context, which looks identical to an auth wall in the logs
+2. **Stage 1b — Scraping** (`deepseek-v4-flash` via `scrape_openrouter.py`; Haiku on the Anthropic fallback): `run_scraper()` issues **one request per query**, calling `run_ui_contract` → `harvest_listings` → `record_listings` per search without navigating to individual job pages. `run_scraper` is provider-agnostic — it takes a `run_pass(instruction)` callable, so its per-query loop, randomised pacing, region-verification check and low-yield recovery pass are shared rather than duplicated. On the **OpenRouter** path each request is a fresh conversation while the browser session persists: on the Anthropic path all six queries shared one transcript, so context per turn grew 41K → 162K across a run and every later query paid for every earlier snapshot. On the **Anthropic** path the one-request-per-query split is still load-bearing — batching all queries into one request lets the first few exhaust `SCRAPER_MAX_TURNS_PER_QUERY` so the rest are never searched (while still reporting `0 jobs`), and opening a fresh client per query makes later ones fail with "browser is in use" against the shared Playwright context, which looks identical to an auth wall in the logs
 3. **Stage 2 — Evaluation** (`evaluate_all_candidates()`), per candidate:
    - **2a Extract** (Haiku, agentic): `extract_job_page()` navigates to the job URL, expands the description, and submits a condensed extract via `submit_job_extract` (nav chrome and boilerplate stripped). If the session ends without submitting (Haiku can exhaust its turn budget hunting through truncated snapshots of large pages), `extract_job_page_direct()` falls back to a deterministic path: navigate + wait + snapshot (+ one "… more" expand click) driven directly over the Playwright MCP session, then one non-agentic Haiku call condenses the full snapshot — same browser and logged-in profile, so bot-detection exposure is identical
    - **2b Hard rules** ($0 on the happy path): `apply_hard_rules()` auto-rates 1 for a **blacklisted company** (poster or `end_client`; checked first, free unless the exact case-sensitive name matches, in which case one cheap confirmation call runs — see Reject Blacklisted Company), closed postings, postings > `JOB_STALE_AGE_DAYS` (30) days old, jobs in a `sponsorship_required_in` location without explicit sponsorship, jobs requiring a language outside `languages` (from the extract's `language_requirement` field), and jobs that hard-require a degree listed in `reject_required_degrees` (from the extract's `education_requirement` field, backed by `derive_education_requirement()`). The blacklist and the three location/language/education gates are **preference-driven** — each is off when its preference list is empty. A required relocation (`relocation` field) does NOT reject — it is flagged as "relocation required: <location>" in the saved job and the Telegram notification, and the evaluator is given `relocation_note` as guidance. Every rejection is logged with its reason (console + `run_dir/logs/run-*.log`)
    - **2c Triage** ($0, local LLM): `triage_job_fit()` scores fit 1–5 with Ollama; scores ≤ `TRIAGE_THRESHOLD` (1) are saved with the triage score and skip the rating call; fails open if the server is down
    - **2d Rating** (configurable): `rate_job()` makes one non-agentic structured-output call, then `apply_rating_caps()` applies the deterministic ceilings (hybrid location, foreign `posting_language`; lowest cap wins, all reasons reported), saves via `do_save_job_posting()`, and sends a Telegram notification for ratings ≥ 4
 
-Before Stage 2, `build_reference_summary()` distills the reference-job PDFs into a ~2.5K-char "ideal role profile" (provider chain: OpenRouter → local Ollama → Anthropic Haiku; falls back to the full reference block if all fail). The result is cached in `run_dir/reference_summary_cache.yaml` keyed by an md5 of the reference texts, so it is only regenerated when the PDFs change. The evaluator prompt embeds this summary instead of the former 20×3,000-char reference block.
+Before Stage 2, `build_reference_summary()` distills the reference-job PDFs into a ~2.5K-char "ideal role profile" (provider chain: OpenRouter → local Ollama → Anthropic Haiku; falls back to the full reference block if all fail). The result is cached in `run_dir/reference_summary_cache.yaml` keyed by an md5 of the reference texts, so it is only regenerated when the PDFs change. The 20 it distills are the **most recently applied**, which is the whole point of the cap — a profile built from the oldest 20 cannot track a change in direction, and reports `cache hit` while doing it. The evaluator prompt embeds this summary instead of the former 20×3,000-char reference block.
 
 Key per-job observability is logged via the `logging` module: extract input tokens vs. condensed size, hard-rule short-circuits, triage score vs. final rating, and the rating provider used. Per-stage costs land in `cost_log.jsonl` under `reference_summary` / `extraction` / `rating` (triage and hard rules are free), charged per session — see the Observability requirement.
 
@@ -170,7 +180,7 @@ Key per-job observability is logged via the `logging` module: extract input toke
 | Factory | Used in | Tools provided |
 |---|---|---|
 | `make_job_search_server(interactive)` | Interactive mode | `check_and_record_job`, `save_job_posting`, `update_job_requirements` (if interactive) |
-| `make_scraper_server()` | Stage 1b | `check_and_record_job`, `queue_candidate` |
+| `make_scraper_server()` | Stage 1b (**Anthropic fallback only**) | `check_and_record_job`, `queue_candidate`, `report_search` |
 | `make_evaluator_server()` | Stage 2a | `submit_job_extract` |
 
 In Stage 2, saving and Telegram notification are plain Python calls (`do_save_job_posting()`, `_send_pipeline_notification()`), not MCP tools.
@@ -182,6 +192,8 @@ In Stage 2, saving and Telegram notification are plain Python calls (`do_save_jo
 | `check_and_record_job` | Returns `already_processed`, `too_old`, or `new`; records to `processed_jobs/*.yaml` |
 | `save_job_posting` | Saves evaluated job to `saved_jobs-{date}/job_posting-*.md` |
 | `queue_candidate` | Adds a job to the in-memory evaluation queue (Stage 1b only); skips below-seniority / people-management titles for $0 |
+| `do_record_listings` | Records a whole search's harvest in one call **from code's copy**; enforces `SCRAPER_MAX_LISTINGS_PER_SEARCH`, returns counts only |
+| `run_ui_contract` / `harvest_listings` / `record_listings` / `report_problem` | The Stage 1b OpenRouter toolset. **None accepts page or job data** — see Anti-fabrication |
 | `submit_job_extract` | Captures the condensed page extract from the Stage 2a extractor |
 | `update_job_requirements` | Rewrites `JOB_REQUIREMENTS.md` (interactive mode only) |
 
@@ -199,6 +211,216 @@ At runtime, `check_and_record_job` enforces:
 `date_posted` accepts absolute (`YYYY-MM-DD`) or relative (`"4 days ago"`) formats; omit if not shown.
 
 ## Known diagnoses
+
+### 2026-08-25 — the local model tag disappeared, and triage died without saying so
+
+`test_generate_local_live` stopped passing. Run with the servers up and outside the sandbox it
+**fails**, not skips:
+
+```
+RuntimeError: MCP tool 'generate' at http://127.0.0.1:8002/mcp returned an error:
+  404 Client Error: Not Found for url: http://localhost:11434/api/generate
+```
+
+`LOCAL_MODEL` was `qwen3.6:latest`, and that tag stopped existing when the model was re-pulled as
+`qwen3.6:27b-mlx` / `35b-mlx` around Aug 15. **Ollama's `latest` is not a moving alias — it is a
+tag like any other, and a re-pull can simply not create it.**
+
+**Nothing was broken, which is the problem.** Triage fails open by design, so every job just
+skipped the free gate and went to the paid rating call. Ten days, invisible:
+
+| run | `Triage:` scored | `Triage unavailable` |
+|---|---|---|
+| Aug 14 | 20 | 3 |
+| Aug 18 | 0 | 53 |
+| Aug 20 | 0 | 62 |
+| Aug 21 | 0 | 63 |
+| Aug 23 | 0 | 49 |
+| Aug 24 | 0 | 28 |
+
+**Three independent mechanisms hid it, and only the first is about this bug.**
+
+1. **The cause could not reach the log, structurally.** `streamable_http_client` and
+   `ClientSession` each open an anyio task group, so the `RuntimeError` naming the missing model
+   surfaces to the caller nested two `ExceptionGroup`s deep — and `str()` of an `ExceptionGroup`
+   is `unhandled errors in a TaskGroup (1 sub-exception)`. `triage_job_fit` logged `{ex}`, so 250+
+   warnings carried **zero** bytes of the one string that identified the fault. This is the same
+   shape as the 2026-08-24 `api_error_status` finding: the diagnostic field existed and was
+   discarded. `unwrap_exception()` now flattens `.exceptions` / `__cause__` / `__context__`
+   before logging. **Every MCP failure in this codebase arrives wrapped**, so anything catching
+   around `call_mcp_tool` must unwrap before logging or it is logging nothing.
+2. **A run-level misconfiguration was rediscovered per job.** 63 identical warnings where one
+   would do — again the shape of 2026-08-24's `categorize_save_dir_pdfs()`. `preflight_local_model()`
+   now runs once before Stage 2, and on a miss logs one ERROR **naming every installed model**,
+   raises a `local_model_missing` alert into `assess_run_health` (so it reaches audit §1b and the
+   Telegram `⚠️ NEEDS ATTENTION` block), and disables triage for the run. A *server* that is down
+   still fails open silently — that is the supported case, and alerting on it would cry wolf.
+3. **The test that existed to catch this hardcoded its own copy of the value.**
+   `test_generate_local_live` passed `model='qwen3.6:latest'` as a literal rather than
+   `config.LOCAL_MODEL`, so it tracked nothing and could not have detected the drift even if it
+   had run. It now reads the constant, and `test_configured_local_model_is_a_concrete_tag` rejects
+   a `:latest` pin outright.
+
+**A note on the sandbox, because it is why nobody noticed.** `_require_llm_server` probes
+`127.0.0.1:8002` with `connect_ex`, which the Bash sandbox always refuses — so in-sandbox this
+test *skips* unconditionally, and a skip that can never become a pass is not a passing test
+(the 2026-08-24 `conftest.py` gate, again). **Live LLM tests must be run with the sandbox
+disabled or they are decorative.**
+
+**The replacement is deliberately small.** `granite4.1:3b` — 65.9 tok/s, 3.9s cold start, 2.1GB,
+against `qwen3.6:35b-mlx` at 52.5 tok/s / 21s / 21.9GB. Triage is one cheap 1-5 JSON score; it
+does not need a 30B model, and Granite advertises structured JSON output as a first-class
+capability. **The risk of sizing down is a false 1** — triage rejects at `TRIAGE_THRESHOLD = 1`
+and a rejected job is saved as "triaged out" and never rated, so a mis-score costs a real job.
+Measured against 17 real saved postings spanning ratings 1-5: **zero false 1s**, every 4/5 posting
+scored 4 or 5, and the only 1s it assigned were on postings the strong rater also rated 1. Where
+it disagreed it erred **high** (3→4, 2→3, 1→2), which is the direction `TRIAGE_INSTRUCTIONS` asks
+for. Re-run that comparison before swapping this model again; `test_triage_job_fit_live` alone
+only proves the model can reject an obvious non-fit, not that it spares a good one.
+
+### 2026-08-25 — the rater calibrated on the jobs the user had already moved on from
+
+Two defects found by watching a live run rather than by a failure. Neither broke anything loudly;
+each silently degraded a documented mechanism, which is why both survived.
+
+**1. The ideal-role profile was built from the OLDEST applied jobs.** `build_reference_summary()`
+and `build_reference_block()` both slice `texts[:MAX_REFERENCE_JOBS]` (20), and
+`_reference_job_texts` was filled by `for pdf in sorted(applied_to_dir.glob('*.pdf'))` — filenames
+are `YYYY-MM-DD-`prefixed, so ascending sort is **oldest first**. With 60 in-horizon records the
+rater calibrated against 2026-05-26 -> 2026-08-09 and never saw the 40 most recent.
+
+The tell was a log line that reads like good news. Immediately after ingesting 8 new PDFs the run
+logged `Reference summary: cache hit` — the new records sort last, never enter the first 20, so
+`combined` was byte-identical and the md5 matched. **A newly applied job could not influence the
+profile at all**; it only entered once older records aged out of the 90-day horizon. The mechanism
+whose stated premise is "the strongest available signal of what to search for" was structurally
+incapable of tracking a change in direction.
+
+The two halves disagreed, which is what kept it invisible: Stage 1a reads `applied_jobs_summary()`
+and *did* pick up the new titles (the query set shifted to `Lead AI Engineer` /
+`Senior Applied AI Engineer` that same run), so query generation tracked the current direction
+while the rater scoring those results lagged it by months.
+
+Fixed in `load_applied_jobs()` by sorting on `applied_date` descending — deliberately not on
+filename, because a legacy file with no date prefix sorts arbitrarily. Both call sites are
+unchanged. A count-only test (`test_build_reference_block_caps_at_max_pdfs`) had been passing all
+along while the code kept exactly the wrong 20; the new tests assert **which** records survive.
+
+**2. The recovery pass turned the distinct-listing counter into a call counter.** The first pass
+computes `seen` as a genuine distinct count; the recovery branch then did
+`seen = sum(delta.values())` and never refreshed `calls`, emitting the impossible
+
+```
+query "Principal AI Engineer" inspected 100 distinct listing(s) of 50 checked
+```
+
+on 4 of 6 queries. `seen` also feeds `_queries_searched`, so a recovered query reported a call count
+where every other query reports distinct listings — and it **inflates**, so a duplicate-saturated
+recovery reads as excellent coverage. That is the 2026-08-18 "saturated run looks healthy" shape,
+reintroduced in the one code path that only runs when a query is already in trouble. Counting
+distinct rather than calls is load-bearing precisely here.
+
+**A derived metric that names a cause it cannot observe is worse than no metric.** The same block
+logged `{calls - seen} were surfaced by more than one region` — but `calls - seen` cannot
+distinguish cross-region duplication from a recovery pass re-harvesting the same page. On this run
+it produced a confident and entirely wrong diagnosis (that the location filter had collapsed on four
+queries) while `region_overlap_report()` — a real Jaccard over per-region id sets — correctly
+reported 0.0 and the filter was working. The line now states what it measured and defers to
+`region_overlap` for cause; a test asserts the region claim cannot come back.
+
+### 2026-08-24 — "error result: success", and the leak that never left `tools_generic.py`
+
+A run failed to categorize all 9 uncategorized PDFs in the save directory, nine times over:
+
+```
+Warning: categorization failed for <file>, leaving uncategorized: Claude Code returned an error result: success
+```
+
+**The string is not ours.** It comes from the installed SDK
+(`claude_agent_sdk/_internal/query.py:383`): when the CLI emits a result frame with
+`is_error: true`, the SDK builds its text from `"; ".join(errors)` and — with `errors` empty —
+falls back to `str(subtype)`. `subtype` was `"success"`, so the word is a *fallback label leaking
+through*, not a status. The SDK's own type definition says what the combination means:
+
+```python
+# HTTP status code (e.g. 429, 500, 529) of the failing API call when
+# ``is_error`` is True and ``subtype`` is "success"; None otherwise.
+api_error_status: int | None = None
+```
+
+So `is_error=True` + `subtype=="success"` is **an HTTP-level API failure**, and the one field that
+names the cause — `api_error_status` — was discarded by us on every path: `grep -rn
+"is_error\|subtype" src/` returned **nothing**. Four `sdk_query` loops each tested
+`isinstance(msg, ResultMessage) and msg.structured_output`, so an errored result simply looked
+like a result with no output, and the real exception arrived later from the SDK stripped of the
+status code. 401, 429 and 529 were indistinguishable — which is why the first hypothesis
+("we weren't logged in") could be neither confirmed nor refuted from nine identical messages.
+
+**Three failure modes, only the first of which is about the error itself.**
+
+1. **Undiagnosable.** Nine identical failures carried zero actionable information. Fixed by
+   `_raise_if_result_error()`, which inspects each `ResultMessage` *before* the SDK's trailing
+   uninformative `ProcessError` and raises `AgentApiError` naming the status, subtype,
+   `terminal_reason` and a hint (401/403 → run `claude /login`; 429/529 → back off).
+2. **Invisible, and silently degrading.** Nothing about categorization reached
+   `run_dir/logs/run-*.log` — it was `console.print()`-only. Uncategorized PDFs never get the
+   `cat-saved_jd-` prefix, so `ingest_save_dir_applied_pdfs()` never moves them into the corpus,
+   so the applied-job corpus stops growing and query generation quietly degrades. **This is the
+   same shape as the 2026-08-18 saturated run: a degraded run that looks like a normal one.**
+   Now logged, and `print_result_stats()` reports `is_error`/`subtype`/`api_error_status` on every
+   result so an errored one is no longer indistinguishable from a good one.
+3. **A systemic error retried per file.** One API-level failure spawned 9 doomed CLI subprocesses.
+   `categorize_save_dir_pdfs()` now separates the two classes: `AgentApiError` logs at ERROR and
+   **aborts the run** (the next PDF would fail identically, and a corpus that stopped growing must
+   not pass as a normal run), while a per-file fault — a corrupt PDF — still warns and continues.
+
+**The adjacent finding was the expensive one.** All four `ClaudeAgentOptions` sites in
+`tools_generic.py` pass `cwd=str(PROJECT_DIR)` but left `setting_sources`, `strict_mcp_config` and
+`skills` at their defaults — the exact bug the 2026-08-21 entry above documents as fixed. It was
+fixed *in `agent.py`*, and that scoping is precisely why nobody looked here. **Measured with
+`get_context_usage()` on the real categorization options: 22,945 tokens → 294, a 78x reduction**,
+all of it `memoryFiles` (this file, loaded in full into a Haiku call that classifies a PDF into one
+word). Nine PDFs paid it per run, as did every `company_matches_applied` and
+`company_blacklist_reason` call.
+
+**The blacklist path deliberately still swallows this error.** `company_blacklist_reason` catches
+`AgentApiError` and rejects on the exact name match anyway — required behaviour, since a tool
+outage must never quietly readmit a blacklisted company (`test_blacklist_confirmation_failure_still_rejects`).
+
+**A gate that asks the wrong question skips instead of failing.** `conftest.py` gated
+`live_agent_claude` on `ANTHROPIC_API_KEY`, which the Agent SDK does not need — it authenticates
+through the logged-in CLI. On a developer machine every live test therefore *silently skipped*, and
+the new context-usage measurement would have skipped with them. The gate now probes the CLI the SDK
+would actually spawn. **A skip that never turns into a pass is not a passing test** — turning it on
+exposed two live tests that had been failing unseen, and each turned out to be a real `src/` bug
+rather than test rot:
+
+1. **`_extract_company_from_text` was deleted from `src/` in commit 96bd708**, replaced by
+   `_extract_applied_job_metadata`, but its test kept calling the old name for three months.
+   Replaced by tests of the successor, including one covering the agency / `end_client` split.
+2. **`save_job_posting` was uncallable, and the shorthand tool schema is why.** The
+   `{"name": str}` form builds `"required": list(properties.keys())`
+   (`claude_agent_sdk/__init__.py:422`), so **every** declared param is mandatory. Three tools
+   therefore demanded fields their own descriptions call optional: `save_job_posting.job_id`,
+   `check_and_record_job.{date_posted,url,content}` and `queue_candidate.{date_posted,query}` —
+   including the `date_posted` this very file tells the model to "omit if not shown", which it
+   could not do. **This is fabrication pressure of exactly the kind the Anti-fabrication
+   requirement describes**: a model told a field is mandatory and unable to observe it must either
+   refuse or invent. Observed live, verbatim: *"I don't want to invent an ID since it's the key
+   this posting gets stored under."* It refused — this time. Optionality needs the full JSON Schema
+   form, which the SDK passes through untouched; `test_optional_tool_params_are_not_declared_required`
+   pins it.
+
+**Interactive mode looks broken by the same probe, and is NOT yet fixed.** With `job_id` optional
+the model called the tool correctly and the call was still refused —
+`permission_mode="acceptEdits"` auto-approves file edits only, **not in-process MCP tools**, and
+the denial surfaces in `ResultMessage.permission_denials`. `main()` configures interactive mode
+(`agent.py:2780`) with exactly that mode, no `can_use_tool` callback and no `allowed_tools`, so
+`save_job_posting`, `check_and_record_job` and `update_job_requirements` should all be denied
+there; every other site in `agent.py` uses `bypassPermissions`. The live test now uses
+`bypassPermissions` to match. **The production change was deliberately not made**: interactive mode
+also holds the Playwright server against the real logged-in LinkedIn account, so broadening its
+permissions is an Account-safety decision, not a test fix.
 
 ### 2026-08-13 — the extractor translates, so the JD's own language was invisible
 
@@ -227,7 +449,143 @@ saved and auditable while putting it below the ≥ 4 notification threshold. A n
 `local_language` is only a warning — many roles in non-English locations genuinely operate in
 English, and the user asked to be told, not to have them dropped.
 
+### 2026-08-21 — Stage 1b was 87% of the bill, and this file was part of the reason
+
+Stage 1b reached **86.9% of total run cost** — $48.24 of $55.52 over ten runs — climbing $2.68
+(Aug 17) → $7.44 (Aug 18) → **$10.06** (Aug 21) to inspect 300 listings of which only 147 were
+distinct. Nothing was broken; nothing reported a problem. Cost was only ever visible as a stage
+total, which is why a 68% → 99% drift went unremarked for weeks.
+
+Cost is `Σ_turns(context_size)`, and **~90% of it was cache traffic** (47% read, 42% write, 10%
+output; a least-squares fit over 47 requests recovers Haiku list price at the 1h TTL to 1.5%).
+Turns were never the constraint — the 260 budget peaked at 163.
+
+Three findings, in increasing order of embarrassment:
+
+1. **The scraper's 40K-token floor was almost entirely not about scraping.** `scraper_options`
+   left `setting_sources`, `strict_mcp_config` and `skills` at their defaults, and the SDK
+   docstring is explicit: *"When `None`, all sources are loaded… Must include `project` to load
+   CLAUDE.md files."* **Measured with `get_context_usage()` on a bare options object declaring no
+   MCP servers at all: 45,523 tokens → 358 with the three set.** The 45,165-token difference is
+   `Memory files` **31,384** (this file) and `MCP tools` **13,781** (nine unrelated global servers
+   — telegram, rag-local, yt-dl, image-gen…), re-read on all 776 turns. The cost history tracks
+   this file's own growth: 8.7KB in July at $0.50/run → 67KB now at $10/run. **This file was
+   materially responsible for the bill it documents.** Fixed at every `ClaudeAgentOptions` site
+   in `agent.py`; moving Stage 1b off the Agent SDK removes it there as well. **That "in
+   `agent.py`" was load-bearing in the worst way** — it was literally true and read as complete,
+   and the four sites in `tools_generic.py` stayed unfixed for three more months (see the
+   2026-08-24 entry). A prose claim scoped to one file cannot police a second one; the AST guard
+   `test_every_claude_agent_options_site_limits_context` now checks every site in the package, so
+   the next one someone adds fails a test rather than quietly costing money.
+2. **Every randomised safety pause was buying a full page snapshot.** Verified in the installed
+   `@playwright/mcp@0.0.79` bundle: 18 action tools call `setIncludeSnapshot()`, resolving
+   `config.snapshot?.mode ?? "full"` — and **`browser_wait_for` is one of them**. The pacing added
+   *for* Account safety was the thing being billed. ~20 auto-snapshots × ~8K tokens × 12 searches ≈
+   1.92M, against the measured 1.96M cache-write. The arithmetic closes. `--snapshot-mode none`
+   fixes it and leaves explicit `browser_snapshot` untouched (it sets `_includeSnapshot =
+   "explicit"`, which ignores the config), so the obstacle path is unaffected. **Not yet applied.**
+3. **~370 of 776 turns re-emitted data the model already had** — the per-listing
+   `check_and_record_job` loop after a harvest that already returned all 25 cards.
+
+**The fix was the model, not the mechanics.** `deepseek-v4-flash` prices identical traffic 9.3x
+cheaper ($0.0287 vs $0.4330 on one measured search) because it caches implicitly at ~88% with **no
+cache-write fee**. Beware the obvious wrong choices: this project's own `OPENROUTER_MODEL`
+(`z-ai/glm-5.2`) costs **more** than Haiku at $0.1932/M cache-read, as do `deepseek-v4-pro` and
+`qwen3.8-max` — five of eleven candidates evaluated lose money. There is **no qwen3.8 flash
+variant**; the 3.8 line is a premium tier.
+
+**Three capability gaps, all harness-fixable, none about page comprehension.** The flash model
+reasoned about the page correctly throughout, but: it could not infer playwright's `target`
+convention (burned 14 iterations discovering the bare ref `e1202`, then regressed twice — fixed by
+~10 lines of prompt); it **retyped the canonical JS from memory and corrupted it**; and it
+**fabricated a page report** when `filename` diverted its evaluate result to disk. The last one
+produced the Anti-fabrication requirement, and the fix for the middle one — dedicated tools that
+take no page code — is strictly better than what it replaced.
+
+**Two process lessons worth more than the savings.** First, `uv run` silently re-resolved
+`mcp>=1.29` to 2.0.0, whose `streamable_http_client` yields two values instead of three, breaking
+`mcp_session` — i.e. every OpenRouter and Ollama call — at runtime, mid-run. Now pinned `<2` with
+two tests. Second, the harness's own test fixtures omitted playwright's `### Ran Playwright code`
+echo, so a parser that scanned to the last `}` ran into the echoed script and returned None on
+**every real harvest** while the tests stayed green. **Fixtures that are cleaner than reality are
+worse than no fixtures.**
+
+### 2026-08-18 — the filter chips were there all along, and the region axis was dead
+
+A run queued **1 candidate from 300 listings inspected** — the end of a four-day slide (26 → 4 → 4
+→ 2 → 1 new jobs) during which **not one notification was sent** and nothing reported a problem.
+Stage 1b was mechanically healthy throughout: 12/12 searches ran, no block, no auth wall.
+
+**The 2026-08-11 entry below was wrong, and this is the correction.** Its central claim — that the
+filter chip row is gone and filters must be typed into the query text — does not hold. Verified
+live against `~/.linkedin-agent-profile`:
+
+| Claim (2026-08-11) | Reality (2026-08-18) |
+|---|---|
+| chip row is gone | **present**: Date posted, Experience level, Employment type, Company, + contextual chips |
+| `location` cannot be set | **location chip works**; autocomplete resolves a region to a `geoId` |
+| filters stripped from the URL | applying a chip **puts `geoId` / `f_TPR` in the URL**, and they survive direct navigation |
+| no sort/date control | **Date posted** = Past month / Past week / Past 24 hours (`f_TPR=r604800`) |
+| only page 1 reachable | results footer exposes **1 · 2 · 3 · Next** |
+
+The trick is simply that you must search on the **bare query** and filter on the results page.
+Typing the region into `keywords` is silently ignored — every "European Union" search returned
+Greater Vancouver instead. Measured, same query:
+
+| | searches | listings | unique | never-seen |
+|---|---|---|---|---|
+| region in query text (the broken design) | 12 | 300 | 101 | **1** |
+| location chip, two regions | 2 | 50 | 50 | **30** |
+
+Zero id overlap between the two chip searches; only 3 of those 30 new jobs had been seen by the
+production run at all. The old design did 6× the searching for a thirtieth of the yield.
+
+**Filters are applied by CLICKING, never by crafting the URL.** `geoId=91000000&f_TPR=r604800`
+demonstrably works when navigated to directly — that is exactly why it is forbidden. No human
+assembles filter parameters by hand, and this drives a real logged-in account. The URL parameters
+are used for one thing only: **reading back** after the clicks to confirm they landed
+(`check_filters_applied`). Known ids: Canada `101174742`, European Union `91000000`.
+
+**Three failures were invisible, and all three are now instrumented.**
+
+1. **The scraper diagnosed the dead region itself, on every single query** — the run log carries
+   *"🔴 Issue detected: The EU region filter did not apply"* six times over — and it reached
+   nothing but the log, because `log_agent_text` output is read by neither the audit log nor the
+   funnel. Judgement now happens in code: the model reports the page structure via
+   `report_search`, and `evaluate_ui_contract` / `check_filters_applied` decide. Same lesson as
+   the hybrid and language caps: **a structural fact must never be left to a model's discretion.**
+2. **The duplication hid itself.** `seen` counted `check_and_record_job` *calls*, so two regions
+   returning the same 25 cards read as 50 listings — indistinguishable from real coverage, and it
+   pushed the query *further* from the `SCRAPER_MIN_LISTINGS_PER_QUERY` retry. Distinct ids are
+   now tracked separately (`listings_distinct`, `region_overlap`); Aug 18 would have scored 1.0.
+3. **A saturated run looked exactly like a healthy quiet one.** `assess_run_health` now alerts on
+   low yield, region overlap, contract breaches, blocks, low listing counts and early stops, in
+   the run log, the audit log (§1b) and the Telegram summary.
+
+**Verifying the contract probe against the live page was essential and caught two real bugs**, both
+of which would have failed every query: the search box is a plain `<input>` with a **placeholder**
+and no `aria-label`, and cards *and chips* are each rendered **twice** in the DOM (a raw count read
+50 cards / 44 chips on a 25-job, 13-chip page). Do not write a selector for this page without
+running it against the real thing.
+
+**Still true from 2026-08-11, and safety-critical:** job ids come from the `componentkey` attribute
+(`div[componentkey="job-card-component-ref-<jobId>"]` inside
+`div[componentkey="SearchResultsMainContent"]`), and **nothing in the results list is ever
+clicked** — the only real `<button>` in a card is Dismiss, which the accessibility tree disguises
+as the card itself, and which already destroyed three real jobs. Clicking filter chips is fine;
+they sit above the results. That boundary is asserted by unit tests.
+
+Also still true: the account-level **salary filter self-injects** (`f_SA_id_227001:277001`
+reappeared unbidden), so the empty `f_SAL=` stays on the search URL; and the **location is sticky**
+across sessions, so it must be set explicitly every search rather than assumed.
+
 ### 2026-08-11 — LinkedIn migrated the account to AI-powered job search
+
+> **SUPERSEDED on 2026-08-18 — see the entry above.** The account really was migrated to
+> AI-powered job search, but the conclusions drawn about filters were wrong: the chip row
+> exists, `geoId`/`f_TPR` work, and typing filters into the query text does nothing. The
+> parts about `componentkey` job ids and never clicking the results list remain correct
+> and safety-critical. Kept for the reasoning trail.
 
 A run surfaced 1 job: 7 listings inspected, against 162–166 on the two previous days. It was
 **not** dedup saturation (the funnel was empty before dedup ran), **not** a bot block (no
@@ -320,7 +678,7 @@ the year-off date-clamp bug, tightening the sponsorship rule, and more queries /
 ### Business Object Model
 
 - **Resume** — user's CV stored as Markdown in `run_dir/`
-- **Preferences** — `run_dir/preferences.yaml` (gitignored), loaded by `preferences.py`: the `save_dir` where saved job PDFs land (default `~/Downloads`), search regions, sponsorship-required locations, languages, `foreign_language_rating_cap`, rejected degree levels, hybrid cap and acceptable locations, target/excluded titles, relocation note, and the **company blacklist** (`companies.blacklist`: per entry a `name`, a `reason`, and an `added` date; entries expire after `COMPANY_BLACKLIST_EXPIRY_DAYS` (180)). This is the **only** home for facts about the person running the agent; tracked source must stay neutral. `preferences.example.yaml` in the project root documents the format with placeholder values
+- **Preferences** — `run_dir/preferences.yaml` (gitignored), loaded by `preferences.py`: the `save_dir` where saved job PDFs land (default `~/Downloads`), search regions (each with a `linkedin_location` typed into the location chip and an optional `geo_id` used only to verify the click landed), sponsorship-required locations, languages, `foreign_language_rating_cap`, rejected degree levels, hybrid cap and acceptable locations, target/excluded titles, relocation note, and the **company blacklist** (`companies.blacklist`: per entry a `name`, a `reason`, and an `added` date; entries expire after `COMPANY_BLACKLIST_EXPIRY_DAYS` (180)). This is the **only** home for facts about the person running the agent; tracked source must stay neutral. `preferences.example.yaml` in the project root documents the format with placeholder values
 - **JOB_REQUIREMENTS.md** — agent-managed preference file; read-only in non-interactive mode
 - **Search Query** — short LinkedIn search string derived from Resume, JOB_REQUIREMENTS.md, and Applied Job Records
 - **Applied Job Record** — a job the User applied to: a date-prefixed PDF in `run_dir/applied_jobs/` plus its `index.yaml` metadata (applied date, company, job title, recruiting-agency flag, end client). Active for 3 months; older records are retained but unused
@@ -354,16 +712,26 @@ the year-off date-clamp bug, tightening the sponsorship rule, and more queries /
 - **Audit Un-surfaced Jobs**: (`--audit-opus N`) sample N Job Postings from each of three un-surfaced pools — filtered at Stage 1, seen but never queued, and rated 2–3 — re-rate each with Opus, and report any the strong model scores ≥4 as a false negative. Diagnostic only; nothing is saved or notified
 - **Scrape Job Postings**: execute Search Queries on LinkedIn and collect candidate Job Postings. Every Search Query runs as **one search per configured region** (see Preferences `search_regions`), and all of them run every time.
 
-  **Filters and region go into the natural-language query text, never into URL parameters or filter chips.** As of 2026-08-11 the account is on LinkedIn's AI-powered job search: filter params are stripped from the URL, the chip row is gone, and LinkedIn's own guidance is to type filters into the search box (see Known diagnoses). Each search navigates to `/jobs/search-results/?keywords=<QUERY TEXT>&f_SAL=` — `keywords` is the only parameter still honoured, and the empty `f_SAL=` clears a leftover account-level salary filter — with the region and the words `remote` and `senior level` in the query text. Sort order is **no longer a coverage axis**: the AI-powered UI exposes no sort control, so the former "each region in both sort orders" fan-out would simply run the same search twice. Region is the one axis that still varies the result set.
+  **Filters are set by CLICKING the filter chips, never by putting them in the URL and never in the query text.** Each search navigates to `/jobs/search-results/?keywords=<QUERY>, remote&f_SAL=` — a bare keyword URL, which is what a bookmarked or shared LinkedIn search looks like — and then clicks: the **location chip** (clear, type the region, pick the autocomplete suggestion), **Date posted** → `SCRAPER_DATE_POSTED_LABEL` (Past week), and **Experience level** → `SCRAPER_EXPERIENCE_LABEL` (Senior). The empty `f_SAL=` stays, because the account-level salary filter self-injects.
 
-  Searches are **expected to return a high proportion of `already_processed`** results — that is the cost of the few genuinely best-matching jobs they surface, and is not a failure signal. Only page 1 is scanned. The converse also holds: **two searches returning the identical list of jobs means the region text did not apply**, and is a failure to report rather than a sign the query is exhausted.
+  Two things this replaces, both wrong: putting the region in the **query text** (silently ignored — every EU search returned the home metro for days), and navigating **directly to `geoId=`/`f_TPR=`** (works, but no human assembles filter parameters by hand, so it is a cheap fingerprint for anti-automation). The `geo_id` preference exists **only** to read back afterwards and confirm the click landed. Sort order is not a coverage axis — the UI exposes no sort control. Region is.
 
-  The scraper **reads back the result count and the query text the search box actually contains** before collecting anything; that read-back is the record of whether the search was real.
+  Searches are **expected to return a high proportion of `already_processed`** results — that is the cost of the few genuinely best-matching jobs they surface, and is not a failure signal. Only page 1 is scanned. The converse also holds: **two searches returning the identical list of jobs means the location filter did not apply**, and is a failure to report rather than a sign the query is exhausted — now measured in code as `region_overlap` rather than left to the model to volunteer.
+  - includes: Verify Search UI Contract
   - includes: Harvest Job Listings
 
-  A search returning zero results is retried once before being counted as empty. A query inspecting fewer than `SCRAPER_MIN_LISTINGS_PER_QUERY` (5) listings is retried once by `run_scraper`: at **zero** (auth-wall / block / empty-shell signature, distinct from "seen but deduped") the retry drops the region text; **above zero** — the signature of a results list that was never walked card by card — the retry re-states the selection procedure. **A challenge or verification page is never retried into**: the recovery prompt tells the model to stop and report instead, because pushing through a block is the one failure that can cost the account.
+  A search returning zero results is retried once before being counted as empty. A query inspecting fewer than `SCRAPER_MIN_LISTINGS_PER_QUERY` (5) **distinct** listings is retried once by `run_scraper`: at **zero** (auth-wall / block / empty-shell signature, distinct from "seen but deduped") the retry drops the location filter; **above zero** — the signature of a results list that was never walked — the retry re-states the harvest procedure. Counting **distinct** listings rather than `check_and_record_job` calls is load-bearing: two regions returning the same 25 cards used to read as 50 and pushed a collapsed query *further* from this threshold. **A challenge or verification page is never retried into**: the recovery prompt tells the model to stop and report instead, because pushing through a block is the one failure that can cost the account.
 
-- **Harvest Job Listings**: read every listing off the results page in **one read-only `browser_evaluate`** (`SCRAPER_HARVEST_JS` in `agent.py`), returning id, title, company, location and posting date per card. Cards are `div[componentkey="job-card-component-ref-<jobId>"]` inside `div[componentkey="SearchResultsMainContent"]` — **the LinkedIn job id is the attribute suffix**, so no clicking is needed to identify a listing. Cards appear twice in the DOM (dedupe by id) and each label is rendered twice (a visually-hidden copy carrying "(Verified job)" plus the visible one), so the extractor collapses both. **Nothing in the results list is ever clicked** — see Account safety. If the harvest returns an error or zero jobs while the page visibly shows results, the markup has changed and the scraper must say so rather than fall back to clicking. Capped at `SCRAPER_MAX_LISTINGS_PER_SEARCH` (25); invoked by Scrape Job Postings
+- **Verify Search UI Contract**: on every search, run one read-only `browser_evaluate` (`SCRAPER_UI_CONTRACT_JS` in `agent.py`) reporting the page's structure — search box, results container, distinct job-card count, chip row and its labels, location pin, pagination, result-count text. On the OpenRouter path the model calls **`run_ui_contract(region)`** and code runs the JS, reads the result and judges it: **code reads, code judges, the model only triggers.** (The Anthropic fallback still hands the object to `report_search` — the older "model reports; code judges" form, which is exactly the courier design that produced a fabricated report; see Anti-fabrication.) `report_search` checks, in this order:
+
+  1. **Block signature** (`UI_BLOCK_SIGNATURES`: CAPTCHA, "unusual activity", verification, forced re-login) — checked *first* because a challenge and a markup change demand opposite responses. The query stops and is **never retried into**.
+  2. **Contract violations** (`evaluate_ui_contract`) — a required `UI_CONTRACT_ELEMENTS` entry missing, or zero cards while the page itself reports results, which is the precise shape of a silent failure that otherwise reads as "no new jobs today". The query stops, the user is alerted, **remaining queries still run**.
+  3. **Filter confirmation** (`check_filters_applied`) — the `geo_id` and `f_TPR=r<seconds>` the clicks should have produced are present in the URL, and the chips have relabelled to their chosen values. This is the only use of those parameters.
+  4. **Fingerprint drift** (`check_fingerprint_drift`) — the chip labels are compared against `run_dir/ui_fingerprint.yaml` and any change is reported *even when every required element still passes*, so a restructure is noticed the run it happens rather than months later.
+
+  Selectors for this page **must be verified against the live page before being trusted**: writing them from the accessibility tree alone produced two failures that would have broken every query (the search box is a plain `<input>` with a placeholder and no `aria-label`; cards *and* chips are each rendered twice in the DOM). Invoked by Scrape Job Postings
+
+- **Harvest Job Listings**: read every listing off the results page in **one read-only `browser_evaluate`** (`SCRAPER_HARVEST_JS` in `agent.py`), returning id, title, company, location and posting date per card. On the OpenRouter path the model calls **`harvest_listings()`** (no arguments): code runs the canonical JS, keeps the listings, and returns only a count — so the model can neither retype the JS wrongly (it corrupted the contract JS this way on 2026-08-21) nor relay job data. **`record_listings()`** then records from code's copy via `do_record_listings`, which enforces `SCRAPER_MAX_LISTINGS_PER_SEARCH` **in code** (previously a prompt suggestion) and returns counts only. Cards are `div[componentkey="job-card-component-ref-<jobId>"]` inside `div[componentkey="SearchResultsMainContent"]` — **the LinkedIn job id is the attribute suffix**, so no clicking is needed to identify a listing. Cards appear twice in the DOM (dedupe by id) and each label is rendered twice (a visually-hidden copy carrying "(Verified job)" plus the visible one), so the extractor collapses both. **Nothing in the results list is ever clicked** — see Account safety. If the harvest returns an error or zero jobs while the page visibly shows results, the markup has changed and the scraper must say so rather than fall back to clicking. Capped at `SCRAPER_MAX_LISTINGS_PER_SEARCH` (25); invoked by Scrape Job Postings
 
   **Scraping is not a deterministic problem and must stay LLM-driven.** It is tempting to
   replace the agentic scraper with a parser: at any single moment the mechanics *are*
@@ -382,7 +750,7 @@ the year-off date-clamp bug, tightening the sponsorship rule, and more queries /
   - includes: Filter Stale Job Posting
 - **Deduplicate Job Posting**: skip a Job Posting already present in Processed Job Records, or whose company is on the already-applied blocklist derived from in-horizon Applied Job Records
 - **Filter Stale Job Posting**: skip a Job Posting whose scraped date is > 21 days old
-- **Summarize Reference Jobs**: distill Reference Job PDFs into a compact ideal-role profile via provider chain (OpenRouter → Local LLM → Anthropic), cached until the PDFs change
+- **Summarize Reference Jobs**: distill the **most recently applied** `MAX_REFERENCE_JOBS` (20) Reference Job PDFs into a compact ideal-role profile via provider chain (OpenRouter → Local LLM → Anthropic), cached until those PDFs change. Newest-first ordering is load-bearing, not cosmetic: the cap is applied with a plain slice, so the sort order decides which 20 the rater ever sees
 - **Evaluate Job Fit**: extract, filter, triage, and rate a candidate Job Posting, saving it as a Saved Job
   - includes: Extract Job Posting
   - includes: Flag Agency Posting
@@ -403,6 +771,7 @@ the year-off date-clamp bug, tightening the sponsorship rule, and more queries /
 - **Flag Workplace Type**: capture the work arrangement as a structured `workplace_type` field (`remote` / `hybrid` / `onsite`) rather than as free text inside the location; when the extractor omits it, `derive_workplace_type()` infers it from the location and description. Any required office days are `hybrid`, even when the board badges the listing "Remote" — LinkedIn's `f_WT=2` filter is not reliable. Extends Extract Job Posting
 - **Flag Required Relocation**: annotate (never reject) a Job Posting requiring relocation/residence in a specific location with "relocation required: <location>" in the Saved Job and Notification; extends Evaluate Job Fit
 - **Triage Job Posting**: score fit 1–5 with the Local LLM; clear low fits (score ≤ 1) are saved with the triage score and skip Rate Job Fit; fails open if the Local LLM is unavailable
+- **Preflight Local Model**: once per run, before Stage 2, verify `LOCAL_MODEL` is actually installed on the local Ollama server. When it is not, report it **once** at ERROR naming every model that *is* installed, raise a `local_model_missing` health alert (audit §1b + the Telegram `⚠️ NEEDS ATTENTION` block), and disable Triage Job Posting for the run. The run still completes and jobs still reach Rate Job Fit — this is a louder fail-open, not a new abort. Silent when the *server* is unreachable, which is the already-supported outage case. Exists because a machine-local Ollama tag can vanish on a re-pull, and when `qwen3.6:latest` did, triage was dead for ten days behind 250+ warnings that named nothing
 - **Extract Job Posting (fallback)**: when the agentic extractor fails to submit, deterministically fetch the page snapshot over the shared Playwright session and condense it with one non-agentic cheap-model call; extends Extract Job Posting
 - **Rate Job Fit**: one non-agentic structured-output call scoring fit 1–5 against JOB_REQUIREMENTS.md and the ideal-role profile, also returning **pros** and **warnings** bullet lists; provider configurable (Anthropic Sonnet default, OpenRouter `z-ai/glm-5.2`, or Local LLM). `apply_rating_caps()` then applies the deterministic hybrid ceiling below
 - **Cap Hybrid Rating**: after rating, deterministically cap a `hybrid`/`onsite` Job Posting at the Preferences `hybrid.rating_cap` unless its location matches `hybrid.acceptable_locations`. A cap is not a rejection — the job is still saved and still appears in the audit log, it just falls below the ≥ 4 notification threshold; extends Rate Job Fit
@@ -414,18 +783,19 @@ the year-off date-clamp bug, tightening the sponsorship rule, and more queries /
 
 ### Non-functional Requirements
 
+- **Anti-fabrication (the model chooses ACTIONS; code moves DATA)** — a tool argument must be a **decision**, never a payload code could have read itself. An LLM has no mechanism separating "I am copying this" from "I am producing this": both are token generation conditioned on context. So when the data is not in context — a call errored, a result was truncated, diverted to a file, or scrolled out — it does not fail, it emits the most plausible continuation, which is a well-formed, schema-valid object. **There is no failure mode where a courier notices it lacks the data**; absence produces fiction, and the fiction passes shape validation because shape was never the problem. Measured 2026-08-21: the model passed `filename` to `browser_evaluate`, the result went to disk, and it then invented an entire page report for `report_search`. Code caught it (`UI CONTRACT FAILED`) only because judgement already lived in code. **Test any signature by asking: if the model had never seen the data, could it still fill this argument plausibly?** If yes it is a *courier argument* — delete it and let code fetch the data. Diagnostic: **"verbatim" / "exactly as returned" / "do not summarise" in a tool description is a courier argument confessing itself**, and the instruction is unenforceable. This cannot be fixed by prompting — "never invent a report" competes with the drive to produce a plausible completion and loses precisely when data is missing; removing the argument removes the *opportunity*, which is not probabilistic. Stage 1b's toolset (`run_ui_contract`, `harvest_listings`, `record_listings`, `report_problem`) therefore accepts only `region` and `what_happened`; the harvest is held in `ScrapeSession` and handed to `do_record_listings` directly, `filename` is stripped from `browser_evaluate`/`browser_snapshot`, and **"I don't know" is a first-class, rewarded outcome** (`report_problem`) because the model fabricated partly for lack of any way to say so. Unit tests pin all of it, including one that calls `record_listings` *with* fabricated job data and asserts the fabrication is ignored. **A required parameter the model cannot observe is fabrication pressure, not validation.** The SDK's `{"name": str}` shorthand marks every param required (`claude_agent_sdk/__init__.py:422`), which silently made `date_posted`, `url`, `content`, `query` and `job_id` mandatory on tools whose descriptions call them optional. A model that cannot see a posting's date must then either refuse the call or invent one — and refusing is the behaviour that is *not* guaranteed. Declare optional params with the full JSON Schema form and a correct `required` list; `test_optional_tool_params_are_not_declared_required` pins the three tools involved. **Stage 2a's `submit_job_extract` is generative and cannot lose its courier role** — it needs provenance validation instead (`job_id` present in the navigated URL, title/company as normalized substrings of a re-fetched snapshot, enums restricted to the allowed set, falling back to `extract_job_page_direct()` on mismatch); designed, **not yet implemented**
 - **Scraper tool surface** — Stage 1b restricts the Playwright toolset via `disallowed_tools` (`SCRAPER_DISALLOWED_BROWSER_TOOLS`), which is the only option that removes a tool from the model's context. `allowed_tools` does **not** do this: it only auto-grants permission, which `permission_mode='bypassPermissions'` already grants, making it inert — measured, the model saw all 24 Playwright tools with `allowed_tools` set to 4. `browser_evaluate` and `browser_click` are load-bearing for discovery (inner-container scroll lazy-loads 7 → 10 listings; Next yields a fresh page) and a unit test asserts they are never disallowed
-- **Cost efficiency** — Haiku for scraping, page extraction, and applied-job metadata; the agentic browser work never runs on Sonnet. Query generation is the one deliberate exception: a single Sonnet call per run (~$0.33), because top-of-funnel query relevance is the pipeline bottleneck and everything downstream is gated by it. Applied-job metadata is cached in `index.yaml` by mtime, so the extraction cost is paid once per PDF. Hard rules and local triage reject clear non-fits for $0 before any paid rating call. The company blacklist is the one hard rule that can cost anything, and only on an exact name hit — a non-matching name short-circuits before any call, so the gate is free on essentially every posting; do **not** "optimise" this by dropping the confirmation call, which is what stops a same-named organization being rejected by mistake. Since LinkedIn no longer enforces `f_E` server-side, a $0 title check at queue time (`title_rejection_reason()`) keeps below-seniority and people-management listings out of the paid Stage 2 path, where each would cost an extract plus a rating call; it is deliberately conservative (word-boundary matches only, and neither `associate` nor bare `graduate` rejects) because an auto-skip is unappealable, and it never filters on work arrangement, which is unreliable on a search card. The rating call is a single non-agentic structured-output call (provider configurable; Sonnet pinned explicitly by default, never the CLI default model). Reference jobs are distilled once into a ~2.5K-char cached profile instead of a ~60K-char block; the evaluator prompt is built once per run and reused across all jobs to maximise prompt-cache hits; the extractor is capped at 8 turns and restricted to the browser tools it needs. **Stage 1b is the one place where cost is explicitly not the priority** — Account safety is. Its turn budget was raised to 180 and its prompt is deliberately verbose, because selecting listings one at a time with randomised pauses costs turns and wall-clock by design. Do not optimise Stage 1b for speed or turn count; optimise what enters the model's context instead
-- **Observability** — the generated Search Queries are logged; every `check_and_record_job` outcome is logged (`new`/`already_processed`/`already_applied`/`too_old`/`auth_required`) so seen-but-deduped is distinguishable from never-seen; per-job logs of the extract signal (`date_posted`/`location`/`closed`/`language_requirement`/`posting_language`/`local_language`/`relocation`/`education_requirement`/`is_agency`/`end_client`), extract compression, hard-rule short-circuits, triage score vs. final rating, and rating provider. Blacklist activity is logged in three distinct forms so each is separable: a confirmed rejection, a **name collision** the confirmation call cleared (a blacklist entry matching a different organization by name), and a confirmation **failure that rejected anyway**; expired and undated entries warn once per run. Each run emits a single `Run funnel: {...}` line (queries → listings seen → check-status counts → candidates → extract ok/failed → hard-ruled by reason, including `hard_ruled_blacklisted` → triaged-out → rated 1–5), also written to `cost_log.jsonl` under `funnel`. Per-stage costs (`reference_summary`, `extraction`, `rating`) in `cost_log.jsonl`. Cost is charged **per session**: `total_cost_usd` is cumulative within a `ClaudeSDKClient` session, so only the increase over that session's last reported value is billed (`cost_delta_for` in `agent.py`, keyed on `session_id`). Stage 1b shares one session across all queries and was previously over-counted ~3.5x; stages that open a fresh session per call were always correct. Token counters in `msg.usage` are per-request and keep summing. Every `ResultMessage` is logged with `session_id`, `num_turns`, usage, and `cost_reported` vs `cost_charged` — previously these went to the `rich` console only and never reached the run log, which is why the over-count went unnoticed for nine runs. Third-party HTTP transport logging (`httpx` / `httpcore` / `mcp.client.streamable_http`, one line per MCP tool call) is suppressed to WARNING so the run log stays the run's own audit trail; set `HTTP_LOG_LEVEL=INFO` to restore it when debugging a tool server. **Agent `TextBlock` narration is mirrored to the run log** via `log_agent_text()`, not just `print()`ed to the console — that is where the scraper says "these two searches returned identical results" or "the Remote filter did not stick", and discarding it left the 2026-08-11 collapse diagnosable only from counters. `check_status` is reported **per query** as well as run-global (`_check_status_per_query`, in the Stage 1b log line, audit §2/§3 and the run funnel), so a dedup-saturated query is distinguishable from one that barely ran — a distinction the run-global count cannot make
+- **Cost efficiency** — Haiku for scraping, page extraction, and applied-job metadata; the agentic browser work never runs on Sonnet. Query generation is the one deliberate exception: a single Sonnet call per run (~$0.33), because top-of-funnel query relevance is the pipeline bottleneck and everything downstream is gated by it. Applied-job metadata is cached in `index.yaml` by mtime, so the extraction cost is paid once per PDF. Hard rules and local triage reject clear non-fits for $0 before any paid rating call. **A triage gate that has silently stopped running still looks free — it just stops saving anything**, which is what Preflight Local Model exists to make visible. The triage model is sized to the job (one 1-5 JSON score): `granite4.1:3b`, not the 30B tier, measured to track the strong rater with zero false 1s across ratings 1-5. The company blacklist is the one hard rule that can cost anything, and only on an exact name hit — a non-matching name short-circuits before any call, so the gate is free on essentially every posting; do **not** "optimise" this by dropping the confirmation call, which is what stops a same-named organization being rejected by mistake. Since LinkedIn no longer enforces `f_E` server-side, a $0 title check at queue time (`title_rejection_reason()`) keeps below-seniority and people-management listings out of the paid Stage 2 path, where each would cost an extract plus a rating call; it is deliberately conservative (word-boundary matches only, and neither `associate` nor bare `graduate` rejects) because an auto-skip is unappealable, and it never filters on work arrangement, which is unreliable on a search card. The rating call is a single non-agentic structured-output call (provider configurable; Sonnet pinned explicitly by default, never the CLI default model). Reference jobs are distilled once into a ~2.5K-char cached profile instead of a ~60K-char block; the evaluator prompt is built once per run and reused across all jobs to maximise prompt-cache hits; the extractor is capped at 8 turns and restricted to the browser tools it needs. **Account safety still outranks cost in Stage 1b**, and its prompt stays deliberately verbose — but cost there is no longer unmanaged: it reached **86.9% of total run cost** ($48.24 of $55.52 over ten runs, peaking at $10.06), so it moved to `deepseek-v4-flash` (`SCRAPER_PROVIDER`), measured 9.3x cheaper on identical traffic. Pacing was **not** traded away: the randomised delays are unchanged. Do not optimise Stage 1b for speed or turn count; optimise **what enters the model's context**, and **which model reads it**. Two mechanisms did most of the work, both measured rather than assumed: a fresh conversation per query (the shared Anthropic transcript grew context per turn 41K → 162K across a run), and batching a search's recording into one `do_record_listings` call instead of ~25 per-listing turns — which also removed 69% of output tokens, since the model no longer re-emits job objects. **Every `ClaudeAgentOptions` site in the package must pass `setting_sources=[]`, `strict_mcp_config=True` and `skills=[]`** — unset, they load this file in full plus every global MCP server into even a one-word classification call. This was fixed in `agent.py` on 2026-08-21 and the four sites in `tools_generic.py` were missed for three months because the note said "in `agent.py`" (measured 2026-08-24: **22,945 → 294 tokens, 78x**, on the PDF categorization options). Prose cannot enforce this, so `test_every_claude_agent_options_site_limits_context` walks the AST of every module in the package and fails on any site missing them
+- **Observability** — the generated Search Queries are logged; every `check_and_record_job` outcome is logged (`new`/`already_processed`/`already_applied`/`too_old`/`auth_required`) so seen-but-deduped is distinguishable from never-seen; per-job logs of the extract signal (`date_posted`/`location`/`closed`/`language_requirement`/`posting_language`/`local_language`/`relocation`/`education_requirement`/`is_agency`/`end_client`), extract compression, hard-rule short-circuits, triage score vs. final rating, and rating provider. Blacklist activity is logged in three distinct forms so each is separable: a confirmed rejection, a **name collision** the confirmation call cleared (a blacklist entry matching a different organization by name), and a confirmation **failure that rejected anyway**; expired and undated entries warn once per run. Each run emits a single `Run funnel: {...}` line (queries → listings seen → check-status counts → candidates → extract ok/failed → hard-ruled by reason, including `hard_ruled_blacklisted` → triaged-out → rated 1–5), also written to `cost_log.jsonl` under `funnel`. Per-stage costs (`reference_summary`, `extraction`, `rating`) in `cost_log.jsonl`. **Stage 1b cost is also reported per query** (`_scrape_per_query` → funnel `scrape_per_query`, plus a `Stage 1b cost: "<query>" $X over N iteration(s)` log line carrying prompt/cached/output tokens), because a scraper regression was previously visible only as a stage total — which is how a 68% → 99% drift went unnoticed for weeks. On the OpenRouter path `cached_tokens` from `usage.prompt_tokens_details` feeds the existing `cache_read_input_tokens` field so the two providers stay comparable. New `ui_alerts` kinds: `empty_harvest` (harvest errored or returned nothing), `blocked_click` (a results-list click refused in code), `model_reported` (the model called `report_problem`), and `provider_fallback` (the OpenRouter scraper failed and the Anthropic one ran). Cost is charged **per session**: `total_cost_usd` is cumulative within a `ClaudeSDKClient` session, so only the increase over that session's last reported value is billed (`cost_delta_for` in `agent.py`, keyed on `session_id`). Stage 1b shares one session across all queries and was previously over-counted ~3.5x; stages that open a fresh session per call were always correct. Token counters in `msg.usage` are per-request and keep summing. Every `ResultMessage` is logged with `session_id`, `num_turns`, usage, and `cost_reported` vs `cost_charged` — previously these went to the `rich` console only and never reached the run log, which is why the over-count went unnoticed for nine runs. Every `ResultMessage` **also** logs `is_error`, `subtype` and `api_error_status`, and an errored one emits a dedicated ERROR line: an HTTP-level API failure is reported by the CLI as `is_error=True` with `subtype="success"`, so without those fields an errored result is indistinguishable from a good one — which is exactly how nine identical `error result: success` warnings stayed undiagnosable (2026-08-24). **`api_error_status` is the only field that separates 401 from 429 from 529**, so any new `sdk_query` loop must run `_raise_if_result_error()` rather than testing `structured_output` alone, which silently reads an error as an empty result. The MCP side has the exact same failure: **an exception from `call_mcp_tool` must be passed through `unwrap_exception()` before it is logged**, because `streamable_http_client` and `ClientSession` each open an anyio task group and `str(ExceptionGroup)` is `unhandled errors in a TaskGroup (1 sub-exception)` — which is how 250+ triage warnings carried none of the `model 'qwen3.6:latest' not found` that caused them (2026-08-25). New `ui_alerts` kind `local_model_missing` (LOCAL_MODEL not installed; triage disabled for the run). PDF categorization is logged to the run log rather than `console.print()`-only, because a categorization that never happens means the applied-job corpus stops growing — a degraded run that otherwise looks entirely normal. Third-party HTTP transport logging (`httpx` / `httpcore` / `mcp.client.streamable_http`, one line per MCP tool call) is suppressed to WARNING so the run log stays the run's own audit trail; set `HTTP_LOG_LEVEL=INFO` to restore it when debugging a tool server. **Agent `TextBlock` narration is mirrored to the run log** via `log_agent_text()`, not just `print()`ed to the console — that is where the scraper says "these two searches returned identical results" or "the Remote filter did not stick", and discarding it left the 2026-08-11 collapse diagnosable only from counters. The funnel also carries `listings_distinct` (distinct jobs, beside the call-count `listings_seen` — the gap between them IS the duplicate-coverage signal), `region_overlap` (Jaccard of harvested ids across regions per query; 1.0 means the location filter did nothing), `ui_alerts` (blocks, contract breaches, filters that did not apply, fingerprint drift, low listing counts, early stops) and `health_alerts` from `assess_run_health()`. Those alerts are written to the run log, to **audit log §1b Discovery health**, and into the Telegram run summary under `⚠️ NEEDS ATTENTION`, with the last few runs' yield read back from `cost_log.jsonl` for context — because a saturated run and a healthy quiet run were previously indistinguishable to the user, and four consecutive zero-notification days passed unremarked. `check_status` is reported **per query** as well as run-global (`_check_status_per_query`, in the Stage 1b log line, audit §2/§3 and the run funnel), so a dedup-saturated query is distinguishable from one that barely ran — a distinction the run-global count cannot make
 - **Account safety** — Stage 1b drives a **real logged-in LinkedIn account** through the shared Playwright profile (`~/.linkedin-agent-profile`), and a flagged or banned account ends the job search permanently. This outranks coverage, cost, and run time: a slow incomplete run always beats an aggressive one. All scraping goes through the Playwright profile; never scrape from the user's own browser. Specifically:
-  - **Nothing in the job results list is ever clicked.** Not a card, not a title, not a logo. The only real `<button>` in a row is **Dismiss**, which the accessibility tree disguises as the card itself, and one stray click permanently removes a job from the User's feed — this already happened, to three real jobs. Clicking is also unnecessary: Harvest Job Listings reads everything from the DOM. This is an invariant, not a preference, and a unit test asserts the prompt states it
+  - **Nothing in the job results list is ever clicked.** Not a card, not a title, not a logo. The only real `<button>` in a row is **Dismiss**, which the accessibility tree disguises as the card itself, and one stray click permanently removes a job from the User's feed — this already happened, to three real jobs. Clicking is also unnecessary: Harvest Job Listings reads everything from the DOM. This is an invariant, not a preference. On the OpenRouter path it is **enforced in code**, not merely prompted: `_guard_call()` in `scrape_openrouter.py` refuses any `browser_click`/`browser_hover` naming `job-card-component-ref`, `SearchResultsMainContent` or `Dismiss`, and any `browser_evaluate` that clicks or dispatches events — each refusal logged and counted as a `blocked_click` alert. This is not theoretical: on 2026-08-21 the model tried to drive the page with JavaScript `.click()` and was refused. Unit tests assert both the guard and that the prompt states the rule
   - **JavaScript may read the page, never drive it** — `browser_evaluate` for extraction and scrolling only; never to click, submit, or dispatch events
   - **Never apply, save, follow, or dismiss** anything
   - **Randomised pacing** between searches (`SCRAPER_INTER_SEARCH_DELAY_SECONDS`) and between queries (`SCRAPER_INTER_QUERY_DELAY_SECONDS`). Every delay is a **(min, max) range drawn uniformly** — a fixed interval is itself a robotic signature, and a unit test rejects degenerate ranges. Inter-query pacing is enforced **in code** (`_human_pause`), not merely prompted, because a model under turn pressure will skip a prompted wait. There is no per-listing delay any more: harvesting is one read-only call, so there is no interaction burst to disguise
   - **Stop on any CAPTCHA, verification challenge, or "unusual activity" notice** rather than work around it, and the recovery pass explicitly refuses to retry into a block. A challenge means LinkedIn already suspects automation; solving or immediately retrying converts a soft signal into a confirmed evasion pattern, which is what escalates to a restriction. Backing off keeps it a blip — the 2026-08-06 run went 0 listings at 11:43 and 74 at 12:08 after a pause. This applies only to *challenge pages*; zero results or a slow load still get a normal retry
 - **Search coverage** — every generated Search Query must actually be searched, once per configured region. Stage 1b sends one request per query (own turn budget) on one shared session (one browser attachment); the run audit log distinguishes "never searched" from "searched, found nothing", which a single `0 jobs` count cannot. Turn starvation is silent — the model stops mid-query and the run still reports a listing count — so `SCRAPER_MAX_TURNS_PER_QUERY` (180) is set with headroom: harvesting is one call per search, but each listing still costs a `check_and_record_job` (and possibly a `queue_candidate`) turn, so the budget scales with `SCRAPER_MAX_LISTINGS_PER_SEARCH` × regions, and `num_turns` is logged per request to make exhaustion visible. **Under-coverage is detected by yield and by turn usage, not only by a zero count**: a query below `SCRAPER_MIN_LISTINGS_PER_QUERY` (5) is retried, and one that stops well short of its turn budget is warned about. Stopping *early* is as much a failure mode as running out — on 2026-08-11 every query used 10 of 90 turns and returned exactly one listing, and a `seen == 0` trigger missed all of it
 - **Rejection auditability** — `python main.py -n --audit` runs normally but additionally re-rates every gate-killed Job Posting (hard-ruled or triaged-out) with the strong rater, logging any **false negative** (gate dropped it but the strong rater scores ≥3) plus a run-end count. Diagnostic only — saving/notification behaviour is unchanged
-- **Resilience** — the LLM MCP tool servers are optional: summarization falls through its provider chain (last resort: full reference block), triage fails open to the rating call
+- **Resilience** — the LLM MCP tool servers are optional: summarization falls through its provider chain (last resort: full reference block), triage fails open to the rating call. **A server that is down and a model that is misconfigured are different failures and must not be reported the same way.** An unreachable server is the supported case: quiet, fail open, no alert. A `LOCAL_MODEL` that is not installed is a misconfiguration that silently disables the free gate on every job, so `preflight_local_model()` catches it once before Stage 2, logs one ERROR naming the models that *are* installed, raises a `local_model_missing` health alert, and disables triage for the run rather than letting each job rediscover it (2026-08-25: ten days of dead triage, 63 identical warnings in the last run alone). `generate_local()` raises `LocalModelMissingError` rather than a generic failure for the same reason
 - **Idempotency** — processed-job records persist across runs so jobs are never evaluated twice; applied-job ingest is a no-op for already-dated files
 - **Applied-date durability** — an Applied Job Record's date is carried by the filename prefix, `index.yaml`, and mtime independently, so it survives a move, copy, or backup restore that drops filesystem metadata
 - **Applied-job horizon** — only Applied Job Records from the last `APPLIED_JOBS_HORIZON_DAYS` (90) feed query generation, the ideal-role profile, and the already-applied blocklist; older PDFs are retained on disk, never deleted

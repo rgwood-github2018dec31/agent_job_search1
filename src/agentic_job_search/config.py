@@ -25,7 +25,15 @@ COMPANY_BLACKLIST_EXPIRY_DAYS = 180
 # Local/remote LLM MCP tool servers (started via their scripts/start-tool-server.sh)
 LLM_LOCAL_MCP_URL = 'http://127.0.0.1:8002/mcp'
 LLM_OPENROUTER_MCP_URL = 'http://127.0.0.1:8006/mcp'
-LOCAL_MODEL = 'qwen3.6:latest'
+# Triage is one cheap 1-5 JSON score whose whole point is to be free and fast, so this is sized to
+# that rather than to a 20-35B tier: granite4.1:3b measures 65.9 tok/s / 3.9s cold start / 2.1GB on
+# this machine and advertises structured JSON output as a first-class capability.
+#
+# This is a MACHINE-LOCAL Ollama tag and it can vanish without warning: `qwen3.6:latest` sat here
+# until a re-pull replaced it with `qwen3.6:27b-mlx`/`35b-mlx`, and Stage 2c triage then failed open
+# on every job for ten days while the run log said only "unhandled errors in a TaskGroup". That is
+# what preflight_local_model() in triage.py now catches, once per run, naming what IS installed.
+LOCAL_MODEL = 'granite4.1:3b'
 OPENROUTER_MODEL = 'z-ai/glm-5.2'
 
 # Stage 1 (discovery) configuration
@@ -33,13 +41,16 @@ MAX_SEARCH_QUERIES = 6  # hard cap; every query costs one LinkedIn search per co
 # Turn budget PER QUERY. Each check_and_record_job / queue_candidate call burns a turn, so a
 # budget shared across all queries silently starves the later ones (see run_scraper).
 #
-# Sized for the post-2026-08-11 access pattern: every listing must be SELECTED to reveal its job
-# id, so one job costs roughly a click + a URL read + check_and_record_job + queue_candidate + a
-# pause. At SCRAPER_MAX_LISTINGS_PER_SEARCH (12) across the usual two regions that is ~120 turns
-# before overhead. Starvation is silent — the model simply stops and the run reports "N listings
-# inspected" with no error — so this is set with headroom rather than tuned tight. Turns are cheap
-# here; account safety is not (see the Account safety requirement in CLAUDE.md).
-SCRAPER_MAX_TURNS_PER_QUERY = 180
+# Sized for the post-2026-08-18 access pattern. Harvesting a page is ONE read-only evaluate, but
+# every listing still costs a check_and_record_job (and possibly a queue_candidate) turn, and each
+# search now sets its filters by CLICKING CHIPS like a person — location (open, clear, type, pick
+# the suggestion), date posted, experience level — which is another ~10-14 turns per search with a
+# randomised pause between each. At SCRAPER_MAX_LISTINGS_PER_SEARCH (25) across the usual two
+# regions that is ~80 record turns plus ~28 chip turns before overhead. Starvation is silent — the
+# model simply stops and the run reports "N listings inspected" with no error — so this is set with
+# headroom rather than tuned tight. Turns are cheap here; account safety is not (see the Account
+# safety requirement in CLAUDE.md).
+SCRAPER_MAX_TURNS_PER_QUERY = 260
 
 # Floor below which a query clearly bailed before finishing one harvest cycle (navigate, snapshot,
 # scroll, evaluate, then a record call per listing). Absolute, NOT a fraction of the budget above:
@@ -54,13 +65,17 @@ SCRAPER_MIN_TURNS_PER_QUERY = 12
 # Getting that account flagged or banned costs incomparably more than a slow run, so discovery is
 # paced rather than run at machine speed.
 #
-# Only page-level pacing remains. There was a per-selection delay when the scraper had to click
-# each card to reveal its job id; that design is gone — the id is read straight off the card's
-# `componentkey` attribute (see the 2026-08-11 entry in CLAUDE.md), so a search is now one page
-# load plus one read-only evaluate, with no interaction burst to disguise.
+# There is still no per-LISTING delay: the id is read straight off the card's `componentkey`
+# attribute, so harvesting is one read-only evaluate with no interaction burst to disguise.
+#
+# There IS a per-ACTION delay again, because filters are now applied by clicking chips rather than
+# by crafting `geoId`/`f_TPR` URL parameters. Hand-assembling filter params is something no human
+# ever does and is a cheap fingerprint for anti-automation; clicking the chips is what a person
+# does, and a person does not do it instantly or at a metronome-steady rate.
 #
 # Ranges are (min, max) seconds; a value is drawn uniformly per pause, because a fixed interval is
 # itself a robotic signature. Never replace these with constants.
+SCRAPER_INTER_ACTION_DELAY_SECONDS = (0.8, 2.6)    # between individual chip/filter interactions
 SCRAPER_INTER_SEARCH_DELAY_SECONDS = (2.5, 6.0)    # between searches within one query
 SCRAPER_INTER_QUERY_DELAY_SECONDS = (8.0, 18.0)    # between queries (code-enforced, not prompted)
 
@@ -71,11 +86,92 @@ SCRAPER_MAX_LISTINGS_PER_SEARCH = 25
 
 # Below this many listings, a query is retried rather than recorded as a real result.
 #
-# Healthy runs inspect ~27 listings per query. A single-digit count means the searches did not
-# actually run. The trigger used to be `seen == 0`, which missed the 2026-08-11 collapse: every
-# query returned exactly ONE listing — the only one the AI-powered UI exposes an id for without
-# selecting it — and the run reported itself a success. Must be >= 1 or recovery is disabled.
-SCRAPER_MIN_LISTINGS_PER_QUERY = 5
+# Counted in DISTINCT listings (see run_scraper): call counts double-count a job surfaced by two
+# regions, which is what let a collapsed region axis look like healthy coverage.
+#
+# Sized against what a working query actually yields. One region alone returns ~25 cards, so a
+# healthy two-region query lands somewhere between ~17 (heavy legitimate cross-region overlap) and
+# 50. The old floor of 5 was calibrated for the pre-chip regime and was far too low: on the first
+# live chip run a query that searched only ONE of its two regions returned 6 distinct listings and
+# sailed straight through. 12 is roughly half a single page — comfortably below a legitimately
+# overlapping query, comfortably above a half-run. Must be >= 1 or recovery is disabled.
+#
+# This is a backstop, not the primary detector: a region that never ran is caught precisely by the
+# per-region report_search check in run_scraper, which does not depend on a count at all.
+SCRAPER_MIN_LISTINGS_PER_QUERY = 12
+
+# Date-posted filter applied via the "Date posted" chip. LinkedIn expresses the choice as
+# f_TPR=r<seconds>; we never navigate to that parameter ourselves (see the chip rationale above),
+# but we DO read it back off the URL to confirm the click actually applied. r604800 = past week,
+# which suits a daily run and sits well inside the 21-day staleness gate.
+SCRAPER_DATE_POSTED_SECONDS = 604800
+SCRAPER_DATE_POSTED_LABEL = 'Past week'
+
+# Experience-level chip option. Individual-contributor seniority only: Manager / Director /
+# Executive are people-management, which the query generator already excludes by title.
+SCRAPER_EXPERIENCE_LABEL = 'Senior'
+
+# --- UI contract -----------------------------------------------------------------------------
+#
+# LinkedIn restructures this page without notice and keeps adding anti-automation measures. A
+# hard-coded reader fails SILENTLY against that: it returns zero listings, which is indistinguish-
+# able from "no new jobs today". That is exactly how the 2026-08-11 regression and the dead EU
+# region survived for days. So every search asserts the page's structure and says so out loud.
+#
+# Each entry is a named structural expectation checked against the report returned by
+# SCRAPER_UI_CONTRACT_JS. `required` elements failing is a contract VIOLATION (the query stops and
+# the user is alerted); non-required ones only feed fingerprint drift.
+UI_CONTRACT_ELEMENTS = (
+    {'name': 'search_box', 'required': True, 'description': 'the "Describe the job you want" textbox'},
+    {'name': 'results_container', 'required': True, 'description': 'div[componentkey="SearchResultsMainContent"]'},
+    {'name': 'job_cards', 'required': True, 'description': 'div[componentkey^="job-card-component-ref-"] cards'},
+    {'name': 'chip_row', 'required': True, 'description': 'the filter chip row'},
+    {'name': 'location_pin', 'required': True, 'description': 'the location chip / pin'},
+    {'name': 'pagination', 'required': False, 'description': 'the 1 / 2 / 3 / Next footer'},
+)
+
+# Substrings that mean LinkedIn is challenging us rather than that the markup moved. Checked FIRST
+# and handled oppositely: a changed selector may be retried, a challenge must NEVER be — pushing
+# through a block converts a soft signal into a confirmed evasion pattern.
+UI_BLOCK_SIGNATURES = (
+    'captcha',
+    'unusual activity',
+    'verify your identity',
+    "let's do a quick security check",
+    'security verification',
+    'sign in to continue',
+    'please sign in',
+    'you have been blocked',
+    'access to this page has been denied',
+)
+
+# Only these chips are STRUCTURAL -- part of the page's shape. The rest of the row is LinkedIn's
+# per-query topical suggestions (Gen AI, LLM, AWS, Computer Vision, AI/ML, Analytics...), which
+# legitimately change with every query. Fingerprinting the whole row made drift fire on ordinary
+# query-to-query variation, and a warning that fires on success trains the reader to ignore it.
+#
+# A chip is also matched by its CHOSEN value, since choosing one relabels it ("Date posted" ->
+# "Past week", "Experience level" -> "Senior").
+UI_STRUCTURAL_CHIPS = (
+    'Jobs', 'Date posted', 'Experience level', 'Employment type', 'Company',
+    'Under 10 applicants', 'In my network', 'Easy Apply',
+    'Past month', 'Past week', 'Past 24 hours',
+    'Entry-level', 'Senior', 'Manager', 'Director', 'Executive',
+)
+
+# Where the last-known-good page shape is remembered, so a change is noticed the run it happens
+# rather than months later. Lives in run_dir (gitignored, machine-local run state).
+UI_FINGERPRINT_FILENAME = 'ui_fingerprint.yaml'
+
+# --- Yield alerting --------------------------------------------------------------------------
+#
+# A saturated run and a healthy run looked identical to the user: silence. Aug 15-18 produced 4, 4,
+# 2 and 1 new jobs from ~300 listings each with no signal that anything was wrong. These thresholds
+# would have fired on all four and stayed quiet on Aug 14 (26 new).
+SATURATION_MIN_NEW_RATIO = 0.05   # share of DISTINCT listings never seen before
+SATURATION_MIN_NEW_JOBS = 3       # ...or this many new jobs outright, whichever is kinder
+# Two regions returning near-identical id sets means the region axis is dead (Aug 18 scored ~1.0).
+REGION_OVERLAP_ALERT_THRESHOLD = 0.5
 
 
 # Playwright MCP tools removed from the scraper's context.
@@ -92,7 +188,9 @@ SCRAPER_MIN_LISTINGS_PER_QUERY = 5
 #   - browser_evaluate is REQUIRED: scrolling the inner results container lazy-loads more
 #     listings (7 -> 10, +43%). Body-level PageDown reveals nothing, so evaluate is the only
 #     working scroll. Removing it silently cuts discovery.
-#   - browser_click is REQUIRED: the Next button yields a fully fresh page of listings.
+#   - browser_click is REQUIRED: the filter chips (location, date posted, experience level) are
+#     clicked to apply a search's filters. Nothing in the RESULTS LIST is ever clicked — the only
+#     real <button> in a result card is Dismiss (see CLAUDE.md, Account safety).
 #   - Kept for obstacle handling even though unused in the happy path: fill_form, type, hover,
 #     select_option, handle_dialog, console_messages.
 #   - Kept for diagnosing and working around a changed or hostile page: take_screenshot (the
@@ -121,6 +219,27 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
     'mcp__playwright__browser_wait_for',
     'mcp__playwright__browser_evaluate',
 ]
+
+# Stage 1b scraper provider.
+#
+# 'openrouter' drives the browser through a function-calling loop (scrape_openrouter.py) instead of
+# the Claude Agent SDK. Measured 2026-08-21 on one live search: $0.0283 vs $0.4330 for identical
+# traffic on Haiku (9.3x), because deepseek-v4-flash caches implicitly (~88% hit rate, and NO
+# cache-write fee -- cache writes were 42% of the Haiku bill).
+#
+# Do NOT point this at OPENROUTER_MODEL (z-ai/glm-5.2): at $0.1932/M cache-read it is ~2x Haiku's
+# rate and would cost MORE than what it replaces. Same trap with deepseek-v4-pro and qwen3.8-max.
+# The win is specific to the flash tier.
+#
+# 'anthropic' selects the original ClaudeSDKClient scraper, kept intact as the rollback path.
+SCRAPER_PROVIDER = 'openrouter'  # 'openrouter' | 'anthropic'; falls back to Anthropic on failure
+SCRAPER_OPENROUTER_MODEL = 'deepseek/deepseek-v4-flash'
+# Replaces max_turns for the OpenRouter loop. A healthy search measured 26 iterations; this is sized
+# for two regions plus recovery, with headroom, because starvation is silent (see Search coverage).
+SCRAPER_OPENROUTER_MAX_ITERATIONS = 90
+# Per tool result. A LinkedIn a11y snapshot is far larger than anything the scraper needs to reason
+# about, and uncached every byte is re-billed on every later iteration.
+SCRAPER_TOOL_RESULT_MAX_CHARS = 30_000
 
 QUERY_PROVIDER = 'openrouter'  # 'openrouter' (glm) | 'anthropic'; falls back to Anthropic on failure
 COMPANY_MATCH_PROVIDER = 'openrouter'  # 'openrouter' (glm) | 'anthropic'; falls back to Anthropic on failure

@@ -31,9 +31,16 @@ from agentic_job_search.config import (
     RATING_PROVIDER,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_INTER_QUERY_DELAY_SECONDS,
+    SCRAPER_DATE_POSTED_LABEL,
+    SCRAPER_EXPERIENCE_LABEL,
+    SCRAPER_INTER_ACTION_DELAY_SECONDS,
     SCRAPER_INTER_SEARCH_DELAY_SECONDS,
+    REGION_OVERLAP_ALERT_THRESHOLD,
+    SATURATION_MIN_NEW_JOBS,
+    SATURATION_MIN_NEW_RATIO,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_MAX_TURNS_PER_QUERY,
+    SCRAPER_PROVIDER,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
@@ -41,6 +48,7 @@ from agentic_job_search.config import (
     TRIAGE_ENABLED,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
+from agentic_job_search import scrape_openrouter
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
 from agentic_job_search.tools_generic import (
@@ -62,6 +70,7 @@ from agentic_job_search.triage import (
     extract_json_object,
     generate_local,
     mcp_session,
+    preflight_local_model,
     rate_with_ollama,
     rate_with_openrouter,
     triage_job_fit,
@@ -203,6 +212,65 @@ SCRAPER_HARVEST_JS = r"""() => {
   return {count: out.length, jobs: out};
 }"""
 
+# Structural report on the search page, run once per search and handed to `report_search`, which
+# does the JUDGING in code. The model is not asked whether the page "looks right": that is exactly
+# the discretion that let a dead EU region and a silently-restructured results list run for days.
+#
+# Read-only, like SCRAPER_HARVEST_JS. It reports what exists, never acts on it.
+SCRAPER_UI_CONTRACT_JS = r"""() => {
+  const box = document.querySelector('div[componentkey="SearchResultsMainContent"]');
+  const txt = el => ((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
+
+  // The search box is a plain <input> carrying a PLACEHOLDER, not an aria-label — verified
+  // against the live page. Matching on aria-label alone reported it missing on every search.
+  const searchBox = [...document.querySelectorAll('input[type="text"], input:not([type]), textarea')]
+    .some(el => /describe the job|search by title|job title|keyword/i.test(
+      (el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('aria-label') || '')));
+
+  // Cards and chips are each rendered TWICE in the DOM (the harvest JS dedupes cards for the
+  // same reason), so a raw count reads 50 cards and 44 chips on a 25-job, 22-chip page.
+  const cardIds = new Set();
+  for (const card of document.querySelectorAll('div[componentkey^="job-card-component-ref-"]')) {
+    const id = (card.getAttribute('componentkey') || '').replace('job-card-component-ref-', '');
+    if (id) cardIds.add(id);
+  }
+
+  // Chips carry an accessible name "Filter by <label>"; once a value is chosen the label BECOMES
+  // the value ("Past week", "Senior"), which is how a click is confirmed without ever crafting
+  // the filter URL ourselves.
+  const chips = [...new Set([...document.querySelectorAll('[aria-label^="Filter by "], [title^="Filter by "]')]
+    .map(el => (el.getAttribute('aria-label') || el.getAttribute('title') || '')
+      .replace(/^Filter by\s*/, '').trim())
+    .filter(Boolean))];
+
+  // The location pin sits beside the result count, labelled "Location <region>".
+  const locEl = document.querySelector('[aria-label^="Location "], [title^="Location "]');
+  const locationPin = locEl
+    ? (locEl.getAttribute('aria-label') || locEl.getAttribute('title') || '')
+        .replace(/^Location\s*/, '').trim()
+    : '';
+
+  const resultCountEl = [...document.querySelectorAll('p, span, h2')]
+    .find(el => /^\d[\d,+]*\s+results?$/i.test(txt(el)));
+
+  // Pagination footer: a "Next" control alongside numbered pages.
+  const pagination = [...document.querySelectorAll('a, button')]
+    .some(el => /^next\b/i.test(txt(el)));
+
+  return {
+    url: location.href,
+    search_box: searchBox,
+    results_container: !!box,
+    job_cards: cardIds.size,
+    chip_row: chips.length,
+    chips: chips,
+    location_pin: locationPin,
+    pagination: pagination,
+    result_count_text: resultCountEl ? txt(resultCountEl) : '',
+    body_sample: txt(document.body).slice(0, 1500).toLowerCase(),
+  };
+}"""
+
 SCRAPER_INSTRUCTIONS_TEMPLATE = """You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation queue.
 
 You are fully authorized to call all available tools. Call them directly — do not ask for permission.
@@ -241,10 +309,14 @@ This account is on LinkedIn's **AI-powered job search**. The page says so: *"You
 AI-powered job search. Some filters may no longer be available, but you can type them into search
 to refine your results."* Two consequences drive everything below.
 
-**1. Filters no longer exist as URL parameters or as chips.** `location`, `f_WT`, `f_E` and
-`sortBy` are all stripped from the URL, and the old filter-chip row is gone. The search box is now
-a natural-language field labelled "Describe the job you want". **Filters go into the query text**,
-exactly as LinkedIn instructs — e.g. `Staff AI Engineer, remote, Canada, senior level`.
+**1. Filters live in the chip row, not in the URL you type.** The search box is a
+natural-language field labelled "Describe the job you want", and LinkedIn rewrites whatever you put
+in it. Above the results is a row of filter chips — Date posted, Experience level, Employment type,
+Company — plus a location chip beside the result count. **That chip row is how filters get set.**
+
+Typing the region into the query text does NOT work: it is silently ignored, and for several days
+every "European Union" search quietly returned the account's home metro instead. Crafting
+`geoId=`/`f_TPR=` URLs *does* work, and is forbidden anyway — see Step 1.
 
 **2. The accessibility tree is a trap on this page — read job ids from the DOM instead.** Result
 cards have no `<a href>`, and the only real `<button>` in each row is its **Dismiss** control,
@@ -263,60 +335,97 @@ Navigate to:
 
    https://www.linkedin.com/jobs/search-results/?keywords=<QUERY+TEXT>&f_SAL=
 
-`keywords` is the only parameter still honoured. The empty `f_SAL=` clears a leftover salary
-filter that persists between sessions and otherwise silently narrows every search.
+Put ONLY the query text in `keywords` — the job title plus the word `remote`. A bare keyword URL
+like this is what a bookmarked or shared LinkedIn search looks like, so arriving this way is
+ordinary. The empty `f_SAL=` clears a leftover salary filter that persists between sessions and
+otherwise silently narrows every search.
 
-### Step 2 — confirm what you are actually looking at, and say so
+**Never put `geoId`, `f_TPR`, `f_E`, `f_WT` or any other filter parameter in a URL you navigate
+to.** They do work — that is not the point. No human assembles filter parameters by hand, and
+doing so is a cheap signal that this is not a person. Filters get clicked, in Step 2.
 
-Take a snapshot and state in your reply: the result count and the query text the search box
-actually contains (LinkedIn rewrites it). If you see a sign-in wall, a challenge, or zero results,
-say that explicitly and stop.
+### Step 2 — set the filters by clicking the chips, like a person
 
-This read-back is the record of whether the search was real. Do not skip it.
+Above the results is a row of filter chips. Take a snapshot, then work through the filters listed
+for this search under "Search coverage" below, **pausing {action_delay_min}–{action_delay_max}
+seconds between each interaction** (use browser_wait_for, and vary it — never the same gap twice).
 
-### Step 3 — harvest every listing in ONE read-only call
+For the **location**: click the location chip (it shows the current region next to the result
+count), clear it, type the region name, then pick the matching suggestion from the autocomplete.
+For **Date posted** and **Experience level**: click the chip, click the option, then click
+"Show results".
 
-The results container is `div[componentkey="SearchResultsMainContent"]`, and each job card is a
-`div[componentkey="job-card-component-ref-<jobId>"]` inside it — **the job id is the attribute
-suffix**. Scroll the results list to load the cards, then run exactly this with browser_evaluate:
+`target` takes the **bare ref exactly as the snapshot shows it**, e.g. `target: "e1202"` — not
+`[ref=e1202]`, not the snapshot's display text like `button "Location"`, and there is no `ref`
+parameter. A unique CSS selector also works. If a click fails, re-read the snapshot and use the
+bare ref rather than reformatting the same guess.
 
-```js
-{harvest_js}
-```
+Two things to keep straight:
 
-Cards are duplicated in the DOM, so the `seen` dedupe matters. This is the one place JavaScript is
-correct here: it *reads* the page, it does not drive it.
+- These chips are ABOVE the results list. Clicking them is fine and expected. The **results list
+  itself is still never clicked** — see the Dismiss warning above. If you cannot find a chip,
+  say so and stop; do not go hunting through the result cards for it.
+- After choosing a value, a chip's label changes from "Date posted" to "Past week", and from
+  "Experience level" to "Senior". That relabelling is how you know the click landed.
 
-### Step 4 — record what you harvested
+### Step 3 — confirm what you are actually looking at
 
-State how many jobs came back. Then for each, up to {max_listings}:
+Call **run_ui_contract** with the region name for this search.
 
-1. Call **check_and_record_job** with site="linkedin", the harvested `id`, `company` and `title`.
-   Pass `date_posted` from `posted` when present (e.g. "4 days ago"); omit it otherwise.
-2. If it returns **"new"**, call **queue_candidate** with the URL
-   `https://www.linkedin.com/jobs/view/<id>/`, plus title, company, the `location` as the snippet,
-   date_posted if known, and query set to the search query string currently being processed.
-3. If it returns "already_processed", "too_old", "already_applied", or "auth_required", move on.
+It runs the exact contract JavaScript for you, reads the result, and judges it in code — that
+judgement is deliberately not yours to make. You do not write the JavaScript and you never handle
+the report. Do what its answer tells you.
 
-If the harvest returns `{{error: ...}}` or zero jobs while the page visibly shows results, LinkedIn
-has changed the markup. **Say so explicitly** — do not fall back to clicking the list. Do not
-navigate to individual job pages and do not apply to anything; a separate evaluation agent visits
-the job pages later.
+Also state in your reply the result count and the location the page is showing. If it says the
+search is unusable, follow what it says and stop.
+
+If you see a CAPTCHA, "unusual activity", a verification challenge, or a forced re-login: call
+**report_problem** and stop the whole query. Do not retry it and do not try to work around it.
+
+### Step 4 — harvest every listing
+
+Call **harvest_listings** — it takes no arguments.
+
+The system runs the exact harvest JavaScript against the results container and keeps the listings
+itself; you get back a count. Job ids come from each card's `componentkey` attribute, so nothing in
+the results list is ever clicked.
+
+### Step 5 — record what was harvested
+
+Call **record_listings** — it takes no arguments.
+
+The system records from its own copy of the harvest. Deduplication, the age check, the
+already-applied blocklist, title screening and queueing all happen in code, and it returns the
+totals. Do not loop over listings, and do not describe, list, or retype job data.
+
+If a harvest reports an error or zero jobs while the page visibly shows results, LinkedIn has
+changed the markup: **call report_problem and stop**. Do not fall back to clicking the list. Do not
+navigate to individual job pages — a separate evaluation agent visits them later.
+
+### If you do not have real data, say so — that is a success, not a failure
+
+You are never required to produce data you did not actually see. If a call fails, a result is
+missing or unreadable, or the page is not what you expected, call **report_problem** and stop.
+Reconstructing or filling in a plausible-looking result is the worst thing you can do here, because
+downstream it is indistinguishable from a real one.
 
 ## Search coverage
 
 You are given ONE search query per session. Run it as {search_count} searches — one per target
-region below — then stop. Do not invent additional queries:
+region below — then stop. Do not invent additional queries. For each search, set these filters by
+clicking, in this order:
 
 {search_list}
+
+Between searches, wait {search_delay_min}–{search_delay_max} seconds.
 
 Expect many `already_processed` results, especially on later searches. **That is expected and
 correct — it is not a failure, and not a reason to skip the rest of a search.** The few new jobs
 that come back are usually the best-matching ones you will find.
 
-**But if two searches return the IDENTICAL list of jobs, the region text did not take effect.**
-That is a failure, not a sign the query is exhausted. Say so explicitly rather than stopping
-early.
+**But if two searches return the IDENTICAL list of jobs, the location filter did not take effect.**
+That is a failure, not a sign the query is exhausted. Say so explicitly rather than stopping early.
+Code checks this too, so do not be tempted to smooth it over.
 
 If a search returns zero results, wait, then re-run it once before concluding there are none.
 
@@ -376,39 +485,58 @@ Do NOT write a warning about the poster being a recruiting agency or the hiring 
 
 
 def build_scraper_instructions() -> str:
-    """Scraper prompt with the configured search regions injected.
+    """Scraper prompt with the configured search regions injected as CHIP sequences.
 
     Regions are a personal preference (see preferences.py), so the search list is generated
-    rather than hardcoded. With no regions configured, the query runs unfiltered in both
-    sort orders.
+    rather than hardcoded. With no regions configured, the query runs once with no location
+    filter (whatever the account defaults to).
 
-    Regions become *query text*, not URL parameters or filter chips. LinkedIn's AI-powered job
-    search strips `location`/`f_WT`/`f_E`/`sortBy` from the URL and has no filter-chip row; its
-    own guidance is to type filters into the search box (see the 2026-08-11 entry in CLAUDE.md).
+    Filters are applied by CLICKING the chip row, never by putting `geoId`/`f_TPR` in a URL.
+    Both work; only one is something a person does. Hand-assembled filter parameters are a cheap
+    fingerprint for anti-automation, and this drives a real logged-in account (see the Account
+    safety requirement in CLAUDE.md).
 
-    Sort order is no longer a coverage axis — the AI-powered UI exposes no sort control, so the
-    former "each region in both sort orders" fan-out would just be the same search run twice.
-    Region is the one axis that still varies the result set.
+    The region must NOT go into the query text. That was the pre-2026-08-18 design and LinkedIn
+    silently ignored it: every "European Union" search returned the account's home metro for days,
+    which is why `geo_id` now exists purely to verify that the click landed.
+
+    Sort order is not a coverage axis — the UI exposes no sort control. Region is.
     """
     regions = preferences.search_regions()
+    date_label = SCRAPER_DATE_POSTED_LABEL
+    exp_label = SCRAPER_EXPERIENCE_LABEL
+
+    def filters_for(location: str) -> str:
+        steps = []
+        if location:
+            steps.append(f'set **Location** to `{location}` (click the location chip, clear it, '
+                         f'type it, pick the suggestion)')
+        steps.append(f'set **Date posted** to `{date_label}`')
+        steps.append(f'set **Experience level** to `{exp_label}`')
+        return '; then '.join(steps)
+
     entries: list[str] = []
     if regions:
         for region in regions:
             name = region.get('name') or region.get('linkedin_location', '')
             location = str(region.get('linkedin_location', ''))
-            entries.append(f'**{name}** — search text: `<QUERY>, remote, {location}, senior level`')
+            entries.append(f'**{name}** — search `<QUERY>, remote`, then {filters_for(location)}.')
     else:
-        entries.append('**Unfiltered** — search text: `<QUERY>, remote, senior level`')
+        entries.append(f'**Unfiltered** — search `<QUERY>, remote`, then {filters_for("")}.')
 
     search_list = '\n'.join(f'{i}. {entry}' for i, entry in enumerate(entries, start=1))
     search_min, search_max = SCRAPER_INTER_SEARCH_DELAY_SECONDS
+    action_min, action_max = SCRAPER_INTER_ACTION_DELAY_SECONDS
     return SCRAPER_INSTRUCTIONS_TEMPLATE.format(
         search_count=len(entries),
         search_list=search_list,
         search_delay_min=search_min,
         search_delay_max=search_max,
+        action_delay_min=action_min,
+        action_delay_max=action_max,
         max_listings=SCRAPER_MAX_LISTINGS_PER_SEARCH,
         harvest_js=SCRAPER_HARVEST_JS,
+        contract_js=SCRAPER_UI_CONTRACT_JS,
     )
 
 
@@ -622,7 +750,17 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
             logger.warning(f'Stage 1a via OpenRouter failed, falling back to Anthropic: {ex}')
 
     if not captured:
+        # SDK isolation. These three default to "load whatever the interactive CLI would": the
+        # docstring is explicit that setting_sources=None loads ALL sources and that "project"
+        # pulls in CLAUDE.md files, strict_mcp_config=False adds every user/global MCP server, and
+        # skills=None is NOT "skills off". Measured 2026-08-21: that put this repo's 67KB CLAUDE.md
+        # (~17K tokens) plus nine unrelated MCP servers into a Haiku scraping session, re-read on
+        # every turn. Nothing here reads project settings at runtime.
+
         options = ClaudeAgentOptions(
+            setting_sources=[],
+            strict_mcp_config=True,
+            skills=[],
             tools=[],
             model=MODEL_NAME_MEDIUM,
             system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
@@ -687,6 +825,9 @@ def build_reference_block() -> str:
 
 async def _summarize_references_anthropic(prompt: str, stage_stats: dict | None) -> str:
     options = ClaudeAgentOptions(
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         model=MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
@@ -823,8 +964,20 @@ def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> N
         f'cache_read={usage.get("cache_read_input_tokens", 0)} '
         f'cache_write={usage.get("cache_creation_input_tokens", 0)} '
         f'cost_reported={msg.total_cost_usd} '
-        f'cost_charged={cost_delta if cost_delta is not None else msg.total_cost_usd}'
+        f'cost_charged={cost_delta if cost_delta is not None else msg.total_cost_usd} '
+        # is_error with subtype="success" is an HTTP-level API failure whose status lives in
+        # api_error_status; without these three fields an errored result is indistinguishable
+        # from a good one in the log, which is how "error result: success" stayed undiagnosable.
+        f'is_error={getattr(msg, "is_error", None)} subtype={getattr(msg, "subtype", None)!r} '
+        f'api_error_status={getattr(msg, "api_error_status", None)}'
     )
+    if getattr(msg, 'is_error', False):
+        logger.error(
+            f'API error on session {msg.session_id}: status='
+            f'{getattr(msg, "api_error_status", None)} subtype={getattr(msg, "subtype", None)!r} '
+            f'terminal_reason={getattr(msg, "terminal_reason", None)!r} '
+            f'errors={getattr(msg, "errors", None)}'
+        )
 
 
 # Keys that are internal bookkeeping, not reported metrics. stage_stats dicts are serialized
@@ -943,8 +1096,22 @@ def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
 
 
 def _listings_seen() -> int:
-    """Total job listings the scraper has inspected this run (any check_and_record_job outcome)."""
+    """Total job listings the scraper has inspected this run (any check_and_record_job outcome).
+
+    This counts CALLS. When two regions return the same cards it double-counts, which is exactly
+    what made a collapsed region axis look like healthy coverage — see _listings_distinct.
+    """
     return sum(tools_module._check_status_counts.values())
+
+
+def _listings_distinct() -> int:
+    """Distinct job listings inspected this run, regardless of how many searches surfaced them."""
+    return len(tools_module._distinct_listing_ids)
+
+
+def _distinct_snapshot() -> set[str]:
+    """Copy of the distinct-id set, for before/after per-query diffing."""
+    return set(tools_module._distinct_listing_ids)
 
 
 async def _human_pause(delay_range: tuple[float, float], reason: str) -> None:
@@ -974,7 +1141,184 @@ def _check_status_delta(before: dict[str, int]) -> dict[str, int]:
     }
 
 
-async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: dict) -> None:
+def _same_query(reported: str, base: str) -> bool:
+    """True if a report_search record belongs to this base query.
+
+    The model reports the full search text it typed ("Principal Data Scientist, remote"), not the
+    base query, so an exact match silently never fires.
+    """
+    reported = (reported or '').strip().lower()
+    base = (base or '').strip().lower()
+    return bool(base) and (reported == base or reported.startswith(base))
+
+
+def assess_run_health(funnel: dict) -> list[str]:
+    """Return human-readable alerts about THIS run's discovery quality; empty means healthy.
+
+    A saturated run and a healthy one looked identical to the user: silence. Aug 15-18 2026
+    produced 4, 4, 2 and 1 new jobs from ~300 listings each, four days in a row with no
+    notification and no signal that anything had changed. The causes are separable and each is
+    actionable, so the alert names which one applies rather than just saying "quiet run".
+    """
+    alerts: list[str] = []
+
+    # 1. A changed page or a block. Most decisive, so it comes first.
+    for alert in funnel.get('ui_alerts') or []:
+        kind = alert.get('kind')
+        where = f"{alert.get('query', '?')} / {alert.get('region', '?')}"
+        if kind == 'blocked':
+            alerts.append(f'BLOCKED by LinkedIn on {where}: "{alert.get("detail")}" — run backed off, did not retry')
+        elif kind == 'contract':
+            alerts.append(f'UI CHANGED on {where}: {alert.get("detail")}')
+        elif kind == 'filters':
+            alerts.append(f'FILTERS DID NOT APPLY on {where}: {alert.get("detail")}')
+        elif kind == 'drift':
+            alerts.append(f'UI drift on {where}: {alert.get("detail")}')
+        elif kind == 'low_listings':
+            alerts.append(f'LOW LISTING COUNT on {alert.get("query", "?")}: {alert.get("detail")}')
+        elif kind == 'unverified_search':
+            alerts.append(
+                f'SEARCH NOT VERIFIED on "{alert.get("query", "?")}" ({alert.get("region")}): '
+                f'{alert.get("detail")}'
+            )
+        elif kind == 'stopped_early':
+            alerts.append(f'STOPPED EARLY on {alert.get("query", "?")}: {alert.get("detail")}')
+        elif kind == 'local_model_missing':
+            alerts.append(f'LOCAL TRIAGE DISABLED: {alert.get("detail")}')
+
+    # 2. A dead region axis: two regions returning the same jobs is not "the query is exhausted".
+    for query, overlap in (funnel.get('region_overlap') or {}).items():
+        if overlap >= REGION_OVERLAP_ALERT_THRESHOLD:
+            alerts.append(
+                f'REGION OVERLAP {overlap:.0%} on "{query}" — the location filter is not '
+                'separating regions, so half the searches are duplicates'
+            )
+
+    # 3. Saturation. Measured against DISTINCT listings; the call count double-counts a job seen
+    #    in two regions and would flatter the ratio.
+    distinct = funnel.get('listings_distinct') or 0
+    new_jobs = (funnel.get('check_status') or {}).get('new', 0)
+    if distinct:
+        ratio = new_jobs / distinct
+        if new_jobs < SATURATION_MIN_NEW_JOBS and ratio < SATURATION_MIN_NEW_RATIO:
+            alerts.append(
+                f'LOW YIELD: {new_jobs} new job(s) from {distinct} distinct listings '
+                f'({ratio:.1%}) — below {SATURATION_MIN_NEW_RATIO:.0%}. The searches are '
+                'returning jobs already processed; the query set or filters likely need widening'
+            )
+    return alerts
+
+
+def recent_yield_history(limit: int = 5) -> list[str]:
+    """Last few runs' yield, read back from cost_log.jsonl, to give an alert context.
+
+    No new state file: every run already writes its funnel there.
+    """
+    path = RUN_DIR / 'cost_log.jsonl'
+    if not path.exists():
+        return []
+    rows = []
+    try:
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if 'funnel' in row:
+                rows.append(row)
+    except Exception as ex:
+        logger.warning(f'could not read yield history from {path}: {ex}')
+        return []
+
+    out = []
+    for row in rows[-limit:]:
+        funnel = row.get('funnel') or {}
+        seen = funnel.get('listings_distinct') or funnel.get('listings_seen') or 0
+        new_jobs = (funnel.get('check_status') or {}).get('new', 0)
+        out.append(f"{str(row.get('timestamp', ''))[:10]}: {new_jobs} new / {seen}")
+    return out
+
+
+def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict):
+    """One Stage 1b request on the shared Claude Agent SDK session (the rollback path)."""
+    async def run_pass(instruction: str) -> int | None:
+        num_turns: int | None = None
+        await client.query(instruction)
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, ThinkingBlock):
+                        print_thinking(block.thinking)
+                    elif isinstance(block, TextBlock):
+                        print(block.text, flush=True)
+                        log_agent_text('Stage 1b', block.text)
+            elif isinstance(msg, ResultMessage):
+                cost_delta = accumulate_stage_stats(stage_stats, msg)
+                print_result_stats(msg, cost_delta)
+                num_turns = msg.num_turns
+        return num_turns
+    return run_pass
+
+
+def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per_query: dict):
+    """One Stage 1b request through the OpenRouter function-calling loop.
+
+    A FRESH conversation per request. On the Anthropic path all six queries share one transcript,
+    so context per turn grew 41K -> 162K across a run and every later query paid for every earlier
+    snapshot. Here the browser session persists (the page stays where it was) while the transcript
+    does not, so each query starts at the floor.
+    """
+    async def run_pass(instruction: str) -> int | None:
+        query = tools_module._current_query or ''
+        session = scrape_openrouter.ScrapeSession(browser_call, query)
+        try:
+            await session.run(build_scraper_prompt(), instruction, tools)
+        finally:
+            stage_stats['cost'] += session.cost
+            stage_stats['input_tokens'] += session.usage['prompt'] - session.usage['cached']
+            stage_stats['output_tokens'] += session.usage['completion']
+            stage_stats['cache_read_input_tokens'] += session.usage['cached']
+            entry = per_query.setdefault(query, {'cost': 0.0, 'iterations': 0, 'prompt': 0, 'cached': 0})
+            entry['cost'] += session.cost
+            entry['iterations'] += session.iterations
+            entry['prompt'] += session.usage['prompt']
+            entry['cached'] += session.usage['cached']
+            logger.info(
+                f'Stage 1b cost: "{query}" ${session.cost:.4f} over {session.iterations} iteration(s) '
+                f'(prompt={session.usage["prompt"]:,} cached={session.usage["cached"]:,} '
+                f'out={session.usage["completion"]:,})')
+        return session.iterations
+    return run_pass
+
+
+async def _run_anthropic_scraper(playwright_mcp: dict, queries: list[str], stage_stats: dict) -> None:
+    """The original Claude Agent SDK scraper, kept intact as the rollback path.
+
+    Deliberately unchanged: it is what runs if the OpenRouter provider is unavailable, so it should
+    stay the known-good implementation rather than drift alongside the new one.
+    """
+    options = ClaudeAgentOptions(
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
+        tools=[],
+        system_prompt=build_scraper_prompt(),
+        mcp_servers={
+            "playwright": playwright_mcp,
+            "job_scraper": make_scraper_server(),
+        },
+        permission_mode="bypassPermissions",
+        # Removes these from the model's context entirely. allowed_tools would NOT — it only
+        # auto-grants permission, which bypassPermissions already does. See the constant.
+        disallowed_tools=SCRAPER_DISALLOWED_BROWSER_TOOLS,
+        cwd=str(PROJECT_DIR),
+        model=MODEL_NAME_LOW,
+        max_turns=SCRAPER_MAX_TURNS_PER_QUERY,
+    )
+    async with ClaudeSDKClient(options) as scraper:
+        await run_scraper(_anthropic_run_pass(scraper, stage_stats), queries, stage_stats)
+
+
+async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results.
 
     ONE REQUEST PER QUERY, on a SINGLE shared session. Two constraints have to hold at once:
@@ -1001,43 +1345,32 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
     Pacing: queries are separated by a randomised pause. This is a real logged-in account, and
     a flagged or banned account ends the whole job search — so pacing is enforced here in code
     rather than left to the model, which under turn pressure will skip a prompted wait.
-    """
-    async def run_pass(instruction: str) -> int | None:
-        """Run one scraper request; returns the turn count the SDK reported, if any."""
-        num_turns: int | None = None
-        await client.query(instruction)
-        async for msg in client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, ThinkingBlock):
-                        print_thinking(block.thinking)
-                    elif isinstance(block, TextBlock):
-                        print(block.text, flush=True)
-                        log_agent_text('Stage 1b', block.text)
-            elif isinstance(msg, ResultMessage):
-                cost_delta = accumulate_stage_stats(stage_stats, msg)
-                print_result_stats(msg, cost_delta)
-                num_turns = msg.num_turns
-        return num_turns
 
+    `run_pass(instruction) -> num_turns | None` is supplied by the caller, so everything in this
+    function — the per-query loop, pacing, the region-verification check, the low-yield recovery
+    pass — is shared between the OpenRouter and Anthropic scrapers rather than duplicated. The two
+    differ only in how one request is executed.
+    """
     for i, query in enumerate(queries, 1):
         console.print(f"[cyan]Stage 1b: query {i}/{len(queries)} — \"{query}\"[/cyan]")
         if i > 1:
             await _human_pause(SCRAPER_INTER_QUERY_DELAY_SECONDS, f'query {i}/{len(queries)}')
         tools_module._current_query = query
         before = _check_status_snapshot()
+        before_distinct = _distinct_snapshot()
         try:
             turns = await run_pass(
                 f'Search LinkedIn for this ONE query only: "{query}"\n\n'
-                "Run every search listed in your instructions (one per region), putting the region "
-                "and the filter words into the search text. Report the result count and the query "
-                "text the search box actually contains. Then harvest the whole results list with "
-                "the single read-only browser_evaluate from your instructions, and call "
-                "check_and_record_job (and queue_candidate for new jobs) for each harvested "
-                "listing. Never click anything in the results list — the card and its Dismiss "
-                "button are indistinguishable to you, and a stray click destroys a real job. Do "
-                "not ask for permission — call the tools directly. Do not navigate to individual "
-                "job pages. Stop when you have worked through the searches for this query."
+                "Run every search listed in your instructions (one per region). Search on the "
+                "query text alone, then set the location, date-posted and experience-level "
+                "filters by CLICKING their chips — never by putting geoId/f_TPR in the URL. Then "
+                "call run_ui_contract with the region name and do what it tells you, then "
+                "harvest_listings, then record_listings. Clicking filter chips is fine; never "
+                "click anything in the results LIST — the card and its Dismiss button are "
+                "indistinguishable to you, and a stray click destroys a real job. If anything is "
+                "missing or unreadable, call report_problem and stop rather than guessing. Do not "
+                "ask for permission — call the tools directly. Do not navigate to individual job "
+                "pages. Stop when you have worked through the searches for this query."
             )
         except Exception as ex:
             # One failed query must not abort the remaining ones.
@@ -1045,13 +1378,47 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
             tools_module._queries_searched[query] = 'error'
             continue
 
+        # Every configured region must actually be searched, and each search must have been
+        # verified. Both are prompted steps, and a model skips prompted steps: on the first live
+        # run report_search was called 5 times across 12 expected searches, and one query searched
+        # only one of its two regions -- with turn budget to spare (49 of 260), so this is choice,
+        # not starvation. An unverified search is silently unfiltered, which is the whole failure
+        # this guard exists to catch, so the omission itself has to be loud.
+        expected_regions = [
+            str(r.get('name') or r.get('linkedin_location', '')) for r in preferences.search_regions()
+        ] or ['(unfiltered)']
+        reported = {
+            str(rec.get('region', '')) for rec in tools_module._search_reports
+            if _same_query(rec.get('query', ''), query)
+        }
+        if missing := [r for r in expected_regions if r not in reported]:
+            logger.warning(
+                f'Stage 1b: query "{query}" never verified {len(missing)} of '
+                f'{len(expected_regions)} region(s): {", ".join(missing)} — the search either did '
+                'not run or ran without its filters confirmed.'
+            )
+            tools_module._ui_alerts.append({
+                'kind': 'unverified_search', 'query': query, 'region': ', '.join(missing),
+                'detail': f'no report_search for {", ".join(missing)} — search unrun or unverified',
+            })
+
         delta = _check_status_delta(before)
-        seen = sum(delta.values())
+        # DISTINCT, not the sum of call counts: two regions returning the same cards would
+        # otherwise read as double coverage and push a collapsed query away from this retry.
+        seen = len(_distinct_snapshot() - before_distinct)
+        calls = sum(delta.values())
+        if calls > seen:
+            logger.info(
+                f'Stage 1b: query "{query}" inspected {calls} listing(s) but only {seen} distinct '
+                f'— {calls - seen} repeat check(s): the same listing recorded more than once, '
+                f'across regions or re-harvested by a recovery pass. '
+                f'See region_overlap for actual cross-region duplication.'
+            )
         if seen < SCRAPER_MIN_LISTINGS_PER_QUERY:
             if seen == 0:
                 logger.warning(
-                    f'Stage 1b: query "{query}" inspected 0 listings — retrying once with the '
-                    'region text dropped (possible auth wall, block page, or empty results shell).'
+                    f'Stage 1b: query "{query}" inspected 0 distinct listings — retrying once '
+                    'without the location filter (possible auth wall, block page, or empty shell).'
                 )
                 retry_instruction = (
                     f'That search surfaced no job listings at all for "{query}" — the results list was '
@@ -1060,10 +1427,11 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
                     'NOT retry. Say what you saw and stop — pushing through a block is the one thing '
                     'that can end this account.\n\n'
                     'Otherwise retry once: load '
-                    f'https://www.linkedin.com/jobs/search-results/?keywords={quote_plus(query)}&f_SAL= '
-                    'with NO region words in the search text (keep "remote" and "senior level"), state '
-                    'the result count you actually see, then walk the listings as instructed. If you '
-                    'STILL see a wall or genuinely zero results, say so explicitly and stop.'
+                    f'https://www.linkedin.com/jobs/search-results/?keywords={quote_plus(query + ", remote")}&f_SAL= '
+                    'and this time apply NO location filter at all — leave the location chip on '
+                    'whatever it defaults to, and set only Date posted and Experience level. State '
+                    'the result count you actually see, then walk the listings as instructed. If '
+                    'you STILL see a wall or genuinely zero results, say so explicitly and stop.'
                 )
             else:
                 logger.warning(
@@ -1085,16 +1453,26 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
                     'the harvest returns an error or zero jobs while results are visible on screen, '
                     'the markup has changed — say so and stop.\n\n'
                     'Stop immediately if a challenge or verification page appears. If two searches '
-                    'return the identical list of jobs, the region text is not applying — say so '
-                    'explicitly rather than treating the query as exhausted.'
+                    'return the identical list of jobs, the location filter is not applying — say '
+                    'so explicitly rather than treating the query as exhausted.'
                 )
+            tools_module._ui_alerts.append({
+                'kind': 'low_listings', 'query': query, 'region': '(all)',
+                'detail': f'only {seen} distinct listing(s) on the first pass '
+                          f'(below {SCRAPER_MIN_LISTINGS_PER_QUERY}) — recovery pass attempted',
+            })
             await _human_pause(SCRAPER_INTER_SEARCH_DELAY_SECONDS, 'the recovery pass')
             try:
                 await run_pass(retry_instruction)
             except Exception as ex:
                 logger.warning(f'Stage 1b: recovery pass for "{query}" failed: {ex}')
             delta = _check_status_delta(before)
-            seen = sum(delta.values())
+            # Recompute BOTH the same way the first pass did (line ~1406). Reassigning `seen` to a
+            # call count here produced the impossible "100 distinct listing(s) of 50 checked", and
+            # fed a call count into _queries_searched -- inflating apparent coverage for exactly
+            # the queries that needed rescuing, which is the "saturated run looks healthy" shape.
+            seen = len(_distinct_snapshot() - before_distinct)
+            calls = sum(delta.values())
 
         tools_module._queries_searched[query] = seen
         tools_module._check_status_per_query[query] = delta
@@ -1111,8 +1489,13 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
                 f'least {SCRAPER_MIN_TURNS_PER_QUERY}) — it stopped before completing a harvest '
                 'cycle, which usually means it treated repeated or empty results as "done".'
             )
+            tools_module._ui_alerts.append({
+                'kind': 'stopped_early', 'query': query, 'region': '(all)',
+                'detail': f'used only {turns} turns (expected >= {SCRAPER_MIN_TURNS_PER_QUERY}) '
+                          '— stopped before completing a harvest cycle',
+            })
         logger.info(
-            f'Stage 1b: query "{query}" inspected {seen} listing(s) '
+            f'Stage 1b: query "{query}" inspected {seen} distinct listing(s) of {calls} checked '
             f'[{tools_module.format_status_counts(delta)}], '
             f'{tools_module._candidates_per_query.get(query, 0)} queued'
         )
@@ -1126,6 +1509,9 @@ async def run_scraper(client: ClaudeSDKClient, queries: list[str], stage_stats: 
 async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: dict) -> dict | None:
     """Stage 2a: Haiku agentic session fetches the job page and submits a condensed extract."""
     options = ClaudeAgentOptions(
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         tools=[],
         system_prompt=EXTRACTOR_INSTRUCTIONS,
         mcp_servers={
@@ -1212,6 +1598,9 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         f'{snapshot[:80000]}'
     )
     options = ClaudeAgentOptions(
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         model=MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
@@ -1662,6 +2051,9 @@ def format_job_notification(
 
 async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
     options = ClaudeAgentOptions(
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         model=MODEL_NAME_MEDIUM,
         effort='low',
         tools=[],
@@ -1727,6 +2119,7 @@ def _hard_rule_category(reason: str) -> str:
 async def evaluate_all_candidates(
     candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str,
     profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
+    triage_enabled: bool = True,
 ) -> None:
     """Stage 2: per candidate — Haiku extract, deterministic hard rules, local triage,
     then one configurable-model rating call. All sharing one browser.
@@ -1735,6 +2128,10 @@ async def evaluate_all_candidates(
     sent through the strong rater so we can detect false negatives (gate dropped it but
     the strong model rates it >=3). Normal saving/notification behaviour is unchanged.
     ``funnel`` (if provided) accumulates per-stage drop counts for the run summary.
+
+    ``triage_enabled`` is the run-level switch the local-model preflight turns off: a missing
+    LOCAL_MODEL is reported ONCE and triage is skipped, rather than every job re-discovering the
+    same misconfiguration and logging an identical warning (2026-08-25, 63 of them in one run).
     """
     if funnel is None:
         funnel = {}
@@ -1839,7 +2236,7 @@ async def evaluate_all_candidates(
                 continue
 
             triage_result = None
-            if TRIAGE_ENABLED:
+            if TRIAGE_ENABLED and triage_enabled:
                 triage_result = await triage_job_fit(extract_text, profile_block)
                 if triage_result:
                     logger.info(
@@ -1914,6 +2311,9 @@ async def evaluate_all_candidates(
 async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
     """One non-agentic Opus rating call — the reference standard for audits only."""
     options = ClaudeAgentOptions(
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         tools=[],
         system_prompt=evaluator_prompt,
         permission_mode='bypassPermissions',
@@ -2051,6 +2451,11 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._check_status_per_query = {}
     tools_module._queue_skipped_counts = {}
     tools_module._current_query = None
+    tools_module._current_region = None
+    tools_module._distinct_listing_ids = set()
+    tools_module._search_ids = {}
+    tools_module._search_reports = []
+    tools_module._ui_alerts = []
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -2093,23 +2498,33 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         console.print(f"[dim]Queries: {queries}[/dim]\n")
 
         console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
-        scraper_options = ClaudeAgentOptions(
-            tools=[],
-            system_prompt=build_scraper_prompt(),
-            mcp_servers={
-                "playwright": playwright_mcp,
-                "job_scraper": make_scraper_server(),
-            },
-            permission_mode="bypassPermissions",
-            # Removes these from the model's context entirely. allowed_tools would NOT — it only
-            # auto-grants permission, which bypassPermissions already does. See the constant.
-            disallowed_tools=SCRAPER_DISALLOWED_BROWSER_TOOLS,
-            cwd=str(PROJECT_DIR),
-            model=MODEL_NAME_LOW,
-            max_turns=SCRAPER_MAX_TURNS_PER_QUERY,
-        )
-        async with ClaudeSDKClient(scraper_options) as scraper:
-            await run_scraper(scraper, queries, stage_stats["scraping"])
+        scrape_per_query = tools_module._scrape_per_query
+        scraped = False
+        if SCRAPER_PROVIDER == 'openrouter':
+            # Browser tools come from the running Playwright server's own schemas rather than a
+            # hand-transcribed constant, so a server-side change cannot drift silently.
+            try:
+                async with mcp_session(f'http://localhost:{port}/mcp') as browser_call:
+                    tool_defs = (scrape_openrouter.browser_tool_defs(await browser_call.list_tools())
+                                 + scrape_openrouter.LOCAL_TOOL_DEFS)
+                    logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
+                                f'{scrape_openrouter.SCRAPER_OPENROUTER_MODEL}')
+                    await run_scraper(
+                        _openrouter_run_pass(browser_call, tool_defs, stage_stats["scraping"],
+                                             scrape_per_query),
+                        queries, stage_stats["scraping"])
+                scraped = True
+            except Exception as ex:
+                # A provider outage must not end the run: fall through to the Anthropic scraper,
+                # exactly as query generation, rating and extraction already do.
+                logger.warning(f'Stage 1b: OpenRouter scraper failed ({ex}) — '
+                               'falling back to the Anthropic scraper')
+                tools_module._ui_alerts.append({
+                    'kind': 'provider_fallback', 'query': '(all)', 'region': '(all)',
+                    'detail': f'OpenRouter scraper failed, fell back to Anthropic: {ex}'})
+
+        if not scraped:
+            await _run_anthropic_scraper(playwright_mcp, queries, stage_stats["scraping"])
 
         candidates = tools_module._candidates
         candidates_per_query = tools_module._candidates_per_query
@@ -2155,6 +2570,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 funnel={
                     "queries_generated": len(queries),
                     "listings_seen": sum(check_status_counts.values()),
+                    "listings_distinct": _listings_distinct(),
+                    "region_overlap": tools_module.region_overlap_report(),
+                    "ui_alerts": list(tools_module._ui_alerts),
                     "check_status": check_status_counts,
                     "check_status_per_query": dict(tools_module._check_status_per_query),
                     "queue_skipped": dict(tools_module._queue_skipped_counts),
@@ -2169,9 +2587,22 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         reference_block = await build_reference_summary(stage_stats["reference_summary"])
         evaluator_prompt = build_evaluator_prompt(reference_block)
         profile_block = build_profile_block(reference_block)
+
+        # One check, before the per-job loop: a LOCAL_MODEL that is not installed silently
+        # disables the free triage gate on every candidate, and the run still looks normal.
+        triage_enabled = True
+        if TRIAGE_ENABLED:
+            preflight_problem = await preflight_local_model()
+            if preflight_problem:
+                triage_enabled = False
+                logger.error(f'Local triage disabled for this run: {preflight_problem}')
+                tools_module._ui_alerts.append({
+                    'kind': 'local_model_missing', 'query': '(all)', 'region': '(all)',
+                    'detail': preflight_problem})
+
         await evaluate_all_candidates(
             candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats,
-            funnel=funnel, audit=audit,
+            funnel=funnel, audit=audit, triage_enabled=triage_enabled,
         )
         if audit_opus:
             console.print(f"[bold magenta]Opus audit: sampling up to {audit_opus} un-surfaced job(s) per pool ...[/bold magenta]")
@@ -2193,13 +2624,25 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     funnel_summary = {
         "queries_generated": len(queries),
         "listings_seen": sum(check_status_counts.values()),
+        "listings_distinct": _listings_distinct(),
+        "region_overlap": tools_module.region_overlap_report(),
+        "ui_alerts": list(tools_module._ui_alerts),
         "check_status": check_status_counts,
         "check_status_per_query": dict(tools_module._check_status_per_query),
         "queue_skipped": dict(tools_module._queue_skipped_counts),
         "candidates_queued": len(candidates),
+        "scrape_per_query": dict(tools_module._scrape_per_query),
         **funnel,
     }
     logger.info(f"Run funnel: {json.dumps(funnel_summary)}")
+
+    # Discovery-health alerts. A run that finds nothing because the page changed, because a region
+    # collapsed, or because the pool is exhausted must not look the same as a healthy quiet run.
+    health_alerts = assess_run_health(funnel_summary)
+    funnel_summary['health_alerts'] = health_alerts
+    for alert in health_alerts:
+        logger.warning(f'Run health: {alert}')
+
     audit_log_path = tools_module.write_run_audit_log(
         queries=queries,
         applied_jobs_in_horizon=len(tools_module._applied_jobs),
@@ -2229,6 +2672,12 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         f"• Cost by stage:\n{stage_cost_lines}",
         f"• Total cost: ${total_cost:.4f}",
     ]
+    if health_alerts:
+        alert_lines = "\n".join(f"  - {a}" for a in health_alerts)
+        history = recent_yield_history()
+        stats_lines.insert(1, f"⚠️ NEEDS ATTENTION ({len(health_alerts)}):\n{alert_lines}")
+        if history:
+            stats_lines.append("• Recent yield:\n" + "\n".join(f"  - {h}" for h in history))
     stats_msg = "\n".join(stats_lines)
     console.print(f"\n[dim]{stats_msg}[/dim]")
     await _send_pipeline_notification(stats_msg)
@@ -2339,6 +2788,9 @@ async def main() -> None:
 
         if interactive:
             options = ClaudeAgentOptions(
+                setting_sources=[],
+                strict_mcp_config=True,
+                skills=[],
                 system_prompt=build_system_prompt(interactive=True),
                 mcp_servers={
                     "playwright": {

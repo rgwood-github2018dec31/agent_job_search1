@@ -32,7 +32,7 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     # Where saved job-posting PDFs land before categorization and ingest. Not a gate and not a
     # personal fact, so this defaults to a real path rather than a neutral empty value.
     'save_dir': '~/Downloads',
-    'search_regions': [],           # [{'name': ..., 'linkedin_location': ...}]; empty = unfiltered search
+    'search_regions': [],           # [{'name':…, 'linkedin_location':…, 'geo_id':…}]; empty = unfiltered search
     'sponsorship_required_in': [],  # lowercase location substrings where the user needs visa sponsorship
     'languages': [],                # languages the user works in; empty = no language gate
     # Ceiling for a posting WRITTEN IN a language outside `languages`. Inert while `languages`
@@ -120,7 +120,17 @@ def save_dir() -> Path:
 
 
 def search_regions() -> list[dict[str, str]]:
-    '''Regions to search, each {'name', 'linkedin_location'}. Empty means one unfiltered search.'''
+    '''Regions to search. Empty means one unfiltered search.
+
+    Each entry is {'name', 'linkedin_location', 'geo_id'}:
+      - `linkedin_location` is the text TYPED INTO the location chip's autocomplete, which is how
+        the region is actually applied. This is deliberate: filters are set by clicking, never by
+        crafting `geoId=` URLs, because no human assembles filter parameters by hand.
+      - `geo_id` is optional and is used ONLY to verify afterwards that the click landed — the id
+        LinkedIn puts in the URL once the suggestion is picked (e.g. European Union = 91000000).
+        Before 2026-08-18 the region was typed into `keywords`, which LinkedIn silently ignored,
+        so every EU search returned the account's home metro for days without anything noticing.
+    '''
     return list(load_preferences()['search_regions'])
 
 

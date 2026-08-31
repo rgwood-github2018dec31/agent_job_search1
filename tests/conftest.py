@@ -1,5 +1,9 @@
+import functools
 import os
+import shutil
+import subprocess
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -100,10 +104,40 @@ def _reset_scraper_run_state(monkeypatch):
     yield
 
 
+@functools.lru_cache(maxsize=1)
 def _claude_available() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+    """Whether a live Claude call can actually be made.
+
+    ANTHROPIC_API_KEY alone is the wrong question: the Agent SDK authenticates through the
+    logged-in Claude Code CLI, so a developer machine with no API key at all can still make live
+    calls — and gating on the env var silently skipped every live test there. Probe the CLI the
+    SDK would actually spawn instead, and fall back to the env var for API-key setups (CI).
+    """
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    try:
+        import claude_agent_sdk
+
+        bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+        cli = str(bundled) if bundled.exists() else shutil.which("claude")
+    except Exception:
+        return False
+    if not cli:
+        return False
+    # `--version` does not authenticate, so confirm the CLI can reach the API with a trivial
+    # prompt. Cached, so this costs one short call per pytest session at most.
+    try:
+        completed = subprocess.run(
+            [str(cli), "-p", "hi", "--max-turns", "1"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
     if item.get_closest_marker("live_agent_claude") and not _claude_available():
-        pytest.skip("Skipping: no ANTHROPIC_API_KEY — Claude not available")
+        pytest.skip("Skipping: Claude not available (no API key and CLI cannot reach the API)")

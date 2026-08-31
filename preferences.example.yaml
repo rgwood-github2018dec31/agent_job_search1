@@ -15,11 +15,20 @@
 # configurable — do not point save_dir at it, or ingest would be moving files onto themselves.
 save_dir: ~/Downloads
 
-# Regions to search on LinkedIn. Each entry becomes four searches (two sort orders x this region).
-# `linkedin_location` is passed as the `location` URL parameter. An empty list searches globally.
+# Regions to search on LinkedIn. Each entry becomes one search per query.
+#
+# `linkedin_location` is TYPED INTO the location filter chip's autocomplete, the same way a person
+# would set it. Filters are never applied by crafting `geoId=`/`f_TPR=` URLs — hand-assembled
+# filter parameters are a cheap fingerprint for anti-automation.
+#
+# `geo_id` is optional. It is the id LinkedIn puts in the URL once the autocomplete suggestion is
+# picked (European Union = 91000000), and is used ONLY to confirm afterwards that the click
+# actually applied. Leave it out and the region is still searched; you just lose that check.
+# An empty list searches globally.
 search_regions:
   - name: Example Country
     linkedin_location: Example Country
+    geo_id: '000000'
 
 # Locations (lowercase substrings, matched against the posting's location) where you would need
 # visa sponsorship. A job there that does not explicitly offer sponsorship is auto-rated 1.

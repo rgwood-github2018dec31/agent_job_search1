@@ -8,7 +8,15 @@ dependencies = [
     "claude-agent-sdk>=0.2.139",
     # Imported directly by triage.py for the LLM tool-server sessions. It arrives transitively via
     # claude-agent-sdk, but an SDK release that drops or renames it would break us, so declare it.
-    "mcp>=1.29",
+    #
+    # PINNED BELOW 2.0 DELIBERATELY. In mcp 2.0 `streamable_http_client` yields 2 values instead of
+    # 3, so `mcp_session` in triage.py (`async with streamable_http_client(url) as (read, write, _)`)
+    # raises "not enough values to unpack". That helper is the ONLY path to the OpenRouter and Ollama
+    # tool servers, so a silent upgrade takes out Stage 2 triage, the non-Anthropic rating call, the
+    # reference summary, and the OpenRouter extractor at once -- and only at runtime, mid-run.
+    # Measured 2026-08-21: a bare `uv run` re-resolved `mcp>=1.29` to 2.0.0 and did exactly that.
+    # Before lifting this, make mcp_session tolerate both arities and verify against a live server.
+    "mcp>=1.29,<2",
     "requests>=2.34",
     "pypdf>=6.16.1",
     "pyyaml>=6.0",

@@ -20,6 +20,14 @@ from agentic_job_search.config import (
     COMPANY_MATCH_PROVIDER,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_LOW,
+    SCRAPER_DATE_POSTED_LABEL,
+    SCRAPER_MAX_LISTINGS_PER_SEARCH,
+    SCRAPER_DATE_POSTED_SECONDS,
+    SCRAPER_EXPERIENCE_LABEL,
+    UI_BLOCK_SIGNATURES,
+    UI_CONTRACT_ELEMENTS,
+    UI_FINGERPRINT_FILENAME,
+    UI_STRUCTURAL_CHIPS,
 )
 import agentic_job_search.preferences as preferences
 from agentic_job_search.triage import chat_openrouter, extract_json_object
@@ -86,6 +94,26 @@ _check_status_per_query: dict[str, dict[str, int]] = {}
 # search text and so never matches.
 _current_query: str | None = None
 
+# --- Per-search coverage bookkeeping -----------------------------------------------------------
+#
+# `_check_status_counts` counts check_and_record_job CALLS, not distinct jobs. When two regions
+# return the same 25 cards that reads as "50 listings inspected" — indistinguishable from genuine
+# coverage of 50, and it pushes the query FURTHER from the low-yield retry threshold. So distinct
+# ids are tracked separately, per run and per (query, region).
+_distinct_listing_ids: set[str] = set()                      # run-global distinct (site, job_id) keys
+_search_ids: dict[tuple[str, str], set[str]] = {}            # (query, region) -> harvested job ids
+# One record per search: region, result count, contract verdict. Feeds the audit log and funnel.
+_search_reports: list[dict] = []
+# Contract/blocking problems found this run, surfaced in the audit log and the Telegram summary.
+_ui_alerts: list[dict] = []
+# Per-query Stage 1b cost/iterations, so a scraper regression is attributable to a query rather
+# than visible only as a stage total.
+_scrape_per_query: dict = {}
+# The region whose search is currently being walked, set by report_search. Listings are attributed
+# to (query, region) so region overlap is measurable; without it the run-global counts cannot tell
+# "two regions, 25 jobs each" from "two regions, the SAME 25 jobs".
+_current_region: str | None = None
+
 
 # queue-time skip reason -> count; folded into the run funnel.
 _queue_skipped_counts: dict[str, int] = {}
@@ -127,6 +155,47 @@ def title_rejection_reason(title: str) -> str | None:
     return None
 
 
+class AgentApiError(Exception):
+    """An Anthropic API call failed at the HTTP level (401 / 429 / 500 / 529 ...).
+
+    The SDK reports this as a ResultMessage with is_error=True and subtype=="success", putting the
+    real status in api_error_status. Its own fallback text renders that as the self-contradictory
+    "Claude Code returned an error result: success" — the word "success" is the subtype leaking
+    through because the `errors` list was empty, not a status. Nine identical copies of that string
+    are what this exception exists to replace.
+
+    Unlike a corrupt PDF, this is systemic: it fails every call the same way, so callers abort
+    rather than retrying per file.
+    """
+
+    def __init__(self, detail: str, api_error_status: int | None = None):
+        super().__init__(detail)
+        self.api_error_status = api_error_status
+
+
+def _raise_if_result_error(msg: ResultMessage, context: str) -> None:
+    """Raise AgentApiError if the SDK reported an API-level failure for this result.
+
+    The errored ResultMessage arrives BEFORE the SDK's trailing, uninformative ProcessError, so
+    raising here is what replaces "error result: success" with the actual status code.
+    """
+    if not getattr(msg, 'is_error', False):
+        return
+    status = getattr(msg, 'api_error_status', None)
+    parts = [f'API error {status}' if status else 'API error']
+    parts.append(f'subtype={getattr(msg, "subtype", None)!r}')
+    if (terminal_reason := getattr(msg, 'terminal_reason', None)):
+        parts.append(f'terminal_reason={terminal_reason!r}')
+    if (errors := getattr(msg, 'errors', None)):
+        parts.append(f'errors={"; ".join(errors)}')
+    if status in (401, 403):
+        parts.append('not authenticated — run `claude /login`')
+    elif status in (429, 500, 502, 503, 529):
+        parts.append('rate limited or overloaded — retry later')
+    detail = f'{context}: ' + ' | '.join(parts)
+    raise AgentApiError(detail, api_error_status=status)
+
+
 async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
     """Extract company, title, and recruiter-agency signal from an applied-job PDF's text.
 
@@ -138,6 +207,9 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
         model=MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         output_format={
             'type': 'json_schema',
             'schema': {
@@ -170,7 +242,10 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
         'recruiting agency/aggregator rather than the hiring employer, and the end client if named.'
     )
     async for msg in sdk_query(prompt=prompt, options=options):
-        if isinstance(msg, ResultMessage) and msg.structured_output:
+        if not isinstance(msg, ResultMessage):
+            continue
+        _raise_if_result_error(msg, f'Applied-job metadata extraction failed for {filename}')
+        if msg.structured_output:
             out = msg.structured_output
             return {
                 'company': out.get('company_name', ''),
@@ -178,6 +253,7 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
                 'is_agency': bool(out.get('is_recruiting_agency', False)),
                 'end_client': out.get('end_client_name', ''),
             }
+    logger.warning(f'No structured output extracting applied-job metadata for {filename}')
     console.print(f'[yellow]Warning: no structured output extracting metadata for {filename}[/yellow]')
     return {'company': '', 'job_title': '', 'is_agency': False, 'end_client': ''}
 
@@ -237,6 +313,9 @@ async def company_matches_applied(candidate: str) -> str | None:
         model=MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         output_format={
             'type': 'json_schema',
             'schema': {
@@ -255,7 +334,10 @@ async def company_matches_applied(candidate: str) -> str | None:
         prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}',
         options=options,
     ):
-        if isinstance(msg, ResultMessage) and msg.structured_output:
+        if not isinstance(msg, ResultMessage):
+            continue
+        _raise_if_result_error(msg, f'Company match check failed for {candidate!r}')
+        if msg.structured_output:
             structured = msg.structured_output
     if not structured or not structured.get('matches'):
         return None
@@ -321,6 +403,9 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
             model=MODEL_NAME_LOW,
             tools=[],
             permission_mode='bypassPermissions',
+            setting_sources=[],
+            strict_mcp_config=True,
+            skills=[],
             output_format={
                 'type': 'json_schema',
                 'schema': {
@@ -338,7 +423,10 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
         )
         try:
             async for msg in sdk_query(prompt=prompt, options=options):
-                if isinstance(msg, ResultMessage) and msg.structured_output:
+                if not isinstance(msg, ResultMessage):
+                    continue
+                _raise_if_result_error(msg, f'Blacklist confirmation failed for {candidate!r}')
+                if msg.structured_output:
                     structured = msg.structured_output
         except Exception as ex:
             logger.warning(
@@ -365,12 +453,15 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
     return label
 
 
-async def _categorize_pdf_text(text: str, filename: str) -> str:
+async def _categorize_pdf_text(text: str, filename: str) -> str | None:
     """Use agent SDK to assign a category label to a PDF. Returns a snake_case string."""
     options = ClaudeAgentOptions(
         model=MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
+        setting_sources=[],
+        strict_mcp_config=True,
+        skills=[],
         output_format={
             'type': 'json_schema',
             'schema': {
@@ -393,10 +484,14 @@ async def _categorize_pdf_text(text: str, filename: str) -> str:
     prompt = f'Filename: {filename}\n\nContent:\n{text}'
     category: str | None = None
     async for msg in sdk_query(prompt=prompt, options=options):
-        if isinstance(msg, ResultMessage) and msg.structured_output:
+        if not isinstance(msg, ResultMessage):
+            continue
+        _raise_if_result_error(msg, f'PDF categorization failed for {filename}')
+        if msg.structured_output:
             category = msg.structured_output.get('category', '')
     if category is not None:
         return underscorify(category) or 'other'
+    logger.warning(f'No structured output categorizing {filename}; leaving uncategorized')
     console.print(f'[yellow]Warning: no structured output for {filename}[/yellow]')
     return None
 
@@ -412,22 +507,39 @@ async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
     if not uncategorized:
         return
     console.print(f'[dim]Categorizing {len(uncategorized)} uncategorized PDF(s) in {directory}...[/dim]')
-    for pdf in uncategorized:
+    for index, pdf in enumerate(uncategorized):
         try:
             reader = pypdf.PdfReader(pdf)
             text = '\n'.join(page.extract_text() or '' for page in reader.pages)
         except Exception as e:
+            logger.warning(f'Could not read {pdf.name}, leaving uncategorized: {e}')
             console.print(f'[yellow]Warning: could not read {pdf.name}: {e}[/yellow]')
             continue
         console.print(f'[dim]  Categorizing {pdf.name}...[/dim]')
         try:
             category = await _categorize_pdf_text(text[:3000], pdf.name)
+        except AgentApiError as ex:
+            # Systemic, not per-file: the next PDF would fail identically. Retrying per file is
+            # what turned one API failure into nine identical warnings and nine doomed CLI
+            # subprocesses. Abort instead — leaving PDFs uncategorized means they are never
+            # ingested into the applied-jobs corpus, so query generation silently degrades, and
+            # that must not pass as a normal run. main() releases the run lock in its finally.
+            remaining = len(uncategorized) - index
+            logger.error(
+                f'Aborting run: PDF categorization hit an API-level failure ({ex}). '
+                f'{remaining} of {len(uncategorized)} PDF(s) left uncategorized, so they will not '
+                f'enter the applied-jobs corpus.'
+            )
+            console.print(f'[red]Error: categorization aborted — {ex}[/red]')
+            raise
         except Exception as ex:
+            logger.warning(f'Categorization failed for {pdf.name}, leaving uncategorized: {ex}')
             console.print(f'[yellow]Warning: categorization failed for {pdf.name}, leaving uncategorized: {ex}[/yellow]')
             continue
         if category is None:
             continue
         new_name = f'cat-{category}-{pdf.name}'
+        logger.info(f'Categorized {pdf.name} -> {new_name}')
         console.print(f'[dim]  → {new_name}[/dim]')
         pdf.rename(pdf.parent / new_name)
 
@@ -614,7 +726,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         if metadata['end_client']:
             companies[metadata['end_client']] = pdf.name
         if text:
-            texts.append(text)
+            texts.append((applied_date, text))
         jobs.append({'filename': pdf.name, 'applied_date': applied_date, **metadata})
 
     if index_dirty:
@@ -622,7 +734,12 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         index_file.write_text(yaml.dump(index, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
     _applied_companies = companies
-    _reference_job_texts = texts
+    # NEWEST first. Consumers cap this at MAX_REFERENCE_JOBS, and taking the OLDEST N meant a
+    # newly applied job could never influence the ideal-role profile — it only entered once older
+    # records aged out of the horizon, so the rater calibrated against jobs the user had moved on
+    # from. Sorted by applied_date rather than left in filename order, because a legacy file
+    # without a YYYY-MM-DD prefix sorts arbitrarily.
+    _reference_job_texts = [text for _date, text in sorted(texts, key=lambda pair: pair[0], reverse=True)]
     _applied_jobs = jobs
     console.print(
         f'[dim]Loaded {len(jobs)} applied job(s) within {APPLIED_JOBS_HORIZON_DAYS} days '
@@ -837,6 +954,42 @@ def write_run_audit_log(
         lines.append(
             '- **Expired blacklist entries (no longer rejecting):** '
             + ', '.join(f'{name} (added {added})' for name, added in expired)
+        )
+
+    # Discovery health up front: a quiet run and a broken run look identical in the tables below,
+    # and that is precisely how a dead region axis survived several days unnoticed.
+    health_alerts = funnel.get('health_alerts') or []
+    lines += ['', '## 1b. Discovery health', '']
+    if health_alerts:
+        lines.append(f'**{len(health_alerts)} alert(s) — this run needs attention:**')
+        lines.append('')
+        lines += [f'- ⚠️ {alert}' for alert in health_alerts]
+    else:
+        lines.append('- No alerts: page structure sound, regions distinct, yield acceptable.')
+
+    seen_total = funnel.get('listings_seen') or 0
+    distinct_total = funnel.get('listings_distinct')
+    if distinct_total is not None:
+        duplicated = seen_total - distinct_total
+        lines.append(
+            f'- Listings inspected: {seen_total} ({distinct_total} distinct'
+            + (f', {duplicated} surfaced by more than one search' if duplicated > 0 else '')
+            + ')'
+        )
+    if overlaps := funnel.get('region_overlap'):
+        lines.append('- Region overlap per query (1.0 = the location filter did nothing): '
+                     + ', '.join(f'{q} {v:.0%}' for q, v in overlaps.items()))
+    for report in _search_reports:
+        status = 'ok'
+        if report.get('blocked'):
+            status = f'BLOCKED ({report["blocked"]})'
+        elif report.get('violations'):
+            status = 'UI CONTRACT FAILED: ' + '; '.join(report['violations'])
+        elif report.get('filter_problems'):
+            status = 'FILTERS NOT APPLIED: ' + '; '.join(report['filter_problems'])
+        lines.append(
+            f'- search `{report.get("query", "")}` / {report.get("region", "")} — '
+            f'{report.get("job_cards")} cards, pin "{report.get("location_pin")}" — {status}'
         )
 
     lines += ['', '## 2. Search queries', '']
@@ -1056,6 +1209,11 @@ async def do_check_and_record_job(
 ) -> dict:
     def _result(status: str) -> dict:
         _check_status_counts[status] = _check_status_counts.get(status, 0) + 1
+        # Distinct-listing bookkeeping, kept separate from the CALL counts above. Two regions
+        # returning the same 25 cards must not read as 50 listings of coverage -- that is what hid
+        # the dead EU region and what pushed a collapsed query away from the low-yield retry.
+        _distinct_listing_ids.add(f'{site}/{job_id}')
+        _search_ids.setdefault((_current_query or '', _current_region or ''), set()).add(job_id)
         _listing_records[(site, job_id)] = {
             'site': site, 'job_id': job_id, 'company': company, 'title': description,
             'date_posted': date_posted, 'check_status': status,
@@ -1172,13 +1330,75 @@ async def do_queue_candidate(
     return {"content": [{"type": "text", "text": f"Queued: {company} — {title}"}]}
 
 
+async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
+    """Record a whole search's harvested listings in one call, from CODE's copy of the harvest.
+
+    `jobs` never originates in the model. This is the anti-fabrication guarantee: a model asked to
+    relay a payload cannot tell copying from producing, so when it has no data it emits a plausible
+    object instead of failing (measured 2026-08-21: an evaluate result was diverted to a file and
+    the model invented a whole page report). Removing the argument removes the opportunity, which
+    is not something a prompt can do. See the Anti-fabrication requirement in CLAUDE.md.
+
+    Also collapses ~25 per-listing tool calls into one, and enforces
+    SCRAPER_MAX_LISTINGS_PER_SEARCH in code rather than as a prompt suggestion.
+
+    Returns a SHORT summary for the model: counts only, never job data.
+    """
+    usable = [j for j in jobs if isinstance(j, dict) and str(j.get('id') or '').strip()]
+    if (malformed := len(jobs) - len(usable)):
+        logger.warning(f'record_listings: dropped {malformed} harvested entr(ies) with no job id')
+    if not usable:
+        return ('nothing to record: the harvest produced no usable listings. Do NOT describe or '
+                'invent listings — say what you saw and stop.')
+
+    capped = usable[:SCRAPER_MAX_LISTINGS_PER_SEARCH]
+    before_skips = sum(_queue_skipped_counts.values())
+    tally: dict[str, int] = {}
+    queued = 0
+    for job in capped:
+        job_id = str(job.get('id'))
+        status_result = await do_check_and_record_job(
+            'linkedin', job_id, str(job.get('company') or ''), str(job.get('title') or ''),
+            date_posted=str(job.get('posted') or '') or None,
+        )
+        status = status_result['content'][0]['text'].strip()
+        tally[status] = tally.get(status, 0) + 1
+        if status == 'new':
+            await do_queue_candidate(
+                'linkedin', job_id, job_url('linkedin', job_id), str(job.get('title') or ''),
+                str(job.get('company') or ''), str(job.get('location') or ''),
+                date_posted=str(job.get('posted') or '') or None, query=query,
+            )
+            queued += 1
+    skipped = sum(_queue_skipped_counts.values()) - before_skips
+    cap_note = f' (capped from {len(usable)})' if len(usable) > len(capped) else ''
+    parts = ', '.join(f'{count} {status}' for status, count in sorted(tally.items()))
+    logger.info(f'record_listings: {len(capped)}{cap_note} recorded — {parts}; '
+                f'{queued} queued, {skipped} skipped by title')
+    return (f'recorded {len(capped)}{cap_note}: {parts}. {queued} queued, '
+            f'{skipped} skipped by title. Continue with the next search.')
+
+
 # --- Tool wrappers (SDK @tool decorators delegate to the implementations above) ---
 
 @tool(
     "save_job_posting",
     "Save a job posting to the daily saved_jobs directory. Call this for every job evaluated. "
     "Extract the LinkedIn job ID from the URL (e.g. linkedin.com/jobs/view/1234567890/) and pass it as job_id.",
-    {"company": str, "description": str, "rating": int, "content": str, "job_id": str},
+    # Explicit JSON Schema, not the {"name": str} shorthand: that shorthand marks EVERY key
+    # required (claude_agent_sdk/__init__.py:422), and a required job_id makes this tool
+    # uncallable for a posting whose id is not visible — the model either refuses or invents one.
+    {
+        "type": "object",
+        "properties": {
+            "company": {"type": "string"},
+            "description": {"type": "string"},
+            "rating": {"type": "integer"},
+            "content": {"type": "string"},
+            "job_id": {"type": "string", "description": "LinkedIn job id if visible; omit if not"},
+        },
+        "required": ["company", "description", "rating", "content"],
+    },
 )
 async def save_job_posting(args: dict[str, Any]) -> dict:
     return await do_save_job_posting(
@@ -1203,7 +1423,19 @@ async def update_job_requirements(args: dict[str, Any]) -> dict:
     "Returns 'already_processed' (skip it), 'too_old' (skip it), 'already_applied' (skip it), 'auth_required' (skip it — requires current US work authorization), or 'new' (proceed to evaluate). "
     "date_posted is optional — pass whatever is visible (YYYY-MM-DD or relative like '4 days ago'); omit if not shown. "
     "Optionally pass url (the job posting URL) and content (full text of the posting) to persist them in the record.",
-    {"site": str, "job_id": str, "company": str, "description": str, "date_posted": str, "url": str, "content": str},
+    {
+        "type": "object",
+        "properties": {
+            "site": {"type": "string"},
+            "job_id": {"type": "string"},
+            "company": {"type": "string"},
+            "description": {"type": "string"},
+            "date_posted": {"type": "string", "description": "YYYY-MM-DD or relative; omit if not shown"},
+            "url": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "required": ["site", "job_id", "company", "description"],
+    },
 )
 async def check_and_record_job(args: dict[str, Any]) -> dict:
     return await do_check_and_record_job(
@@ -1220,7 +1452,20 @@ async def check_and_record_job(args: dict[str, Any]) -> dict:
     "date_posted is optional — pass it if visible (exact or relative), omit if not shown. "
     "query is optional — pass the search query string that returned this result (e.g. 'Staff ML Engineer'). "
     "Do NOT navigate to the individual job page — a separate agent handles that in stage 2.",
-    {"site": str, "job_id": str, "url": str, "title": str, "company": str, "snippet": str, "date_posted": str, "query": str},
+    {
+        "type": "object",
+        "properties": {
+            "site": {"type": "string"},
+            "job_id": {"type": "string"},
+            "url": {"type": "string"},
+            "title": {"type": "string"},
+            "company": {"type": "string"},
+            "snippet": {"type": "string"},
+            "date_posted": {"type": "string", "description": "exact or relative; omit if not shown"},
+            "query": {"type": "string", "description": "search query that returned this result"},
+        },
+        "required": ["site", "job_id", "url", "title", "company", "snippet"],
+    },
 )
 async def queue_candidate(args: dict[str, Any]) -> dict:
     return await do_queue_candidate(
@@ -1324,11 +1569,231 @@ def make_job_search_server(interactive: bool):
     return create_sdk_mcp_server(name="job_search", version="1.0.0", tools=tools)
 
 
+# --- UI contract -------------------------------------------------------------------------------
+
+
+def _fingerprint_path() -> Path:
+    return RUN_DIR / UI_FINGERPRINT_FILENAME
+
+
+def detect_block_signature(report: dict) -> str:
+    """Return the block phrase found in the page, or '' if none.
+
+    Checked BEFORE any contract judgement, because the two need opposite responses: a moved
+    selector may be retried, a challenge must never be. Pushing through a block is what turns a
+    soft suspicion into a confirmed evasion pattern, and a banned account ends the job search.
+    """
+    haystack = ' '.join(str(report.get(key, '')) for key in ('body_sample', 'result_count_text'))
+    haystack = haystack.lower()
+    for phrase in UI_BLOCK_SIGNATURES:
+        if phrase in haystack:
+            return phrase
+    return ''
+
+
+def evaluate_ui_contract(report: dict) -> list[str]:
+    """Return a list of contract violations; empty means the page looks structurally sound.
+
+    Deliberately code-side. Asking the model 'does this page look right?' is the same discretion
+    that let a dead region and a restructured results list run for days -- it reports, code judges.
+    """
+    violations: list[str] = []
+    for element in UI_CONTRACT_ELEMENTS:
+        if not element['required']:
+            continue
+        name = element['name']
+        value = report.get(name)
+        missing = (value in (None, '', False)) or (isinstance(value, int) and value == 0)
+        if missing:
+            violations.append(f"{name} missing ({element['description']})")
+
+    # Zero cards while the page itself claims results is the specific silent-failure shape:
+    # the harvest returns nothing and the run reports "no new jobs today".
+    count_text = str(report.get('result_count_text', ''))
+    if not report.get('job_cards') and re.search(r'\d', count_text):
+        violations.append(f'0 job cards harvested while the page shows "{count_text.strip()}"')
+    return violations
+
+
+def check_filters_applied(report: dict, region: dict) -> list[str]:
+    """Return reasons the requested filters do NOT look applied.
+
+    This is where the geoId/f_TPR discovery earns its keep. We never NAVIGATE to those parameters
+    -- that is the bot-shaped move -- but once the chips are clicked LinkedIn puts them in the URL
+    itself, so reading them back proves the clicks landed. Before this existed, a location filter
+    that silently did nothing was invisible.
+    """
+    problems: list[str] = []
+    url = str(report.get('url', ''))
+    chips = [str(c).lower() for c in (report.get('chips') or [])]
+    pin = str(report.get('location_pin', '')).strip().lower()
+
+    wanted_location = str(region.get('linkedin_location', '')).strip().lower()
+    if wanted_location:
+        geo_id = str(region.get('geo_id', '')).strip()
+        if geo_id and f'geoId={geo_id}' not in url:
+            problems.append(f'location: geoId={geo_id} absent from the URL')
+        elif not geo_id and wanted_location not in pin:
+            problems.append(f'location: pin reads "{report.get("location_pin", "")}", wanted "{wanted_location}"')
+
+    if f'f_TPR=r{SCRAPER_DATE_POSTED_SECONDS}' not in url and SCRAPER_DATE_POSTED_LABEL.lower() not in chips:
+        problems.append(f'date posted: neither f_TPR=r{SCRAPER_DATE_POSTED_SECONDS} nor a "{SCRAPER_DATE_POSTED_LABEL}" chip')
+
+    # Experience level applies server-side with no URL parameter, so the relabelled chip is the
+    # only evidence available.
+    if SCRAPER_EXPERIENCE_LABEL.lower() not in chips:
+        problems.append(f'experience level: no "{SCRAPER_EXPERIENCE_LABEL}" chip')
+    return problems
+
+
+def check_fingerprint_drift(report: dict) -> str:
+    """Compare the page shape against the last known good one; returns a description or ''.
+
+    Fires even when every required element is still present, so a restructure is noticed the run
+    it happens rather than months later when something finally breaks.
+    """
+    # Structural chips only: the topical suggestions vary per query by design, and including
+    # them made this fire on every single query.
+    observed = sorted({str(c) for c in (report.get('chips') or []) if str(c) in UI_STRUCTURAL_CHIPS})
+    path = _fingerprint_path()
+    previous: list[str] = []
+    if path.exists():
+        try:
+            stored = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+            previous = sorted(str(c) for c in (stored.get('chips') or []))
+        except Exception as ex:
+            logger.warning(f'UI fingerprint at {path} unreadable, treating as absent: {ex}')
+
+    if observed and observed != previous:
+        try:
+            path.write_text(
+                yaml.safe_dump({'chips': observed, 'updated': datetime.now().isoformat()},
+                               allow_unicode=True, sort_keys=False),
+                encoding='utf-8',
+            )
+        except Exception as ex:
+            logger.warning(f'could not write UI fingerprint to {path}: {ex}')
+        if previous:
+            added = [c for c in observed if c not in previous]
+            removed = [c for c in previous if c not in observed]
+            parts = []
+            if added:
+                parts.append(f'new chips {added}')
+            if removed:
+                parts.append(f'chips gone {removed}')
+            return '; '.join(parts) if parts else ''
+    return ''
+
+
+@tool(
+    "report_search",
+    "Report the structural state of one search results page (from the UI-contract evaluate call).",
+    {
+        "query": str,
+        "region": str,
+        "report": dict,
+    },
+)
+async def report_search(args: dict) -> dict:
+    """Record one search and judge whether the page is usable. Judgement lives here, not in the prompt."""
+    query = str(args.get("query") or _current_query or "")
+    region_name = str(args.get("region") or "")
+    report = args.get("report") or {}
+    if not isinstance(report, dict):
+        return {"content": [{"type": "text", "text": "report must be the object returned by the contract evaluate call"}]}
+
+    global _current_region
+    _current_region = region_name
+
+    regions = {str(r.get('name') or r.get('linkedin_location', '')): r for r in preferences.search_regions()}
+    region = regions.get(region_name, {})
+
+    blocked = detect_block_signature(report)
+    violations = [] if blocked else evaluate_ui_contract(report)
+    filter_problems = [] if (blocked or violations) else check_filters_applied(report, region)
+    drift = check_fingerprint_drift(report) if not blocked else ''
+
+    record = {
+        'query': query,
+        'region': region_name,
+        'job_cards': report.get('job_cards'),
+        'location_pin': report.get('location_pin'),
+        'result_count_text': report.get('result_count_text'),
+        'blocked': blocked,
+        'violations': violations,
+        'filter_problems': filter_problems,
+        'drift': drift,
+    }
+    _search_reports.append(record)
+
+    logger.info(
+        f'report_search: query="{query}" region="{region_name}" cards={report.get("job_cards")} '
+        f'pin="{report.get("location_pin")}" blocked={blocked or "no"} '
+        f'violations={len(violations)} filter_problems={len(filter_problems)}'
+    )
+
+    if blocked:
+        _ui_alerts.append({'kind': 'blocked', 'query': query, 'region': region_name, 'detail': blocked})
+        logger.warning(f'Stage 1b BLOCKED on "{query}" / {region_name}: page matched "{blocked}"')
+        return {"content": [{"type": "text", "text":
+            f'BLOCKED: the page matched "{blocked}". Stop this query now. Do NOT retry it, do not '
+            'reload, and do not try to work around it. Say what you saw and move on.'}]}
+
+    if violations:
+        _ui_alerts.append({'kind': 'contract', 'query': query, 'region': region_name,
+                           'detail': '; '.join(violations)})
+        logger.warning(f'Stage 1b UI CONTRACT broken on "{query}" / {region_name}: {"; ".join(violations)}')
+        return {"content": [{"type": "text", "text":
+            'UI CONTRACT FAILED: ' + '; '.join(violations) + '. LinkedIn has changed this page. '
+            'Stop this query and say exactly what you saw. Do not fall back to clicking the '
+            'results list.'}]}
+
+    if drift:
+        _ui_alerts.append({'kind': 'drift', 'query': query, 'region': region_name, 'detail': drift})
+        logger.warning(f'Stage 1b UI drift on "{query}" / {region_name}: {drift}')
+
+    if filter_problems:
+        _ui_alerts.append({'kind': 'filters', 'query': query, 'region': region_name,
+                           'detail': '; '.join(filter_problems)})
+        logger.warning(f'Stage 1b filters not applied on "{query}" / {region_name}: {"; ".join(filter_problems)}')
+        return {"content": [{"type": "text", "text":
+            'FILTERS NOT APPLIED: ' + '; '.join(filter_problems) + '. Re-apply the missing filter '
+            'by clicking its chip, then call report_search again. If a chip is genuinely absent, '
+            'say so and stop this search.'}]}
+
+    return {"content": [{"type": "text", "text": "ok — page looks sound, filters applied; harvest it"}]}
+
+
+def region_overlap_report() -> dict[str, float]:
+    """Jaccard overlap of harvested ids between regions, per query.
+
+    A near-1.0 score means the location filter did nothing. On 2026-08-18 every query would have
+    scored ~1.0 and nothing in the funnel could say so.
+    """
+    by_query: dict[str, list[set[str]]] = {}
+    for (query, _region), ids in _search_ids.items():
+        by_query.setdefault(query, []).append(ids)
+
+    overlaps: dict[str, float] = {}
+    for query, id_sets in by_query.items():
+        if len(id_sets) < 2:
+            continue
+        worst = 0.0
+        for i in range(len(id_sets)):
+            for j in range(i + 1, len(id_sets)):
+                union = id_sets[i] | id_sets[j]
+                if not union:
+                    continue
+                worst = max(worst, len(id_sets[i] & id_sets[j]) / len(union))
+        overlaps[query] = round(worst, 3)
+    return overlaps
+
+
 def make_scraper_server():
     """MCP server for stage 1: collects candidates from search results."""
     return create_sdk_mcp_server(
         name="job_scraper", version="1.0.0",
-        tools=[check_and_record_job, queue_candidate],
+        tools=[check_and_record_job, queue_candidate, report_search],
     )
 
 
