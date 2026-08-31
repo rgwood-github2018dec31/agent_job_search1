@@ -17,6 +17,8 @@ import yaml
 from pathlib import Path
 from typing import Any
 
+from utils_tools_n_agents_common import setup_logging
+
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_OPUS_SAMPLE_SIZE,
@@ -2697,22 +2699,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
 async def main() -> None:
     # Console + persistent per-run file log (triage/hard-rule rejections, extract sizes,
-    # ratings — everything logged via the logging module lands in both).
-    log_dir = RUN_DIR / 'logs'
-    log_dir.mkdir(parents=True, exist_ok=True)
-    run_log_path = log_dir / f'run-{datetime.now().strftime("%Y%b%d-%H%M%S")}.log'
-    logging.basicConfig(
-        level=os.environ.get('LOG_LEVEL', 'INFO'),
-        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-        handlers=[logging.StreamHandler(), logging.FileHandler(run_log_path)],
-    )
-    logging.getLogger('claude_agent_sdk').setLevel(logging.WARNING)
-    # One 'HTTP Request: ...' line per MCP tool call drowns out our own logging; set
-    # HTTP_LOG_LEVEL=INFO to get the transport chatter back when debugging a tool server.
-    http_log_level = os.environ.get('HTTP_LOG_LEVEL', 'WARNING')
-    for noisy_logger_name in ('httpx', 'httpcore', 'mcp.client.streamable_http'):
-        logging.getLogger(noisy_logger_name).setLevel(http_log_level)
-    logger.info(f'Logging to {run_log_path}')
+    # ratings — everything logged via the logging module lands in both). Written to
+    # run_dir/logs/run-<YYYY-MM-DD>_<HHMMSS>.log via the shared logging setup.
+    setup_logging('run', RUN_DIR, level=os.environ.get('LOG_LEVEL', 'INFO'))
     parser = argparse.ArgumentParser(description="Job Search Agent")
     parser.add_argument(
         "--non-interactive", "-n",

@@ -13,6 +13,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "rich" },
+    { name = "utils-tools-n-agents-common" },
 ]
 
 [package.dev-dependencies]
@@ -29,6 +30,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.34" },
     { name = "rich", specifier = ">=15.0" },
+    { name = "utils-tools-n-agents-common", editable = "../utils_tools_n_agents_common" },
 ]
 
 [package.metadata.requires-dev]
@@ -837,6 +839,16 @@ sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
 ]
+
+[[package]]
+name = "utils-tools-n-agents-common"
+version = "0.1.0"
+source = { editable = "../utils_tools_n_agents_common" }
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.0.3" }]
 
 [[package]]
 name = "uvicorn"

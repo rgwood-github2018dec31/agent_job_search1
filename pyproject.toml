@@ -21,7 +21,11 @@ dependencies = [
     "pypdf>=6.16.1",
     "pyyaml>=6.0",
     "rich>=15.0",
+    "utils-tools-n-agents-common",
 ]
+
+[tool.uv.sources]
+utils-tools-n-agents-common = { path = "../utils_tools_n_agents_common", editable = true }
 
 [project.scripts]
 job-search = "agentic_job_search.agent:cli"
