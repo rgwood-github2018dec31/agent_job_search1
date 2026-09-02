@@ -29,6 +29,10 @@ from agentic_job_search.config import (
     MODEL_NAME_HIGH,
     MODEL_NAME_LOW,
     MODEL_NAME_MEDIUM,
+    PLAYWRIGHT_MCP_PACKAGE,
+    PLAYWRIGHT_MCP_REGISTRY_URL,
+    PLAYWRIGHT_MCP_VERSION,
+    PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
     QUERY_PROVIDER,
     RATING_PROVIDER,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
@@ -67,6 +71,7 @@ from agentic_job_search.tools_generic import (
     parse_posting_date,
 )
 from agentic_job_search.triage import (
+    ProviderUnavailableError,
     call_mcp_tool,
     chat_openrouter,
     extract_json_object,
@@ -77,6 +82,7 @@ from agentic_job_search.triage import (
     rate_with_openrouter,
     triage_job_fit,
     triage_rejects,
+    unwrap_exception,
 )
 
 from claude_agent_sdk import (
@@ -1187,6 +1193,24 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'STOPPED EARLY on {alert.get("query", "?")}: {alert.get("detail")}')
         elif kind == 'local_model_missing':
             alerts.append(f'LOCAL TRIAGE DISABLED: {alert.get("detail")}')
+        elif kind == 'playwright_mcp_outdated':
+            alerts.append(f'BROWSER TOOLCHAIN OUTDATED: {alert.get("detail")}')
+
+    # 1b. Queries that failed outright. Deliberately ahead of saturation: saturation is measured
+    #     against DISTINCT listings and is skipped entirely when there are none (`if distinct:`
+    #     below), so the case where something is most obviously wrong -- every query erroring, zero
+    #     listings -- produced no alert at all. On 2026-09-02 all six queries died on an OpenRouter
+    #     402 and audit section 1b still read "No alerts: page structure sound, regions distinct,
+    #     yield acceptable".
+    failed = funnel.get('queries_failed') or {}
+    if failed:
+        total = funnel.get('queries_generated') or len(failed)
+        scope = f'ALL {total}' if len(failed) >= total else f'{len(failed)} of {total}'
+        first_reason = next(iter(failed.values()), '')
+        alerts.append(
+            f'{scope} QUERIES FAILED — no search completed, so 0 listings is not "nothing new '
+            f'today". First error: {str(first_reason)[:300]}'
+        )
 
     # 2. A dead region axis: two regions returning the same jobs is not "the query is exhausted".
     for query, overlap in (funnel.get('region_overlap') or {}).items():
@@ -1209,6 +1233,30 @@ def assess_run_health(funnel: dict) -> list[str]:
                 'returning jobs already processed; the query set or filters likely need widening'
             )
     return alerts
+
+
+def attach_run_health(funnel: dict) -> list[str]:
+    """Assess this run's discovery health, record it on the funnel, and log every alert.
+
+    Called from BOTH exit paths. The zero-candidate path used to return before the main path ran
+    this, so a run where every query errored reported "No alerts: page structure sound, regions
+    distinct, yield acceptable" in audit section 1b and carried no NEEDS ATTENTION block in
+    Telegram (2026-09-02) -- in the one branch where the alerts matter most. An alert that reaches
+    neither the audit log nor the user is the most-repeated bug in this project.
+    """
+    alerts = assess_run_health(funnel)
+    funnel['health_alerts'] = alerts
+    for alert in alerts:
+        logger.warning(f'Run health: {alert}')
+    return alerts
+
+
+def health_alert_block(alerts: list[str]) -> str:
+    """The Telegram/console NEEDS ATTENTION section, or '' when the run was healthy."""
+    if not alerts:
+        return ''
+    alert_lines = '\n'.join(f'  - {a}' for a in alerts)
+    return f'⚠️ NEEDS ATTENTION ({len(alerts)}):\n{alert_lines}'
 
 
 def recent_yield_history(limit: int = 5) -> list[str]:
@@ -1374,10 +1422,27 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
                 "ask for permission — call the tools directly. Do not navigate to individual job "
                 "pages. Stop when you have worked through the searches for this query."
             )
+        except ProviderUnavailableError as ex:
+            # Systemic, not per-query: the provider is refusing every call, so the remaining
+            # queries would each fail identically -- after paying their full human-emulation
+            # pacing delay first. Abort the loop so the caller can fall back to the Anthropic
+            # scraper, which is what the 2026-09-02 run should have done and could not, because
+            # the handler below swallowed the 402 and let run_scraper return normally.
+            logger.error(
+                f'Stage 1b: provider unavailable on query "{query}" ({ex}) — aborting the query '
+                f'loop after {i} of {len(queries)} so the caller can fall back'
+            )
+            # A query the loop never reached must not read as "searched, found nothing" in the
+            # audit log; _queries_searched is what sections 2 and 3 report from.
+            for pending in queries[i - 1:]:
+                tools_module._queries_searched.setdefault(pending, 'error')
+                tools_module._query_errors.setdefault(pending, str(ex))
+            raise
         except Exception as ex:
             # One failed query must not abort the remaining ones.
             logger.warning(f'Stage 1b: query "{query}" failed: {ex}')
             tools_module._queries_searched[query] = 'error'
+            tools_module._query_errors[query] = str(ex)
             continue
 
         # Every configured region must actually be searched, and each search must have been
@@ -2404,9 +2469,102 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
+# Alerts raised before run_non_interactive() starts. It resets tools_module._ui_alerts to [] on
+# entry, so anything appended there during startup would be silently discarded — a health signal
+# that reaches nothing is this project's most-repeated bug, not a new one.
+_startup_ui_alerts: list[dict] = []
+
+
+def _parse_semver(version: str) -> tuple[int, ...] | None:
+    """('0.0.80') -> (0, 0, 80); None for anything not purely numeric dotted parts."""
+    parts = version.strip().split('.')
+    if not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def check_playwright_mcp_version() -> str | None:
+    """Return the published @playwright/mcp version if it is NEWER than the pin, else None.
+
+    Fails open on absolutely everything — offline, timeout, a registry outage, a body that does
+    not parse. This runs before the run lock is taken and before the browser starts, so a network
+    hiccup here must cost a log line, never a run.
+    """
+    try:
+        response = requests.get(
+            PLAYWRIGHT_MCP_REGISTRY_URL, timeout=PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        published = str(response.json()['version'])
+    except Exception as ex:
+        logger.info(
+            f'Could not check for a newer @playwright/mcp than the pinned '
+            f'{PLAYWRIGHT_MCP_VERSION} at {PLAYWRIGHT_MCP_REGISTRY_URL} — continuing on the pin: '
+            f'{type(ex).__name__}: {ex}'
+        )
+        return None
+
+    pinned_parts, published_parts = _parse_semver(PLAYWRIGHT_MCP_VERSION), _parse_semver(published)
+    if pinned_parts is None or published_parts is None:
+        logger.info(
+            f'Cannot compare @playwright/mcp versions (pinned {PLAYWRIGHT_MCP_VERSION!r}, '
+            f'published {published!r}) — continuing on the pin'
+        )
+        return None
+    return published if published_parts > pinned_parts else None
+
+
+def _playwright_upgrade_instructions(published: str) -> str:
+    return (
+        f'  1. npx --yes @playwright/mcp@{published} --version\n'
+        f"  2. set PLAYWRIGHT_MCP_VERSION = '{published}' in src/agentic_job_search/config.py\n"
+        f'  3. re-run and watch one live search — this drives the real LinkedIn account'
+    )
+
+
+def prompt_playwright_mcp_upgrade(interactive: bool) -> None:
+    """Offer the choice BEFORE the run lock, the job load, or npx — so exiting costs nothing.
+
+    Asks ONLY in interactive mode with a real TTY. Both conditions are load-bearing, and gating on
+    the TTY alone was a bug: `-n` is the autonomous mode, run by cron *and* by hand from a terminal,
+    where isatty() is True — so a hand-run `-n` stopped dead on a question, which is precisely the
+    failure this whole mechanism exists to prevent. `-n` means "do not ask me things".
+
+    Anywhere it does not ask, it warns, raises a health alert, and continues on the pin.
+    """
+    published = check_playwright_mcp_version()
+    if not published:
+        return
+
+    detail = f'@playwright/mcp {published} is available; this run uses the pinned {PLAYWRIGHT_MCP_VERSION}'
+    if not interactive or not sys.stdin.isatty():
+        logger.warning(f'{detail}. To upgrade:\n{_playwright_upgrade_instructions(published)}')
+        _startup_ui_alerts.append({
+            'kind': 'playwright_mcp_outdated', 'query': '(all)', 'region': '(all)',
+            'detail': detail})
+        return
+
+    console.print(f'\n[yellow]{detail}.[/yellow]')
+    console.print('[dim]To upgrade:[/dim]')
+    console.print(f'[dim]{_playwright_upgrade_instructions(published)}[/dim]')
+    try:
+        choice = input(
+            f'\n[u] exit so you can upgrade   [c] continue on {PLAYWRIGHT_MCP_VERSION} (default): '
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        # Ctrl-D, Ctrl-C, or a TTY that reports itself interactive but never delivers a line.
+        console.print(f'\n[dim]No answer read — continuing on pinned {PLAYWRIGHT_MCP_VERSION}.[/dim]')
+        logger.warning(f'{detail}; no answer read, continuing on the pin')
+        return
+    if choice.startswith('u'):
+        console.print('\n[bold]Exiting without running.[/bold] Do the three steps above, then re-run.')
+        sys.exit(0)
+    logger.info(f'Continuing on pinned @playwright/mcp {PLAYWRIGHT_MCP_VERSION} ({published} available)')
+
+
 async def start_playwright_server(port: int, browser_mode: str = 'minimized') -> asyncio.subprocess.Process:
     cmd = [
-        'npx', '@playwright/mcp@latest',
+        'npx', '--yes', PLAYWRIGHT_MCP_PACKAGE,
         '--port', str(port),
         '--user-data-dir', str(BROWSER_PROFILE_DIR),
         '--shared-browser-context',
@@ -2425,13 +2583,21 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
     # 'visible': no additional flags
     # @playwright/mcp prints a "Listening on ..." banner + client-config JSON to stdout
     # whenever --port is used; there's no CLI flag or env var to suppress it (checked
-    # `npx @playwright/mcp@latest --help`). Harmless noise — the URL below is what we
+    # `npx --yes <pinned package> --help`). Harmless noise — the URL below is what we
     # actually use, not the banner's copy-paste config.
     proc = await asyncio.create_subprocess_exec(*cmd)
     try:
         console.print(f'[dim]→ GET http://localhost:{port}/mcp (polling until ready)[/dim]')
         for _ in range(30):
             await asyncio.sleep(1)
+            # A dead npx polls exactly like a slow one, so without this a bad pin costs 30s of
+            # silence and then surfaces as a connection error naming neither npx nor the version.
+            if proc.returncode is not None:
+                raise RuntimeError(
+                    f'{PLAYWRIGHT_MCP_PACKAGE} failed to launch: npx exited '
+                    f'{proc.returncode} (its output is above). If that version does not exist or '
+                    f'was yanked, correct PLAYWRIGHT_MCP_VERSION in config.py.'
+                )
             try:
                 requests.get(f'http://localhost:{port}/mcp', timeout=1)
                 break
@@ -2443,6 +2609,44 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
     return proc
 
 
+async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scraping_stats: dict) -> bool:
+    """Run Stage 1b on the configured provider, falling back to the Anthropic scraper on failure.
+
+    Extracted from `run_non_interactive` so the fallback is REACHABLE BY A TEST. It was previously
+    inline, and the bug it hides is not hypothetical: on 2026-09-02 an OpenRouter 402 was swallowed
+    by `run_scraper`'s per-query handler, so this `except` never saw it, `scraped` stayed True, and
+    the Anthropic scraper -- sitting right there, correct, and never called -- did not run. Nothing
+    could have caught that, because nothing could call this code without a live browser.
+
+    Returns True if the OpenRouter path completed, False if the Anthropic fallback ran.
+    """
+    if SCRAPER_PROVIDER == 'openrouter':
+        # Browser tools come from the running Playwright server's own schemas rather than a
+        # hand-transcribed constant, so a server-side change cannot drift silently.
+        try:
+            async with mcp_session(f'http://localhost:{port}/mcp') as browser_call:
+                tool_defs = (scrape_openrouter.browser_tool_defs(await browser_call.list_tools())
+                             + scrape_openrouter.LOCAL_TOOL_DEFS)
+                logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
+                            f'{scrape_openrouter.SCRAPER_OPENROUTER_MODEL}')
+                await run_scraper(
+                    _openrouter_run_pass(browser_call, tool_defs, scraping_stats,
+                                         tools_module._scrape_per_query),
+                    queries, scraping_stats)
+            return True
+        except Exception as ex:
+            # A provider outage must not end the run: fall through to the Anthropic scraper,
+            # exactly as query generation, rating and extraction already do.
+            logger.warning(f'Stage 1b: OpenRouter scraper failed ({unwrap_exception(ex)}) — '
+                           'falling back to the Anthropic scraper')
+            tools_module._ui_alerts.append({
+                'kind': 'provider_fallback', 'query': '(all)', 'region': '(all)',
+                'detail': f'OpenRouter scraper failed, fell back to Anthropic: {unwrap_exception(ex)}'})
+
+    await _run_anthropic_scraper(playwright_mcp, queries, scraping_stats)
+    return False
+
+
 async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0) -> None:
     tools_module._candidates = []
     tools_module._candidates_per_query = {}
@@ -2450,6 +2654,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._check_status_counts = {}
     tools_module._listing_records = {}
     tools_module._queries_searched = {}
+    tools_module._query_errors = {}
     tools_module._check_status_per_query = {}
     tools_module._queue_skipped_counts = {}
     tools_module._current_query = None
@@ -2457,7 +2662,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._distinct_listing_ids = set()
     tools_module._search_ids = {}
     tools_module._search_reports = []
-    tools_module._ui_alerts = []
+    tools_module._ui_alerts = list(_startup_ui_alerts)
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -2500,33 +2705,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         console.print(f"[dim]Queries: {queries}[/dim]\n")
 
         console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
-        scrape_per_query = tools_module._scrape_per_query
-        scraped = False
-        if SCRAPER_PROVIDER == 'openrouter':
-            # Browser tools come from the running Playwright server's own schemas rather than a
-            # hand-transcribed constant, so a server-side change cannot drift silently.
-            try:
-                async with mcp_session(f'http://localhost:{port}/mcp') as browser_call:
-                    tool_defs = (scrape_openrouter.browser_tool_defs(await browser_call.list_tools())
-                                 + scrape_openrouter.LOCAL_TOOL_DEFS)
-                    logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
-                                f'{scrape_openrouter.SCRAPER_OPENROUTER_MODEL}')
-                    await run_scraper(
-                        _openrouter_run_pass(browser_call, tool_defs, stage_stats["scraping"],
-                                             scrape_per_query),
-                        queries, stage_stats["scraping"])
-                scraped = True
-            except Exception as ex:
-                # A provider outage must not end the run: fall through to the Anthropic scraper,
-                # exactly as query generation, rating and extraction already do.
-                logger.warning(f'Stage 1b: OpenRouter scraper failed ({ex}) — '
-                               'falling back to the Anthropic scraper')
-                tools_module._ui_alerts.append({
-                    'kind': 'provider_fallback', 'query': '(all)', 'region': '(all)',
-                    'detail': f'OpenRouter scraper failed, fell back to Anthropic: {ex}'})
-
-        if not scraped:
-            await _run_anthropic_scraper(playwright_mcp, queries, stage_stats["scraping"])
+        await run_stage_1b(port, playwright_mcp, queries, stage_stats["scraping"])
 
         candidates = tools_module._candidates
         candidates_per_query = tools_module._candidates_per_query
@@ -2551,9 +2730,35 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 f"check_status={json.dumps(check_status_counts)}"
             )
             query_lines = "\n".join(f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' for q in queries)
-            await _send_pipeline_notification(
-                f"Job search run FAILED\n• Error: 0 candidates found\n• Queries ({len(queries)}):\n{query_lines}\n• Listings seen: {sum(check_status_counts.values())} {check_status_counts}\n• Elapsed: {elapsed_mins:.1f} min\n• Total cost: ${total_cost:.4f}"
-            )
+            # Health is assessed HERE too, not only on the main path below: this branch returns
+            # before that code, so without this a run whose every query failed reported itself as
+            # healthy in both the audit log and Telegram.
+            zero_funnel = {
+                "queries_generated": len(queries),
+                "listings_seen": sum(check_status_counts.values()),
+                "listings_distinct": _listings_distinct(),
+                "region_overlap": tools_module.region_overlap_report(),
+                "ui_alerts": list(tools_module._ui_alerts),
+                "check_status": check_status_counts,
+                "check_status_per_query": dict(tools_module._check_status_per_query),
+                "queries_failed": dict(tools_module._query_errors),
+                "queue_skipped": dict(tools_module._queue_skipped_counts),
+                "candidates_queued": 0,
+            }
+            health_alerts = attach_run_health(zero_funnel)
+            fail_lines = [
+                "Job search run FAILED",
+                "• Error: 0 candidates found",
+                f"• Queries ({len(queries)}):\n{query_lines}",
+                f"• Listings seen: {sum(check_status_counts.values())} {check_status_counts}",
+                f"• Elapsed: {elapsed_mins:.1f} min",
+                f"• Total cost: ${total_cost:.4f}",
+            ]
+            if block := health_alert_block(health_alerts):
+                fail_lines.insert(1, block)
+                if history := recent_yield_history():
+                    fail_lines.append("• Recent yield:\n" + "\n".join(f"  - {h}" for h in history))
+            await _send_pipeline_notification("\n".join(fail_lines))
             log_run_cost({
                 "timestamp": datetime.now().isoformat(),
                 "mode": "non-interactive",
@@ -2569,17 +2774,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 queries=queries,
                 applied_jobs_in_horizon=len(tools_module._applied_jobs),
                 applied_jobs_total=len(list(tools_module.APPLIED_JOBS_DIR.glob('*.pdf'))),
-                funnel={
-                    "queries_generated": len(queries),
-                    "listings_seen": sum(check_status_counts.values()),
-                    "listings_distinct": _listings_distinct(),
-                    "region_overlap": tools_module.region_overlap_report(),
-                    "ui_alerts": list(tools_module._ui_alerts),
-                    "check_status": check_status_counts,
-                    "check_status_per_query": dict(tools_module._check_status_per_query),
-                    "queue_skipped": dict(tools_module._queue_skipped_counts),
-                    "candidates_queued": 0,
-                },
+                funnel=zero_funnel,
             )
             console.print(f"[dim]Run audit log: {audit_log_path}[/dim]")
             return
@@ -2631,6 +2826,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         "ui_alerts": list(tools_module._ui_alerts),
         "check_status": check_status_counts,
         "check_status_per_query": dict(tools_module._check_status_per_query),
+        "queries_failed": dict(tools_module._query_errors),
         "queue_skipped": dict(tools_module._queue_skipped_counts),
         "candidates_queued": len(candidates),
         "scrape_per_query": dict(tools_module._scrape_per_query),
@@ -2640,10 +2836,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
     # Discovery-health alerts. A run that finds nothing because the page changed, because a region
     # collapsed, or because the pool is exhausted must not look the same as a healthy quiet run.
-    health_alerts = assess_run_health(funnel_summary)
-    funnel_summary['health_alerts'] = health_alerts
-    for alert in health_alerts:
-        logger.warning(f'Run health: {alert}')
+    health_alerts = attach_run_health(funnel_summary)
 
     audit_log_path = tools_module.write_run_audit_log(
         queries=queries,
@@ -2674,11 +2867,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         f"• Cost by stage:\n{stage_cost_lines}",
         f"• Total cost: ${total_cost:.4f}",
     ]
-    if health_alerts:
-        alert_lines = "\n".join(f"  - {a}" for a in health_alerts)
-        history = recent_yield_history()
-        stats_lines.insert(1, f"⚠️ NEEDS ATTENTION ({len(health_alerts)}):\n{alert_lines}")
-        if history:
+    if block := health_alert_block(health_alerts):
+        stats_lines.insert(1, block)
+        if history := recent_yield_history():
             stats_lines.append("• Recent yield:\n" + "\n".join(f"  - {h}" for h in history))
     stats_msg = "\n".join(stats_lines)
     console.print(f"\n[dim]{stats_msg}[/dim]")
@@ -2725,6 +2916,11 @@ async def main() -> None:
         help="Start even if another run holds the run lock (concurrent runs steal each other's jobs)",
     )
     parser.add_argument(
+        "--no-version-check",
+        action="store_true",
+        help="Skip the startup check for a newer @playwright/mcp than the pinned version",
+    )
+    parser.add_argument(
         "--audit-opus",
         nargs="?",
         type=int,
@@ -2747,6 +2943,12 @@ async def main() -> None:
     if args.status:
         console.print(tools_module.describe_run_status())
         return
+
+    # Before the run lock, the processed-job load, and any npx spawn: choosing to upgrade here
+    # costs nothing to unwind. The browser server does not start until run_non_interactive (or,
+    # interactively, until ClaudeSDKClient spawns the stdio server) far below.
+    if not args.no_version_check:
+        prompt_playwright_mcp_upgrade(interactive=interactive)
 
     # Concurrent runs share processed_jobs/ and one browser profile: the first run to see a
     # listing marks it processed, so the second dedups it away and neither evaluates it.
@@ -2786,7 +2988,8 @@ async def main() -> None:
                         "type": "stdio",
                         "command": "npx",
                         "args": [
-                            "@playwright/mcp@latest",
+                            "--yes",
+                            PLAYWRIGHT_MCP_PACKAGE,
                             "--user-data-dir", str(BROWSER_PROFILE_DIR),
                             "--output-dir", str(PLAYWRIGHT_OUTPUT_DIR),
                         ],

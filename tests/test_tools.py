@@ -9,6 +9,7 @@ import re
 from datetime import date, datetime, timedelta
 
 import pytest
+import requests
 import yaml
 from claude_agent_sdk import ResultMessage
 
@@ -2544,6 +2545,288 @@ async def test_run_scraper_survives_a_failing_query(monkeypatch):
     assert 'Bad Query' not in tools._check_status_per_query, 'an errored query records no counts'
 
 
+async def test_stage_1b_falls_back_to_anthropic_when_the_provider_runs_out_of_credit(monkeypatch):
+    """THE test for the 2026-09-02 defect: the fallback must actually be reached.
+
+    Everything else about that run was already covered by a test somewhere. What was not, and
+    could not be while the dispatch was inline in run_non_interactive, is the only question that
+    mattered: when OpenRouter returns 402 for every call, does the Anthropic scraper run? It did
+    not, for the whole life of that code path.
+    """
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_scrape_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_PROVIDER', 'openrouter')
+
+    # The failure must originate INSIDE run_scraper's per-query loop, which is where the real
+    # 402 arrived and where it was swallowed. Raising at the session boundary instead would pass
+    # against the buggy code too, since that `except` always worked -- it was simply never reached.
+    for name in ('_check_status_counts', '_distinct_listing_ids', '_search_ids', '_search_reports',
+                 '_candidates', '_candidates_per_query', '_queries_searched', '_query_errors',
+                 '_check_status_per_query'):
+        monkeypatch.setattr(tools, name, set() if 'ids' in name else {})
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+
+    class _Session:
+        async def __aenter__(self):
+            async def call(*a, **k):
+                return ''
+            async def list_tools():
+                return []
+            call.list_tools = list_tools
+            return call
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(agent, 'mcp_session', lambda url: _Session())
+
+    def failing_run_pass(browser_call, tool_defs, stats, per_query):
+        async def run_pass(instruction):
+            raise triage.ProviderUnavailableError(
+                'OpenRouter chat failed: 402 Client Error: Payment Required for url: x', status=402)
+        return run_pass
+
+    monkeypatch.setattr(agent, '_openrouter_run_pass', failing_run_pass)
+
+    fallback_ran = []
+
+    async def fake_anthropic(playwright_mcp, queries, stats):
+        fallback_ran.append(queries)
+
+    monkeypatch.setattr(agent, '_run_anthropic_scraper', fake_anthropic)
+
+    used_openrouter = await agent.run_stage_1b(
+        1234, {'type': 'http'}, ['Q1', 'Q2'], {'cost': 0.0})
+
+    assert used_openrouter is False
+    assert fallback_ran == [['Q1', 'Q2']], 'the Anthropic scraper must actually run'
+    kinds = [a['kind'] for a in tools._ui_alerts]
+    assert 'provider_fallback' in kinds, 'a silent fallback bills Anthropic prices unnoticed'
+
+
+async def test_stage_1b_reports_the_cause_through_an_exception_group(monkeypatch):
+    """The failure crosses the browser MCP session's task group, so it arrives WRAPPED.
+
+    `str(ExceptionGroup)` is "unhandled errors in a TaskGroup (1 sub-exception)" — logging the
+    exception directly would record none of the 402, which is how a dead triage model stayed
+    invisible for ten days (2026-08-25). The alert must carry the real cause.
+    """
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_scrape_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_PROVIDER', 'openrouter')
+
+    class _BoomGroup:
+        async def __aenter__(self):
+            raise ExceptionGroup('unhandled errors in a TaskGroup', [
+                triage.ProviderUnavailableError('402 Client Error: Payment Required', status=402)])
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(agent, 'mcp_session', lambda url: _BoomGroup())
+
+    async def fake_anthropic(playwright_mcp, queries, stats):
+        pass
+
+    monkeypatch.setattr(agent, '_run_anthropic_scraper', fake_anthropic)
+    await agent.run_stage_1b(1234, {'type': 'http'}, ['Q1'], {'cost': 0.0})
+
+    detail = next(a['detail'] for a in tools._ui_alerts if a['kind'] == 'provider_fallback')
+    assert '402' in detail, 'the wrapped cause must be unwrapped, not swallowed by the group'
+
+
+async def test_stage_1b_does_not_fall_back_when_the_provider_is_healthy(monkeypatch):
+    """The fallback is ~9x more expensive per search; it must not fire on a healthy run."""
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_scrape_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_PROVIDER', 'openrouter')
+
+    class _Ok:
+        async def __aenter__(self):
+            async def call(*a, **k):
+                return ''
+            call.list_tools = lambda: _empty()
+            return call
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def _empty():
+        return []
+
+    monkeypatch.setattr(agent, 'mcp_session', lambda url: _Ok())
+
+    async def fake_run_scraper(run_pass, queries, stats):
+        return None
+
+    fallback_ran = []
+
+    async def fake_anthropic(playwright_mcp, queries, stats):
+        fallback_ran.append(queries)
+
+    monkeypatch.setattr(agent, 'run_scraper', fake_run_scraper)
+    monkeypatch.setattr(agent, '_run_anthropic_scraper', fake_anthropic)
+
+    assert await agent.run_stage_1b(1234, {'type': 'http'}, ['Q1'], {'cost': 0.0}) is True
+    assert fallback_ran == [], 'a healthy OpenRouter run must never pay Anthropic prices'
+    assert not tools._ui_alerts
+
+
+async def test_run_scraper_aborts_the_whole_loop_on_a_provider_failure(monkeypatch):
+    """A 402 breaks EVERY query, so the loop must abort and let the caller fall back.
+
+    Regression for 2026-09-02: OpenRouter ran out of credit mid-run, the per-query handler
+    swallowed all six 402s, run_scraper returned normally, `scraped = True` was set, and the
+    Anthropic fallback that exists precisely for this never fired. The run reported 0 jobs.
+    """
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_query_errors', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+
+    attempted = []
+
+    async def run_pass(instruction):
+        attempted.append(instruction)
+        raise triage.ProviderUnavailableError(
+            'OpenRouter chat failed: 402 Client Error: Payment Required for url: x', status=402)
+
+    queries = ['Q1', 'Q2', 'Q3']
+    with pytest.raises(triage.ProviderUnavailableError):
+        await agent.run_scraper(run_pass, queries, {'cost': 0.0})
+
+    assert len(attempted) == 1, 'the remaining queries must not each burn a doomed request'
+    # Every query must read as failed, including the ones the loop never reached: a query that
+    # never ran must not be reported as "searched, found nothing" in audit sections 2 and 3.
+    assert [tools._queries_searched.get(q) for q in queries] == ['error'] * 3
+    assert '402' in tools._query_errors['Q3'], 'the cause must be carried, not just the fact'
+
+
+async def test_run_scraper_still_survives_a_single_query_failure(monkeypatch):
+    """The abort above must not regress per-query resilience: a one-off failure still continues."""
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_query_errors', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+
+    attempted = []
+
+    async def run_pass(instruction):
+        attempted.append(instruction)
+        raise RuntimeError('page did not load')
+
+    await agent.run_scraper(run_pass, ['Q1', 'Q2', 'Q3'], {'cost': 0.0})
+
+    assert len(attempted) == 3, 'a one-off failure must not abort the remaining queries'
+    assert tools._query_errors['Q2'] == 'page did not load'
+
+
+@pytest.mark.parametrize('status,expected', [
+    (402, triage.ProviderUnavailableError),
+    (401, triage.ProviderUnavailableError),
+    (403, triage.ProviderUnavailableError),
+    (429, triage.ProviderUnavailableError),
+    (500, RuntimeError),
+    (404, RuntimeError),
+])
+def test_provider_error_classifies_on_status_not_reason_phrase(status, expected):
+    """Match the STATUS: the reason phrase is upstream's text and can change without notice."""
+    err = triage.provider_error(
+        'OpenRouter chat failed',
+        f'{status} Client Error: Some Upstream Wording for url: https://openrouter.ai/api/v1/x')
+    assert type(err) is expected
+    if expected is triage.ProviderUnavailableError:
+        assert err.status == status
+
+
+def test_provider_error_reads_a_status_out_of_a_json_body():
+    err = triage.provider_error('OpenRouter chat failed', '{"error": {"code": 402, "message": "x"}}')
+    assert isinstance(err, triage.ProviderUnavailableError)
+
+
+def test_provider_error_without_any_status_is_not_systemic():
+    """No status named means no evidence the PROVIDER is down - do not abort the whole run."""
+    err = triage.provider_error('OpenRouter chat failed', 'connection reset by peer')
+    assert type(err) is RuntimeError
+
+
+def test_assess_run_health_alerts_when_every_query_failed():
+    """The exact funnel of the 2026-09-02 run, which returned no alerts at all.
+
+    Saturation is guarded by `if distinct:`, so zero listings skipped every existing check and
+    the audit log printed "No alerts: page structure sound, regions distinct, yield acceptable"
+    while all six queries had died on a 402.
+    """
+    alerts = agent.assess_run_health({
+        'queries_generated': 6,
+        'listings_seen': 0,
+        'listings_distinct': 0,
+        'region_overlap': {},
+        'ui_alerts': [],
+        'check_status': {},
+        'queries_failed': {f'Q{i}': '402 Client Error: Payment Required' for i in range(1, 7)},
+    })
+    assert alerts, 'a run where every query failed must never report as healthy'
+    joined = ' '.join(alerts)
+    assert 'ALL 6' in joined
+    assert '402' in joined, 'the alert must name the cause, which previously reached only the run log'
+
+
+def test_assess_run_health_reports_a_partial_query_failure():
+    alerts = agent.assess_run_health({
+        'queries_generated': 6, 'listings_distinct': 0,
+        'queries_failed': {'Q1': 'boom', 'Q2': 'boom'},
+    })
+    assert any('2 of 6' in a for a in alerts)
+
+
+def test_assess_run_health_stays_quiet_when_no_query_failed():
+    assert agent.assess_run_health({'queries_generated': 6, 'queries_failed': {}}) == []
+
+
+def test_attach_run_health_records_alerts_on_the_funnel():
+    """Both exit paths go through this, so the zero-candidate branch cannot skip assessment."""
+    funnel = {'queries_generated': 2, 'queries_failed': {'Q1': 'boom', 'Q2': 'boom'}}
+    alerts = agent.attach_run_health(funnel)
+    assert alerts and funnel['health_alerts'] == alerts
+
+
+def test_audit_log_does_not_claim_no_alerts_when_queries_failed(tmp_path, monkeypatch):
+    """Audit section 1b must name the failure instead of declaring the page structure sound."""
+    monkeypatch.setattr(tools, '_queries_searched', {'Q1': 'error'})
+    monkeypatch.setattr(tools, '_query_errors', {'Q1': '402 Client Error: Payment Required'})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(tools, '_listing_records', {})
+    monkeypatch.setattr(tools, '_search_reports', [])
+
+    funnel = {'queries_generated': 1, 'listings_distinct': 0,
+              'queries_failed': {'Q1': '402 Client Error: Payment Required'}}
+    agent.attach_run_health(funnel)
+    path = tools.write_run_audit_log(
+        queries=['Q1'], applied_jobs_in_horizon=0, applied_jobs_total=0, funnel=funnel,
+        run_dir=tmp_path)
+
+    body = Path(path).read_text(encoding='utf-8')
+    assert 'No alerts' not in body
+    assert '402' in body, 'the audit log must carry the cause of the failure'
+
+
 # ---------------------------------------------------------------------------
 # run lock: concurrent-run detection
 # ---------------------------------------------------------------------------
@@ -3982,6 +4265,313 @@ def test_report_query_matching_tolerates_the_full_search_text():
 
 
 # ---------------------------------------------------------------------------
+# @playwright/mcp version pin
+# ---------------------------------------------------------------------------
+
+def test_playwright_mcp_version_is_concrete():
+    """`@latest` is resolved by npm on EVERY run. npx had cached `^0.0.79` under the key
+    `@playwright/mcp@latest`; upstream published 0.0.80, the cached tree stopped satisfying
+    `latest`, and npx halted the run at an interactive `Ok to proceed? (y)` -- on the startup path
+    cron uses. The prompt was the symptom; the real defect is that the tool surface the scraper
+    drives a real logged-in LinkedIn account through could change with no commit."""
+    assert re.fullmatch(r'\d+\.\d+\.\d+', config.PLAYWRIGHT_MCP_VERSION), (
+        f'PLAYWRIGHT_MCP_VERSION must be a concrete version, got '
+        f'{config.PLAYWRIGHT_MCP_VERSION!r}'
+    )
+    assert config.PLAYWRIGHT_MCP_PACKAGE == f'@playwright/mcp@{config.PLAYWRIGHT_MCP_VERSION}'
+
+
+def test_playwright_mcp_is_pinned_at_every_launch_site():
+    """The static guard, in the shape of test_every_claude_agent_options_site_limits_context: the
+    fix was applied at two launch sites, and prose cannot stop a third from being added with
+    `@latest`. Every literal naming the package must carry a concrete version."""
+    source_dir = Path(agent.__file__).parent
+    offenders = []
+    for path in sorted(p for p in source_dir.rglob('*.py')
+                       if '__pycache__' not in p.parts):
+        for lineno, line in enumerate(path.read_text(encoding='utf-8').splitlines(), start=1):
+            if line.lstrip().startswith('#'):
+                continue  # prose about the bug, not a launch argument
+            for match in re.finditer(r'@playwright/mcp@([\w.{\-]*)', line):
+                spec = match.group(1)
+                # '{' is an f-string interpolating a version this file pins as concrete above.
+                if spec.startswith('{') or re.fullmatch(r'\d+\.\d+\.\d+', spec):
+                    continue
+                offenders.append(f'{path.relative_to(source_dir)}:{lineno} @playwright/mcp@{spec or "<empty>"}')
+    assert not offenders, (
+        'unpinned @playwright/mcp reference(s) -- use config.PLAYWRIGHT_MCP_PACKAGE:\n'
+        + '\n'.join(offenders)
+    )
+
+
+def _npx_launch_sites(tree):
+    """Yield (lineno, argument nodes) for every npx invocation in a parsed module.
+
+    Two shapes exist in this package:
+        ['npx', '--yes', PLAYWRIGHT_MCP_PACKAGE, '--port', ...]        -> a list literal
+        {"command": "npx", "args": ["--yes", PLAYWRIGHT_MCP_PACKAGE]}  -> a stdio server dict
+    """
+    import ast
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.List) and any(
+                isinstance(e, ast.Constant) and e.value == 'npx' for e in node.elts):
+            yield node.lineno, node.elts
+        elif isinstance(node, ast.Dict):
+            pairs = {k.value: v for k, v in zip(node.keys, node.values)
+                     if isinstance(k, ast.Constant)}
+            command, args = pairs.get('command'), pairs.get('args')
+            if (isinstance(command, ast.Constant) and command.value == 'npx'
+                    and isinstance(args, ast.List)):
+                yield node.lineno, args.elts
+
+
+def test_every_npx_launch_passes_yes_and_the_pin():
+    """--yes is what stops npx blocking on a cold cache (new machine, cleared cache, or straight
+    after a deliberate bump), and it is only safe BECAUSE the version is exact: it can install
+    nothing but the pin. So both must hold at EVERY launch site.
+
+    Checked structurally rather than by regex. The previous version searched for
+    `"npx",.*?"--yes", PLAYWRIGHT_MCP_PACKAGE` with re.S, and the lazy `.*?` spans any distance --
+    measured, a third launch site with no --yes still passed, because the regex paired its bare
+    `"npx",` with the EXISTING site's `--yes` further down the file. A guard that assumes exactly
+    the sites present when it was written is the failure this repo already has a scar from
+    (agent.py fixed 2026-08-21, the four tools_generic.py sites missed for three months).
+
+    Package-wide for the same reason, not just agent.py.
+    """
+    import ast
+
+    source_dir = Path(agent.__file__).parent
+    offenders = []
+    sites = 0
+
+    for path in sorted(p for p in source_dir.rglob('*.py')
+                       if '__pycache__' not in p.parts):
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        for lineno, elements in _npx_launch_sites(tree):
+            sites += 1
+            has_yes = any(isinstance(e, ast.Constant) and e.value == '--yes' for e in elements)
+            has_pin = any(isinstance(e, ast.Name) and e.id == 'PLAYWRIGHT_MCP_PACKAGE'
+                          for e in elements)
+            if not (has_yes and has_pin):
+                missing = [n for n, ok in (('--yes', has_yes),
+                                           ('PLAYWRIGHT_MCP_PACKAGE', has_pin)) if not ok]
+                offenders.append(f'{path.relative_to(source_dir)}:{lineno} missing {missing}')
+
+    # Without this, a walk that matches nothing compares an empty list and passes forever.
+    assert sites >= 2, f'expected to find the known npx launch sites, found {sites}'
+    assert not offenders, (
+        'npx launch site(s) that can block on a cold cache or drift off the pin:\n'
+        + '\n'.join(offenders)
+    )
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def test_check_playwright_mcp_version_reports_newer(monkeypatch):
+    monkeypatch.setattr(agent, 'PLAYWRIGHT_MCP_VERSION', '0.0.79')
+    monkeypatch.setattr(agent.requests, 'get', lambda *a, **kw: _FakeResponse({'version': '0.0.80'}))
+    assert agent.check_playwright_mcp_version() == '0.0.80'
+
+
+@pytest.mark.parametrize('published', ['0.0.79', '0.0.78', '0.0.9'])
+def test_check_playwright_mcp_version_silent_when_not_newer(monkeypatch, published):
+    """0.0.9 is the ordering case a string comparison gets wrong: '0.0.9' > '0.0.79' lexically."""
+    monkeypatch.setattr(agent, 'PLAYWRIGHT_MCP_VERSION', '0.0.79')
+    monkeypatch.setattr(agent.requests, 'get', lambda *a, **kw: _FakeResponse({'version': published}))
+    assert agent.check_playwright_mcp_version() is None
+
+
+@pytest.mark.parametrize('failure', [
+    ConnectionError('offline'),
+    TimeoutError('registry timed out'),
+])
+def test_check_playwright_mcp_version_fails_open_on_network_error(monkeypatch, failure):
+    """This runs before the run lock and before the browser starts. A registry outage must cost a
+    log line, never a run."""
+    def boom(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(agent.requests, 'get', boom)
+    assert agent.check_playwright_mcp_version() is None
+
+
+@pytest.mark.parametrize('payload', [
+    {},                                  # no 'version' key
+    {'version': 'latest'},               # not comparable
+    ValueError('not json'),              # malformed body
+])
+def test_check_playwright_mcp_version_fails_open_on_bad_payload(monkeypatch, payload):
+    monkeypatch.setattr(agent.requests, 'get', lambda *a, **kw: _FakeResponse(payload))
+    assert agent.check_playwright_mcp_version() is None
+
+
+def test_upgrade_prompt_never_blocks_without_a_tty(monkeypatch):
+    """The whole point. cron has nobody to answer, so an available upgrade warns and continues --
+    it must not read stdin, which is precisely what `@latest` did via npx."""
+    monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
+    monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: False)
+    monkeypatch.setattr(agent, '_startup_ui_alerts', [])
+
+    def no_input(*args, **kwargs):
+        raise AssertionError('prompted for input with no TTY attached')
+
+    monkeypatch.setattr('builtins.input', no_input)
+    agent.prompt_playwright_mcp_upgrade(interactive=True)
+
+    kinds = [alert['kind'] for alert in agent._startup_ui_alerts]
+    assert kinds == ['playwright_mcp_outdated']
+    assert '0.0.80' in agent._startup_ui_alerts[0]['detail']
+
+
+def test_upgrade_prompt_never_prompts_in_non_interactive_mode(monkeypatch):
+    """`-n` is the autonomous mode -- cron runs it, and so does a person at a terminal, where
+    isatty() is True. Gating on the TTY alone meant a hand-run `-n` stopped dead on a question,
+    which is the exact failure this mechanism exists to prevent. `-n` means do not ask."""
+    monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
+    monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)   # a real terminal
+    monkeypatch.setattr(agent, '_startup_ui_alerts', [])
+
+    def no_input(*args, **kwargs):
+        raise AssertionError('prompted in non-interactive mode')
+
+    monkeypatch.setattr('builtins.input', no_input)
+    agent.prompt_playwright_mcp_upgrade(interactive=False)
+
+    assert [a['kind'] for a in agent._startup_ui_alerts] == ['playwright_mcp_outdated']
+
+
+@pytest.mark.parametrize('failure', [EOFError, KeyboardInterrupt])
+def test_upgrade_prompt_survives_stdin_ending(monkeypatch, failure):
+    """Ctrl-D or Ctrl-C at the question must continue on the pin, not traceback out of startup."""
+    monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
+    monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)
+
+    def boom(*args, **kwargs):
+        raise failure()
+
+    monkeypatch.setattr('builtins.input', boom)
+    agent.prompt_playwright_mcp_upgrade(interactive=True)   # returns normally
+
+
+def test_upgrade_prompt_exits_when_user_chooses_update(monkeypatch):
+    monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
+    monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr('builtins.input', lambda *a, **kw: 'u')
+    with pytest.raises(SystemExit) as excinfo:
+        agent.prompt_playwright_mcp_upgrade(interactive=True)
+    assert excinfo.value.code == 0
+
+
+@pytest.mark.parametrize('answer', ['', 'c', 'continue'])
+def test_upgrade_prompt_continues_on_anything_else(monkeypatch, answer):
+    monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
+    monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr('builtins.input', lambda *a, **kw: answer)
+    agent.prompt_playwright_mcp_upgrade(interactive=True)  # returns normally; runs on the pin
+
+
+def test_upgrade_prompt_is_silent_when_pin_is_current(monkeypatch):
+    """No newer version means no prompt, no alert, and no stdin read even on a TTY."""
+    monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: None)
+    monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(agent, '_startup_ui_alerts', [])
+
+    def no_input(*args, **kwargs):
+        raise AssertionError('prompted when the pin is already current')
+
+    monkeypatch.setattr('builtins.input', no_input)
+    agent.prompt_playwright_mcp_upgrade(interactive=True)
+    assert agent._startup_ui_alerts == []
+
+
+def test_playwright_outdated_reaches_run_health():
+    """An alert nobody surfaces is this project's most-repeated bug, so pin the path into
+    assess_run_health -> run log, audit 1b, and the Telegram NEEDS ATTENTION block."""
+    alerts = agent.assess_run_health({'ui_alerts': [{
+        'kind': 'playwright_mcp_outdated', 'query': '(all)', 'region': '(all)',
+        'detail': '@playwright/mcp 0.0.80 is available; this run uses the pinned 0.0.79'}]})
+    assert any('BROWSER TOOLCHAIN OUTDATED' in alert for alert in alerts)
+    assert any('0.0.80' in alert for alert in alerts)
+
+
+@pytest.mark.network
+def test_npm_registry_still_reports_a_semver_version():
+    """Does the real registry still return what check_playwright_mcp_version() parses?
+
+    Deliberately does the fetch itself instead of calling check_playwright_mcp_version(). That
+    function fails open and returns None on ANY error, so an assertion written around it
+    (`assert published is None or ...`) is a tautology: green whether the registry answers, is
+    unreachable, drops the `version` key, or changes shape entirely. Measured -- it passed with the
+    URL pointed at an unroutable host. An assert that can never fail is the same defect as a skip
+    that can never pass. The wrapper's own logic is covered by the mocked tests above.
+
+    Marked `network`, not `live`: `live` means the LLM MCP tool servers on :8002/:8006 (see
+    pyproject.toml), which this needs no part of. Self-skips on a connection error, following the
+    convention _require_llm_server established -- offline is the one outcome that must not fail.
+    """
+    try:
+        response = requests.get(config.PLAYWRIGHT_MCP_REGISTRY_URL, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as ex:
+        pytest.skip(f'npm registry unreachable: {type(ex).__name__}: {ex}')
+
+    published = response.json()['version']    # KeyError here is a real failure, not a skip
+    assert re.fullmatch(r'\d+\.\d+\.\d+', published), (
+        f'the registry returned {published!r}, which is not plain semver -- '
+        'check_playwright_mcp_version() cannot compare it'
+    )
+    assert agent._parse_semver(published) is not None, (
+        f'_parse_semver rejects what the registry actually publishes ({published!r})'
+    )
+
+
+@pytest.mark.network
+def test_pinned_playwright_mcp_version_exists_in_the_registry():
+    """Does the version we pin actually EXIST? Nothing else asks.
+
+    Every other guard checks the pin's SHAPE -- concrete semver, no `@latest`, present at each
+    launch site with --yes. A typo'd or yanked version satisfies all of them: measured, a pin of
+    '0.0.97' passes the entire suite, then every run dies at `npx` with "No matching version
+    found". Worse, the typo silences its own alarm -- check_playwright_mcp_version() sees
+    0.0.97 > 0.0.80 and reports no upgrade available, so startup says nothing either.
+
+    Kept separate from test_npm_registry_still_reports_a_semver_version deliberately: "the pin does
+    not exist" is fixed in config.py, "the latest response is not semver" means npm changed its
+    API. Folding them together would report both as the same red.
+    """
+    url = config.PLAYWRIGHT_MCP_REGISTRY_URL.rsplit('/', 1)[0] + f'/{config.PLAYWRIGHT_MCP_VERSION}'
+    try:
+        response = requests.get(url, timeout=10)
+    except requests.exceptions.RequestException as ex:
+        pytest.skip(f'npm registry unreachable: {type(ex).__name__}: {ex}')
+
+    if response.status_code == 404:
+        pytest.fail(
+            f'PLAYWRIGHT_MCP_VERSION = {config.PLAYWRIGHT_MCP_VERSION!r} does not exist in the '
+            f'registry (404 at {url}) -- it is a typo, or the release was yanked. Every run will '
+            'fail at npx with "No matching version found". Fix the constant in config.py.'
+        )
+    # Anything else non-200 is a registry problem, NOT a bad pin -- do not conflate them.
+    assert response.status_code == 200, (
+        f'unexpected {response.status_code} from {url}; this looks like a registry fault rather '
+        f'than a bad pin, so PLAYWRIGHT_MCP_VERSION was not verified this run'
+    )
+
+
+# ---------------------------------------------------------------------------
 # mcp version guard
 # ---------------------------------------------------------------------------
 
@@ -4333,7 +4923,8 @@ def test_every_claude_agent_options_site_limits_context():
     offenders = []
     sites = 0
 
-    for path in sorted(source_dir.glob('*.py')):
+    for path in sorted(p for p in source_dir.rglob('*.py')
+                       if '__pycache__' not in p.parts):
         tree = ast.parse(path.read_text(encoding='utf-8'))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -4344,7 +4935,7 @@ def test_every_claude_agent_options_site_limits_context():
             sites += 1
             passed = {kw.arg for kw in node.keywords if kw.arg}
             if missing := (required - passed):
-                offenders.append(f'{path.name}:{node.lineno} missing {sorted(missing)}')
+                offenders.append(f'{path.relative_to(source_dir)}:{node.lineno} missing {sorted(missing)}')
 
     assert sites >= 12, f'expected to find the known option sites, found {sites}'
     assert not offenders, 'ClaudeAgentOptions sites that leak context:\n' + '\n'.join(offenders)
@@ -4660,3 +5251,62 @@ async def test_duplicate_listing_line_makes_no_region_claim(monkeypatch, caplog)
         assert 'more than one region' not in line, (
             f'the line must not attribute duplicates to regions: {line}'
         )
+# ---------------------------------------------------------------------------
+# Tracked-source guard: a module on disk but not in git breaks every other machine
+# ---------------------------------------------------------------------------
+
+# Directories holding Python this repo must be able to import on a fresh clone. Flat globs, to
+# match test_every_claude_agent_options_site_limits_context rather than invent a second convention.
+_PY_SOURCE_DIRS = ('src/agentic_job_search', 'tests', 'scripts', '.')
+
+
+def _git(repo_root, *args):
+    import subprocess
+    return subprocess.run(['git', *args], cwd=repo_root, capture_output=True, text=True)
+
+
+def test_every_python_module_is_tracked_by_git():
+    """`scrape_openrouter.py` sat on disk untracked for months while agent.py imported it, so a
+    clean clone of master died at `ImportError: cannot import name 'scrape_openrouter'` -- the
+    agent could not start and this suite could not even collect. Locally everything passed the
+    whole time, because locally the file is there. Same shape as the context-leak guard above:
+    process did not catch it, so a test has to.
+
+    Compared against the INDEX (`git ls-files`), not HEAD. HEAD is stricter and would also have
+    caught this, but it fires on every legitimately new file until it is committed -- i.e. on the
+    normal workflow -- and a check that fires on success is one people learn to ignore. `git add`
+    is the act being policed here; committing is not.
+
+    An ignored file is caught by the same check, since `git ls-files` omits those too.
+    """
+    repo_root = Path(agent.__file__).parent.parent.parent
+    if _git(repo_root, 'rev-parse', '--is-inside-work-tree').returncode != 0:
+        pytest.skip(f'{repo_root} is not a git work tree (installed package or source tarball)')
+
+    listed = _git(repo_root, 'ls-files', '--', '*.py')
+    assert listed.returncode == 0, f'git ls-files failed: {listed.stderr.strip()}'
+    tracked = {repo_root / line for line in listed.stdout.split()}
+
+    on_disk = set()
+    for directory in _PY_SOURCE_DIRS:
+        # Recursive for the source trees, so a whole nested subpackage cannot slip through the
+        # way scrape_openrouter.py did as a single file. The repo root stays SHALLOW on purpose:
+        # rglob from there descends into .venv/, run_dir/ and .uv-cache/, none of them tracked.
+        found = ((repo_root / directory).glob('*.py') if directory == '.'
+                 else (repo_root / directory).rglob('*.py'))
+        on_disk |= {p for p in found if '__pycache__' not in p.parts}
+
+    # Without this, a wrong cwd or a typo'd directory compares two empty sets and passes forever.
+    package_modules = [p for p in on_disk if p.parent.name == 'agentic_job_search']
+    assert len(package_modules) >= 8, (
+        f'expected to find the package modules, found {len(package_modules)} in {repo_root} -- '
+        'this guard is not looking where it thinks it is'
+    )
+
+    untracked = sorted(str(p.relative_to(repo_root)) for p in on_disk - tracked)
+    assert not untracked, (
+        'Python file(s) on disk but not tracked by git. A fresh clone will not have them, so any '
+        'module importing one fails at import:\n'
+        f'  git add {" ".join(untracked)}\n'
+        '(a .gitignore rule matching a source file looks identical here -- check that too)'
+    )

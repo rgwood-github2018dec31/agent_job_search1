@@ -256,3 +256,28 @@ TRIAGE_ENABLED = True
 TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (clear low fits)
 REFERENCE_SUMMARY_MAX_CHARS = 2500
 LLM_JSON_MAX_TOKENS = 3000  # both default models spend tokens on reasoning before the JSON answer
+
+# Browser toolchain (@playwright/mcp) — PINNED, never '@latest'.
+#
+# Both launch sites used `npx @playwright/mcp@latest`, re-resolved by npm on every run. npx had
+# cached `@playwright/mcp: "^0.0.79"` under the key `@playwright/mcp@latest`, and `^0.0.79` on a
+# 0.0.x version means EXACTLY 0.0.79 — so when upstream published 0.0.80 the cached tree stopped
+# satisfying `latest` and npx halted the run at an interactive `Ok to proceed? (y)`. That is the
+# startup path cron uses, where nothing can answer.
+#
+# The prompt was the symptom; the silent upgrade is the defect. This package is the tool surface
+# the Stage 1b scraper drives a REAL logged-in LinkedIn account through, and the --snapshot-mode
+# analysis in CLAUDE.md is verified against one specific bundle. `@latest` could invalidate that
+# with no commit — the same shape as the `mcp>=1.29` -> 2.0.0 re-resolution in Known diagnoses.
+#
+# Upgrading is therefore a reviewable edit to this constant, prompted for by
+# check_playwright_mcp_version() rather than taken automatically.
+PLAYWRIGHT_MCP_VERSION = '0.0.79'
+PLAYWRIGHT_MCP_PACKAGE = f'@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}'
+# Queried directly over HTTPS rather than via `npm view`, which shells out through the npm cache
+# and can fail for reasons unrelated to the registry (a root-owned cache file, for one).
+PLAYWRIGHT_MCP_REGISTRY_URL = 'https://registry.npmjs.org/@playwright/mcp/latest'
+# Applied by requests to the connect AND the read separately, so this is a ~6s ceiling, not
+# a 3s one; DNS resolution is bounded by neither. The measured cost against a healthy
+# registry is ~0.25s. The call fails open, so a slow registry delays a run, never fails it.
+PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS = 3

@@ -9,6 +9,7 @@ callers treat that as a provider failure (fall through / fail open).
 
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from mcp.client.session import ClientSession
@@ -24,6 +25,56 @@ from agentic_job_search.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+PROVIDER_UNAVAILABLE_STATUSES = frozenset({401, 402, 403, 429})
+
+# `requests` renders a raised-for status as "402 Client Error: Payment Required for url: ...";
+# the OpenRouter body itself carries {"error": {"code": 402, ...}}. Both are matched, and the
+# match is on the STATUS, never on the reason phrase -- the phrase is upstream's text and can
+# change without notice, while the code is the contract.
+_HTTP_STATUS_RE = re.compile(r'\b(\d{3})\s+(?:Client|Server)\s+Error\b')
+_JSON_STATUS_RE = re.compile(r'"(?:code|status|status_code)"\s*:\s*(\d{3})\b')
+
+
+class ProviderUnavailableError(RuntimeError):
+    """The remote LLM provider itself is refusing every call - unpaid, unauthorised, or throttled.
+
+    Distinct from a one-off failure, and the distinction decides control flow. A page that would
+    not load breaks ONE query and the next should still run; a 402 breaks EVERY query, so retrying
+    per query burns the remaining requests and their human-emulation pacing delays on calls that
+    cannot succeed, then reports "0 jobs" as though the searches had simply found nothing. That is
+    exactly what happened on 2026-09-02: six queries, six 402s, ~70s of pacing between them, and
+    the Anthropic fallback -- which exists precisely for this -- never fired, because `run_scraper`
+    swallowed each failure and returned normally.
+
+    Same shape as `AgentApiError` in tools_generic (2026-08-24): a systemic API-level fault must
+    abort the loop, while a per-item fault warns and continues.
+    """
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+def http_status_of(error_text: str) -> int | None:
+    """The HTTP status named in a provider error string, or None if it names none."""
+    for pattern in (_HTTP_STATUS_RE, _JSON_STATUS_RE):
+        if match := pattern.search(error_text):
+            return int(match.group(1))
+    return None
+
+
+def provider_error(context: str, error_text: str) -> RuntimeError:
+    """Classify an OpenRouter MCP failure as systemic (provider) or one-off.
+
+    Returns the exception rather than raising it, so call sites keep their `raise` visible.
+    """
+    status = http_status_of(error_text)
+    message = f'{context}: {error_text}'
+    if status in PROVIDER_UNAVAILABLE_STATUSES:
+        return ProviderUnavailableError(message, status=status)
+    return RuntimeError(message)
 
 
 class LocalModelMissingError(RuntimeError):
@@ -130,8 +181,10 @@ async def chat_openrouter(
         {'messages': messages, 'model': model, 'max_tokens': max_tokens},
     )
     data = json.loads(raw)
-    if not data.get('ok') or not data.get('content'):
-        raise RuntimeError(f'OpenRouter chat failed or returned empty content: {raw[:300]}')
+    if not data.get('ok'):
+        raise provider_error('OpenRouter chat failed', str(data.get('error') or raw[:300]))
+    if not data.get('content'):
+        raise RuntimeError(f'OpenRouter chat returned empty content: {raw[:300]}')
     return data['content'], float(data.get('cost_usd') or 0.0)
 
 

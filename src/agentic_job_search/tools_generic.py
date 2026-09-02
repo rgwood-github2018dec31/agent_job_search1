@@ -84,6 +84,11 @@ _check_status_counts: dict[str, int] = {}  # status -> count (new/already_proces
 _listing_records: dict[tuple[str, str], dict] = {}
 # query -> listings inspected, so "never searched" is distinguishable from "searched, found nothing"
 _queries_searched: dict[str, Any] = {}
+# query -> why it failed. Kept separate from the 'error' sentinel in _queries_searched, which the
+# audit log renders as **FAILED** and which must stay a bare sentinel. Without this the CAUSE of a
+# failed query reached the run log and nothing else: on 2026-09-02 six queries died on a 402 and
+# neither the audit log nor the Telegram summary carried a single byte of the reason.
+_query_errors: dict[str, str] = {}
 # query -> {status: count}: per-query breakdown of check_and_record_job outcomes, so a
 # dedup-saturated query is distinguishable from one that barely ran. The run-global
 # _check_status_counts cannot make that distinction, which is why a run that inspected 7
@@ -1002,7 +1007,11 @@ def write_run_audit_log(
             if searched is None:
                 status = '**NEVER SEARCHED**'
             elif searched == 'error':
+                # Name the cause, not just the fact. Six queries once read as **FAILED** with the
+                # 402 that killed all of them recorded nowhere but the run log.
                 status = '**FAILED**'
+                if reason := _query_errors.get(q):
+                    status += f' — {reason[:200]}'
             else:
                 breakdown = format_status_counts(_check_status_per_query.get(q, {}))
                 status = f'{searched} listing(s) inspected ({breakdown})'
