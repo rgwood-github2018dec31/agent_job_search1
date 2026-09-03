@@ -20,9 +20,9 @@ from typing import Any, Callable
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
+    MODEL_NAME_SCRAPER,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
-    SCRAPER_OPENROUTER_MODEL,
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     UI_BLOCK_SIGNATURES,
 )
@@ -166,7 +166,7 @@ class ScrapeSession:
     def __init__(self, browser_call: Callable, query: str, model: str | None = None):
         self._browser = browser_call
         self.query = query
-        self.model = model or SCRAPER_OPENROUTER_MODEL
+        self.model = model or MODEL_NAME_SCRAPER
         self._harvest: list[dict] | None = None
         self.region = ''
         self.problems: list[str] = []

@@ -2630,7 +2630,7 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
                 tool_defs = (scrape_openrouter.browser_tool_defs(await browser_call.list_tools())
                              + scrape_openrouter.LOCAL_TOOL_DEFS)
                 logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
-                            f'{scrape_openrouter.SCRAPER_OPENROUTER_MODEL}')
+                            f'{scrape_openrouter.MODEL_NAME_SCRAPER}')
                 await run_scraper(
                     _openrouter_run_pass(browser_call, tool_defs, scraping_stats,
                                          tools_module._scrape_per_query),

@@ -1,6 +1,7 @@
 from utils_tools_n_agents_common.models import (
     OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
     OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
+    OPENROUTER_MODEL_NAME_SCRAPER,
 )
 
 # Job search parameters
@@ -227,7 +228,7 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
 #
 # 'openrouter' drives the browser through a function-calling loop (scrape_openrouter.py) instead of
 # the Claude Agent SDK. Measured 2026-08-21 on one live search: $0.0283 vs $0.4330 for identical
-# traffic on Haiku (9.3x), because deepseek-v4-flash caches implicitly (~88% hit rate, and NO
+# traffic on Haiku (9.3x), because MODEL_NAME_SCRAPER caches implicitly (~88% hit rate, and NO
 # cache-write fee -- cache writes were 42% of the Haiku bill).
 #
 # Do NOT point this at glm-5.2 measured $0.1932/M cache-read (~2x Haiku's
@@ -236,7 +237,7 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
 #
 # 'anthropic' selects the original ClaudeSDKClient scraper, kept intact as the rollback path.
 SCRAPER_PROVIDER = 'openrouter'  # 'openrouter' | 'anthropic'; falls back to Anthropic on failure
-SCRAPER_OPENROUTER_MODEL = 'deepseek/deepseek-v4-flash'
+MODEL_NAME_SCRAPER = OPENROUTER_MODEL_NAME_SCRAPER
 # Replaces max_turns for the OpenRouter loop. A healthy search measured 26 iterations; this is sized
 # for two regions plus recovery, with headroom, because starvation is silent (see Search coverage).
 SCRAPER_OPENROUTER_MAX_ITERATIONS = 90
