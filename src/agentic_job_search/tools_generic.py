@@ -19,7 +19,6 @@ from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     COMPANY_MATCH_PROVIDER,
     JOB_MAX_AGE_DAYS,
-    MODEL_NAME_LOW,
     SCRAPER_DATE_POSTED_LABEL,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_DATE_POSTED_SECONDS,
@@ -29,6 +28,7 @@ from agentic_job_search.config import (
     UI_FINGERPRINT_FILENAME,
     UI_STRUCTURAL_CHIPS,
 )
+from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW
 import agentic_job_search.preferences as preferences
 from agentic_job_search.triage import chat_openrouter, extract_json_object
 from claude_agent_sdk import (
@@ -209,7 +209,7 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
     future listing that agency posts, hence the explicit is_recruiting_agency / end_client_name.
     """
     options = ClaudeAgentOptions(
-        model=MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
         setting_sources=[],
@@ -315,7 +315,7 @@ async def company_matches_applied(candidate: str) -> str | None:
             logger.warning(f'company_matches_applied via OpenRouter failed, falling back to Anthropic: {ex}')
 
     options = ClaudeAgentOptions(
-        model=MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
         setting_sources=[],
@@ -405,7 +405,7 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
 
     if structured is None:
         options = ClaudeAgentOptions(
-            model=MODEL_NAME_LOW,
+            model=ANTHROPIC_MODEL_NAME_LOW,
             tools=[],
             permission_mode='bypassPermissions',
             setting_sources=[],
@@ -461,7 +461,7 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
 async def _categorize_pdf_text(text: str, filename: str) -> str | None:
     """Use agent SDK to assign a category label to a PDF. Returns a snake_case string."""
     options = ClaudeAgentOptions(
-        model=MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
         setting_sources=[],

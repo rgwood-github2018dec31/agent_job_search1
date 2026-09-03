@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from utils_tools_n_agents_common import setup_logging
+from utils_tools_n_agents_common.models import (
+    ANTHROPIC_MODEL_NAME_HIGH,
+    ANTHROPIC_MODEL_NAME_LOW,
+    ANTHROPIC_MODEL_NAME_MEDIUM,
+)
 
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
@@ -26,9 +31,6 @@ from agentic_job_search.config import (
     JOB_STALE_AGE_DAYS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
-    MODEL_NAME_HIGH,
-    MODEL_NAME_LOW,
-    MODEL_NAME_MEDIUM,
     PLAYWRIGHT_MCP_PACKAGE,
     PLAYWRIGHT_MCP_REGISTRY_URL,
     PLAYWRIGHT_MCP_VERSION,
@@ -770,7 +772,7 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
             strict_mcp_config=True,
             skills=[],
             tools=[],
-            model=MODEL_NAME_MEDIUM,
+            model=ANTHROPIC_MODEL_NAME_MEDIUM,
             system_prompt='You are a tool-calling assistant. Always respond by calling the provided tool — never respond with text.',
             mcp_servers={'query_generator': query_server},
             allowed_tools=['mcp__query_generator__submit_search_queries'],
@@ -836,7 +838,7 @@ async def _summarize_references_anthropic(prompt: str, stage_stats: dict | None)
         setting_sources=[],
         strict_mcp_config=True,
         skills=[],
-        model=MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
         output_format={
@@ -1361,7 +1363,7 @@ async def _run_anthropic_scraper(playwright_mcp: dict, queries: list[str], stage
         # auto-grants permission, which bypassPermissions already does. See the constant.
         disallowed_tools=SCRAPER_DISALLOWED_BROWSER_TOOLS,
         cwd=str(PROJECT_DIR),
-        model=MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         max_turns=SCRAPER_MAX_TURNS_PER_QUERY,
     )
     async with ClaudeSDKClient(options) as scraper:
@@ -1593,7 +1595,7 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
         ],
         permission_mode="bypassPermissions",
         cwd=str(PROJECT_DIR),
-        model=MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         max_turns=16,
     )
     query = (
@@ -1668,7 +1670,7 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         setting_sources=[],
         strict_mcp_config=True,
         skills=[],
-        model=MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
         output_format={'type': 'json_schema', 'schema': EXTRACT_OUTPUT_SCHEMA},
@@ -2121,7 +2123,7 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
         setting_sources=[],
         strict_mcp_config=True,
         skills=[],
-        model=MODEL_NAME_MEDIUM,
+        model=ANTHROPIC_MODEL_NAME_MEDIUM,
         effort='low',
         tools=[],
         system_prompt=evaluator_prompt,
@@ -2384,7 +2386,7 @@ async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats:
         tools=[],
         system_prompt=evaluator_prompt,
         permission_mode='bypassPermissions',
-        model=MODEL_NAME_HIGH,
+        model=ANTHROPIC_MODEL_NAME_HIGH,
         output_format={
             'type': 'json_schema',
             'schema': {

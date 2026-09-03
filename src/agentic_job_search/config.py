@@ -1,7 +1,7 @@
-# Model tier constants
-MODEL_NAME_HIGH = 'claude-opus-5'  # audit reference standard only (--audit-opus)
-MODEL_NAME_MEDIUM = 'claude-sonnet-5'
-MODEL_NAME_LOW = 'claude-haiku-4-5'
+from utils_tools_n_agents_common.models import (
+    OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
+    OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
+)
 
 # Job search parameters
 JOB_MAX_AGE_DAYS = 21
@@ -34,7 +34,10 @@ LLM_OPENROUTER_MCP_URL = 'http://127.0.0.1:8006/mcp'
 # on every job for ten days while the run log said only "unhandled errors in a TaskGroup". That is
 # what preflight_local_model() in triage.py now catches, once per run, naming what IS installed.
 LOCAL_MODEL = 'granite4.1:3b'
-OPENROUTER_MODEL = 'z-ai/glm-5.2'
+# Single-call OpenRouter tasks (query generation, company matching, rating): the shared
+# intelligence default. Agentic loops (extraction) get their own const below — they want
+# the flash tier for cost, not the strongest single-call model.
+OPENROUTER_MODEL = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 # Stage 1 (discovery) configuration
 MAX_SEARCH_QUERIES = 6  # hard cap; every query costs one LinkedIn search per configured region
@@ -227,8 +230,8 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
 # traffic on Haiku (9.3x), because deepseek-v4-flash caches implicitly (~88% hit rate, and NO
 # cache-write fee -- cache writes were 42% of the Haiku bill).
 #
-# Do NOT point this at OPENROUTER_MODEL (z-ai/glm-5.2): at $0.1932/M cache-read it is ~2x Haiku's
-# rate and would cost MORE than what it replaces. Same trap with deepseek-v4-pro and qwen3.8-max.
+# Do NOT point this at glm-5.2 measured $0.1932/M cache-read (~2x Haiku's
+# rate, costing MORE than what it replaces), as did deepseek-v4-pro and qwen3.8-max.
 # The win is specific to the flash tier.
 #
 # 'anthropic' selects the original ClaudeSDKClient scraper, kept intact as the rollback path.
@@ -250,6 +253,10 @@ AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
 # Stage 2 (evaluation) configuration
 RATING_PROVIDER = 'openrouter'  # 'anthropic' | 'openrouter' | 'ollama'
 EXTRACTOR_PROVIDER = 'openrouter'  # 'anthropic' (Haiku agentic session) | 'openrouter' (function-calling loop)
+# The extraction loop is a many-iteration tool-calling conversation, so it runs on the
+# shared agentic (flash-tier) default rather than OPENROUTER_MODEL — glm-5.2 measured
+# agentic 45.7 vs 58.2 for glm-5.3-flash, at ~1/19th the per-token price.
+EXTRACTOR_OPENROUTER_MODEL = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10
 EXTRACTOR_TOOL_RESULT_MAX_CHARS = 40_000
 TRIAGE_ENABLED = True

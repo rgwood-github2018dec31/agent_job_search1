@@ -12,6 +12,7 @@ import pytest
 import requests
 import yaml
 from claude_agent_sdk import ResultMessage
+from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW
 
 from agentic_job_search import agent
 from agentic_job_search import config
@@ -4953,7 +4954,7 @@ async def test_live_categorization_options_do_not_load_repo_context():
     from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
     options = ClaudeAgentOptions(
-        model=config.MODEL_NAME_LOW,
+        model=ANTHROPIC_MODEL_NAME_LOW,
         tools=[],
         permission_mode='bypassPermissions',
         setting_sources=[],

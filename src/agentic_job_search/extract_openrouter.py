@@ -12,9 +12,9 @@ import logging
 
 from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
+    EXTRACTOR_OPENROUTER_MODEL,
     EXTRACTOR_TOOL_RESULT_MAX_CHARS,
     LLM_OPENROUTER_MCP_URL,
-    OPENROUTER_MODEL,
 )
 from agentic_job_search.triage import call_mcp_tool, mcp_session
 
@@ -184,7 +184,7 @@ async def extract_job_page_openrouter(
         for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
             raw = await call_mcp_tool(
                 LLM_OPENROUTER_MCP_URL, 'chat',
-                {'messages': messages, 'model': OPENROUTER_MODEL, 'tools': OPENROUTER_EXTRACT_TOOLS},
+                {'messages': messages, 'model': EXTRACTOR_OPENROUTER_MODEL, 'tools': OPENROUTER_EXTRACT_TOOLS},
             )
             data = json.loads(raw)
             if not data.get('ok'):
