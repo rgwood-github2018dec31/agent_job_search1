@@ -17,7 +17,7 @@ import yaml
 from pathlib import Path
 from typing import Any
 
-from utils_tools_n_agents_common import setup_logging
+from utils_tools_n_agents_common.logging_setup import setup_logging
 from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_HIGH,
     ANTHROPIC_MODEL_NAME_LOW,
