@@ -55,6 +55,36 @@ foreign_language_rating_cap: 3
 # never does.
 reject_required_degrees: []
 
+# WHERE A ROLE MAY BE ANCHORED. Purely geographic — this asks "is this a place I would be",
+# and deliberately nothing about the language spoken there (that is `languages`, above, and the
+# two must never be folded together: a rule keyed on "non-English" would exclude a French-language
+# remote role in Canada).
+#
+# A bare location is NOT read as a residency requirement. "Germany (Remote)" means the role is
+# anchored in Germany while you could live anywhere in the EU, so `location` and an explicit
+# `relocation` statement in the JD are judged separately, against the same lists.
+#
+# Resolution is three-tier, cheapest first:
+#   1. `hybrid.acceptable_locations` below exempts outright — so you can put `france` in `exclude`
+#      and still keep Nice and Toulouse, by listing those cities there.
+#   2. `exclude` rejects outright.
+#   3. Anything neither list names goes to a cached LLM classifier (run_dir/location_cache.yaml),
+#      which returns the country and one of: southern_europe, northern_europe, western_europe,
+#      eastern_europe, north_america, other, unknown. `reject_regions` then decides.
+# A job is rejected only when EVERY country named is in a rejected region, so "the UK or the
+# Netherlands" passes, and so does anything naming no country ("European Union", "Remote (EMEA)").
+# Classifier failure fails OPEN — an outage must not start rejecting jobs.
+#
+# BOTH lists empty means no geographic gate and, deliberately, not a single classifier call.
+# To keep or drop ONE specific country, use `exclude` or `hybrid.acceptable_locations` — both are
+# plain string matches. Do NOT try to do it by adjusting `reject_regions`: the classifier is
+# phrasing-dependent at the margins (measured: "Dublin, Ireland" -> western_europe, bare "Ireland"
+# -> northern_europe), so a country can sit in two different regions depending on how a posting
+# writes it. Regions are for the coarse decision; the lists are for named exceptions.
+locations:
+  exclude: []
+  reject_regions: []
+
 hybrid:
   # Highest rating a hybrid/on-site job outside `acceptable_locations` can receive. This is a
   # ceiling, not a rejection: the job is still saved and auditable, it just cannot reach the
@@ -62,6 +92,8 @@ hybrid:
   rating_cap: 3
   # Places where you would actually accept commuting to an office, as lowercase substrings.
   # List both countries and their major cities. Empty caps every hybrid/on-site job.
+  # This list does double duty: it is also tier 1 of the `locations` gate above, exempting a
+  # REMOTE role anchored in one of these places.
   acceptable_locations: []
 
 titles:

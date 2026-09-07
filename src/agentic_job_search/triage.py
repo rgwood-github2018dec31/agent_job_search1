@@ -16,7 +16,6 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from agentic_job_search.config import (
-    LLM_JSON_MAX_TOKENS,
     LLM_LOCAL_MCP_URL,
     LLM_OPENROUTER_MCP_URL,
     LOCAL_MODEL,
@@ -55,6 +54,23 @@ class ProviderUnavailableError(RuntimeError):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+class TruncatedResponseError(RuntimeError):
+    """The model hit its output ceiling mid-answer, so the body is incomplete.
+
+    Distinct from a malformed response, and the distinction is the whole point: a truncated JSON
+    body is not a parse bug to be worked around, it is a request that needs re-issuing with more
+    room. Before this existed, `chat_openrouter` inspected `finish_reason` only when `content` was
+    null, so a truncated NON-empty body went to `extract_json_object` as if it were complete and
+    surfaced as "No JSON object found in LLM response" — which reads like a fence or a prose
+    wrapper and sent the 2026-09 diagnosis down exactly that dead end. `finish_reason` was in the
+    payload the entire time.
+    """
+
+    def __init__(self, message: str, max_tokens: int | None = None):
+        super().__init__(message)
+        self.max_tokens = max_tokens
 
 
 def http_status_of(error_text: str) -> int | None:
@@ -165,24 +181,53 @@ def extract_json_object(text: str) -> dict:
         except json.JSONDecodeError:
             pass
         start = text.find('{', start + 1)
-    raise ValueError(f'No JSON object found in LLM response (first 300 chars): {text[:300]!r}')
+    # Head AND tail, deliberately. The head-only message is why this was first misdiagnosed as a
+    # ```json fence problem: the fence is at the head and the fault is always in the tail (a
+    # truncated body, or `"reasoning":Exceptional` with the opening quote missing). Fences have
+    # always parsed here — raw_decode scans from the first '{' and ignores everything around it.
+    raise ValueError(
+        f'No JSON object found in LLM response ({len(text)} chars). '
+        f'Head: {text[:200]!r} ... Tail: {text[-200:]!r}'
+    )
 
 
 async def chat_openrouter(
-    prompt: str, system: str = '', model: str = OPENROUTER_MODEL, max_tokens: int = LLM_JSON_MAX_TOKENS
+    prompt: str, system: str = '', model: str = OPENROUTER_MODEL, max_tokens: int | None = None
 ) -> tuple[str, float]:
-    """One completion via the OpenRouter MCP server. Returns (content, cost_usd)."""
+    """One completion via the OpenRouter MCP server. Returns (content, cost_usd).
+
+    `max_tokens` defaults to None, i.e. it is NOT SENT and the model's own ceiling applies. There
+    is nothing to protect against here: the MCP tool declares it optional and applies no clamp,
+    `glm-5.3-flash` allows 131,072 completion tokens, and the two agentic call sites
+    (scrape_openrouter, extract_openrouter) have always sent nothing. The former 3000 default was
+    chosen by no call site — all eight simply inherited it — and every one of the 13 truncations
+    across 2026-09-01..03 was `completion_tokens: 3000` exactly, surviving a model change.
+
+    Removing it should also LOWER cost: a truncated company-match paid for 3000 reasoning tokens,
+    returned null, and then paid again for the Anthropic fallback. Finishing the answer is cheaper
+    than paying for both halves of a failure.
+    """
     messages = []
     if system:
         messages.append({'role': 'system', 'content': system})
     messages.append({'role': 'user', 'content': prompt})
-    raw = await call_mcp_tool(
-        LLM_OPENROUTER_MCP_URL, 'chat',
-        {'messages': messages, 'model': model, 'max_tokens': max_tokens},
-    )
+    args = {'messages': messages, 'model': model}
+    if max_tokens is not None:
+        args['max_tokens'] = max_tokens
+    raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args)
     data = json.loads(raw)
     if not data.get('ok'):
         raise provider_error('OpenRouter chat failed', str(data.get('error') or raw[:300]))
+    # Checked BEFORE the content test, and regardless of whether content is empty: a truncated
+    # non-empty body is the case that used to reach the JSON parser disguised as a parse failure.
+    if data.get('finish_reason') == 'length':
+        usage = data.get('usage') or {}
+        raise TruncatedResponseError(
+            f'OpenRouter response truncated (finish_reason=length) from {model}: '
+            f'max_tokens={max_tokens}, completion_tokens={usage.get("completion_tokens")}, '
+            f'prompt_tokens={usage.get("prompt_tokens")}, content_chars={len(data.get("content") or "")}',
+            max_tokens=max_tokens,
+        )
     if not data.get('content'):
         raise RuntimeError(f'OpenRouter chat returned empty content: {raw[:300]}')
     return data['content'], float(data.get('cost_usd') or 0.0)
@@ -221,7 +266,7 @@ async def _describe_missing_model(model: str) -> str:
 
 
 async def generate_local(
-    prompt: str, system: str = '', model: str = LOCAL_MODEL, max_tokens: int = LLM_JSON_MAX_TOKENS
+    prompt: str, system: str = '', model: str = LOCAL_MODEL, max_tokens: int | None = None
 ) -> str:
     """One completion via the local Ollama MCP server. Returns the response text.
 
@@ -230,10 +275,10 @@ async def generate_local(
     re-raised untouched: a down server must keep reading as a down server.
     """
     try:
-        raw = await call_mcp_tool(
-            LLM_LOCAL_MCP_URL, 'generate',
-            {'prompt': prompt, 'system': system, 'model': model, 'max_tokens': max_tokens, 'temperature': 0.2},
-        )
+        args = {'prompt': prompt, 'system': system, 'model': model, 'temperature': 0.2}
+        if max_tokens is not None:
+            args['max_tokens'] = max_tokens
+        raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'generate', args)
     except Exception as ex:
         if _looks_like_missing_model(unwrap_exception(ex)):
             raise LocalModelMissingError(await _describe_missing_model(model)) from ex
@@ -303,11 +348,27 @@ RATING_JSON_INSTRUCTIONS = (
 )
 
 
+# Room to finish the answer when a model has already proved it wants more than its own default.
+# Only ever used on the retry, never on the first attempt.
+_TRUNCATION_RETRY_MAX_TOKENS = 32_000
+
+
 async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = OPENROUTER_MODEL) -> tuple[dict, float]:
-    """Rate a job via OpenRouter. Returns (rating dict, cost_usd)."""
-    content, cost_usd = await chat_openrouter(
-        f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}', system=system_prompt, model=model
-    )
+    """Rate a job via OpenRouter. Returns (rating dict, cost_usd).
+
+    Retries once on truncation because losing this call is not recoverable later: the job was
+    written to processed_jobs/ back in Stage 1b, so an eval_error means the next run returns
+    `already_processed` and it is never rated again. A posting the model had scored 5 was lost
+    that way on 2026-09-03.
+    """
+    prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}'
+    try:
+        content, cost_usd = await chat_openrouter(prompt, system=system_prompt, model=model)
+    except TruncatedResponseError as ex:
+        logger.warning(f'Rating call truncated, retrying once with max_tokens={_TRUNCATION_RETRY_MAX_TOKENS}: {ex}')
+        content, cost_usd = await chat_openrouter(
+            prompt, system=system_prompt, model=model, max_tokens=_TRUNCATION_RETRY_MAX_TOKENS
+        )
     result = extract_json_object(content)
     result['rating'] = int(result['rating'])
     return result, cost_usd

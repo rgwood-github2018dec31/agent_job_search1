@@ -263,7 +263,13 @@ EXTRACTOR_TOOL_RESULT_MAX_CHARS = 40_000
 TRIAGE_ENABLED = True
 TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (clear low fits)
 REFERENCE_SUMMARY_MAX_CHARS = 2500
-LLM_JSON_MAX_TOKENS = 3000  # both default models spend tokens on reasoning before the JSON answer
+# No output-token cap is set anywhere, deliberately. There used to be LLM_JSON_MAX_TOKENS = 3000,
+# which no call site ever chose — all eight inherited it as a default argument — against models
+# that allow 131,072 completion tokens (glm-5.3-flash) with no server-side clamp. Every one of the
+# 13 truncations across 2026-09-01..03 was `completion_tokens: 3000` exactly and survived a model
+# change, and each cost double: the wasted reasoning tokens plus the Anthropic fallback that ran
+# after them. If a ceiling is ever genuinely needed, pass `max_tokens` at the call site that needs
+# it rather than reinstating a global default nobody reads.
 
 # Browser toolchain (@playwright/mcp) — PINNED, never '@latest'.
 #

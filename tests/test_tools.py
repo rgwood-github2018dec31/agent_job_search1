@@ -1991,6 +1991,32 @@ async def test_chat_openrouter_live():
 
 
 @pytest.mark.live
+async def test_classify_location_live(monkeypatch, tmp_path):
+    """The real classifier against the real server. Uses a throwaway cache so a stale entry can
+    never make this pass — the point is that the model still answers geography correctly."""
+    _require_llm_server(8006)
+    from agentic_job_search import location
+
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {})
+    # Override the autouse network block: this test is exactly the one that should reach out.
+    monkeypatch.setattr(location, 'chat_openrouter', triage.chat_openrouter)
+
+    facts = await location.classify_location('Berlin, Germany (Remote across Europe)')
+    assert facts['countries'] == ['germany']
+    assert facts['regions'] == ['western_europe']
+    assert facts['local_language'] == 'german'
+
+    # The distinction the whole gate rests on: a Mediterranean location is a different region,
+    # regardless of the language spoken there.
+    spain = await location.classify_location('Barcelona, Spain (Remote)')
+    assert spain['regions'] == ['southern_europe']
+
+    # Names no country, so no policy can reject it.
+    assert (await location.classify_location('European Union'))['countries'] == []
+
+
+@pytest.mark.live
 async def test_triage_job_fit_live():
     _require_llm_server(8002)
     result = await triage.triage_job_fit(
@@ -3739,15 +3765,26 @@ async def test_devologyx_regression_end_to_end():
         ),
         salary='€700-€900/day (DOE)', date_posted='1 week ago', language_requirement='english',
     )
-    assert await agent.apply_hard_rules(candidate, extract) is None  # not a hard reject — it is a cap
+    # As of the 2026-09 location gate this posting is now REJECTED outright rather than capped:
+    # the Netherlands is in a rejected region. That is a strictly stronger version of what this
+    # regression has always demanded (it must never be notified), so the test asserts the new
+    # outcome rather than being weakened to accommodate it.
+    assert await agent.apply_hard_rules(candidate, extract) == (
+        'located in an excluded region: netherlands (western_europe)'
+    )
 
-    rating, cap_reason = agent.apply_rating_caps(extract, 4)
+    # The original mechanism still has to work on its own, for a posting the location gate does
+    # not reach — otherwise this regression would silently stop testing the hybrid cap at all.
+    hybrid_only = dict(extract, location='Testville (Hybrid - 2-3 days onsite)')
+    assert await agent.apply_hard_rules(candidate, hybrid_only) is None
+    unacceptable = dict(extract, location='Nowhereton (Hybrid - 2-3 days onsite)')
+    rating, cap_reason = agent.apply_rating_caps(unacceptable, 4)
     assert rating == 3
     assert rating < 4, 'a capped job must fall below the >=4 notification threshold'
     assert 'hybrid' in cap_reason
 
     warnings = agent.merge_warnings(
-        agent.build_deterministic_warnings(candidate, extract), ['Contract, not full-time'],
+        agent.build_deterministic_warnings(candidate, unacceptable), ['Contract, not full-time'],
     )
     assert any('Hybrid' in w for w in warnings)
     assert any('Contract role' in w for w in warnings)
@@ -3772,17 +3809,21 @@ def test_default_preferences_apply_no_personal_gates(neutral_preferences):
     assert preferences.rejected_degrees() == ()
     assert preferences.hybrid_acceptable_locations() == ()
     assert preferences.search_regions() == []
+    assert preferences.excluded_locations() == ()
+    assert preferences.rejected_regions() == ()
 
 
-async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences):
-    """The three personal gates must be inert when unconfigured — not silently inherited."""
+async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences, stub_location_classifier):
+    """Every personal gate must be inert when unconfigured — not silently inherited."""
     extract = _make_extract(
-        location='United States (Remote)',
+        location='Berlin, Germany (Remote)',
         description='PhD in Machine Learning is required. Fluent Dutch is required.',
         language_requirement='dutch',
         education_requirement='phd',
+        relocation='Germany',
     )
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert stub_location_classifier == [], 'an unconfigured checkout must not make a paid call'
 
 
 def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences):
@@ -3834,8 +3875,368 @@ def test_example_preferences_file_is_neutral():
     assert loaded['sponsorship_required_in'] == []
     assert loaded['reject_required_degrees'] == []
     assert loaded['hybrid']['acceptable_locations'] == []
+    assert loaded['locations']['exclude'] == []
+    assert loaded['locations']['reject_regions'] == []
     for region in loaded['search_regions']:
         assert 'Example' in region['name'] or 'Test' in region['name']
+
+
+# ---------------------------------------------------------------------------
+# location gate: three tiers (exempt list / deny list / cached classifier)
+#
+# Purely geographic. These tests exist as much to pin what the rule must NOT look at as what it
+# does: it reads no language field, because a "non-English" conjunct would exclude a
+# French-language remote role in Canada. See test_location_gate_ignores_local_language.
+# ---------------------------------------------------------------------------
+
+async def test_rejected_location_flags_a_country_in_a_rejected_region():
+    assert await agent.rejected_location('Germany (Remote)') == 'germany (western_europe)'
+
+
+async def test_rejected_location_spares_an_acceptable_region():
+    assert await agent.rejected_location('Barcelona, Spain (Remote)') == ''
+
+
+async def test_rejected_location_exempt_list_beats_the_classifier(stub_location_classifier):
+    """Tier 1 short-circuits: an exempt location never reaches a paid call."""
+    assert await agent.rejected_location('Testville, Germany') == ''
+    assert stub_location_classifier == [], 'exempt locations must not cost a classifier call'
+
+
+async def test_rejected_location_deny_list_beats_the_classifier(stub_location_classifier):
+    assert await agent.rejected_location('Blockedland (Remote)') == 'blockedland'
+    assert stub_location_classifier == [], 'deny-list hits must not cost a classifier call'
+
+
+async def test_rejected_location_spares_a_location_naming_no_country(stub_location_classifier):
+    """'European Union' / 'Remote (EMEA)' name no country, so no policy can reject them."""
+    assert await agent.rejected_location('European Union') == ''
+    assert await agent.rejected_location('Remote (EMEA)') == ''
+
+
+async def test_rejected_location_spares_a_multi_country_location_with_one_acceptable():
+    """Rejection requires EVERY named country to be rejected — one good option is enough."""
+    assert await agent.rejected_location('Remote — anywhere in Spain or the Netherlands') == ''
+
+
+async def test_rejected_location_rejects_an_english_speaking_country_in_a_rejected_region():
+    """The gate is geographic, so being English-speaking does not rescue Ireland or the UK.
+
+    This is the knob the user has to set deliberately: `western_europe` catches them along with
+    Germany and the Netherlands. Wanting them back is what the exempt list is for — see the test
+    below — rather than a language special case, which is the conflation this whole rule avoids.
+    """
+    assert await agent.rejected_location('Dublin, Ireland (Remote)') == 'ireland (western_europe)'
+
+
+async def test_exempt_list_rescues_a_country_in_a_rejected_region(monkeypatch):
+    """Tier 1 is the documented way to keep one country out of a rejected region."""
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('testville', 'ireland'))
+    assert await agent.rejected_location('Dublin, Ireland (Remote)') == ''
+
+
+async def test_rejected_location_rejects_when_every_named_country_is_rejected():
+    assert await agent.rejected_location('Germany or the Netherlands') == 'germany (western_europe)'
+
+
+async def test_rejected_location_is_inert_without_preferences(neutral_preferences, stub_location_classifier):
+    """Unconfigured means no gate AND, deliberately, not one classifier call."""
+    assert await agent.rejected_location('Germany (Remote)') == ''
+    assert stub_location_classifier == []
+
+
+async def test_classifier_fails_open_when_the_tool_server_is_down(monkeypatch, tmp_path):
+    """A tool-server outage must never START rejecting jobs.
+
+    Deliberately the opposite of the blacklist's fail-closed rule: there a name had already
+    matched something the user wrote down, so an outage must not readmit it. Here nothing the
+    user wrote down matched, so an outage must not begin excluding jobs it would have kept.
+    """
+    from agentic_job_search import location
+
+    async def failing_chat(*args, **kwargs):
+        raise RuntimeError('MCP server down')
+
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {})
+    monkeypatch.setattr(location, 'chat_openrouter', failing_chat)
+
+    facts = await location.classify_location('Germany (Remote)')
+    assert facts['countries'] == [] and facts['regions'] == []
+
+    # ...and a gate fed by that empty answer keeps the job.
+    monkeypatch.setattr(agent, 'classify_location', location.classify_location)
+    assert await agent.rejected_location('Germany (Remote)') == ''
+
+
+# ---------------------------------------------------------------------------
+# location gate: the hard rules it feeds
+# ---------------------------------------------------------------------------
+
+async def test_apply_hard_rules_rejects_a_location_in_a_rejected_region():
+    reason = await agent.apply_hard_rules(_make_candidate(), _make_extract(location='Germany (Remote)'))
+    assert reason == 'located in an excluded region: germany (western_europe)'
+    assert agent._hard_rule_category(reason) == 'hard_ruled_location'
+
+
+async def test_apply_hard_rules_rejects_a_stated_relocation_to_a_rejected_region():
+    extract = _make_extract(location='Testville (Remote)', relocation='Germany')
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason == 'relocation required to an excluded region: germany (western_europe)'
+    assert agent._hard_rule_category(reason) == 'hard_ruled_relocation'
+
+
+async def test_apply_hard_rules_ignores_a_non_specific_relocation():
+    """Finom's posting said `relocation: European Union` — that names no country and must pass."""
+    extract = _make_extract(location='Testville (Remote)', relocation='European Union')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+async def test_apply_hard_rules_allows_relocation_to_an_acceptable_location():
+    extract = _make_extract(location='Spain (Remote)', relocation='Barcelona, Spain')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+def test_hard_rule_category_order_is_stable():
+    """Ordered substring dispatch: 'relocation required...' also contains the word 'location'."""
+    assert agent._hard_rule_category('relocation required to an excluded region: germany (western_europe)') == 'hard_ruled_relocation'
+    assert agent._hard_rule_category('located in an excluded region: germany (western_europe)') == 'hard_ruled_location'
+    assert agent._hard_rule_category('requires unsupported language: german') == 'hard_ruled_language'
+    assert agent._hard_rule_category('requires advanced degree: phd') == 'hard_ruled_education'
+    assert agent._hard_rule_category('blacklisted company: X (y)') == 'hard_ruled_blacklisted'
+
+
+# ---------------------------------------------------------------------------
+# the four language/location facts stay independent
+# ---------------------------------------------------------------------------
+
+async def test_location_gate_ignores_local_language():
+    """A Spanish-speaking location is acceptable; the gate is geographic, not linguistic.
+
+    This is the pin for the design error that nearly shipped: "non-English AND not on the
+    acceptable list" gets Spain and Germany right for the wrong reason, and gets Quebec wrong.
+    """
+    extract = _make_extract(location='Spain (Remote)', local_language='spanish')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+async def test_local_language_alone_never_rejects_or_caps():
+    """French-speaking Canada: warned about, never gated. The Valtech mechanism, restated."""
+    extract = _make_extract(location='Canada (Remote)', local_language='french')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert agent.apply_rating_caps(extract, 5) == (5, '')
+
+
+async def test_september_2026_regression_remote_germany_is_hard_ruled():
+    """The seven DE/NL postings rated 4-5 and notified on 2026-09-02..03.
+
+    Every existing gate correctly declined: the JD demanded English, the page was written in
+    English, and the job was remote so the hybrid cap never consulted a location list. Only the
+    missing geographic fact let them through.
+    """
+    extract = _make_extract(
+        title='Senior AI Engineer', company='Finom', location='Berlin, Germany (Remote across Europe)',
+        description='Agentic AI, RAG, tool calling. Remote across Europe.',
+        language_requirement='english', posting_language='english', local_language='german',
+    )
+    assert agent.foreign_posting_language(extract) == '', 'the posting is in English — cap must not fire'
+    assert agent.derive_workplace_type(extract) == 'remote', 'remote — the hybrid cap must not fire'
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'germany' in reason
+    assert agent._hard_rule_category(reason) == 'hard_ruled_location'
+
+
+# ---------------------------------------------------------------------------
+# derive_local_language  (cosmetic: no gate reads it)
+# ---------------------------------------------------------------------------
+
+async def test_derive_local_language_fills_from_the_location_when_the_extractor_is_silent():
+    assert await agent.derive_local_language(
+        _make_extract(location='Berlin, Germany (Remote)', local_language='')
+    ) == 'german'
+
+
+async def test_derive_local_language_corrects_a_contradicted_english_claim():
+    """team.blue's Berlin posting came back 'english' while Finom's and Flip's came back 'german'."""
+    assert await agent.derive_local_language(
+        _make_extract(location='Berlin, Germany (Remote)', local_language='english')
+    ) == 'german'
+
+
+async def test_derive_local_language_keeps_a_foreign_claim_the_classifier_would_not_make():
+    """Valtech: the extractor read 'colleagues outside Quebec' from the body. It may add, never erase."""
+    assert await agent.derive_local_language(
+        _make_extract(location='Canada (Remote)', local_language='french')
+    ) == 'french'
+
+
+async def test_derive_local_language_empty_for_an_unnamed_location():
+    assert await agent.derive_local_language(
+        _make_extract(location='Remote (Anywhere)', local_language='')
+    ) == ''
+
+
+# ---------------------------------------------------------------------------
+# location cache
+# ---------------------------------------------------------------------------
+
+def test_location_cache_key_normalizes_whitespace_and_case():
+    from agentic_job_search import location
+    assert location.cache_key('  Berlin,   GERMANY \n') == location.cache_key('berlin, germany')
+
+
+def test_location_cache_survives_a_missing_file(monkeypatch, tmp_path):
+    from agentic_job_search import location
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'nope.yaml')
+    monkeypatch.setattr(location, '_cache', None)
+    assert location._load_cache() == {}
+
+
+def test_location_cache_rebuilds_a_corrupt_file(monkeypatch, tmp_path):
+    """A corrupt cache costs money to rebuild, never a crashed run."""
+    from agentic_job_search import location
+    path = tmp_path / 'location_cache.yaml'
+    path.write_text('{{{ not yaml at all', encoding='utf-8')
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', path)
+    monkeypatch.setattr(location, '_cache', None)
+    assert location._load_cache() == {}
+
+
+def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_through():
+    """An out-of-vocabulary region must read as 'I could not tell', not as 'acceptable'."""
+    from agentic_job_search import location
+    coerced = location._coerce({'countries': ['germany'], 'regions': ['middle_earth'], 'local_language': 'german'})
+    assert coerced['regions'] == ['unknown']
+
+
+async def test_location_classification_is_cached(monkeypatch, tmp_path):
+    """The cache is what makes an LLM call inside a hard rule deterministic — two jobs in the
+    same city cannot get different answers, within a run or across runs."""
+    from agentic_job_search import location
+    calls = []
+
+    async def fake_chat(prompt, **kwargs):
+        calls.append(prompt)
+        return '{"countries": ["germany"], "regions": ["western_europe"], "local_language": "german"}', 0.0
+
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {})
+    monkeypatch.setattr(location, 'chat_openrouter', fake_chat)
+
+    first = await location.classify_location('Berlin, Germany (Remote)')
+    second = await location.classify_location('  berlin,   germany (remote)  ')
+    assert first['regions'] == second['regions'] == ['western_europe']
+    assert len(calls) == 1, 'a repeated location must not be re-asked'
+    assert second['source'] == 'cache'
+
+
+# ---------------------------------------------------------------------------
+# output-token ceiling and JSON parse failures
+#
+# Fixtures here are the REAL bytes from run_dir/logs/run-2026-09-0*.log. A fixture cleaner than
+# reality is worse than no fixture: the tidy `{"rating": 5}` these were first written against is
+# exactly why a truncation was diagnosed as a ```json fence for a week.
+# ---------------------------------------------------------------------------
+
+# Verbatim from run-2026-09-02_102421.log:933 — note `"reasoning":Exceptional`, the opening quote
+# of the value simply missing. No fence-stripping or repair fixes this, and none should try.
+_ARCHER_MALFORMED = (
+    '```json\n{\n  "rating": 4,\n  "company": "Archer Recruitment (pharma client undisclosed)",\n'
+    '  "title": "Senior Agentic AI Engineer / Architect",\n  "reasoning":Exceptional domain match'
+)
+
+# Verbatim head from run-2026-09-03_115601.log — valid JSON that simply stops (finish_reason=length).
+_JOBGETHER_TRUNCATED = (
+    '```json\n{\n  "rating": 5,\n  "company": "Jobgether (unnamed partner company)",\n'
+    '  "title": "Agentic AI Architect - Anthropic",\n  "reasoning": "Near-perfect match to the'
+)
+
+
+def test_extract_json_object_parses_a_fenced_code_block():
+    """Pins the NON-bug. raw_decode scans from the first '{' and ignores everything around it, so
+    a ```json fence has always parsed. Recorded so nobody re-diagnoses a truncation as a fence."""
+    parsed = triage.extract_json_object('```json\n{"rating": 5, "company": "X"}\n```')
+    assert parsed == {'rating': 5, 'company': 'X'}
+
+
+def test_extract_json_object_error_reports_head_and_tail():
+    """The head is where the fence is; the fault is always in the tail."""
+    with pytest.raises(ValueError) as excinfo:
+        triage.extract_json_object(_JOBGETHER_TRUNCATED)
+    message = str(excinfo.value)
+    assert 'Head:' in message and 'Tail:' in message
+    assert str(len(_JOBGETHER_TRUNCATED)) in message
+    assert 'Near-perfect match to the' in message, 'the tail is the diagnostic part'
+
+
+def test_extract_json_object_error_exposes_a_malformed_value():
+    with pytest.raises(ValueError) as excinfo:
+        triage.extract_json_object(_ARCHER_MALFORMED)
+    assert 'Exceptional domain match' in str(excinfo.value)
+
+
+async def test_chat_openrouter_sends_no_max_tokens_by_default(monkeypatch):
+    """No ceiling is sent at all: the MCP tool declares it optional and applies no clamp, and the
+    former 3000 default was inherited by all eight call sites rather than chosen by any."""
+    seen = {}
+
+    async def fake_call(url, tool, args):
+        seen.update(args)
+        return json.dumps({'ok': True, 'content': '{"ok": 1}', 'finish_reason': 'stop', 'cost_usd': 0.001})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    content, _cost = await triage.chat_openrouter('hi')
+    assert content == '{"ok": 1}'
+    assert 'max_tokens' not in seen
+
+
+async def test_chat_openrouter_raises_a_named_error_on_a_length_finish(monkeypatch):
+    """The real payload shape from run-2026-09-02_102421.log:304 — a company-match question that
+    spent its entire budget on reasoning and returned null."""
+    async def fake_call(url, tool, args):
+        return json.dumps({
+            'ok': True, 'content': None, 'tool_calls': None, 'finish_reason': 'length',
+            'model': 'z-ai/glm-5.2',
+            'usage': {'prompt_tokens': 233, 'completion_tokens': 3000, 'total_tokens': 3233},
+        })
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    with pytest.raises(triage.TruncatedResponseError) as excinfo:
+        await triage.chat_openrouter('hi')
+    assert 'finish_reason=length' in str(excinfo.value)
+    assert '3000' in str(excinfo.value)
+
+
+async def test_chat_openrouter_raises_on_truncated_non_empty_content(monkeypatch):
+    """The case that used to reach the JSON parser disguised as a parse failure."""
+    async def fake_call(url, tool, args):
+        return json.dumps({
+            'ok': True, 'content': _JOBGETHER_TRUNCATED, 'finish_reason': 'length',
+            'model': 'z-ai/glm-5.3-flash', 'usage': {'completion_tokens': 3000},
+        })
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    with pytest.raises(triage.TruncatedResponseError):
+        await triage.chat_openrouter('hi')
+
+
+async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
+    """Losing a rating call is not recoverable: the job is already in processed_jobs/ from Stage
+    1b, so an eval_error means it returns already_processed forever. A posting the model had
+    scored 5 was lost that way on 2026-09-03."""
+    attempts = []
+
+    async def fake_chat(prompt, system='', model='', max_tokens=None):
+        attempts.append(max_tokens)
+        if len(attempts) == 1:
+            raise triage.TruncatedResponseError('truncated', max_tokens=None)
+        return '{"rating": 5, "reasoning": "great"}', 0.002
+
+    monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
+    result, cost = await triage.rate_with_openrouter('sys', 'user')
+    assert result['rating'] == 5
+    assert len(attempts) == 2, 'exactly one retry'
+    assert attempts[0] is None and attempts[1] == triage._TRUNCATION_RETRY_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------

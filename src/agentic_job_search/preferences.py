@@ -39,6 +39,15 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     # is empty, like every other language rule.
     'foreign_language_rating_cap': 3,
     'reject_required_degrees': [],  # e.g. ['master', 'phd']; empty = no education gate
+    # Where a role may be ANCHORED. Purely geographic: this asks "is this a place I would be",
+    # never anything about the language spoken there (that is `languages`, a separate fact).
+    # Resolution is three-tier -- hybrid.acceptable_locations exempts, `exclude` rejects, and
+    # anything neither list names goes to the cached classifier in location.py. BOTH empty means
+    # no geographic gate at all and, deliberately, not a single classifier call.
+    'locations': {
+        'exclude': [],         # lowercase location substrings that always reject
+        'reject_regions': [],  # region names from location.LOCATION_REGIONS
+    },
     'hybrid': {
         'rating_cap': 3,
         'acceptable_locations': [],  # empty = every hybrid/on-site job is capped
@@ -137,6 +146,16 @@ def search_regions() -> list[dict[str, str]]:
 def sponsorship_required_in() -> tuple[str, ...]:
     '''Lowercase location substrings where the user would need visa sponsorship.'''
     return tuple(str(loc).lower() for loc in load_preferences()['sponsorship_required_in'])
+
+
+def excluded_locations() -> tuple[str, ...]:
+    '''Lowercase location substrings that reject outright, ahead of any classifier call.'''
+    return tuple(str(loc).lower() for loc in load_preferences()['locations']['exclude'])
+
+
+def rejected_regions() -> tuple[str, ...]:
+    '''Lowercase geographic regions whose jobs are rejected. Empty means no geographic gate.'''
+    return tuple(str(region).lower() for region in load_preferences()['locations']['reject_regions'])
 
 
 def languages() -> tuple[str, ...]:

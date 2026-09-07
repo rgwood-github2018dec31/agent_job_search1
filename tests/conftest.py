@@ -1,4 +1,5 @@
 import functools
+import re
 import os
 import shutil
 import subprocess
@@ -29,6 +30,13 @@ TEST_PREFERENCES = {
     'languages': ['english'],
     'foreign_language_rating_cap': 3,
     'reject_required_degrees': ['master', 'phd'],
+    # Fictional places, so no test can depend on the real classifier or on real geography.
+    # 'blockedland' is on the deny list; 'testville'/'exampleton' are exempt; anything else
+    # reaches the classifier, which tests stub via the `stub_location_classifier` fixture.
+    'locations': {
+        'exclude': ['blockedland'],
+        'reject_regions': ['northern_europe', 'western_europe', 'eastern_europe'],
+    },
     'hybrid': {
         'rating_cap': 3,
         'acceptable_locations': ['testville', 'exampleton'],
@@ -50,6 +58,94 @@ TEST_PREFERENCES = {
         ],
     },
 }
+
+
+# Fictional-but-shaped geography for the location classifier. Unit tests must never reach the
+# real MCP tool server: it costs money, needs a network, and would make the suite's verdict depend
+# on a third party. Note the classifier fails OPEN, so an unstubbed test would have *passed* while
+# silently making a live call on every job -- which is exactly the "a skip that never becomes a
+# pass" shape CLAUDE.md warns about, one layer down.
+# Fictional-but-shaped geography for the location classifier. Unit tests must never reach the
+# real MCP tool server: it costs money, needs a network, and would make the suite's verdict depend
+# on a third party. Note the classifier fails OPEN, so an unstubbed test would have *passed* while
+# silently making a live call on every job -- the "a skip that never becomes a pass" shape one
+# layer down.
+#
+# Each entry maps a name to (country, region, local language). Cities resolve to their country,
+# because the real classifier returns COUNTRIES -- a stub that returned 'berlin' as a country
+# would let a test pass against behaviour the production path never produces.
+FAKE_GEOGRAPHY = {
+    'canada': ('canada', 'north_america', 'english'),
+    'quebec': ('canada', 'north_america', 'french'),
+    'montreal': ('canada', 'north_america', 'french'),
+    'united states': ('united states', 'north_america', 'english'),
+    'germany': ('germany', 'western_europe', 'german'),
+    'berlin': ('germany', 'western_europe', 'german'),
+    'stuttgart': ('germany', 'western_europe', 'german'),
+    'munich': ('germany', 'western_europe', 'german'),
+    'netherlands': ('netherlands', 'western_europe', 'dutch'),
+    'amsterdam': ('netherlands', 'western_europe', 'dutch'),
+    'ireland': ('ireland', 'western_europe', 'english'),
+    'dublin': ('ireland', 'western_europe', 'english'),
+    'united kingdom': ('united kingdom', 'western_europe', 'english'),
+    'uk': ('united kingdom', 'western_europe', 'english'),
+    'france': ('france', 'western_europe', 'french'),
+    'paris': ('france', 'western_europe', 'french'),
+    'nice': ('france', 'southern_europe', 'french'),
+    'toulouse': ('france', 'southern_europe', 'french'),
+    'spain': ('spain', 'southern_europe', 'spanish'),
+    'barcelona': ('spain', 'southern_europe', 'spanish'),
+    'portugal': ('portugal', 'southern_europe', 'portuguese'),
+    'greece': ('greece', 'southern_europe', 'greek'),
+    'poland': ('poland', 'eastern_europe', 'polish'),
+    'czechia': ('czechia', 'eastern_europe', 'czech'),
+    'prague': ('czechia', 'eastern_europe', 'czech'),
+    'sweden': ('sweden', 'northern_europe', 'swedish'),
+}
+
+# Word boundaries, because 'nice' is inside 'Venice' and 'uk' is inside almost everything. The
+# production classifier is an LLM and has no such problem; the stub must not invent one.
+_GEO_RE = re.compile(
+    r'\b(' + '|'.join(sorted((re.escape(n) for n in FAKE_GEOGRAPHY), key=len, reverse=True)) + r')\b'
+)
+
+
+def fake_classify(text):
+    """Every COUNTRY named in `text`, first mention first, deduped. Unmatched text names none."""
+    haystack = ' '.join(str(text or '').split()).lower()
+    countries, regions, language = [], [], ''
+    for match in _GEO_RE.finditer(haystack):
+        country, region, local_language = FAKE_GEOGRAPHY[match.group(1)]
+        if not language:
+            language = local_language
+        if country in countries:
+            continue
+        countries.append(country)
+        regions.append(region)
+    return {'countries': countries, 'regions': regions, 'local_language': language, 'source': 'stub'}
+
+
+@pytest.fixture(autouse=True)
+def stub_location_classifier(monkeypatch):
+    """Autouse: no unit test may reach the real classifier. Returns the call log for assertions.
+
+    Patches the binding the production path actually uses (agent imported the name at module
+    load), and separately blocks the network underneath the real classifier so a test that calls
+    `location.classify_location` directly still cannot escape. Tests exercising the real
+    classifier monkeypatch `chat_openrouter` themselves, which wins over this.
+    """
+    calls = []
+
+    async def _fake(text):
+        calls.append(text)
+        return fake_classify(text)
+
+    async def _no_network(*args, **kwargs):
+        raise AssertionError('a unit test tried to reach the OpenRouter MCP server')
+
+    monkeypatch.setattr(agent, 'classify_location', _fake)
+    monkeypatch.setattr('agentic_job_search.location.chat_openrouter', _no_network)
+    return calls
 
 
 _REAL_LOAD_PREFERENCES = preferences.load_preferences

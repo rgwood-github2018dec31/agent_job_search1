@@ -56,6 +56,7 @@ from agentic_job_search.config import (
     TRIAGE_ENABLED,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
+from agentic_job_search.location import classify_location
 from agentic_job_search import scrape_openrouter
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
@@ -1952,6 +1953,14 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
         ]
         if unsupported:
             return f'requires unsupported language: {", ".join(unsupported)}'
+    # Where the role is ANCHORED, and separately whether the JD demands a move. A bare location is
+    # NOT a residency requirement — "Germany (Remote)" means the role sits in Germany and you could
+    # live anywhere in the EU — so the two are judged apart, on different fields.
+    if region := await rejected_location(extract.get('location', '')):
+        return f'located in an excluded region: {region}'
+    if relocation := str(extract.get('relocation') or '').strip():
+        if region := await rejected_location(relocation):
+            return f'relocation required to an excluded region: {region}'
     degree = derive_education_requirement(extract)
     if degree and degree in preferences.rejected_degrees():
         return f'requires advanced degree: {degree}'
@@ -1982,10 +1991,72 @@ def foreign_local_language(extract: dict) -> str:
     return _unsupported_language(extract.get('local_language', ''))
 
 
+async def derive_local_language(extract: dict) -> str:
+    """`local_language`, reconciled against the location classifier. Cosmetic: NO gate reads this.
+
+    The extractor may only ever ADD a foreign-language finding, never erase one:
+      - extractor silent          -> the classifier's answer
+      - extractor named a foreign language the classifier would not have -> the extractor wins
+        (it read the body; that is the Valtech "colleagues outside Quebec" case, which is the
+        whole reason this field is a model judgement rather than a lookup)
+      - extractor claimed a language the user DOES work in, contradicted by the country ->
+        the classifier wins (team.blue's Berlin posting came back 'english' while Finom's and
+        Flip's German postings came back 'german')
+    """
+    stated = str(extract.get('local_language') or '').strip().lower()
+    if stated and _unsupported_language(stated):
+        return stated
+    facts = await classify_location(extract.get('location', ''))
+    return str(facts.get('local_language') or '').strip().lower() or stated
+
+
 def hybrid_location_is_acceptable(location: str) -> bool:
     """True if a hybrid/on-site role in this location is one the user would actually take."""
     haystack = (location or '').lower()
     return any(token in haystack for token in preferences.hybrid_acceptable_locations())
+
+
+async def rejected_location(text: str) -> str:
+    """The rejected region named in `text`, or '' when acceptable, unrecognised, or unconfigured.
+
+    Purely geographic. This deliberately reads NO language field: an earlier design rejected on
+    "non-English AND not on the acceptable list", which got the right answers for the wrong reason
+    and would have excluded a French-language remote role in Canada — `acceptable_locations` lists
+    Vancouver and British Columbia but not Canada itself. What language is spoken somewhere is a
+    separate fact (`local_language`), it warns only, and it must never be folded back in here.
+
+    Three tiers, cheapest first:
+      1. unconfigured -> '' (no classifier call is ever made)
+      2. an exempt location (`hybrid.acceptable_locations`) wins outright, so `france` can sit on
+         the deny list while Toulouse and Nice still pass
+      3. the deny list (`locations.exclude`)
+      4. otherwise the cached classifier, and a rejection only when EVERY named country is in a
+         rejected region — so 'the UK or the Netherlands' passes, and so does anything naming no
+         country at all ('European Union', 'Remote (EMEA)')
+    """
+    haystack = ' '.join(str(text or '').split()).lower()
+    if not haystack:
+        return ''
+    if not (preferences.excluded_locations() or preferences.rejected_regions()):
+        return ''
+    if hybrid_location_is_acceptable(haystack):
+        return ''
+    for token in preferences.excluded_locations():
+        if token in haystack:
+            return token
+
+    unwanted = preferences.rejected_regions()
+    if not unwanted:
+        return ''
+    facts = await classify_location(haystack)
+    regions = facts.get('regions') or []
+    if not regions:
+        return ''
+    if not all(region in unwanted for region in regions):
+        return ''
+    countries = facts.get('countries') or []
+    named = countries[0] if countries else regions[0]
+    return f'{named} ({regions[0]})'
 
 
 def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
@@ -2178,6 +2249,12 @@ def _hard_rule_category(reason: str) -> str:
         return 'hard_ruled_stale'
     if 'sponsorship' in reason:
         return 'hard_ruled_us_auth'
+    # Before the location branch: the relocation reason contains the word "location" too, and
+    # this dispatcher is ordered substring matching — it must not depend on that accident.
+    if 'relocation required' in reason:
+        return 'hard_ruled_relocation'
+    if 'excluded region' in reason:
+        return 'hard_ruled_location'
     if 'language' in reason:
         return 'hard_ruled_language'
     if 'degree' in reason:
@@ -2244,13 +2321,18 @@ async def evaluate_all_candidates(
                 logger.warning(f"Extract failed (both paths): {candidate['company']} — {candidate['title']}")
                 continue
             bump('extract_ok')
+            # Resolve local_language ONCE, here, and write it back — so format_extract_text and
+            # build_deterministic_warnings (both sync) keep reading a plain field. Cosmetic only:
+            # no gate reads local_language, by design.
+            raw_local_language = str(extract.get('local_language') or '')
+            extract['local_language'] = await derive_local_language(extract)
             extract_text = format_extract_text(candidate, extract)
             logger.info(
                 f"Extract signal: {candidate['company']} — {candidate['title']}: "
                 f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
                 f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
                 f"posting_language={extract.get('posting_language')!r} "
-                f"local_language={extract.get('local_language')!r} "
+                f"local_language={raw_local_language!r}->{extract.get('local_language')!r} "
                 f"relocation={extract.get('relocation')!r} "
                 f"education_requirement={extract.get('education_requirement')!r} "
                 f"is_agency={derive_agency_posting(extract)} end_client={extract.get('end_client')!r}"
