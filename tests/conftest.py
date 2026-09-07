@@ -110,6 +110,10 @@ _GEO_RE = re.compile(
 )
 
 
+# Multi-country areas: an offer of one of these is an unrejected option in its own right.
+FAKE_BROAD_AREAS = ('european union', ' eu ', 'emea', 'anywhere', 'worldwide', 'across europe')
+
+
 def fake_classify(text):
     """Every COUNTRY named in `text`, first mention first, deduped. Unmatched text names none."""
     haystack = ' '.join(str(text or '').split()).lower()
@@ -122,7 +126,15 @@ def fake_classify(text):
             continue
         countries.append(country)
         regions.append(region)
-    return {'countries': countries, 'regions': regions, 'local_language': language, 'source': 'stub'}
+    # 'across europe' qualifies a single anchored country ("Berlin, Germany (Remote across
+    # Europe)") rather than offering the whole area, so it only counts when no country is named.
+    broad = any(area in f' {haystack} ' for area in FAKE_BROAD_AREAS[:4]) or (
+        not countries and any(area in f' {haystack} ' for area in FAKE_BROAD_AREAS)
+    )
+    return {
+        'countries': countries, 'regions': regions, 'broad_area': broad,
+        'local_language': language, 'source': 'stub',
+    }
 
 
 @pytest.fixture(autouse=True)

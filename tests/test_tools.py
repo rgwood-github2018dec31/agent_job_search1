@@ -3935,6 +3935,19 @@ async def test_exempt_list_rescues_a_country_in_a_rejected_region(monkeypatch):
     assert await agent.rejected_location('Dublin, Ireland (Remote)') == ''
 
 
+async def test_rejected_location_spares_a_broad_area_that_also_names_a_country():
+    """'European Union (Remote, UK and EU)' is not a UK-only role because the UK is the one country
+    it names. Found by the live backtest, which flipped a real 5/5 posting of exactly this shape."""
+    assert await agent.rejected_location('European Union (Remote, UK and EU)') == ''
+
+
+async def test_rejected_location_still_rejects_a_country_phrased_expansively():
+    """The other half of that rule, and the one that keeps it honest: a single anchored country
+    described in expansive terms is still that country. Otherwise 'Berlin, Germany (Remote across
+    Europe)' — the exact Finom posting this whole gate exists for — would spare itself."""
+    assert await agent.rejected_location('Berlin, Germany (Remote across Europe)') == 'germany (western_europe)'
+
+
 async def test_rejected_location_rejects_when_every_named_country_is_rejected():
     assert await agent.rejected_location('Germany or the Netherlands') == 'germany (western_europe)'
 
@@ -4100,6 +4113,12 @@ def test_location_cache_rebuilds_a_corrupt_file(monkeypatch, tmp_path):
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', path)
     monkeypatch.setattr(location, '_cache', None)
     assert location._load_cache() == {}
+
+
+def test_location_classifier_defaults_broad_area_to_false():
+    """A model that omits the field must not accidentally wave every job through."""
+    from agentic_job_search import location
+    assert location._coerce({'countries': ['germany'], 'regions': ['western_europe']})['broad_area'] is False
 
 
 def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_through():

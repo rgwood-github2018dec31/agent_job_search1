@@ -65,13 +65,18 @@ Location text: "{text}"
 Return ONLY a JSON object, no prose and no code fence:
 {{"countries": ["<country in English>", ...],
   "regions": ["<one region per country, same order>", ...],
+  "broad_area": <true|false>,
   "local_language": "<dominant working language of the FIRST country, lowercase English name>"}}
 
 Rules:
 - `regions` must use exactly these values: {regions}.
 - One entry in `regions` for each entry in `countries`, in the same order.
-- If the text names no specific country (e.g. "European Union", "Remote (EMEA)", "Anywhere"),
-  return {{"countries": [], "regions": [], "local_language": ""}}.
+- `broad_area` is true when the text offers a whole MULTI-COUNTRY area to work from — "European
+  Union", "EU", "EMEA", "Europe", "anywhere", "worldwide", "LATAM". It is true even when specific
+  countries are ALSO named, e.g. "European Union (Remote, UK and EU)" is true, because the offer is
+  not limited to the countries it happens to name. A single country, however phrased, is false:
+  "Germany (Remote across Europe)" is false, since the role is anchored in Germany.
+- If the text names no specific country, return an empty `countries` and `regions`.
 - If several countries are named ("the UK or the Netherlands"), list every one of them.
 - southern_europe means the Mediterranean and Iberia, including SOUTHERN France (Nice, Marseille,
   Montpellier, Toulouse). Northern France, including Paris, is western_europe.
@@ -120,7 +125,7 @@ def cache_key(text: str) -> str:
 
 def _empty(reason: str) -> dict[str, Any]:
     """The fail-open answer: no country named, so no policy can reject."""
-    return {'countries': [], 'regions': [], 'local_language': '', 'source': reason}
+    return {'countries': [], 'regions': [], 'broad_area': False, 'local_language': '', 'source': reason}
 
 
 def _coerce(raw: dict) -> dict[str, Any]:
@@ -138,6 +143,7 @@ def _coerce(raw: dict) -> dict[str, Any]:
     return {
         'countries': countries,
         'regions': regions,
+        'broad_area': bool(raw.get('broad_area')),
         'local_language': str(raw.get('local_language') or '').strip().lower(),
     }
 

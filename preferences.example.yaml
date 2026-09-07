@@ -71,8 +71,9 @@ reject_required_degrees: []
 #   3. Anything neither list names goes to a cached LLM classifier (run_dir/location_cache.yaml),
 #      which returns the country and one of: southern_europe, northern_europe, western_europe,
 #      eastern_europe, north_america, other, unknown. `reject_regions` then decides.
-# A job is rejected only when EVERY country named is in a rejected region, so "the UK or the
-# Netherlands" passes, and so does anything naming no country ("European Union", "Remote (EMEA)").
+# A job is rejected only when EVERY country named is in a rejected region, so "Spain or the
+# Netherlands" passes; so does anything naming no country ("European Union", "Remote (EMEA)"), and
+# so does a posting offering a whole multi-country area even when it names one country inside it.
 # Classifier failure fails OPEN — an outage must not start rejecting jobs.
 #
 # BOTH lists empty means no geographic gate and, deliberately, not a single classifier call.

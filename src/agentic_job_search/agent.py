@@ -2049,6 +2049,12 @@ async def rejected_location(text: str) -> str:
     if not unwanted:
         return ''
     facts = await classify_location(haystack)
+    # A whole multi-country area on offer is itself an unrejected option: "European Union (Remote,
+    # UK and EU)" is not a UK-only role just because the UK is the one country it names. Found by
+    # the live backtest, which flipped a 5/5 posting of exactly that shape. A single country phrased
+    # expansively ("Berlin, Germany (Remote across Europe)") is NOT this — it stays anchored.
+    if facts.get('broad_area'):
+        return ''
     regions = facts.get('regions') or []
     if not regions:
         return ''
