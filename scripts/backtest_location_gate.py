@@ -40,7 +40,10 @@ logger = logging.getLogger('backtest')
 FIELD_RE = {
     'location': re.compile(r'^Location:[ \t]*(\S.*)$', re.MULTILINE),
     'relocation': re.compile(r'^Relocation required:[ \t]*(\S.*)$', re.MULTILINE),
-    'local_language': re.compile(r'^Local working language:[ \t]*(\S.*)$', re.MULTILINE),
+    # Both labels: the postings saved before the rename carry 'Local working language:', and a
+    # backtest that silently parsed nothing from them would look exactly like a clean run.
+    'implied_local_language': re.compile(
+        r'^(?:Implied local language|Local working language):[ \t]*(\S.*)$', re.MULTILINE),
     'posting_language': re.compile(r'^Posting written in:[ \t]*(\S.*)$', re.MULTILINE),
     'workplace': re.compile(r'^Workplace:[ \t]*(\S.*)$', re.MULTILINE),
 }

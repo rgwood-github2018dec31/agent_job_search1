@@ -61,30 +61,36 @@ LOCATION_REGIONS = (
 )
 
 # EU membership, as of 2026-09-09. World knowledge, so it belongs in tracked source — which
-# regions the user will not work in is personal and lives in run_dir/preferences.yaml. Lowercase,
-# spelled the way the classifier returns countries; the aliases below cover the variants it also
-# uses, because `_coerce` deliberately does not normalize country names.
+# regions the user will not work in is personal and lives in run_dir/preferences.yaml. Written the
+# way the countries are written: a constant holds the real name of the thing it names, and folding
+# happens at the comparison, in `is_eu_member`. A name folded here could never be unfolded, and a
+# folded constant reads as correct right up until someone displays it.
 EU_MEMBER_STATES = frozenset({
-    'austria', 'belgium', 'bulgaria', 'croatia', 'cyprus', 'czechia', 'denmark', 'estonia',
-    'finland', 'france', 'germany', 'greece', 'hungary', 'ireland', 'italy', 'latvia',
-    'lithuania', 'luxembourg', 'malta', 'netherlands', 'poland', 'portugal', 'romania',
-    'slovakia', 'slovenia', 'spain', 'sweden',
+    'Austria', 'Belgium', 'Bulgaria', 'Croatia', 'Cyprus', 'Czechia', 'Denmark', 'Estonia',
+    'Finland', 'France', 'Germany', 'Greece', 'Hungary', 'Ireland', 'Italy', 'Latvia',
+    'Lithuania', 'Luxembourg', 'Malta', 'Netherlands', 'Poland', 'Portugal', 'Romania',
+    'Slovakia', 'Slovenia', 'Spain', 'Sweden',
 })
 
-# Spellings the classifier uses interchangeably with the canonical names above.
+# Spellings used interchangeably with the canonical names above.
 _EU_ALIASES = frozenset({
-    'czech republic', 'the netherlands', 'holland', 'republic of ireland', 'hellas',
+    'Czech Republic', 'The Netherlands', 'Holland', 'Republic of Ireland', 'Hellas',
 })
+
+# The folded lookup index, DERIVED so the two sets above stay the single source of truth. Built
+# once at import rather than per call: `is_eu_member` runs once per country per posting. Two
+# encodings of one list drift apart, so nothing may be added here that is not up there.
+_EU_LOOKUP = frozenset(name.casefold() for name in EU_MEMBER_STATES | _EU_ALIASES)
 
 
 def is_eu_member(country: str) -> bool:
     """True if `country` names an EU member state, tolerating case and spelling variants.
 
-    Folding happens HERE, at the comparison, not in whatever produced `country`. The sets below are
-    written lowercase because they are a lookup index, not something anyone displays.
+    Folding happens HERE, at the comparison, not in whatever produced `country` and not in the
+    constants. `_coerce` returns countries as the classifier wrote them ('Germany'), the cache may
+    still hold pre-2026-09-09 lowercase entries on the stale path, and both must answer the same.
     """
-    normalized = ' '.join(str(country or '').split()).casefold()
-    return normalized in EU_MEMBER_STATES or normalized in _EU_ALIASES
+    return ' '.join(str(country or '').split()).casefold() in _EU_LOOKUP
 
 
 @functools.lru_cache(maxsize=512)
@@ -135,10 +141,10 @@ _PROMPT = """You are a geography reference. Answer ONLY about the PLACE named be
 Location text: "{text}"
 
 Return ONLY a JSON object, no prose and no code fence:
-{{"countries": ["<country in English>", ...],
+{{"countries": ["<country in English, properly capitalised>", ...],
   "regions": ["<one region per country, same order>", ...],
   "broad_area": <true|false>,
-  "local_language": "<dominant working language of the FIRST country, lowercase English name>",
+  "implied_local_language": "<dominant working language of the FIRST country, lowercase English name>",
   "place_names": ["<every place this text refers to, English and local spellings>", ...]}}
 
 Rules:
@@ -154,6 +160,8 @@ Rules:
 - southern_europe means the Mediterranean and Iberia, including SOUTHERN France (Nice, Marseille,
   Montpellier, Toulouse). Northern France, including Paris, is western_europe.
 - A city implies its country: "Berlin" -> Germany, "Barcelona" -> Spain.
+- `countries` are proper names, like `place_names` below: write "Germany", never
+  "germany". Code folds case where it needs to; it cannot restore a name you folded.
 - `place_names` lists every place the text refers to at EVERY level -- city, region/state, country
   -- in BOTH the common English form and the local form, properly capitalised and accented, e.g.
   "Sevilla, Andalusia, Spain" -> ["Sevilla", "Seville", "Andalucia", "Andalucía", "Andalusia",
@@ -191,9 +199,9 @@ def countries_seen_this_run() -> dict[str, str]:
 def place_names_seen_this_run() -> set[str]:
     """Every place name this run encountered, as written by the classifier.
 
-    Countries are lowercase (that is how `countries` comes back); `place_names` are proper names.
-    The reviewer needs the proper-name set to tell a list entry that has not come up yet from one
-    that can never match — 'malaga' against a corpus that says 'Málaga'.
+    Both `countries` and `place_names` come back as proper names; this is the wider set, naming
+    every place at every level. The reviewer needs it to tell a list entry that has not come up
+    yet from one that can never match — 'malaga' against a corpus that says 'Málaga'.
     """
     return set(_place_names_seen_this_run)
 
@@ -244,7 +252,7 @@ def cache_key(text: str) -> str:
 def _empty(reason: str) -> dict[str, Any]:
     """The fail-open answer: no country named, so no policy can reject."""
     return {
-        'countries': [], 'regions': [], 'broad_area': False, 'local_language': '',
+        'countries': [], 'regions': [], 'broad_area': False, 'implied_local_language': '',
         'place_names': [], 'source': reason,
     }
 
@@ -268,7 +276,7 @@ def _coerce(raw: dict) -> dict[str, Any]:
         'countries': countries,
         'regions': regions,
         'broad_area': bool(raw.get('broad_area')),
-        'local_language': str(raw.get('local_language') or '').strip().lower(),
+        'implied_local_language': str(raw.get('implied_local_language') or '').strip().lower(),
         # Proper names, deliberately NOT lowercased: they are matched case-sensitively against the
         # user's lists. Deduped preserving order so the cache file stays stable.
         'place_names': list(dict.fromkeys(
@@ -280,7 +288,7 @@ def _coerce(raw: dict) -> dict[str, Any]:
 
 
 async def classify_location(text: str) -> dict[str, Any]:
-    """Geographic facts about `text`: {countries, regions, local_language}.
+    """Geographic facts about `text`: {countries, regions, implied_local_language}.
 
     Cached on disk by normalized location string, so a repeated location costs nothing and — more
     importantly — cannot be answered two different ways. Every failure returns the empty answer,
@@ -314,6 +322,10 @@ async def classify_location(text: str) -> dict[str, Any]:
             # this, one outage silently disables the region gate for every location ever cached.
             entry = dict(stale)
             entry.setdefault('place_names', [])
+            # Same for the pre-rename language key. This is the one path that serves an entry the
+            # `place_names` guard above would otherwise have reclassified, so it is the only place
+            # the old name can still reach a consumer.
+            entry.setdefault('implied_local_language', stale.get('local_language', ''))
             entry['source'] = 'stale'
             _record_countries(entry)
             return entry
@@ -325,7 +337,7 @@ async def classify_location(text: str) -> dict[str, Any]:
     _write_cache()
     logger.info(
         f'Location classified: {text!r} -> countries={result["countries"]} '
-        f'regions={result["regions"]} local_language={result["local_language"]!r} (${cost:.6f})'
+        f'regions={result["regions"]} implied_local_language={result["implied_local_language"]!r} (${cost:.6f})'
     )
     entry = dict(result)
     entry['source'] = 'llm'

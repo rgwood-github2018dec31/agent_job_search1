@@ -39,8 +39,9 @@ sponsorship_required_in: []
 # while it is empty:
 #   1. A posting that explicitly REQUIRES another language is auto-rated 1 (hard rule).
 #   2. A posting WRITTEN IN another language is capped at `foreign_language_rating_cap` below.
-#   3. A job whose location has a different local working language (English JD in Montreal or
-#      Madrid) gets a warning — never a rejection.
+#   3. A job whose location IMPLIES a different working language (English JD in Montreal or
+#      Madrid) gets a warning — never a rejection. That language comes from the location alone,
+#      via the cached geography classifier; the posting is never asked about it.
 languages:
   - english
 

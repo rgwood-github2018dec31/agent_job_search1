@@ -464,7 +464,6 @@ Also capture:
 - workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
 - language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
 - posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely undeterminable.
-- local_language: the dominant local WORKING/BUSINESS language of the job's location, lowercase English name, e.g. "french" for Quebec/Montreal, "spanish" for Spain, "english" for Toronto or London. Use location references anywhere in the posting body, not just the location field — a remote-Canada role whose text mentions "colleagues outside Quebec" is "french". Leave empty for work-from-anywhere roles or when the location is unknown.
 - residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany", "open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere", "any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is advertised: "Romania (Remote)" on its own says nothing here.
 - relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
 - education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required.
@@ -494,7 +493,7 @@ Also produce:
 - warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — hybrid/on-site, contract vs full-time, salary below target, missing salary, stack mismatch, language expectations. Every conflict you notice MUST appear here, even when you still rate the job highly.
 
 ## Language
-Check the `Posting written in:` and `Local working language:` lines. A posting written in another language, and a workplace whose local working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English. Do not write a warning bullet for either: both are detected deterministically and added for you.
+Check the `Posting written in:` and `Implied local language:` lines. A posting written in another language, and a workplace whose implied local working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English. Do not write a warning bullet for either: both are detected deterministically and added for you.
 
 Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
 """
@@ -596,7 +595,6 @@ EXTRACT_OUTPUT_SCHEMA = {
         'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
         'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
         'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
-        'local_language': {'type': 'string', 'description': "Dominant local working language of the job's location, lowercase e.g. 'french' for Quebec, 'spanish' for Spain; empty for work-from-anywhere or unknown location"},
         'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
                             'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
         'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
@@ -1704,7 +1702,6 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         'sponsorship_note': structured.get('sponsorship_note', ''),
         'language_requirement': structured.get('language_requirement', ''),
         'posting_language': (structured.get('posting_language') or '').strip().lower(),
-        'local_language': (structured.get('local_language') or '').strip().lower(),
         'relocation': structured.get('relocation', ''),
         'residency_scope': (structured.get('residency_scope') or '').strip().lower(),
         'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
@@ -1815,8 +1812,9 @@ def derive_residency_scope(extract: dict) -> str:
     the extractor or the text sticks, and it is checked before the area patterns. A wrong
     `area_wide` silently switches the geographic gate off for that job -- the exact failure this
     field exists to close -- while a wrong `country_only` surfaces as a rejection with a stated
-    reason in the audit log and the run funnel. Same shape as the `local_language` rule that may
-    only ever ADD a finding, never erase one.
+    reason in the audit log and the run funnel. The union direction is the point: a restrictive
+    finding from either source sticks, because only the permissive value can silently switch a gate
+    off.
 
     The regexes are a fallback for when the extractor leaves the field unset; they carry the load
     only until the field is populated, which is why the patterns are anchored on a concrete
@@ -2016,8 +2014,8 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Language requirement: {extract['language_requirement']}")
     if extract.get('posting_language'):
         lines.append(f"Posting written in: {extract['posting_language']}")
-    if extract.get('local_language'):
-        lines.append(f"Local working language: {extract['local_language']}")
+    if extract.get('implied_local_language'):
+        lines.append(f"Implied local language: {extract['implied_local_language']}")
     if extract.get('relocation'):
         lines.append(f"Relocation required: {extract['relocation']}")
     if extract.get('education_requirement'):
@@ -2105,28 +2103,27 @@ def foreign_posting_language(extract: dict) -> str:
     return _unsupported_language(extract.get('posting_language', ''))
 
 
-def foreign_local_language(extract: dict) -> str:
-    """The local working language of the job's location, when it is not one the user speaks."""
-    return _unsupported_language(extract.get('local_language', ''))
+def foreign_implied_local_language(extract: dict) -> str:
+    """The language implied by the job's location, when it is not one the user speaks."""
+    return _unsupported_language(extract.get('implied_local_language', ''))
 
 
-async def derive_local_language(extract: dict) -> str:
-    """`local_language`, reconciled against the location classifier. Cosmetic: NO gate reads this.
+async def derive_implied_local_language(extract: dict) -> str:
+    """The working language IMPLIED by the job's location. Cosmetic: NO gate reads this.
 
-    The extractor may only ever ADD a foreign-language finding, never erase one:
-      - extractor silent          -> the classifier's answer
-      - extractor named a foreign language the classifier would not have -> the extractor wins
-        (it read the body; that is the Valtech "colleagues outside Quebec" case, which is the
-        whole reason this field is a model judgement rather than a lookup)
-      - extractor claimed a language the user DOES work in, contradicted by the country ->
-        the classifier wins (team.blue's Berlin posting came back 'english' while Finom's and
-        Flip's German postings came back 'german')
+    A place implies a language -- Italy implies Italian -- and that is world knowledge about a
+    location, not a judgement about the posting. So the cached classifier is the only source:
+    it cannot answer two Berlin jobs differently, within a run or across runs.
+
+    The extractor used to supply this too, under a rule where its foreign finding won over the
+    classifier's. That bought one thing -- a language named only in the body, like Valtech's
+    "colleagues outside Quebec" on a `Canada (Remote)` posting -- at the cost of a fact about a
+    place being decided per job by a model. A foreign language named in the body is no longer
+    detected; a foreign language the JD is WRITTEN in still is, via `posting_language`, which is a
+    fact about the page and stays a model judgement for that reason.
     """
-    stated = str(extract.get('local_language') or '').strip().lower()
-    if stated and _unsupported_language(stated):
-        return stated
     facts = await classify_location(extract.get('location', ''))
-    return str(facts.get('local_language') or '').strip().lower() or stated
+    return str(facts.get('implied_local_language') or '').strip().lower()
 
 
 def hybrid_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
@@ -2159,7 +2156,7 @@ async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
     "non-English AND not on the acceptable list", which got the right answers for the wrong reason
     and would have excluded a French-language remote role in Canada — `acceptable_locations` lists
     Vancouver and British Columbia but not Canada itself. What language is spoken somewhere is a
-    separate fact (`local_language`), it warns only, and it must never be folded back in here.
+    separate fact (`implied_local_language`), it warns only, and must never be folded back in here.
 
     Three tiers, cheapest first:
       1. unconfigured -> '' (no classifier call is ever made)
@@ -2325,9 +2322,9 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if language := foreign_posting_language(extract):
         warnings.append(f'Posting written in {language.title()} — not English')
 
-    if local_language := foreign_local_language(extract):
+    if implied_local_language := foreign_implied_local_language(extract):
         location = extract.get('location') or 'location not stated'
-        warnings.append(f'Local working language: {local_language.title()} — {location}')
+        warnings.append(f'Implied local language: {implied_local_language.title()} — {location}')
 
     if extract.get('relocation'):
         warnings.append(f"Relocation required: {extract['relocation']}")
@@ -2529,19 +2526,19 @@ async def evaluate_all_candidates(
                 logger.warning(f"Extract failed (both paths): {candidate['company']} — {candidate['title']}")
                 continue
             bump('extract_ok')
-            # Resolve local_language ONCE, here, and write it back — so format_extract_text and
-            # build_deterministic_warnings (both sync) keep reading a plain field. Cosmetic only:
-            # no gate reads local_language, by design.
-            raw_local_language = str(extract.get('local_language') or '')
-            extract['local_language'] = await derive_local_language(extract)
+            # Resolve the implied local language ONCE, here, and write it back — so
+            # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
+            # field. Cosmetic only: no gate reads it, by design.
+            extract['implied_local_language'] = await derive_implied_local_language(extract)
             # Same treatment for residency_scope, and for the same reason: resolve once here so
             # the sync consumers (the gate, the warnings) read a plain field, and log raw->derived
             # so a fallback that silently overrides the extractor stays countable.
             raw_residency_scope = str(extract.get('residency_scope') or '')
             extract['residency_scope'] = derive_residency_scope(extract)
             # Every other name this place goes by, resolved ONCE (the classifier answer is already
-            # cached from derive_local_language above, so this is free) and written back, so the
-            # sync consumers below read a plain field instead of each needing to be async.
+            # cached from derive_implied_local_language above, which now calls it unconditionally,
+            # so this is always free) and written back, so the sync consumers below read a plain
+            # field instead of each needing to be async.
             extract['place_names'] = (
                 await classify_location(extract.get('location', ''))
             ).get('place_names') or []
@@ -2551,7 +2548,7 @@ async def evaluate_all_candidates(
                 f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
                 f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
                 f"posting_language={extract.get('posting_language')!r} "
-                f"local_language={raw_local_language!r}->{extract.get('local_language')!r} "
+                f"implied_local_language={extract.get('implied_local_language')!r} "
                 f"relocation={extract.get('relocation')!r} "
                 f"residency_scope={raw_residency_scope!r}->{extract.get('residency_scope')!r} "
                 f"place_names={extract.get('place_names')} "

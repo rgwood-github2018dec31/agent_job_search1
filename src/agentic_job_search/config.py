@@ -1,3 +1,9 @@
+from utils_tools_n_agents_common.models import (
+    OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
+    OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
+    OPENROUTER_MODEL_NAME_SCRAPER,
+)
+
 # Job search parameters
 JOB_MAX_AGE_DAYS = 21
 JOB_STALE_AGE_DAYS = 30  # hard rule: postings older than this are auto-rated 1
@@ -234,11 +240,6 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
 #   OLLAMA_*      -> the local Ollama MCP server (:8002)
 # Repoint a const at a different family to change the route; repoint it within a family
 # to change only the model.
-from utils_tools_n_agents_common.models import (
-    OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
-    OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
-    OPENROUTER_MODEL_NAME_SCRAPER,
-)
 
 MODEL_NAME_QUERY = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 MODEL_NAME_COMPANY_MATCH = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE

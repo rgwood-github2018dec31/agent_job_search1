@@ -1,6 +1,7 @@
 """Tests for the job search agent."""
 
 from pathlib import Path
+from typing import ClassVar
 import asyncio
 import json
 import logging
@@ -960,7 +961,7 @@ async def test_categorize_save_dir_pdfs_renames_uncategorized(tmp_path, monkeypa
 
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
     class FakeReader:
-        pages = []
+        pages: ClassVar[list] = []
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -978,7 +979,7 @@ async def test_categorize_save_dir_pdfs_skips_rename_on_error(tmp_path, monkeypa
 
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
     class FakeReader:
-        pages = []
+        pages: ClassVar[list] = []
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -1020,7 +1021,7 @@ async def test_categorize_save_dir_pdfs_defaults_to_preference(tmp_path, monkeyp
     monkeypatch.setattr(tools.preferences, 'save_dir', lambda: tmp_path)
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
     class FakeReader:
-        pages = []
+        pages: ClassVar[list] = []
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -1194,20 +1195,27 @@ async def test_submit_job_extract_defaults(monkeypatch):
     assert extract['relocation'] == ''
     assert extract['education_requirement'] == ''
     assert extract['posting_language'] == ''
-    assert extract['local_language'] == ''
+    assert 'local_language' not in extract, 'the extractor no longer supplies it — the location does'
 
 
 async def test_submit_job_extract_normalizes_language_fields(monkeypatch):
     monkeypatch.setattr(tools, '_job_extracts', [])
 
     await tools.do_submit_job_extract(
-        'Scientifique principal', 'Valtech', 'desc',
-        posting_language=' French ', local_language='FRENCH',
+        'Scientifique principal', 'Valtech', 'desc', posting_language=' French ',
     )
 
-    extract = tools._job_extracts[0]
-    assert extract['posting_language'] == 'french'
-    assert extract['local_language'] == 'french'
+    assert tools._job_extracts[0]['posting_language'] == 'french'
+
+
+async def test_submit_job_extract_rejects_a_local_language_argument():
+    """The implied local language is a fact about a PLACE, resolved by the cached classifier.
+
+    Pinned as a signature check rather than prose: re-adding the parameter would otherwise be
+    accepted and silently ignored, which is the shape this repo keeps catching.
+    """
+    with pytest.raises(TypeError):
+        await tools.do_submit_job_extract('t', 'c', 'desc', local_language='french')
 
 
 # ---------------------------------------------------------------------------
@@ -1228,7 +1236,7 @@ def _make_extract(**overrides) -> dict:
         'location': 'Canada (Remote)', 'date_posted': '3 days ago',
         'closed': False, 'salary': '', 'sponsorship_note': '',
         'language_requirement': '', 'relocation': '', 'education_requirement': '',
-        'posting_language': '', 'local_language': '', 'residency_scope': '',
+        'posting_language': '', 'implied_local_language': '', 'residency_scope': '',
     }
     extract.update(overrides)
     return extract
@@ -2018,9 +2026,11 @@ async def test_classify_location_live(monkeypatch, tmp_path):
     monkeypatch.setattr(location, 'chat_openrouter', triage.chat_openrouter)
 
     facts = await location.classify_location('Berlin, Germany (Remote across Europe)')
-    assert facts['countries'] == ['germany']
+    # Proper-cased, because the prompt asks for it and nothing downstream folds it back. A model
+    # that answers 'germany' fails here rather than being quietly normalised into agreement.
+    assert facts['countries'] == ['Germany']
     assert facts['regions'] == ['western_europe']
-    assert facts['local_language'] == 'german'
+    assert facts['implied_local_language'] == 'german'
 
     # The distinction the whole gate rests on: a Mediterranean location is a different region,
     # regardless of the language spoken there.
@@ -2689,7 +2699,7 @@ async def test_stage_1b_does_not_fall_back_when_the_provider_is_healthy(monkeypa
         async def __aenter__(self):
             async def call(*a, **k):
                 return ''
-            call.list_tools = lambda: _empty()
+            call.list_tools = _empty
             return call
 
         async def __aexit__(self, *exc):
@@ -3521,8 +3531,9 @@ def test_foreign_posting_language(value, expected):
     ('english', ''),
     ('', ''),
 ])
-def test_foreign_local_language(value, expected):
-    assert agent.foreign_local_language(_make_extract(local_language=value)) == expected
+def test_foreign_implied_local_language(value, expected):
+    assert agent.foreign_implied_local_language(
+        _make_extract(implied_local_language=value)) == expected
 
 
 def test_apply_rating_caps_caps_foreign_language_posting():
@@ -3540,9 +3551,9 @@ def test_apply_rating_caps_foreign_language_does_not_raise_a_low_rating():
     assert agent.apply_rating_caps(_make_extract(posting_language='french'), 2) == (2, '')
 
 
-def test_apply_rating_caps_local_language_alone_never_caps():
+def test_apply_rating_caps_implied_local_language_alone_never_caps():
     """A non-English workplace is a warning, not a ceiling — only the JD's own language caps."""
-    assert agent.apply_rating_caps(_make_extract(local_language='french'), 5) == (5, '')
+    assert agent.apply_rating_caps(_make_extract(implied_local_language='french'), 5) == (5, '')
 
 
 def test_apply_rating_caps_applies_lowest_cap_and_reports_every_reason(monkeypatch):
@@ -3562,17 +3573,18 @@ def test_build_deterministic_warnings_flags_foreign_posting_language():
     assert any('Posting written in French' in w for w in warnings)
 
 
-def test_build_deterministic_warnings_flags_non_english_local_language():
+def test_build_deterministic_warnings_flags_non_english_implied_local_language():
+    """Reads the RESOLVED field; `derive_implied_local_language` is what puts it there."""
     extract = _make_extract(
-        local_language='french', location='Canada (Remote)', salary='CAD 200,000',
+        implied_local_language='french', location='Montreal, Canada', salary='CAD 200,000',
     )
     warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
-    assert any('Local working language: French' in w and 'Canada (Remote)' in w for w in warnings)
+    assert any('Implied local language: French' in w and 'Montreal, Canada' in w for w in warnings)
 
 
 @pytest.mark.parametrize('overrides', [
-    {'posting_language': 'english', 'local_language': 'english'},
-    {'posting_language': '', 'local_language': ''},
+    {'posting_language': 'english', 'implied_local_language': 'english'},
+    {'posting_language': '', 'implied_local_language': ''},
 ])
 def test_build_deterministic_warnings_quiet_for_english_language_fields(overrides):
     extract = _make_extract(salary='CAD 220,000', **overrides)
@@ -3581,16 +3593,16 @@ def test_build_deterministic_warnings_quiet_for_english_language_fields(override
 
 def test_format_extract_text_includes_language_fields():
     text = agent.format_extract_text(
-        _make_candidate(), _make_extract(posting_language='french', local_language='french'),
+        _make_candidate(), _make_extract(posting_language='french', implied_local_language='french'),
     )
     assert 'Posting written in: french' in text
-    assert 'Local working language: french' in text
+    assert 'Implied local language: french' in text
 
 
 def test_format_extract_text_omits_empty_language_fields():
     text = agent.format_extract_text(_make_candidate(), _make_extract())
     assert 'Posting written in:' not in text
-    assert 'Local working language:' not in text
+    assert 'Implied local language:' not in text
 
 
 def test_valtech_regression_french_posting_is_capped_and_warned():
@@ -3601,7 +3613,7 @@ def test_valtech_regression_french_posting_is_capped_and_warned():
     extract = _make_extract(
         title='Scientifique principal des donnees en IA', company='Valtech',
         location='Canada (Remote)', workplace_type='remote',
-        language_requirement='english', posting_language='french', local_language='french',
+        language_requirement='english', posting_language='french',
         description='Senior individual contributor role in data science and applied AI.',
     )
     rating, reason = agent.apply_rating_caps(extract, 4)
@@ -3610,7 +3622,12 @@ def test_valtech_regression_french_posting_is_capped_and_warned():
 
     warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
     assert any('Posting written in French' in w for w in warnings)
-    assert any('Local working language: French' in w for w in warnings)
+
+    # The SECOND bullet this posting used to get is deliberately gone. Its French working language
+    # was one sentence in the body ('colleagues outside Quebec'); `Canada (Remote)` implies English,
+    # and the implied local language is now a fact about the place alone. The outcome is unchanged
+    # — `posting_language` is a fact about the PAGE, still a model judgement, and still caps here.
+    assert not any('Implied local language' in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -3888,10 +3905,10 @@ async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences
 def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences):
     """With no languages configured there is nothing to be foreign to — no cap, no warning."""
     extract = _make_extract(
-        posting_language='french', local_language='french', salary='CAD 200,000',
+        posting_language='french', implied_local_language='french', salary='CAD 200,000',
     )
     assert agent.foreign_posting_language(extract) == ''
-    assert agent.foreign_local_language(extract) == ''
+    assert agent.foreign_implied_local_language(extract) == ''
     assert agent.apply_rating_caps(extract, 5) == (5, '')
     assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
 
@@ -4017,6 +4034,7 @@ async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatc
     """
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {
+        # Deliberately the PRE-RENAME shape: no `place_names`, and the old `local_language` key.
         'berlin, germany': {'countries': ['germany'], 'regions': ['western_europe'],
                             'broad_area': False, 'local_language': 'german'},
     })
@@ -4028,6 +4046,9 @@ async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatc
     assert facts['source'] == 'stale'
     assert facts['regions'] == ['western_europe'], 'the region gate still works from the old answer'
     assert facts['place_names'] == [], 'but no aliases until it can actually be upgraded'
+    assert facts['implied_local_language'] == 'german', (
+        'the pre-rename key still reads: this is the one path that serves an un-upgraded entry'
+    )
 
     unseen = await location.classify_location('Somewhere Never Seen')
     assert unseen['source'] == 'error' and unseen['countries'] == []
@@ -4108,11 +4129,11 @@ def test_classifier_keeps_country_names_proper():
     """`_coerce` must not fold a name. Regions and languages ARE folded — they are vocabularies."""
     coerced = location._coerce({
         'countries': ['Spain', '  United  Kingdom '], 'regions': ['Southern_Europe', 'WESTERN_EUROPE'],
-        'local_language': 'Spanish',
+        'implied_local_language': 'Spanish',
     })
     assert coerced['countries'] == ['Spain', 'United Kingdom']
     assert coerced['regions'] == ['southern_europe', 'western_europe']
-    assert coerced['local_language'] == 'spanish'
+    assert coerced['implied_local_language'] == 'spanish'
 
 
 async def test_review_makes_no_llm_call_when_nothing_is_undecided(monkeypatch):
@@ -4366,7 +4387,7 @@ def test_residency_scope_extractor_country_only_wins_over_a_silent_fallback():
 
 
 def test_residency_scope_fallback_country_only_wins_over_an_extractor_area_wide():
-    """The union direction — the `local_language` "may only ADD, never erase" shape.
+    """The union direction: a restrictive finding from EITHER source sticks.
 
     The opposite of the `is_agency` rule, deliberately: there the extractor's negative judgement
     wins, because being wrong only loses a warning. Here being wrong disables a gate.
@@ -4450,7 +4471,7 @@ async def test_globallogic_romania_regression_end_to_end():
     extract = _make_extract(
         title='Senior ML/AI Data Scientist', company='GlobalLogic',
         location='Romania (Remote within country)', relocation='Romania',
-        workplace_type='remote', posting_language='english', local_language='romanian',
+        workplace_type='remote', posting_language='english',
         description='Greenfield GenAI platform, OpenAI LLMs in production, Azure.',
     )
     assert agent.derive_workplace_type(extract) == 'remote'
@@ -4580,10 +4601,30 @@ def test_eu_member_states_covers_the_countries_the_default_turns_on():
 
 
 def test_eu_membership_tolerates_classifier_spelling_variants():
-    """`_coerce` does not normalize country names, so the classifier may return either spelling."""
+    """`_coerce` preserves the classifier's case and spelling, so `is_eu_member` folds both.
+
+    The classifier may say 'Czechia' or 'Czech Republic', and a pre-2026-09-09 cache entry served
+    on the stale path still says 'germany'. All of them must answer the same.
+    """
     assert location.is_eu_member('czech republic')
     assert location.is_eu_member('Czechia')
     assert location.is_eu_member('The Netherlands')
+    assert location.is_eu_member('germany')
+    assert location.is_eu_member('GERMANY')
+
+
+def test_eu_constants_are_written_as_proper_names():
+    """The constants hold the real names; folding lives in `is_eu_member`, not in the data.
+
+    A folded constant is invisible until someone displays it, and it cannot be unfolded. This
+    fails if anyone "simplifies" the sets back to lowercase to match a comparison — the comparison
+    is what should move. `_EU_LOOKUP` is derived, so the two can never disagree.
+    """
+    for name in location.EU_MEMBER_STATES | location._EU_ALIASES:
+        assert name != name.casefold(), name
+    assert location._EU_LOOKUP == frozenset(
+        name.casefold() for name in location.EU_MEMBER_STATES | location._EU_ALIASES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4591,7 +4632,7 @@ def test_eu_membership_tolerates_classifier_spelling_variants():
 #
 # Purely geographic. These tests exist as much to pin what the rule must NOT look at as what it
 # does: it reads no language field, because a "non-English" conjunct would exclude a
-# French-language remote role in Canada. See test_location_gate_ignores_local_language.
+# French-language remote role in Canada. See test_location_gate_ignores_implied_local_language.
 # ---------------------------------------------------------------------------
 
 async def test_rejected_location_flags_a_country_in_a_rejected_region():
@@ -4720,16 +4761,16 @@ async def test_apply_hard_rules_keeps_a_silent_remote_posting_in_an_eu_country()
 
 async def test_apply_hard_rules_still_rejects_a_silent_remote_posting_outside_the_eu():
     """The counterpart. A UK/Serbian/Norwegian/Swiss anchor implies no EU work rights."""
-    for location in (
+    for loc in (
         'United Kingdom (Remote)', 'Belgrade, Serbia (Remote)',
         'Oslo, Norway (Remote)', 'Zurich, Switzerland (Remote)',
     ):
         extract = _make_extract(
-            location=location, workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
+            location=loc, workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
         )
-        assert agent.derive_residency_scope(extract) == '', location
+        assert agent.derive_residency_scope(extract) == '', loc
         reason = await agent.apply_hard_rules(_make_candidate(), extract)
-        assert reason is not None and 'excluded region' in reason, location
+        assert reason is not None and 'excluded region' in reason, loc
 
 
 async def test_apply_hard_rules_rejects_a_stated_relocation_to_a_rejected_region():
@@ -4763,19 +4804,23 @@ def test_hard_rule_category_order_is_stable():
 # the four language/location facts stay independent
 # ---------------------------------------------------------------------------
 
-async def test_location_gate_ignores_local_language():
+async def test_location_gate_ignores_implied_local_language():
     """A Spanish-speaking location is acceptable; the gate is geographic, not linguistic.
 
     This is the pin for the design error that nearly shipped: "non-English AND not on the
     acceptable list" gets Spain and Germany right for the wrong reason, and gets Quebec wrong.
+    The classifier really does imply Spanish here — the gate must not consult it.
     """
-    extract = _make_extract(location='Spain (Remote)', local_language='spanish')
+    extract = _make_extract(location='Spain (Remote)')
+    assert (await location.classify_location('Spain (Remote)'))['implied_local_language'] == 'spanish'
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
-async def test_local_language_alone_never_rejects_or_caps():
-    """French-speaking Canada: warned about, never gated. The Valtech mechanism, restated."""
-    extract = _make_extract(location='Canada (Remote)', local_language='french')
+async def test_implied_local_language_alone_never_rejects_or_caps():
+    """French-speaking Quebec: warned about, never gated. The Valtech mechanism, restated."""
+    extract = _make_extract(location='Montreal, Canada (Remote)')
+    extract['implied_local_language'] = await agent.derive_implied_local_language(extract)
+    assert extract['implied_local_language'] == 'french'
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
     assert agent.apply_rating_caps(extract, 5) == (5, '')
 
@@ -4798,7 +4843,7 @@ async def test_september_2026_regression_is_superseded_for_silent_remote_posting
     extract = _make_extract(
         title='Senior AI Engineer', company='Finom', location='Berlin, Germany (Remote across Europe)',
         description='Agentic AI, RAG, tool calling. Remote across Europe.',
-        language_requirement='english', posting_language='english', local_language='german',
+        language_requirement='english', posting_language='english',
     )
     assert agent.foreign_posting_language(extract) == '', 'the posting is in English — cap must not fire'
     assert agent.derive_workplace_type(extract) == 'remote', 'remote — the hybrid cap must not fire'
@@ -4819,32 +4864,33 @@ async def test_september_2026_regression_is_superseded_for_silent_remote_posting
 
 
 # ---------------------------------------------------------------------------
-# derive_local_language  (cosmetic: no gate reads it)
+# derive_implied_local_language  (cosmetic: no gate reads it)
+#
+# The location is the ONLY source. The extractor no longer supplies a claim, so there is no
+# precedence rule left to test -- which is the point: a fact about a place cannot be decided
+# differently for two jobs in the same place.
 # ---------------------------------------------------------------------------
 
-async def test_derive_local_language_fills_from_the_location_when_the_extractor_is_silent():
-    assert await agent.derive_local_language(
-        _make_extract(location='Berlin, Germany (Remote)', local_language='')
+async def test_derive_implied_local_language_comes_from_the_location():
+    assert await agent.derive_implied_local_language(
+        _make_extract(location='Berlin, Germany (Remote)')
     ) == 'german'
 
 
-async def test_derive_local_language_corrects_a_contradicted_english_claim():
-    """team.blue's Berlin posting came back 'english' while Finom's and Flip's came back 'german'."""
-    assert await agent.derive_local_language(
-        _make_extract(location='Berlin, Germany (Remote)', local_language='english')
+async def test_derive_implied_local_language_ignores_a_stale_field_on_the_extract():
+    """team.blue's Berlin posting once came back 'english' while Finom's came back 'german'.
+
+    Nothing populates this field before resolution any more, but if anything ever did, the
+    classifier still decides -- two Berlin jobs cannot disagree.
+    """
+    assert await agent.derive_implied_local_language(
+        _make_extract(location='Berlin, Germany (Remote)', implied_local_language='english')
     ) == 'german'
 
 
-async def test_derive_local_language_keeps_a_foreign_claim_the_classifier_would_not_make():
-    """Valtech: the extractor read 'colleagues outside Quebec' from the body. It may add, never erase."""
-    assert await agent.derive_local_language(
-        _make_extract(location='Canada (Remote)', local_language='french')
-    ) == 'french'
-
-
-async def test_derive_local_language_empty_for_an_unnamed_location():
-    assert await agent.derive_local_language(
-        _make_extract(location='Remote (Anywhere)', local_language='')
+async def test_derive_implied_local_language_empty_for_an_unnamed_location():
+    assert await agent.derive_implied_local_language(
+        _make_extract(location='Remote (Anywhere)')
     ) == ''
 
 
@@ -4883,7 +4929,8 @@ def test_location_classifier_defaults_broad_area_to_false():
 def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_through():
     """An out-of-vocabulary region must read as 'I could not tell', not as 'acceptable'."""
     from agentic_job_search import location
-    coerced = location._coerce({'countries': ['germany'], 'regions': ['middle_earth'], 'local_language': 'german'})
+    coerced = location._coerce(
+        {'countries': ['germany'], 'regions': ['middle_earth'], 'implied_local_language': 'german'})
     assert coerced['regions'] == ['unknown']
 
 
@@ -4895,7 +4942,8 @@ async def test_location_classification_is_cached(monkeypatch, tmp_path):
 
     async def fake_chat(prompt, **kwargs):
         calls.append(prompt)
-        return '{"countries": ["germany"], "regions": ["western_europe"], "local_language": "german"}', 0.0
+        return ('{"countries": ["germany"], "regions": ["western_europe"], '
+                '"implied_local_language": "german"}'), 0.0
 
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {})
@@ -5011,7 +5059,7 @@ async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
         return '{"rating": 5, "reasoning": "great"}', 0.002
 
     monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
-    result, cost = await triage.rate_with_openrouter('sys', 'user')
+    result, _ = await triage.rate_with_openrouter('sys', 'user')
     assert result['rating'] == 5
     assert len(attempts) == 2, 'exactly one retry'
     assert attempts[0] is None and attempts[1] == triage._TRUNCATION_RETRY_MAX_TOKENS
@@ -6027,7 +6075,7 @@ async def test_categorize_save_dir_pdfs_aborts_on_api_error(tmp_path, monkeypatc
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
 
     class FakeReader:
-        pages = []
+        pages: ClassVar[list] = []
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -6052,7 +6100,7 @@ async def test_categorize_save_dir_pdfs_continues_past_per_file_error(tmp_path, 
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
 
     class FakeReader:
-        pages = []
+        pages: ClassVar[list] = []
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
