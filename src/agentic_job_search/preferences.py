@@ -144,8 +144,15 @@ def search_regions() -> list[dict[str, str]]:
 
 
 def sponsorship_required_in() -> tuple[str, ...]:
-    '''Lowercase location substrings where the user would need visa sponsorship.'''
-    return tuple(str(loc).lower() for loc in load_preferences()['sponsorship_required_in'])
+    '''Place names where the user would need visa sponsorship, as written.
+
+    Returned unfolded like the other place-name lists. This rule still compares by SUBSTRING and
+    case-insensitively at its call site, unlike the two geographic lists -- but the folding happens
+    there, where it is a comparison, rather than here, where it would be a lossy store.
+    '''
+    return tuple(
+        str(loc).strip() for loc in load_preferences()['sponsorship_required_in'] if str(loc).strip()
+    )
 
 
 def excluded_locations() -> tuple[str, ...]:

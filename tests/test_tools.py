@@ -3829,7 +3829,7 @@ async def test_devologyx_regression_end_to_end():
     # regression has always demanded (it must never be notified), so the test asserts the new
     # outcome rather than being weakened to accommodate it.
     assert await agent.apply_hard_rules(candidate, extract) == (
-        'located in an excluded region: netherlands (western_europe)'
+        'located in an excluded region: Netherlands (western_europe)'
     )
 
     # The original mechanism still has to work on its own, for a posting the location gate does
@@ -3952,7 +3952,7 @@ async def test_exonym_matches_the_listed_english_name(monkeypatch):
     """
     assert not location.location_token_matches('Munich', 'München, Bavaria, Germany')
     monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ())
-    assert await agent.rejected_location('München, Bavaria, Germany (Remote)') == 'germany (western_europe)'
+    assert await agent.rejected_location('München, Bavaria, Germany (Remote)') == 'Germany (western_europe)'
     monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('Munich',))
     assert await agent.rejected_location('München, Bavaria, Germany (Remote)') == ''
 
@@ -4088,6 +4088,31 @@ def test_undecided_countries_skips_anything_either_list_names(monkeypatch):
         {'countries': {}},
     )
     assert list(undecided) == ['serbia']
+
+
+def test_undecided_skips_a_country_the_lists_name_in_proper_case(monkeypatch):
+    """A regression that only exists if a name is folded on the way in.
+
+    The classifier returns 'Spain'; the lists say 'Spain'; matching is case-sensitive. When
+    `_coerce` still lowercased countries to 'spain', NOTHING matched — so every country the user
+    had already decided on was reported as undecided and sent to the LLM on every run, quietly
+    destroying the "zero calls in steady state" guarantee while looking like it worked.
+    """
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('Spain', 'Portugal'))
+    monkeypatch.setattr(preferences, 'excluded_locations', lambda: ('Poland',))
+    seen = {'Spain': 'southern_europe', 'Poland': 'eastern_europe', 'Serbia': 'eastern_europe'}
+    assert list(location_review.undecided_countries(seen, {'countries': {}})) == ['Serbia']
+
+
+def test_classifier_keeps_country_names_proper():
+    """`_coerce` must not fold a name. Regions and languages ARE folded — they are vocabularies."""
+    coerced = location._coerce({
+        'countries': ['Spain', '  United  Kingdom '], 'regions': ['Southern_Europe', 'WESTERN_EUROPE'],
+        'local_language': 'Spanish',
+    })
+    assert coerced['countries'] == ['Spain', 'United Kingdom']
+    assert coerced['regions'] == ['southern_europe', 'western_europe']
+    assert coerced['local_language'] == 'spanish'
 
 
 async def test_review_makes_no_llm_call_when_nothing_is_undecided(monkeypatch):
@@ -4375,7 +4400,7 @@ async def test_hybrid_in_an_eu_country_does_not_get_the_eu_remote_spare():
         description=_NEUTRAL_DESCRIPTION,
     )
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
-    assert reason is not None and 'poland' in reason
+    assert reason is not None and 'Poland' in reason
 
 
 async def test_onsite_in_an_eu_country_does_not_get_the_eu_remote_spare():
@@ -4383,7 +4408,7 @@ async def test_onsite_in_an_eu_country_does_not_get_the_eu_remote_spare():
         location='Warsaw, Poland (On-site)', workplace_type='onsite', description=_NEUTRAL_DESCRIPTION,
     )
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
-    assert reason is not None and 'poland' in reason
+    assert reason is not None and 'Poland' in reason
 
 
 async def test_excluded_locations_beat_the_eu_remote_spare(monkeypatch):
@@ -4411,7 +4436,7 @@ async def test_relocation_rule_is_unaffected_by_the_eu_remote_spare():
         description=_NEUTRAL_DESCRIPTION,
     )
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
-    assert reason == 'relocation required to an excluded region: romania (eastern_europe)'
+    assert reason == 'relocation required to an excluded region: Romania (eastern_europe)'
     assert agent._hard_rule_category(reason) == 'hard_ruled_relocation'
 
 
@@ -4432,7 +4457,7 @@ async def test_globallogic_romania_regression_end_to_end():
     assert agent.derive_residency_scope(extract) == 'country_only'
     assert not agent.hybrid_location_is_acceptable(extract['location']), "'roma' must not match 'romania'"
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
-    assert reason is not None and 'romania' in reason
+    assert reason is not None and 'Romania' in reason
 
 
 async def test_area_wide_keeps_a_posting_anchored_outside_the_eu():
@@ -4570,7 +4595,7 @@ def test_eu_membership_tolerates_classifier_spelling_variants():
 # ---------------------------------------------------------------------------
 
 async def test_rejected_location_flags_a_country_in_a_rejected_region():
-    assert await agent.rejected_location('Germany (Remote)') == 'germany (western_europe)'
+    assert await agent.rejected_location('Germany (Remote)') == 'Germany (western_europe)'
 
 
 async def test_rejected_location_spares_an_acceptable_region():
@@ -4606,7 +4631,7 @@ async def test_rejected_location_rejects_an_english_speaking_country_in_a_reject
     Germany and the Netherlands. Wanting them back is what the exempt list is for — see the test
     below — rather than a language special case, which is the conflation this whole rule avoids.
     """
-    assert await agent.rejected_location('Dublin, Ireland (Remote)') == 'ireland (western_europe)'
+    assert await agent.rejected_location('Dublin, Ireland (Remote)') == 'Ireland (western_europe)'
 
 
 async def test_exempt_list_rescues_a_country_in_a_rejected_region(monkeypatch):
@@ -4625,11 +4650,11 @@ async def test_rejected_location_still_rejects_a_country_phrased_expansively():
     """The other half of that rule, and the one that keeps it honest: a single anchored country
     described in expansive terms is still that country. Otherwise 'Berlin, Germany (Remote across
     Europe)' — the exact Finom posting this whole gate exists for — would spare itself."""
-    assert await agent.rejected_location('Berlin, Germany (Remote across Europe)') == 'germany (western_europe)'
+    assert await agent.rejected_location('Berlin, Germany (Remote across Europe)') == 'Germany (western_europe)'
 
 
 async def test_rejected_location_rejects_when_every_named_country_is_rejected():
-    assert await agent.rejected_location('Germany or the Netherlands') == 'germany (western_europe)'
+    assert await agent.rejected_location('Germany or the Netherlands') == 'Germany (western_europe)'
 
 
 async def test_rejected_location_is_inert_without_preferences(neutral_preferences, stub_location_classifier):
@@ -4671,7 +4696,7 @@ async def test_apply_hard_rules_rejects_a_location_in_a_rejected_region():
     extract = _make_extract(location='Germany (Remote within country)', workplace_type='remote')
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason == (
-        'located in an excluded region: germany (western_europe) '
+        'located in an excluded region: Germany (western_europe) '
         '— residency pinned to the anchor country'
     )
     assert agent._hard_rule_category(reason) == 'hard_ruled_location'
@@ -4710,7 +4735,7 @@ async def test_apply_hard_rules_still_rejects_a_silent_remote_posting_outside_th
 async def test_apply_hard_rules_rejects_a_stated_relocation_to_a_rejected_region():
     extract = _make_extract(location='Testville (Remote)', relocation='Germany')
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
-    assert reason == 'relocation required to an excluded region: germany (western_europe)'
+    assert reason == 'relocation required to an excluded region: Germany (western_europe)'
     assert agent._hard_rule_category(reason) == 'hard_ruled_relocation'
 
 
@@ -4727,8 +4752,8 @@ async def test_apply_hard_rules_allows_relocation_to_an_acceptable_location():
 
 def test_hard_rule_category_order_is_stable():
     """Ordered substring dispatch: 'relocation required...' also contains the word 'location'."""
-    assert agent._hard_rule_category('relocation required to an excluded region: germany (western_europe)') == 'hard_ruled_relocation'
-    assert agent._hard_rule_category('located in an excluded region: germany (western_europe)') == 'hard_ruled_location'
+    assert agent._hard_rule_category('relocation required to an excluded region: Germany (western_europe)') == 'hard_ruled_relocation'
+    assert agent._hard_rule_category('located in an excluded region: Germany (western_europe)') == 'hard_ruled_location'
     assert agent._hard_rule_category('requires unsupported language: german') == 'hard_ruled_language'
     assert agent._hard_rule_category('requires advanced degree: phd') == 'hard_ruled_education'
     assert agent._hard_rule_category('blacklisted company: X (y)') == 'hard_ruled_blacklisted'
@@ -4783,13 +4808,13 @@ async def test_september_2026_regression_is_superseded_for_silent_remote_posting
     # ...but the office case, which is what the gate was built for, is unchanged.
     onsite = dict(extract, workplace_type='hybrid', description='Hybrid — 2 days a week in the Berlin office.')
     reason = await agent.apply_hard_rules(_make_candidate(), onsite)
-    assert reason is not None and 'germany' in reason
+    assert reason is not None and 'Germany' in reason
     assert agent._hard_rule_category(reason) == 'hard_ruled_location'
 
     # ...and so is a remote posting that pins residence to Germany.
     pinned = dict(extract, location='Berlin, Germany (Remote within country)')
     reason = await agent.apply_hard_rules(_make_candidate(), pinned)
-    assert reason is not None and 'germany' in reason
+    assert reason is not None and 'Germany' in reason
     assert agent._hard_rule_category(reason) == 'hard_ruled_location'
 
 

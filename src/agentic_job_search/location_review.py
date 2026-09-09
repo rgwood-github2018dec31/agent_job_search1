@@ -220,11 +220,16 @@ def undecided_countries(seen: dict[str, str], doc: dict[str, Any]) -> dict[str, 
     """Countries neither list names and that no recommendation already covers."""
     named = tuple(preferences.excluded_locations()) + tuple(preferences.hybrid_acceptable_locations())
     recorded = doc.get('countries') or {}
+    recorded_folded = {str(key).casefold() for key in recorded}
     return {
         country: region
         for country, region in sorted(seen.items())
-        if country not in recorded
-        and not any(location_token_matches(token, country) for token in named)
+        if country.casefold() not in recorded_folded
+        # Folded at the COMPARISON, not at either source. Both sides are proper names today, but a
+        # cache entry written before that was true still holds 'spain', and a country that reads as
+        # undecided because of its casing is one the reviewer asks the LLM about on every run --
+        # silently turning "zero calls in steady state" into a call per country per run.
+        and not any(location_token_matches(token.casefold(), country.casefold()) for token in named)
     }
 
 
@@ -238,12 +243,16 @@ def _coerce_recommendations(raw: Any, allowed: dict[str, str]) -> list[dict[str,
     for item in (raw.get('recommendations') if isinstance(raw, dict) else None) or []:
         if not isinstance(item, dict):
             continue
-        country = str(item.get('country') or '').strip().lower()
-        recommendation = str(item.get('recommendation') or '').strip().lower()
-        if country not in allowed or recommendation not in RECOMMENDATIONS:
+        # The country keeps its proper name; only the ENUM is folded, because that is a
+        # vocabulary rather than a name. Matching back to what we asked about is done
+        # case-insensitively here, at the comparison.
+        country = ' '.join(str(item.get('country') or '').split())
+        recommendation = str(item.get('recommendation') or '').strip().casefold()
+        canonical = next((a for a in allowed if a.casefold() == country.casefold()), '')
+        if not canonical or recommendation not in RECOMMENDATIONS:
             continue
         kept.append({
-            'country': country,
+            'country': canonical,
             'recommendation': recommendation,
             'reason': ' '.join(str(item.get('reason') or '').split())[:300],
         })

@@ -1753,9 +1753,13 @@ _REMOTE_RE = re.compile(r'\b(?:fully\s+)?remote\b|\bwork\s+from\s+(?:home|anywhe
 # These patterns are matched case-INSENSITIVELY, unlike the place-name lists. That split is
 # deliberate: this reads prose, where "remote within europe" is written every way imaginable,
 # while the lists hold proper names, where 'Nice' the city is not 'nice' the adjective.
+# Written as the names actually are -- 'EU', not 'eu' -- even though `re.IGNORECASE` on the
+# patterns below means the case is not what does the matching. Folding is something you do at the
+# point of comparison; a name stored folded can never be unfolded, and reading 'emea' in source
+# gives no hint whether it is an acronym, a country or a typo.
 _AREA_WORDS = (
-    r'(?:eu|e\.u\.|eea|emea|europ(?:e|ean)|american?s?|north\s+america|south\s+america|'
-    r'schengen|latam|latin\s+america|apac|asia[\s-]pacific|mena|'
+    r'(?:EU|E\.U\.|EEA|EMEA|Europ(?:e|ean)|American?s?|North\s+America|South\s+America|'
+    r'Schengen|LATAM|Latin\s+America|APAC|Asia[\s-]Pacific|MENA|'
     r'anywhere|world|globe|worldwide|country\s+where|countries\s+where)'
 )
 # What may sit between a preposition and an area name: one determiner and one adjective, so
@@ -2051,8 +2055,11 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     if posted and (date.today() - posted).days > JOB_STALE_AGE_DAYS:
         return f'posting older than {JOB_STALE_AGE_DAYS} days ({posted.isoformat()})'
     sponsorship_locations = preferences.sponsorship_required_in()
-    location = extract['location'].lower()
-    needs_sponsorship = any(loc in location for loc in sponsorship_locations)
+    # Folded HERE rather than in the accessor: the preference holds place names, and a name folded
+    # on the way in cannot be unfolded on the way out. This rule is still a substring match, unlike
+    # the two geographic lists -- see CLAUDE.md.
+    location = extract['location'].casefold()
+    needs_sponsorship = any(loc.casefold() in location for loc in sponsorship_locations)
     if sponsorship_locations and (
         _requires_current_us_auth(full_text) or (needs_sponsorship and 'sponsor' not in full_text.lower())
     ):

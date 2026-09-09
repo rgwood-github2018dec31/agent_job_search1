@@ -78,8 +78,12 @@ _EU_ALIASES = frozenset({
 
 
 def is_eu_member(country: str) -> bool:
-    """True if `country` names an EU member state, tolerating the classifier's spelling variants."""
-    normalized = ' '.join(str(country or '').split()).lower()
+    """True if `country` names an EU member state, tolerating case and spelling variants.
+
+    Folding happens HERE, at the comparison, not in whatever produced `country`. The sets below are
+    written lowercase because they are a lookup index, not something anyone displays.
+    """
+    normalized = ' '.join(str(country or '').split()).casefold()
     return normalized in EU_MEMBER_STATES or normalized in _EU_ALIASES
 
 
@@ -252,7 +256,10 @@ def _coerce(raw: dict) -> dict[str, Any]:
     check compares against a configured list, and a typo'd region that matched nothing would
     silently read as "acceptable" instead of "I could not tell".
     """
-    countries = [str(c).strip().lower() for c in (raw.get('countries') or []) if str(c).strip()]
+    # Countries keep the case the classifier returned -- 'Spain', not 'spain'. They are proper
+    # names, they are compared against the user's (also proper) lists, and every comparison that
+    # needs folding does it at the point of comparison. A name folded here could never be unfolded.
+    countries = [' '.join(str(c).split()) for c in (raw.get('countries') or []) if str(c).strip()]
     regions = [str(r).strip().lower() for r in (raw.get('regions') or [])]
     regions = [r if r in LOCATION_REGIONS else 'unknown' for r in regions]
     # Pad or trim so the two lists always correspond positionally.

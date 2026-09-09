@@ -30,7 +30,7 @@ search_regions:
     linkedin_location: Example Country
     geo_id: '000000'
 
-# Locations (lowercase, matched as whole words against the posting's location) where you would need
+# Places (written properly — 'Germany', not 'germany') where you would need
 # visa sponsorship. A job there that does not explicitly offer sponsorship is auto-rated 1.
 # Leave empty if you are authorized everywhere you search.
 sponsorship_required_in: []
