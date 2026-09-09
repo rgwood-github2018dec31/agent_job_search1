@@ -1,9 +1,3 @@
-from utils_tools_n_agents_common.models import (
-    OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
-    OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
-    OPENROUTER_MODEL_NAME_SCRAPER,
-)
-
 # Job search parameters
 JOB_MAX_AGE_DAYS = 21
 JOB_STALE_AGE_DAYS = 30  # hard rule: postings older than this are auto-rated 1
@@ -26,19 +20,23 @@ COMPANY_BLACKLIST_EXPIRY_DAYS = 180
 # Local/remote LLM MCP tool servers (started via their scripts/start-tool-server.sh)
 LLM_LOCAL_MCP_URL = 'http://127.0.0.1:8002/mcp'
 LLM_OPENROUTER_MCP_URL = 'http://127.0.0.1:8006/mcp'
-# Triage is one cheap 1-5 JSON score whose whole point is to be free and fast, so this is sized to
-# that rather than to a 20-35B tier: granite4.1:3b measures 65.9 tok/s / 3.9s cold start / 2.1GB on
-# this machine and advertises structured JSON output as a first-class capability.
+# Machine-local Ollama tag for Stage 2c triage (one cheap 1-5 JSON score, free and fast —
+# deliberately NOT sized to a 20-35B tier): granite4.1:3b measures 65.9 tok/s / 3.9s cold start /
+# 2.1GB on this machine and advertises structured JSON output as a first-class capability.
 #
 # This is a MACHINE-LOCAL Ollama tag and it can vanish without warning: `qwen3.6:latest` sat here
 # until a re-pull replaced it with `qwen3.6:27b-mlx`/`35b-mlx`, and Stage 2c triage then failed open
 # on every job for ten days while the run log said only "unhandled errors in a TaskGroup". That is
 # what preflight_local_model() in triage.py now catches, once per run, naming what IS installed.
-LOCAL_MODEL = 'granite4.1:3b'
-# Single-call OpenRouter tasks (query generation, company matching, rating): the shared
-# intelligence default. Agentic loops (extraction) get their own const below — they want
-# the flash tier for cost, not the strongest single-call model.
-OPENROUTER_MODEL = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+# The OLLAMA_ prefix is the one place that says "machine-local tag" — unlike the OpenRouter-routed
+# consts from utils_tools_n_agents_common.models, this value is defined here and nowhere else.
+OLLAMA_MODEL_NAME_TRIAGE = 'granite4.1:3b'
+# Single-call OpenRouter tasks (query generation, company matching, rating) and agentic loops
+# (extraction, scraping) each name their shared const DIRECTLY at call sites — no local aliases:
+# query-gen / company-match / rating import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, extraction
+# imports OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC (flash tier for cost, not the strongest single-call
+# model), scraping imports OPENROUTER_MODEL_NAME_SCRAPER. All come from
+# utils_tools_n_agents_common.models — a model swap is one edit there, not a per-project hunt.
 
 # Stage 1 (discovery) configuration
 MAX_SEARCH_QUERIES = 6  # hard cap; every query costs one LinkedIn search per configured region
@@ -224,19 +222,39 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
     'mcp__playwright__browser_evaluate',
 ]
 
-# Stage 1b scraper provider.
+# Stage model + route selection.
 #
-# 'openrouter' drives the browser through a function-calling loop (scrape_openrouter.py) instead of
-# the Claude Agent SDK. Measured 2026-08-21 on one live search: $0.0283 vs $0.4330 for identical
-# traffic on Haiku (9.3x), because MODEL_NAME_SCRAPER caches implicitly (~88% hit rate, and NO
-# cache-write fee -- cache writes were 42% of the Haiku bill).
-#
-# Do NOT point this at glm-5.2 measured $0.1932/M cache-read (~2x Haiku's
-# rate, costing MORE than what it replaces), as did deepseek-v4-pro and qwen3.8-max.
-# The win is specific to the flash tier.
-#
-# 'anthropic' selects the original ClaudeSDKClient scraper, kept intact as the rollback path.
-SCRAPER_PROVIDER = 'openrouter'  # 'openrouter' | 'anthropic'; falls back to Anthropic on failure
+# One const per pipeline stage, following the shared naming pattern
+# [<provider_prefix>_]MODEL_NAME_<desc>. The family prefix of the const this points at
+# IS the route selector — there is deliberately no separate *_PROVIDER-style string
+# knob any more (two encodings of one decision drift apart; the family prefix already
+# carries the routing, and models.route_for() dispatches on it):
+#   OPENROUTER_*  -> OpenRouter chat API via the MCP server (:8006), then Anthropic fallback
+#   ANTHROPIC_*   -> the Anthropic SDK directly
+#   OLLAMA_*      -> the local Ollama MCP server (:8002)
+# Repoint a const at a different family to change the route; repoint it within a family
+# to change only the model.
+from utils_tools_n_agents_common.models import (
+    OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
+    OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
+    OPENROUTER_MODEL_NAME_SCRAPER,
+)
+
+MODEL_NAME_QUERY = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+MODEL_NAME_COMPANY_MATCH = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+MODEL_NAME_RATING = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+# The extraction loop is a many-iteration tool-calling conversation, so it runs on the
+# shared agentic (flash-tier) default rather than the intelligence default — glm-5.2
+# measured agentic 45.7 vs 58.2 for glm-5.3-flash, at ~1/19th the per-token price.
+MODEL_NAME_EXTRACTOR = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
+# Stage 1b scraping is the one place DeepSeek wins (implicit caching, no cache-write fee;
+# measured 9.3x cheaper than Haiku on one live search — $0.0283 vs $0.4330 — because
+# OPENROUTER_MODEL_NAME_SCRAPER caches implicitly at ~88% and cache writes were 42% of
+# the Haiku bill). Do NOT repoint it at the intelligence default: glm-5.2 measured
+# $0.1932/M cache-read (~2x Haiku's rate, costing MORE than what it replaces), as did
+# deepseek-v4-pro and qwen3.8-max. The win is specific to the flash tier. Pointing it at
+# an ANTHROPIC_MODEL_NAME_* const instead routes Stage 1b through the original
+# ClaudeSDKClient scraper, kept intact as the rollback path.
 MODEL_NAME_SCRAPER = OPENROUTER_MODEL_NAME_SCRAPER
 # Replaces max_turns for the OpenRouter loop. A healthy search measured 26 iterations; this is sized
 # for two regions plus recovery, with headroom, because starvation is silent (see Search coverage).
@@ -245,19 +263,10 @@ SCRAPER_OPENROUTER_MAX_ITERATIONS = 90
 # about, and uncached every byte is re-billed on every later iteration.
 SCRAPER_TOOL_RESULT_MAX_CHARS = 30_000
 
-QUERY_PROVIDER = 'openrouter'  # 'openrouter' (glm) | 'anthropic'; falls back to Anthropic on failure
-COMPANY_MATCH_PROVIDER = 'openrouter'  # 'openrouter' (glm) | 'anthropic'; falls back to Anthropic on failure
-
 # Audit configuration
 AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
 
 # Stage 2 (evaluation) configuration
-RATING_PROVIDER = 'openrouter'  # 'anthropic' | 'openrouter' | 'ollama'
-EXTRACTOR_PROVIDER = 'openrouter'  # 'anthropic' (Haiku agentic session) | 'openrouter' (function-calling loop)
-# The extraction loop is a many-iteration tool-calling conversation, so it runs on the
-# shared agentic (flash-tier) default rather than OPENROUTER_MODEL — glm-5.2 measured
-# agentic 45.7 vs 58.2 for glm-5.3-flash, at ~1/19th the per-token price.
-EXTRACTOR_OPENROUTER_MODEL = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10
 EXTRACTOR_TOOL_RESULT_MAX_CHARS = 40_000
 TRIAGE_ENABLED = True

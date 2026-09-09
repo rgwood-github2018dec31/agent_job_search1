@@ -29,15 +29,17 @@ user wrote down matched this location, so a tool-server outage must not start re
 would otherwise have kept.
 """
 
+import functools
 import logging
+import re
 from datetime import date
 from typing import Any
 
 import yaml
 
-from agentic_job_search.config import OPENROUTER_MODEL
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.triage import chat_openrouter, extract_json_object, unwrap_exception
+from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,72 @@ LOCATION_REGIONS = (
     'unknown',           # not resolvable to a country — 'European Union', 'Remote (EMEA)', ''
 )
 
+# EU membership, as of 2026-09-09. World knowledge, so it belongs in tracked source — which
+# regions the user will not work in is personal and lives in run_dir/preferences.yaml. Lowercase,
+# spelled the way the classifier returns countries; the aliases below cover the variants it also
+# uses, because `_coerce` deliberately does not normalize country names.
+EU_MEMBER_STATES = frozenset({
+    'austria', 'belgium', 'bulgaria', 'croatia', 'cyprus', 'czechia', 'denmark', 'estonia',
+    'finland', 'france', 'germany', 'greece', 'hungary', 'ireland', 'italy', 'latvia',
+    'lithuania', 'luxembourg', 'malta', 'netherlands', 'poland', 'portugal', 'romania',
+    'slovakia', 'slovenia', 'spain', 'sweden',
+})
+
+# Spellings the classifier uses interchangeably with the canonical names above.
+_EU_ALIASES = frozenset({
+    'czech republic', 'the netherlands', 'holland', 'republic of ireland', 'hellas',
+})
+
+
+def is_eu_member(country: str) -> bool:
+    """True if `country` names an EU member state, tolerating the classifier's spelling variants."""
+    normalized = ' '.join(str(country or '').split()).lower()
+    return normalized in EU_MEMBER_STATES or normalized in _EU_ALIASES
+
+
+@functools.lru_cache(maxsize=512)
+def _token_pattern(token: str) -> re.Pattern[str]:
+    r"""Compiled whole-token matcher for one place name. Case-SENSITIVE and accent-exact.
+
+    Two things about the boundary class, both load-bearing:
+
+    1. It is a lookaround, never ``\b``. ``re.escape('U.S.')`` is ``U\.S\.``, and ``\b`` after a
+       '.' needs a word character to follow — so ``\bU\.S\.\b`` matches NEITHER 'U.S.' nor
+       'Remote, U.S. only'. The obvious fix silently deletes an entry the user wrote down.
+    2. It is ``[^\W_]`` (unicode letters and digits, minus underscore), not ``[a-z0-9]``. The
+       lowercase-ASCII class was only ever safe because the caller lowercased first. Matching
+       proper names directly, it lets 'ROMA' reach into 'ROMANIA' and 'Roma' into 'Romaña' —
+       the original bug back again, in caps and via an accent. Case-sensitivity and this class
+       changed together and cannot be separated.
+
+    No ``re.IGNORECASE``: place names are proper names, and 'Nice' the city is not 'nice' the
+    adjective.
+    """
+    return re.compile(r'(?<![^\W_])' + re.escape(token) + r'(?![^\W_])')
+
+
+def location_token_matches(token: str, text: str) -> bool:
+    """True if `token` appears in `text` as a whole place name rather than as any old substring.
+
+    Bare ``token in text`` is what let 'roma' (Rome, on the acceptable-locations list) match
+    'romania (remote within country)' and 'parma, emilia-romagna, italy'. Because that list is
+    tier 1 of the geographic gate and exempts OUTRIGHT, every Romanian posting skipped the deny
+    list, the classifier and the region policy — one of them was rated 4 and notified. The test
+    double in tests/conftest.py had used word boundaries all along, with a comment about 'nice'
+    inside 'Venice'; production never did.
+
+    Case and accents are preserved on both sides: the lists hold place names as places are
+    actually written ('Málaga', 'Sevilla'), and folding them was how 'malaga' came to be an entry
+    that could never match anything. Only whitespace is normalized, so a stray space in the YAML
+    (' Malaga ') and a tab in a scraped location are both harmless. A place the exact match still
+    misses is resolved through `place_names` from the classifier, not by loosening this.
+    """
+    token = ' '.join(str(token or '').split())
+    if not token:
+        return False
+    return _token_pattern(token).search(' '.join(str(text or '').split())) is not None
+
+
 _PROMPT = """You are a geography reference. Answer ONLY about the PLACE named below.
 
 Location text: "{text}"
@@ -66,7 +134,8 @@ Return ONLY a JSON object, no prose and no code fence:
 {{"countries": ["<country in English>", ...],
   "regions": ["<one region per country, same order>", ...],
   "broad_area": <true|false>,
-  "local_language": "<dominant working language of the FIRST country, lowercase English name>"}}
+  "local_language": "<dominant working language of the FIRST country, lowercase English name>",
+  "place_names": ["<every place this text refers to, English and local spellings>", ...]}}
 
 Rules:
 - `regions` must use exactly these values: {regions}.
@@ -81,9 +150,54 @@ Rules:
 - southern_europe means the Mediterranean and Iberia, including SOUTHERN France (Nice, Marseille,
   Montpellier, Toulouse). Northern France, including Paris, is western_europe.
 - A city implies its country: "Berlin" -> Germany, "Barcelona" -> Spain.
+- `place_names` lists every place the text refers to at EVERY level -- city, region/state, country
+  -- in BOTH the common English form and the local form, properly capitalised and accented, e.g.
+  "Sevilla, Andalusia, Spain" -> ["Sevilla", "Seville", "Andalucia", "Andalucía", "Andalusia",
+  "Spain", "España"]. Include the form as written in the text. Omit workplace words ("Remote",
+  "Hybrid"), and return an empty list when the text names no place.
 """
 
 _cache: dict[str, Any] | None = None
+
+# Countries this run actually encountered, country -> region. Run-scoped, NOT the disk cache: the
+# cache accumulates forever and says nothing about what today's postings named. Reset explicitly
+# at the top of a run (an un-reset module global is the most-repeated bug in CLAUDE.md).
+_countries_seen_this_run: dict[str, str] = {}
+_place_names_seen_this_run: set[str] = set()
+
+
+def _record_countries(result: dict[str, Any]) -> None:
+    """Note the countries in a classification. Called on BOTH return paths of classify_location.
+
+    The cache-hit path matters as much as the LLM path: in steady state almost every location is a
+    hit, so recording only new classifications would report a country once, ever, and then never
+    again.
+    """
+    regions = result.get('regions') or []
+    for index, country in enumerate(result.get('countries') or []):
+        _countries_seen_this_run.setdefault(country, regions[index] if index < len(regions) else 'unknown')
+    _place_names_seen_this_run.update(result.get('place_names') or [])
+
+
+def countries_seen_this_run() -> dict[str, str]:
+    """Countries encountered this run, country -> region."""
+    return dict(_countries_seen_this_run)
+
+
+def place_names_seen_this_run() -> set[str]:
+    """Every place name this run encountered, as written by the classifier.
+
+    Countries are lowercase (that is how `countries` comes back); `place_names` are proper names.
+    The reviewer needs the proper-name set to tell a list entry that has not come up yet from one
+    that can never match — 'malaga' against a corpus that says 'Málaga'.
+    """
+    return set(_place_names_seen_this_run)
+
+
+def reset_countries_seen() -> None:
+    """Clear the run-scoped accumulators. Called once at the start of a run."""
+    _countries_seen_this_run.clear()
+    _place_names_seen_this_run.clear()
 
 
 def _load_cache() -> dict[str, Any]:
@@ -125,7 +239,10 @@ def cache_key(text: str) -> str:
 
 def _empty(reason: str) -> dict[str, Any]:
     """The fail-open answer: no country named, so no policy can reject."""
-    return {'countries': [], 'regions': [], 'broad_area': False, 'local_language': '', 'source': reason}
+    return {
+        'countries': [], 'regions': [], 'broad_area': False, 'local_language': '',
+        'place_names': [], 'source': reason,
+    }
 
 
 def _coerce(raw: dict) -> dict[str, Any]:
@@ -145,6 +262,13 @@ def _coerce(raw: dict) -> dict[str, Any]:
         'regions': regions,
         'broad_area': bool(raw.get('broad_area')),
         'local_language': str(raw.get('local_language') or '').strip().lower(),
+        # Proper names, deliberately NOT lowercased: they are matched case-sensitively against the
+        # user's lists. Deduped preserving order so the cache file stays stable.
+        'place_names': list(dict.fromkeys(
+            name for name in (
+                ' '.join(str(n or '').split()) for n in (raw.get('place_names') or [])
+            ) if name
+        )),
     }
 
 
@@ -160,9 +284,14 @@ async def classify_location(text: str) -> dict[str, Any]:
         return _empty('empty')
 
     cache = _load_cache()
-    if key in cache:
+    # A cached entry predating `place_names` is treated as a MISS and reclassified. Serving it
+    # would silently disable alias matching for that location forever, which is the same shape as
+    # the dead `malaga` entry this field exists to fix -- a mechanism that reports success while
+    # doing nothing. One-off cost: ~81 entries at the flash-tier rate.
+    if key in cache and 'place_names' in cache[key]:
         entry = dict(cache[key])
         entry['source'] = 'cache'
+        _record_countries(entry)
         return entry
 
     try:
@@ -172,9 +301,18 @@ async def classify_location(text: str) -> dict[str, Any]:
         # Fail open: nothing the user wrote down matched this location, so an outage must not
         # start rejecting jobs. Logged at WARNING because a silent classifier is a silent gate.
         logger.warning(f'Location classification failed for {text!r}, treating as unknown: {unwrap_exception(ex)}')
+        if stale := cache.get(key):
+            # ...but a `place_names`-less entry is stale, not wrong. Reclassifying it is an upgrade,
+            # and an upgrade that cannot happen must not cost us the answer we already had: without
+            # this, one outage silently disables the region gate for every location ever cached.
+            entry = dict(stale)
+            entry.setdefault('place_names', [])
+            entry['source'] = 'stale'
+            _record_countries(entry)
+            return entry
         return _empty('error')
 
-    result['model'] = OPENROUTER_MODEL
+    result['model'] = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
     result['classified_on'] = date.today().isoformat()
     cache[key] = result
     _write_cache()
@@ -184,4 +322,5 @@ async def classify_location(text: str) -> dict[str, Any]:
     )
     entry = dict(result)
     entry['source'] = 'llm'
+    _record_countries(entry)
     return entry

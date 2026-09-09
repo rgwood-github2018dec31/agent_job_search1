@@ -3,7 +3,8 @@
 Runs a function-calling agent loop: an OpenRouter model (via the tools_llm_remote_openrouter
 MCP server's `chat` tool) decides which browser tools to call, this module executes them
 against the shared Playwright MCP session, and the loop ends when the model calls
-submit_job_extract or the iteration cap is hit. Used when EXTRACTOR_PROVIDER='openrouter';
+submit_job_extract or the iteration cap is hit. Used when MODEL_NAME_EXTRACTOR routes
+via OpenRouter;
 the deterministic Haiku fallback in agent.py still covers loop failures.
 """
 
@@ -12,9 +13,9 @@ import logging
 
 from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
-    EXTRACTOR_OPENROUTER_MODEL,
     EXTRACTOR_TOOL_RESULT_MAX_CHARS,
     LLM_OPENROUTER_MCP_URL,
+    MODEL_NAME_EXTRACTOR,
 )
 from agentic_job_search.triage import call_mcp_tool, mcp_session
 
@@ -83,6 +84,12 @@ OPENROUTER_EXTRACT_TOOLS = [
                 'Pass sponsorship_note with any visa/work-authorization statement, verbatim. '
                 'Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), '
                 "comma-separated lowercase, e.g. 'english, german'; omit if none stated. "
+                "Pass residency_scope as 'country_only' if the posting requires LIVING IN the "
+                "country it is advertised in ('Remote within country', 'must be based in "
+                "Germany'), or 'area_wide' if it offers a whole multi-country area ('remote "
+                "anywhere in the EU', 'Work from Anywhere', 'any EMEA country'); omit it when "
+                "the posting does not say. This is where the HOLDER MUST LIVE, not where the "
+                "job is advertised. "
                 'Pass posting_language with the language the SOURCE PAGE ITSELF IS WRITTEN IN, '
                 "lowercase, e.g. 'english', 'french'. Judge the original page, NOT the condensed "
                 'English text you are writing here — you translate as you condense. The original job '
@@ -118,6 +125,8 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase"},
                     'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output"},
                     'local_language': {'type': 'string', 'description': "Dominant local working language of the job's location, lowercase e.g. 'french' for Quebec, 'spanish' for Spain; empty for work-from-anywhere or unknown location"},
+                    'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
+                                        'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
                     'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if required'},
                     'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
                     # Must stay in sync with submit_job_extract in tools_generic.py — a field added
@@ -154,6 +163,7 @@ def _extract_from_submit_args(args: dict) -> dict:
         'posting_language': str(args.get('posting_language') or '').strip().lower(),
         'local_language': str(args.get('local_language') or '').strip().lower(),
         'relocation': args.get('relocation', ''),
+        'residency_scope': str(args.get('residency_scope') or '').strip().lower(),
         'workplace_type': str(args.get('workplace_type') or '').strip().lower(),
         'education_requirement': str(args.get('education_requirement') or '').strip().lower(),
         # None (not False) when the model said nothing, so derive_agency_posting() can tell
@@ -184,7 +194,7 @@ async def extract_job_page_openrouter(
         for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
             raw = await call_mcp_tool(
                 LLM_OPENROUTER_MCP_URL, 'chat',
-                {'messages': messages, 'model': EXTRACTOR_OPENROUTER_MODEL, 'tools': OPENROUTER_EXTRACT_TOOLS},
+                {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS},
             )
             data = json.loads(raw)
             if not data.get('ok'):

@@ -17,8 +17,8 @@ from rich.console import Console
 
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
-    COMPANY_MATCH_PROVIDER,
     JOB_MAX_AGE_DAYS,
+    MODEL_NAME_COMPANY_MATCH,
     SCRAPER_DATE_POSTED_LABEL,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_DATE_POSTED_SECONDS,
@@ -28,7 +28,8 @@ from agentic_job_search.config import (
     UI_FINGERPRINT_FILENAME,
     UI_STRUCTURAL_CHIPS,
 )
-from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW
+from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
+from agentic_job_search import location_review
 import agentic_job_search.preferences as preferences
 from agentic_job_search.triage import chat_openrouter, extract_json_object
 from claude_agent_sdk import (
@@ -277,12 +278,13 @@ _COMPANY_NOISE_WORDS = {
 
 
 async def _company_matches_openrouter(candidate: str, companies_list: str) -> dict:
-    """Fuzzy company match via the OpenRouter MCP server (glm). Raises on any failure."""
+    """Fuzzy company match via the OpenRouter MCP server. Raises on any failure."""
     content, _cost = await chat_openrouter(
         f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
         f'{companies_list}\n\n'
         'Respond with ONLY a JSON object: '
-        '{"matches": <true|false>, "matched_company_name": "<exact name from the list, or empty string>"}'
+        '{"matches": <true|false>, "matched_company_name": "<exact name from the list, or empty string>"}',
+        model=MODEL_NAME_COMPANY_MATCH,
     )
     return extract_json_object(content)
 
@@ -305,7 +307,7 @@ async def company_matches_applied(candidate: str) -> str | None:
 
     companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
 
-    if COMPANY_MATCH_PROVIDER == 'openrouter':
+    if route_for(MODEL_NAME_COMPANY_MATCH) == 'openrouter':
         try:
             structured = await _company_matches_openrouter(candidate, companies_list)
             if not structured.get('matches'):
@@ -364,8 +366,8 @@ def _blacklist_confirm_prompt(company: str, entry_name: str, reason: str, contex
 
 
 async def _blacklist_confirms_openrouter(prompt: str) -> dict:
-    """Confirm a blacklist name hit via the OpenRouter MCP server (glm). Raises on any failure."""
-    content, _cost = await chat_openrouter(prompt)
+    """Confirm a blacklist name hit via the OpenRouter MCP server. Raises on any failure."""
+    content, _cost = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
     return extract_json_object(content)
 
 
@@ -397,7 +399,7 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
     prompt = _blacklist_confirm_prompt(candidate, entry_name, reason, context)
     structured: dict | None = None
 
-    if COMPANY_MATCH_PROVIDER == 'openrouter':
+    if route_for(MODEL_NAME_COMPANY_MATCH) == 'openrouter':
         try:
             structured = await _blacklist_confirms_openrouter(prompt)
         except Exception as ex:
@@ -997,6 +999,41 @@ def write_run_audit_log(
             f'{report.get("job_cards")} cards, pin "{report.get("location_pin")}" — {status}'
         )
 
+    # 1c. Country-list review. Advisory: nothing here changed a rating or a preference. It lives in
+    # the audit log rather than only in the alert because the alert carries a count and this
+    # carries the reasoning, which is what the user needs in order to promote or dismiss an entry.
+    lines += ['', '## 1c. Country list review (advisory)', '']
+    try:
+        review = yaml.safe_load(
+            location_review.LOCATION_RECOMMENDATIONS_PATH.read_text(encoding='utf-8')
+        ) or {}
+    except (OSError, yaml.YAMLError):
+        review = {}
+    pending = {
+        country: entry for country, entry in (review.get('countries') or {}).items()
+        if (entry or {}).get('status') == 'pending'
+    }
+    warnings = [w for w in (review.get('entry_warnings') or []) if (w or {}).get('status') == 'pending']
+    if not pending and not warnings:
+        lines.append('No pending recommendations.')
+    for country, entry in sorted(pending.items()):
+        lines.append(
+            f'- **{country}** ({entry.get("region", "?")}) -> `{entry.get("recommendation")}` '
+            f'— {entry.get("reason", "")}'
+        )
+    for warning in warnings:
+        lines.append(
+            f'- entry `{warning.get("entry")}` on `{warning.get("list")}` is a substring of '
+            f'`{warning.get("collides_with")}` — {warning.get("detail", "")}'
+        )
+    if pending or warnings:
+        lines.append('')
+        lines.append(
+            'Promote or dismiss these by editing `run_dir/preferences.yaml` yourself and setting '
+            f'`status:` in `{location_review.LOCATION_RECOMMENDATIONS_PATH.name}`. '
+            'The agent never edits preferences.'
+        )
+
     lines += ['', '## 2. Search queries', '']
 
     if queries:
@@ -1277,6 +1314,7 @@ async def do_submit_job_extract(
     location: str | None = None, date_posted: str | None = None,
     closed: bool = False, salary: str | None = None, sponsorship_note: str | None = None,
     language_requirement: str | None = None, relocation: str | None = None,
+    residency_scope: str | None = None,
     workplace_type: str | None = None, education_requirement: str | None = None,
     is_agency: bool | None = None, end_client: str | None = None,
     posting_language: str | None = None, local_language: str | None = None,
@@ -1286,6 +1324,7 @@ async def do_submit_job_extract(
         'location': location or '', 'date_posted': date_posted or '',
         'closed': closed, 'salary': salary or '', 'sponsorship_note': sponsorship_note or '',
         'language_requirement': language_requirement or '', 'relocation': relocation or '',
+        'residency_scope': (residency_scope or '').strip().lower(),
         'posting_language': (posting_language or '').strip().lower(),
         'local_language': (local_language or '').strip().lower(),
         'workplace_type': (workplace_type or '').strip().lower(),
@@ -1506,6 +1545,12 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
     "or when the location is unknown. "
     "Pass relocation with the country/city if the posting requires relocating to or residing in a "
     "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles. "
+    "Pass residency_scope as 'country_only' if the posting requires LIVING IN the country it "
+    "is advertised in ('Remote within country', 'must be based in Germany', 'open only to "
+    "candidates residing in Poland'), or 'area_wide' if it offers a whole multi-country area "
+    "('remote anywhere in the EU', 'Work from Anywhere', 'any EMEA country'); omit it when the "
+    "posting does not say. This is where the HOLDER MUST LIVE, not where the job is "
+    "advertised \u2014 'Romania (Remote)' on its own says nothing here. "
     "Pass workplace_type as exactly 'remote', 'hybrid', or 'onsite' when the page states the work "
     "arrangement; omit only if the page genuinely does not say. Any mention of required days in "
     "the office (e.g. '2-3 days onsite') is 'hybrid', not 'remote'. "
@@ -1532,6 +1577,8 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
             'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
             'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
             'local_language': {'type': 'string', 'description': "Dominant local working language of the job's location, lowercase e.g. 'french' for Quebec, 'spanish' for Spain; empty for work-from-anywhere or unknown location"},
+            'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
+                                'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
             'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
             'education_requirement': {'type': 'string', 'description': "'master' or 'phd' if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
             # Wording mirrors _extract_applied_job_metadata's is_recruiting_agency/end_client_name
@@ -1559,6 +1606,7 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
         closed=args.get("closed", False), salary=args.get("salary"),
         sponsorship_note=args.get("sponsorship_note"),
         language_requirement=args.get("language_requirement"), relocation=args.get("relocation"),
+        residency_scope=args.get("residency_scope"),
         workplace_type=args.get("workplace_type"),
         education_requirement=args.get("education_requirement"),
         is_agency=args.get("is_agency"),

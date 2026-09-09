@@ -12,9 +12,17 @@ import pytest
 import requests
 import yaml
 from claude_agent_sdk import ResultMessage
-from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW
+from utils_tools_n_agents_common.models import (
+    ANTHROPIC_MODEL_NAME_LOW,
+    ANTHROPIC_MODEL_NAME_MEDIUM,
+    OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
+    OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
+    OPENROUTER_MODEL_NAME_SCRAPER,
+)
 
 from agentic_job_search import agent
+from agentic_job_search import location
+from agentic_job_search import location_review
 from agentic_job_search import config
 from agentic_job_search import extract_openrouter
 from agentic_job_search import preferences
@@ -1206,6 +1214,13 @@ async def test_submit_job_extract_normalizes_language_fields(monkeypatch):
 # apply_hard_rules
 # ---------------------------------------------------------------------------
 
+# NOTE the default description says "Remote within Canada", which `derive_residency_scope` reads
+# as `country_only`. That is load-bearing for the older gate tests -- it is why they still judge
+# the anchor -- but it is an accident of the fixture, not a statement of intent. A test about the
+# residency rule MUST pass its own description, or it silently tests the wrong branch.
+_NEUTRAL_DESCRIPTION = 'Build agentic AI systems in Python.'
+
+
 def _make_extract(**overrides) -> dict:
     extract = {
         'title': 'Staff AI Engineer', 'company': 'Acme',
@@ -1213,7 +1228,7 @@ def _make_extract(**overrides) -> dict:
         'location': 'Canada (Remote)', 'date_posted': '3 days ago',
         'closed': False, 'salary': '', 'sponsorship_note': '',
         'language_requirement': '', 'relocation': '', 'education_requirement': '',
-        'posting_language': '', 'local_language': '',
+        'posting_language': '', 'local_language': '', 'residency_scope': '',
     }
     extract.update(overrides)
     return extract
@@ -1526,7 +1541,7 @@ async def test_build_reference_summary_empty_without_texts(monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_rate_job_dispatches_to_openrouter(monkeypatch):
-    monkeypatch.setattr(agent, 'RATING_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_RATING', OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE)
 
     async def fake_rate(system_prompt, user_prompt, model=''):
         return {'rating': 4, 'company': 'Acme', 'title': 'Engineer', 'reasoning': 'good', 'summary': 'acme_engineer'}, 0.002
@@ -1540,7 +1555,7 @@ async def test_rate_job_dispatches_to_openrouter(monkeypatch):
 
 
 async def test_rate_job_dispatches_to_ollama(monkeypatch):
-    monkeypatch.setattr(agent, 'RATING_PROVIDER', 'ollama')
+    monkeypatch.setattr(agent, 'MODEL_NAME_RATING', config.OLLAMA_MODEL_NAME_TRIAGE)
 
     async def fake_rate(system_prompt, user_prompt, model=''):
         return {'rating': 3, 'company': 'Acme', 'title': 'Engineer', 'reasoning': 'ok', 'summary': 'acme_engineer'}
@@ -1554,9 +1569,9 @@ async def test_rate_job_dispatches_to_ollama(monkeypatch):
 
 
 async def test_rate_job_dispatches_to_anthropic_by_default(monkeypatch):
-    monkeypatch.setattr(agent, 'RATING_PROVIDER', 'anthropic')
+    monkeypatch.setattr(agent, 'MODEL_NAME_RATING', ANTHROPIC_MODEL_NAME_MEDIUM)
 
-    async def fake_anthropic(evaluator_prompt, extract_text, stage_stats):
+    async def fake_anthropic(evaluator_prompt, extract_text, stage_stats, model=''):
         return {'rating': 5, 'company': 'Acme', 'title': 'Engineer', 'reasoning': 'great', 'summary': 'acme_engineer'}
 
     monkeypatch.setattr(agent, '_rate_with_anthropic', fake_anthropic)
@@ -1803,7 +1818,7 @@ async def test_openrouter_loop_truncates_tool_results(monkeypatch):
 
 
 async def test_extractor_provider_dispatch_openrouter(monkeypatch):
-    monkeypatch.setattr(agent, 'EXTRACTOR_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
     called = {'openrouter': 0, 'anthropic': 0, 'direct': 0}
 
     async def fake_openrouter(candidate, url, stats, system_prompt):
@@ -1947,7 +1962,7 @@ async def test_preflight_local_model_is_silent_when_server_is_down(monkeypatch):
 
 async def test_configured_local_model_is_a_concrete_tag():
     """`:latest` is the tag that vanished on a re-pull; pin a concrete one."""
-    assert not config.LOCAL_MODEL.endswith(':latest')
+    assert not config.OLLAMA_MODEL_NAME_TRIAGE.endswith(':latest')
 
 
 def test_local_model_missing_alert_reaches_run_health():
@@ -1976,9 +1991,9 @@ def _require_llm_server(port: int) -> None:
 @pytest.mark.live
 async def test_generate_local_live():
     _require_llm_server(8002)
-    # config.LOCAL_MODEL, never a hardcoded copy: this test's whole job is to catch that tag
+    # config.OLLAMA_MODEL_NAME_TRIAGE, never a hardcoded copy: this test's whole job is to catch that tag
     # going stale, and a test carrying its own duplicate of the value tracks nothing.
-    response = await triage.generate_local('Reply with exactly: OK', model=config.LOCAL_MODEL, max_tokens=500)
+    response = await triage.generate_local('Reply with exactly: OK', model=config.OLLAMA_MODEL_NAME_TRIAGE, max_tokens=500)
     assert response.strip() != ''
 
 
@@ -2135,7 +2150,7 @@ async def test_company_matches_applied_exact_match_skips_llm(monkeypatch):
 
 async def test_company_matches_applied_falls_back_to_anthropic(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify.pdf'})
-    monkeypatch.setattr(tools, 'COMPANY_MATCH_PROVIDER', 'openrouter')
+    monkeypatch.setattr(tools, 'MODEL_NAME_COMPANY_MATCH', OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE)
 
     async def broken_openrouter(candidate, companies_list):
         raise RuntimeError('OpenRouter MCP server down')
@@ -2289,7 +2304,7 @@ def test_query_instructions_exclude_managerial_titles():
 
 
 async def test_generate_search_queries_uses_openrouter(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent, 'QUERY_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_QUERY', OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE)
     monkeypatch.setattr(agent, 'load_resume', lambda: 'resume text')
     monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'missing.md')
     monkeypatch.setattr(tools, 'applied_jobs_summary', lambda: '- Staff AI Engineer — Acme (2026-07-01)')
@@ -2308,7 +2323,7 @@ async def test_generate_search_queries_uses_openrouter(tmp_path, monkeypatch):
 
 
 async def test_generate_search_queries_enforces_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent, 'QUERY_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_QUERY', OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE)
     monkeypatch.setattr(agent, 'MAX_SEARCH_QUERIES', 3)
     monkeypatch.setattr(agent, 'load_resume', lambda: 'resume')
     monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'missing.md')
@@ -2325,7 +2340,7 @@ async def test_generate_search_queries_enforces_cap(tmp_path, monkeypatch):
 
 
 async def test_generate_search_queries_falls_back_to_anthropic(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent, 'QUERY_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_QUERY', OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE)
     monkeypatch.setattr(agent, 'load_resume', lambda: 'resume')
     monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'missing.md')
     monkeypatch.setattr(tools, 'applied_jobs_summary', lambda: '')
@@ -2582,7 +2597,7 @@ async def test_stage_1b_falls_back_to_anthropic_when_the_provider_runs_out_of_cr
     """
     monkeypatch.setattr(tools, '_ui_alerts', [])
     monkeypatch.setattr(tools, '_scrape_per_query', {})
-    monkeypatch.setattr(agent, 'SCRAPER_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
 
     # The failure must originate INSIDE run_scraper's per-query loop, which is where the real
     # 402 arrived and where it was swallowed. Raising at the session boundary instead would pass
@@ -2642,7 +2657,7 @@ async def test_stage_1b_reports_the_cause_through_an_exception_group(monkeypatch
     """
     monkeypatch.setattr(tools, '_ui_alerts', [])
     monkeypatch.setattr(tools, '_scrape_per_query', {})
-    monkeypatch.setattr(agent, 'SCRAPER_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
 
     class _BoomGroup:
         async def __aenter__(self):
@@ -2668,7 +2683,7 @@ async def test_stage_1b_does_not_fall_back_when_the_provider_is_healthy(monkeypa
     """The fallback is ~9x more expensive per search; it must not fire on a healthy run."""
     monkeypatch.setattr(tools, '_ui_alerts', [])
     monkeypatch.setattr(tools, '_scrape_per_query', {})
-    monkeypatch.setattr(agent, 'SCRAPER_PROVIDER', 'openrouter')
+    monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
 
     class _Ok:
         async def __aenter__(self):
@@ -3709,8 +3724,52 @@ def test_extract_schemas_stay_in_sync_across_both_providers():
         f'anthropic-only={sorted(set(anthropic_schema) - set(openrouter_schema))}, '
         f'openrouter-only={sorted(set(openrouter_schema) - set(anthropic_schema))}'
     )
-    for field in ('is_agency', 'end_client'):
+    for field in ('is_agency', 'end_client', 'residency_scope'):
         assert field in anthropic_schema and field in openrouter_schema
+
+
+# The direct fallback is a THIRD surface, and it drifted unnoticed: `is_agency`/`end_client` are
+# declared on both agentic extractors and on neither half of the deterministic path, so a posting
+# that falls through to it silently loses agency detection to a regex CLAUDE.md measures at 1-in-10
+# against the extractor field's 15-in-16. Recorded rather than silently fixed — the point here is
+# that residency_scope must not join it.
+KNOWN_DIRECT_FALLBACK_GAPS = {'is_agency', 'end_client'}
+
+
+def test_direct_fallback_schema_matches_the_agentic_extractors():
+    anthropic_schema = set(tools.submit_job_extract.input_schema['properties'])
+    direct_schema = set(agent.EXTRACT_OUTPUT_SCHEMA['properties'])
+    assert anthropic_schema - direct_schema == KNOWN_DIRECT_FALLBACK_GAPS, (
+        'a new field reached the agentic extractors but not extract_job_page_direct — a posting '
+        'that falls through to the fallback would silently return empty for it'
+    )
+    assert not direct_schema - anthropic_schema
+
+
+def test_residency_scope_is_declared_optional_on_every_extractor():
+    """A required parameter the model cannot observe is fabrication pressure, not validation."""
+    assert 'residency_scope' not in tools.submit_job_extract.input_schema['required']
+    openrouter_tool = next(
+        t for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
+        if t['function']['name'] == 'submit_job_extract'
+    )
+    assert 'residency_scope' not in openrouter_tool['function']['parameters']['required']
+    assert 'residency_scope' not in agent.EXTRACT_OUTPUT_SCHEMA['required']
+
+
+def test_residency_scope_vocabulary_is_closed_and_identical_everywhere():
+    expected = ['country_only', 'area_wide', '']
+    openrouter_tool = next(
+        t for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
+        if t['function']['name'] == 'submit_job_extract'
+    )
+    for properties in (
+        tools.submit_job_extract.input_schema['properties'],
+        openrouter_tool['function']['parameters']['properties'],
+        agent.EXTRACT_OUTPUT_SCHEMA['properties'],
+    ):
+        assert properties['residency_scope']['enum'] == expected
+    assert list(agent.RESIDENCY_SCOPES) == ['country_only', 'area_wide']
 
 
 def test_merge_warnings_dedupes_case_insensitively_and_keeps_order():
@@ -3882,6 +3941,627 @@ def test_example_preferences_file_is_neutral():
 
 
 # ---------------------------------------------------------------------------
+# alias tier: exonyms no normalization can reach
+# ---------------------------------------------------------------------------
+
+async def test_exonym_matches_the_listed_english_name(monkeypatch):
+    """'München' on the page, 'Munich' on the list. No amount of folding connects those two.
+
+    Germany is in a rejected region, so the alias tier is the ONLY thing that can return '' here —
+    the negative control below is what makes that true rather than incidental.
+    """
+    assert not location.location_token_matches('Munich', 'München, Bavaria, Germany')
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ())
+    assert await agent.rejected_location('München, Bavaria, Germany (Remote)') == 'germany (western_europe)'
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('Munich',))
+    assert await agent.rejected_location('München, Bavaria, Germany (Remote)') == ''
+
+
+async def test_exonym_on_the_deny_list_also_rejects(monkeypatch):
+    """Tiers 1 and 2 compare the same kind of list against the same text; they must not disagree
+    about what counts as a match, which is how `roma` survived on one list while the other was
+    empty."""
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ())
+    monkeypatch.setattr(preferences, 'excluded_locations', lambda: ('Turin',))
+    assert await agent.rejected_location('Torino, Piedmont, Italy (Remote)') == 'Turin'
+
+
+async def test_alias_tier_does_not_fire_when_the_classifier_names_nothing(stub_location_classifier):
+    """Fail-open is unchanged: no place names, no alias match, no new way to reject."""
+    assert await agent.rejected_location('Remote (EMEA)') == ''
+
+
+def test_hybrid_cap_uses_the_resolved_place_names(monkeypatch):
+    """Without this the async gate and the sync cap would disagree on the same posting."""
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('Seville',))
+    extract = _make_extract(location='Sevilla, Spain (Hybrid)', workplace_type='hybrid')
+    assert agent.apply_rating_caps(extract, 5) == (3, 'hybrid in Sevilla, Spain (Hybrid) (not an acceptable hybrid location)')
+    resolved = dict(extract, place_names=['Sevilla', 'Seville', 'Spain'])
+    assert agent.apply_rating_caps(resolved, 5) == (5, '')
+
+
+def test_classifier_returns_place_names_on_every_path():
+    """Every return path must have the same shape, or a consumer reads a missing key as 'no aliases'."""
+    assert location._empty('error')['place_names'] == []
+    coerced = location._coerce({'countries': ['spain'], 'regions': ['southern_europe'],
+                                'place_names': ['  Sevilla ', 'Seville', 'Sevilla', '']})
+    assert coerced['place_names'] == ['Sevilla', 'Seville'], 'trimmed, deduped, order preserved'
+    assert location._coerce({})['place_names'] == []
+
+
+def test_reviewer_flags_an_entry_that_only_matches_when_folded(monkeypatch):
+    """The check that would have caught `malaga`, and the distinction it draws.
+
+    An entry that has simply not come up yet looks identical to one that can never match. This
+    separates them: it reports only entries whose folded form DID appear this run.
+    """
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('malaga', 'Bologna'))
+    monkeypatch.setattr(preferences, 'excluded_locations', lambda: ())
+    location.reset_countries_seen()
+    location._record_countries({'countries': ['spain'], 'regions': ['southern_europe'],
+                                'place_names': ['Málaga', 'Andalusia', 'Spain']})
+    findings = location_review.dead_entries(location.place_names_seen_this_run())
+    assert [f['entry'] for f in findings] == ['malaga'], "'Bologna' merely did not come up"
+    assert findings[0]['collides_with'] == 'Málaga'
+
+
+async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatch, tmp_path):
+    """Adding `place_names` invalidates every cached entry. An outage must not turn that into a
+    silently disabled gate.
+
+    Treating a `place_names`-less entry as a miss is right — serving it would disable alias
+    matching for that location forever. But the entry is stale, not wrong, so if the upgrade call
+    cannot be made the old answer is still the best answer available. Without this, one tool-server
+    outage fails every previously-cached location open at once, which is a far larger blast radius
+    than the per-location fail-open the module is designed around.
+    """
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {
+        'berlin, germany': {'countries': ['germany'], 'regions': ['western_europe'],
+                            'broad_area': False, 'local_language': 'german'},
+    })
+    async def _down(*a, **k):
+        raise RuntimeError('unhandled errors in a TaskGroup (1 sub-exception)')
+    monkeypatch.setattr(location, 'chat_openrouter', _down)
+
+    facts = await location.classify_location('Berlin, Germany')
+    assert facts['source'] == 'stale'
+    assert facts['regions'] == ['western_europe'], 'the region gate still works from the old answer'
+    assert facts['place_names'] == [], 'but no aliases until it can actually be upgraded'
+
+    unseen = await location.classify_location('Somewhere Never Seen')
+    assert unseen['source'] == 'error' and unseen['countries'] == []
+
+
+def test_reviewer_never_advises_writing_roma_as_romania(monkeypatch):
+    """The folded comparison must stay WHOLE-TOKEN, or the reviewer recommends the original bug.
+
+    'roma' is a folded substring of 'romania'. A dead-entry check written as `folded in _fold(name)`
+    reports "'Roma' never matched, but 'Romania' did — write the entry the way the place is
+    written", which is advice to reintroduce the exact entry that broke the gate. Folding may
+    ignore case and accents; it may never ignore boundaries.
+    """
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('Roma',))
+    monkeypatch.setattr(preferences, 'excluded_locations', lambda: ())
+    assert location_review.dead_entries({'Romania', 'Bucharest'}) == []
+    # ...but it is still reported as an ambiguous entry by the collision check.
+    collisions = location_review.substring_collisions({'romania': 'eastern_europe'})
+    assert [c['entry'] for c in collisions] == ['Roma']
+
+
+# ---------------------------------------------------------------------------
+# country list review — advisory, never enforced
+# ---------------------------------------------------------------------------
+
+def _seen(**countries):
+    """Seed the run-scoped accumulator the way classify_location would."""
+    location.reset_countries_seen()
+    location._record_countries({
+        'countries': list(countries), 'regions': list(countries.values()),
+    })
+
+
+def test_substring_collisions_flags_roma_against_romania(monkeypatch):
+    """The deterministic half. This — not the prompt — is what catches the entry that broke the gate.
+
+    'roma' inside 'romania' is arithmetic, and CLAUDE.md's rule that a structural fact must never
+    be left to a model's discretion applies to the reviewer as much as to the rater. It also means
+    the warning still appears with the tool server down.
+    """
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('roma', 'spain'))
+    collisions = location_review.substring_collisions({'romania': 'eastern_europe', 'spain': 'southern_europe'})
+    assert [c['entry'] for c in collisions] == ['roma']
+    assert collisions[0]['collides_with'] == 'romania'
+    assert collisions[0]['list'] == 'hybrid.acceptable_locations'
+
+
+def test_substring_collisions_ignores_a_whole_word_entry(monkeypatch):
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('spain',))
+    assert location_review.substring_collisions({'spain': 'southern_europe'}) == []
+
+
+def test_undecided_countries_skips_anything_either_list_names(monkeypatch):
+    monkeypatch.setattr(preferences, 'excluded_locations', lambda: ('poland',))
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('spain',))
+    undecided = location_review.undecided_countries(
+        {'poland': 'eastern_europe', 'spain': 'southern_europe', 'serbia': 'eastern_europe'},
+        {'countries': {}},
+    )
+    assert list(undecided) == ['serbia']
+
+
+async def test_review_makes_no_llm_call_when_nothing_is_undecided(monkeypatch):
+    """The steady state, and the whole cost argument: a country is asked about once, ever."""
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('spain',))
+    async def _boom(*a, **k):
+        raise AssertionError('the reviewer must not call the LLM when nothing is undecided')
+    monkeypatch.setattr(location_review, 'chat_openrouter', _boom)
+    _seen(spain='southern_europe')
+    assert await location_review.review_location_lists({}) == ''
+
+
+async def test_review_records_a_recommendation_and_does_not_reask(monkeypatch):
+    calls = []
+    async def _chat(prompt, **kwargs):
+        calls.append(prompt)
+        return '{"recommendations": [{"country": "serbia", "recommendation": "exclude", "reason": "Not the EU."}]}', 0.0001
+    monkeypatch.setattr(location_review, 'chat_openrouter', _chat)
+    _seen(serbia='eastern_europe')
+
+    detail = await location_review.review_location_lists({})
+    assert 'serbia -> exclude' in detail
+    doc = yaml.safe_load(location_review.LOCATION_RECOMMENDATIONS_PATH.read_text())
+    assert doc['countries']['serbia']['status'] == 'pending'
+    assert doc['countries']['serbia']['recommendation'] == 'exclude'
+
+    # A second run over the same country asks nothing and raises nothing — the cry-wolf guard.
+    _seen(serbia='eastern_europe')
+    assert await location_review.review_location_lists({}) == ''
+    assert len(calls) == 1
+
+
+async def test_review_never_writes_preferences(monkeypatch):
+    """Recommend-only. An auto-reject is unappealable, so nothing gates until the user promotes it."""
+    before = preferences.PREFERENCES_PATH.read_bytes() if preferences.PREFERENCES_PATH.exists() else None
+    async def _chat(prompt, **kwargs):
+        return '{"recommendations": [{"country": "serbia", "recommendation": "exclude", "reason": "x"}]}', 0.0
+    monkeypatch.setattr(location_review, 'chat_openrouter', _chat)
+    _seen(serbia='eastern_europe')
+    await location_review.review_location_lists({})
+    after = preferences.PREFERENCES_PATH.read_bytes() if preferences.PREFERENCES_PATH.exists() else None
+    assert before == after
+    assert preferences.excluded_locations() == ('Blockedland',), 'the live list must be untouched'
+
+
+async def test_review_drops_a_recommendation_it_did_not_ask_about(monkeypatch):
+    """Anti-fabrication: a generative answer that is persisted needs a closed vocabulary in code."""
+    async def _chat(prompt, **kwargs):
+        return ('{"recommendations": ['
+                '{"country": "atlantis", "recommendation": "exclude", "reason": "made up"},'
+                '{"country": "serbia", "recommendation": "banish", "reason": "not a verdict"},'
+                '{"country": "serbia", "recommendation": "exclude", "reason": "ok"}]}'), 0.0
+    monkeypatch.setattr(location_review, 'chat_openrouter', _chat)
+    _seen(serbia='eastern_europe')
+    await location_review.review_location_lists({})
+    doc = yaml.safe_load(location_review.LOCATION_RECOMMENDATIONS_PATH.read_text())
+    assert list(doc['countries']) == ['serbia']
+
+
+async def test_review_preserves_a_hand_edited_status(monkeypatch):
+    location_review.LOCATION_RECOMMENDATIONS_PATH.write_text(yaml.safe_dump({
+        'countries': {'serbia': {'status': 'rejected', 'recommendation': 'exclude',
+                                 'reason': 'r', 'note': 'mine'}},
+        'entry_warnings': [], 'reviewed': {},
+    }))
+    async def _boom(*a, **k):
+        raise AssertionError('a country the user already decided must never be re-queried')
+    monkeypatch.setattr(location_review, 'chat_openrouter', _boom)
+    _seen(serbia='eastern_europe')
+    await location_review.review_location_lists({})
+    doc = yaml.safe_load(location_review.LOCATION_RECOMMENDATIONS_PATH.read_text())
+    assert doc['countries']['serbia']['status'] == 'rejected'
+    assert doc['countries']['serbia']['note'] == 'mine', 'unknown keys must survive'
+
+
+async def test_review_skips_rather_than_rebuilds_a_corrupt_file(monkeypatch):
+    """Deliberately the OPPOSITE of location_cache.yaml, which rebuilds.
+
+    A cache is recomputable; this is a record of the user's decisions, and rebuilding it would
+    silently discard every entry they accepted or rejected.
+    """
+    location_review.LOCATION_RECOMMENDATIONS_PATH.write_text('[not, a, mapping]')
+    _seen(serbia='eastern_europe')
+    assert await location_review.review_location_lists({}) == ''
+    assert location_review.LOCATION_RECOMMENDATIONS_PATH.read_text() == '[not, a, mapping]'
+
+
+async def test_review_fails_open_when_the_tool_server_is_down(monkeypatch):
+    async def _down(*a, **k):
+        raise RuntimeError('unhandled errors in a TaskGroup (1 sub-exception)')
+    monkeypatch.setattr(location_review, 'chat_openrouter', _down)
+    _seen(serbia='eastern_europe')
+    assert await location_review.review_location_lists({}) == ''
+
+
+async def test_review_is_inert_without_a_configured_gate(neutral_preferences, monkeypatch):
+    async def _boom(*a, **k):
+        raise AssertionError('an unconfigured checkout has no lists to tune')
+    monkeypatch.setattr(location_review, 'chat_openrouter', _boom)
+    _seen(serbia='eastern_europe')
+    assert await location_review.review_location_lists({}) == ''
+
+
+def test_location_recommendations_alert_reaches_assess_run_health():
+    """An unrecognised `ui_alerts` kind is silently dropped by assess_run_health's if/elif chain."""
+    alerts = agent.assess_run_health({
+        'ui_alerts': [{'kind': 'location_recommendations', 'query': '', 'region': '',
+                       'detail': '1 country list recommendation(s): serbia -> exclude'}],
+    })
+    assert any('COUNTRY LISTS' in alert and 'serbia' in alert for alert in alerts)
+
+
+def test_countries_seen_is_recorded_on_a_cache_hit_too():
+    """In steady state almost every location is a cache hit, so an llm-only accumulator sees nothing."""
+    location.reset_countries_seen()
+    location._record_countries({'countries': ['romania'], 'regions': ['eastern_europe']})
+    assert location.countries_seen_this_run() == {'romania': 'eastern_europe'}
+    location.reset_countries_seen()
+    assert location.countries_seen_this_run() == {}
+
+
+# ---------------------------------------------------------------------------
+# residency scope — where the posting says the holder must LIVE, which is not the anchor
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('location,relocation,expected', [
+    # Real strings from run_dir/saved_jobs-2026Sep04..08.
+    ('Romania (Remote within country)', 'Romania', 'country_only'),
+    ('Poland (Remote within country)', 'Poland', 'country_only'),
+    ('Germany (Remote)', 'Germany (must be based in Germany; fully remote)', 'country_only'),
+    ('Kelowna, BC, Canada (Remote within country — open only to candidates residing in AB, BC)',
+     '', 'country_only'),
+    ('Austria (Remote)', 'Germany (work is fully remote from anywhere within Germany)', 'country_only'),
+    ('Portugal (Remote — anywhere in the EU/Europe)', 'European Union', 'area_wide'),
+    ('France (Remote — Work from Anywhere)', '', 'area_wide'),
+    ('Netherlands (Remote; can be based in any EMEA Red Hat country)', '', 'area_wide'),
+    ('Germany (Remote within Europe, UTC+0 to UTC+2)',
+     'Europe (UTC+0 to UTC+2) — candidate must be based in European time zones', 'area_wide'),
+    ('Bulgaria (Remote)', 'European Union region (work from EU and work permit required)', 'area_wide'),
+    ('Dublin, County Dublin, Ireland (Remote)', 'Based in Europe or the Americas', 'area_wide'),
+    # Silent — the case the whole EU default exists for.
+    ('Munich, Bavaria, Germany (Remote)', 'Munich, Germany', ''),
+    ('Poland (Remote)', 'Poland', ''),
+    ('Gothenburg, Västra Götaland County, Sweden (Remote)', '', ''),
+])
+def test_derive_residency_scope_over_real_postings(location, relocation, expected):
+    """Table-driven over strings taken verbatim from the saved corpus.
+
+    The two that matter most are the last group: a posting naming a country and saying nothing
+    about residence is NOT a residency requirement, and must derive as unspecified.
+    """
+    extract = _make_extract(
+        location=location, relocation=relocation, description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == expected
+
+
+@pytest.mark.parametrize('location,expected', [
+    # The pair the whole design turns on: same eight words, different last one.
+    ('Germany (Remote) — must be based in Germany', 'country_only'),
+    ('Germany (Remote) — must be based in Europe', 'area_wide'),
+    ('Germany (Remote, must be located in the EU)', 'area_wide'),
+    # A determiner and an adjective may sit before the area name. Both patterns share one
+    # definition of that filler; when they drifted apart this string fell through BOTH — the
+    # country branch stopped claiming it and no area branch picked it up.
+    ('Germany (Remote within our EMEA region)', 'area_wide'),
+    # ...but "any" alone is not an area offer. Offices are specific places.
+    ('Spain (Remote — based in any of our offices)', ''),
+    # Only one filler word, deliberately: country_only is the conservative reading of a mixed
+    # statement, and widening this makes "Germany or Europe" read as area-wide.
+    ('Germany (Remote) — must be based in Germany or Europe', 'country_only'),
+])
+def test_derive_residency_scope_distinguishes_a_country_object_from_an_area_object(location, expected):
+    """Every country-pinning pattern requires an object that is NOT an area name.
+
+    That is the entire trick, and the two directions are equally load-bearing: a wrong `area_wide`
+    silently disables the gate, a wrong `country_only` makes the EU default a no-op.
+    """
+    extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
+    assert agent.derive_residency_scope(extract) == expected
+
+
+@pytest.mark.parametrize('location', [
+    'Germany (Remote within the Schengen area)',
+    'Spain (Remote — anywhere in LATAM)',
+    'Germany (Remote, any APAC country)',
+    'Germany (Remote anywhere in MENA)',
+    'Germany (Remote across Europe)',
+])
+def test_open_ended_areas_are_area_wide(location):
+    """An area too large to enumerate is what `area_wide` is for."""
+    extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
+    assert agent.derive_residency_scope(extract) == 'area_wide'
+
+
+@pytest.mark.parametrize('location', [
+    'Germany (Remote within DACH)',
+    'Netherlands (Remote across Benelux)',
+    'Sweden (Remote anywhere in the Nordics)',
+    'Poland (Remote within CEE)',
+])
+def test_small_closed_blocs_are_judged_on_the_anchor(location):
+    """DACH is NOT an area word, and leaving it out is a decision rather than an oversight.
+
+    `area_wide` passes unconditionally, mirroring `broad_area`, whose justification is that a
+    posting offering a whole multi-country area "is not limited to the countries it happens to
+    name". That reasoning holds for the EU or Schengen and collapses for a three-country acronym:
+    "remote within DACH" IS limited to Germany, Austria and Switzerland. Listing it as an area
+    would turn a role you must live in one of three specific countries for into an automatic pass
+    — strictly worse than judging the anchor, which is what happens now.
+    """
+    extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
+    assert agent.derive_residency_scope(extract) == 'country_only'
+
+
+def test_area_words_are_matched_case_insensitively_unlike_place_names():
+    """The two regex families read different things, and the split is deliberate.
+
+    `_AREA_WORDS` reads PROSE, where "remote within europe" is written every way imaginable, so it
+    folds case. The place-name lists hold PROPER NAMES, where folding case is what made 'malaga' an
+    entry that could never match 'Málaga' — and where 'Nice' the city is not 'nice' the adjective.
+    """
+    for text in ('Germany (Remote within EUROPE)', 'Germany (remote within europe)',
+                 'Germany (Remote Within Europe)'):
+        extract = _make_extract(location=text, relocation='', description=_NEUTRAL_DESCRIPTION)
+        assert agent.derive_residency_scope(extract) == 'area_wide', text
+    # ...while a place name is not folded.
+    assert location.location_token_matches('Nice', 'Nice, France')
+    assert not location.location_token_matches('Nice', 'NICE, FRANCE')
+
+
+def test_derive_residency_scope_country_only_beats_area_wide_on_one_posting():
+    """'Romania (Remote) — role is remote anywhere in the EU' with an explicit in-country clause.
+
+    Both phrasings appear on real postings at once. country_only is tested first and wins, because
+    a wrong `area_wide` silently switches the gate off while a wrong `country_only` surfaces as a
+    rejection with a stated reason.
+    """
+    extract = _make_extract(
+        location='Romania (Remote) — role is remote anywhere in the EU',
+        relocation='Romania (must be based in Romania)', description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == 'country_only'
+
+
+def test_residency_scope_extractor_country_only_wins_over_a_silent_fallback():
+    extract = _make_extract(
+        location='Poland (Remote)', residency_scope='country_only', description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == 'country_only'
+
+
+def test_residency_scope_fallback_country_only_wins_over_an_extractor_area_wide():
+    """The union direction — the `local_language` "may only ADD, never erase" shape.
+
+    The opposite of the `is_agency` rule, deliberately: there the extractor's negative judgement
+    wins, because being wrong only loses a warning. Here being wrong disables a gate.
+    """
+    extract = _make_extract(
+        location='Poland (Remote within country)', residency_scope='area_wide',
+        description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == 'country_only'
+
+
+def test_residency_scope_extractor_area_wide_wins_over_a_silent_fallback():
+    """Between the two permissive values the extractor wins — it read the body, the regex is a backstop."""
+    extract = _make_extract(
+        location='Poland (Remote)', residency_scope='area_wide', description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == 'area_wide'
+
+
+def test_residency_scope_ignores_a_value_outside_the_vocabulary():
+    extract = _make_extract(
+        location='Poland (Remote)', residency_scope='whatever', description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == ''
+
+
+async def test_hybrid_in_an_eu_country_does_not_get_the_eu_remote_spare():
+    """An office pins you to the office — the Munich/Berlin case the gate was built for."""
+    extract = _make_extract(
+        location='Warsaw, Poland (Hybrid — 2 days a week in the office)', workplace_type='hybrid',
+        description=_NEUTRAL_DESCRIPTION,
+    )
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'poland' in reason
+
+
+async def test_onsite_in_an_eu_country_does_not_get_the_eu_remote_spare():
+    extract = _make_extract(
+        location='Warsaw, Poland (On-site)', workplace_type='onsite', description=_NEUTRAL_DESCRIPTION,
+    )
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'poland' in reason
+
+
+async def test_excluded_locations_beat_the_eu_remote_spare(monkeypatch):
+    """`locations.exclude` stays absolute — it is the escape hatch for one specific country.
+
+    The spare lives in the classifier tier only. If it applied above the deny list there would be
+    no way at all to drop a single EU country for remote roles.
+    """
+    monkeypatch.setattr(preferences, 'excluded_locations', lambda: ('Poland',))
+    extract = _make_extract(
+        location='Poland (Remote)', workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
+    )
+    # The reason echoes the entry as the user wrote it, so the log names the token they can edit.
+    assert await agent.location_rejection_reason(extract) == 'Poland'
+
+
+async def test_relocation_rule_is_unaffected_by_the_eu_remote_spare():
+    """The most important test in this change: the location half loosened, the relocation half did not.
+
+    This is what still rejects the two GlobalLogic Romania postings — both carried
+    `Relocation required: Romania`, and before the `roma` fix neither rule ever ran.
+    """
+    extract = _make_extract(
+        location='Romania (Remote)', relocation='Romania', workplace_type='remote',
+        description=_NEUTRAL_DESCRIPTION,
+    )
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason == 'relocation required to an excluded region: romania (eastern_europe)'
+    assert agent._hard_rule_category(reason) == 'hard_ruled_relocation'
+
+
+async def test_globallogic_romania_regression_end_to_end():
+    """job_posting-4453702157 (rated 4 and notified) and job_posting-4452991539 (rated 3).
+
+    Both were Romanian, both said 'Remote within country', both named Romania as required
+    residence — and both sailed through, because 'roma' on the acceptable list exempted them at
+    tier 1 before any rule ran.
+    """
+    extract = _make_extract(
+        title='Senior ML/AI Data Scientist', company='GlobalLogic',
+        location='Romania (Remote within country)', relocation='Romania',
+        workplace_type='remote', posting_language='english', local_language='romanian',
+        description='Greenfield GenAI platform, OpenAI LLMs in production, Azure.',
+    )
+    assert agent.derive_workplace_type(extract) == 'remote'
+    assert agent.derive_residency_scope(extract) == 'country_only'
+    assert not agent.hybrid_location_is_acceptable(extract['location']), "'roma' must not match 'romania'"
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'romania' in reason
+
+
+async def test_area_wide_keeps_a_posting_anchored_outside_the_eu():
+    """`area_wide` is unconditional, mirroring `broad_area`.
+
+    Pinned by name because it is the one value that can switch the gate off for a non-EU anchor —
+    which is exactly why the precedence table never lets the weak source assert it.
+    """
+    extract = _make_extract(
+        location='United Kingdom (Remote — Work from Anywhere)', workplace_type='remote',
+        description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == 'area_wide'
+    assert await agent.location_rejection_reason(extract) == ''
+
+
+async def test_location_gate_makes_no_classifier_call_when_unconfigured(
+    neutral_preferences, stub_location_classifier
+):
+    """The EU branch reaches classify_location directly, so it needs its own short-circuit."""
+    extract = _make_extract(location='Germany (Remote)', workplace_type='remote',
+                            description=_NEUTRAL_DESCRIPTION)
+    assert await agent.location_rejection_reason(extract) == ''
+    assert stub_location_classifier == []
+
+
+# ---------------------------------------------------------------------------
+# location token matching
+#
+# The tier-1 exempt list and the tier-2 deny list are plain string lists the user writes by hand,
+# matched against a posting's location. They used to be matched with `token in haystack`, and
+# because tier 1 exempts OUTRIGHT that made one entry able to switch the whole gate off for a
+# country it never named.
+# ---------------------------------------------------------------------------
+
+def test_place_tokens_are_matched_case_sensitively():
+    """The lists hold PROPER names, so 'Nice' the city is not 'nice' the adjective."""
+    assert location.location_token_matches('Spain', 'Barcelona, Catalonia, Spain')
+    assert not location.location_token_matches('spain', 'Barcelona, Catalonia, Spain')
+    assert location.location_token_matches('Nice', 'Nice, France (Remote)')
+    assert not location.location_token_matches('Nice', 'a nice remote role')
+
+
+def test_accented_place_name_matches_itself_and_folding_is_not_a_match():
+    """`malaga` was a dead entry: LinkedIn writes `Málaga` and matching is accent-exact.
+
+    The fix is to write the entry correctly, NOT to fold accents at match time — folding would
+    also fold the boundaries this file spent a whole diagnosis entry getting right.
+    """
+    assert location.location_token_matches('Málaga', 'Málaga, Andalusia, Spain (Remote)')
+    assert not location.location_token_matches('Málaga', 'malaga, spain')
+    assert location.location_token_matches('València', 'València, Spain')
+
+
+def test_roma_does_not_match_romania_in_any_case_or_accent():
+    """The named regression, extended to the two forms case-sensitivity newly exposes.
+
+    THIS is the test that fails if the boundary class is left as `[a-z0-9]` while the lowercasing
+    is removed. That class only blocks lowercase ASCII neighbours, so it was correct only in
+    combination with a caller that lowercased first: matching proper names directly, 'ROMA' reaches
+    into 'ROMANIA' and 'Roma' into 'Romaña'. The two changes are coupled and nothing else catches it.
+    """
+    assert not location.location_token_matches('Roma', 'Romania (Remote within country)')
+    assert not location.location_token_matches('ROMA', 'ROMANIA (REMOTE)')
+    assert not location.location_token_matches('Roma', 'Romaña, Spain')
+    assert not location.location_token_matches('Roma', 'Parma, Emilia-Romagna, Italy')
+    # ...while still matching the city it was added for.
+    assert location.location_token_matches('Roma', 'Roma, Lazio, Italy')
+
+
+def test_roma_does_not_match_romania():
+    """'roma' (Rome) on the acceptable list exempted every Romanian posting from the gate.
+
+    Tier 1 short-circuits before the deny list, the classifier and reject_regions, so a Romanian
+    role was never gated at all: job_posting-4453702157 was rated 4 and notified while Bulgaria,
+    Poland, Czechia and Lithuania rejected correctly in the same run.
+    """
+    assert not location.location_token_matches('roma', 'romania (remote within country)')
+    assert not location.location_token_matches('roma', 'parma, emilia-romagna, italy')
+    # ...while still matching the city it was added for.
+    assert location.location_token_matches('roma', 'roma, lazio, italy')
+    assert location.location_token_matches('rome', 'rome, italy (remote)')
+
+
+def test_location_token_matcher_handles_punctuation():
+    r"""'u.s.' is a real entry, and  cannot match it — the boundary after '.' needs a word char.
+
+    A matcher written as r'' + token + r'' returns False for BOTH strings below, silently
+    switching off an entry the user wrote down. That is why the matcher uses letter/digit
+    lookarounds instead.
+    """
+    assert location.location_token_matches('u.s.', 'remote, u.s. only')
+    assert location.location_token_matches('u.s.', 'u.s.')
+    assert location.location_token_matches('usa', 'usa (remote)')
+
+
+def test_location_token_matcher_rejects_substring_collisions():
+    assert not location.location_token_matches('nice', 'venice, veneto, italy')
+    assert location.location_token_matches('nice', 'nice, france (remote)')
+    # 'milan' no longer matches 'milano' — harmless, because both spellings are listed separately.
+    assert not location.location_token_matches('milan', 'milano, lombardy, italy')
+    assert location.location_token_matches('milan', 'milan, italy')
+    # Multi-word entries and hyphen-adjacent hits still work.
+    assert location.location_token_matches('british columbia', 'vancouver, british columbia')
+    assert location.location_token_matches('porto', 'portugal / porto-based (remote)')
+
+
+def test_location_token_matcher_ignores_empty_tokens():
+    assert not location.location_token_matches('', 'anywhere')
+    assert not location.location_token_matches('   ', 'anywhere')
+
+
+def test_eu_member_states_covers_the_countries_the_default_turns_on():
+    assert len(location.EU_MEMBER_STATES) == 27
+    for member in ('poland', 'romania', 'germany', 'bulgaria', 'ireland', 'sweden'):
+        assert location.is_eu_member(member), member
+    # The four the "bare remote anchor is assumed EU-wide" default deliberately excludes.
+    for outsider in ('united kingdom', 'norway', 'switzerland', 'serbia'):
+        assert not location.is_eu_member(outsider), outsider
+
+
+def test_eu_membership_tolerates_classifier_spelling_variants():
+    """`_coerce` does not normalize country names, so the classifier may return either spelling."""
+    assert location.is_eu_member('czech republic')
+    assert location.is_eu_member('Czechia')
+    assert location.is_eu_member('The Netherlands')
+
+
+# ---------------------------------------------------------------------------
 # location gate: three tiers (exempt list / deny list / cached classifier)
 #
 # Purely geographic. These tests exist as much to pin what the rule must NOT look at as what it
@@ -3904,7 +4584,7 @@ async def test_rejected_location_exempt_list_beats_the_classifier(stub_location_
 
 
 async def test_rejected_location_deny_list_beats_the_classifier(stub_location_classifier):
-    assert await agent.rejected_location('Blockedland (Remote)') == 'blockedland'
+    assert await agent.rejected_location('Blockedland (Remote)') == 'Blockedland'
     assert stub_location_classifier == [], 'deny-list hits must not cost a classifier call'
 
 
@@ -3931,7 +4611,7 @@ async def test_rejected_location_rejects_an_english_speaking_country_in_a_reject
 
 async def test_exempt_list_rescues_a_country_in_a_rejected_region(monkeypatch):
     """Tier 1 is the documented way to keep one country out of a rejected region."""
-    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('testville', 'ireland'))
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations', lambda: ('Testville', 'Ireland'))
     assert await agent.rejected_location('Dublin, Ireland (Remote)') == ''
 
 
@@ -3987,9 +4667,44 @@ async def test_classifier_fails_open_when_the_tool_server_is_down(monkeypatch, t
 # ---------------------------------------------------------------------------
 
 async def test_apply_hard_rules_rejects_a_location_in_a_rejected_region():
-    reason = await agent.apply_hard_rules(_make_candidate(), _make_extract(location='Germany (Remote)'))
-    assert reason == 'located in an excluded region: germany (western_europe)'
+    """A remote posting that pins residence to the anchor country is judged on the anchor."""
+    extract = _make_extract(location='Germany (Remote within country)', workplace_type='remote')
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason == (
+        'located in an excluded region: germany (western_europe) '
+        '— residency pinned to the anchor country'
+    )
     assert agent._hard_rule_category(reason) == 'hard_ruled_location'
+
+
+async def test_apply_hard_rules_keeps_a_silent_remote_posting_in_an_eu_country():
+    """'Germany (Remote)', saying nothing about residence, is now KEPT.
+
+    This is the deliberate reversal of the 2026-09-04 gate for remote roles: a bare location is an
+    anchor, not a residency requirement, and an EU anchor implies work rights the user has, so the
+    holder can live in another member state. See
+    test_september_2026_regression_is_superseded_for_silent_remote_postings for the full reasoning
+    and for everything that still rejects.
+    """
+    extract = _make_extract(
+        location='Germany (Remote)', workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
+    )
+    assert agent.derive_residency_scope(extract) == '', 'the posting says nothing about residence'
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+async def test_apply_hard_rules_still_rejects_a_silent_remote_posting_outside_the_eu():
+    """The counterpart. A UK/Serbian/Norwegian/Swiss anchor implies no EU work rights."""
+    for location in (
+        'United Kingdom (Remote)', 'Belgrade, Serbia (Remote)',
+        'Oslo, Norway (Remote)', 'Zurich, Switzerland (Remote)',
+    ):
+        extract = _make_extract(
+            location=location, workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
+        )
+        assert agent.derive_residency_scope(extract) == '', location
+        reason = await agent.apply_hard_rules(_make_candidate(), extract)
+        assert reason is not None and 'excluded region' in reason, location
 
 
 async def test_apply_hard_rules_rejects_a_stated_relocation_to_a_rejected_region():
@@ -4040,12 +4755,20 @@ async def test_local_language_alone_never_rejects_or_caps():
     assert agent.apply_rating_caps(extract, 5) == (5, '')
 
 
-async def test_september_2026_regression_remote_germany_is_hard_ruled():
-    """The seven DE/NL postings rated 4-5 and notified on 2026-09-02..03.
+async def test_september_2026_regression_is_superseded_for_silent_remote_postings():
+    """The seven DE/NL postings rated 4-5 and notified on 2026-09-02..03, revisited.
 
-    Every existing gate correctly declined: the JD demanded English, the page was written in
-    English, and the job was remote so the hybrid cap never consulted a location list. Only the
-    missing geographic fact let them through.
+    The 2026-09-04 gate rejected these on the ANCHOR. That is now deliberately reversed for
+    `remote` postings: "Berlin, Germany (Remote across Europe)" says the holder may live anywhere
+    in Europe, so it is kept — the user's rule is that residence, not the anchor, is what the gate
+    may judge, and that a posting saying nothing is assumed to mean remote-from-the-EU.
+
+    What the 2026-09-04 entry was actually built to stop has NOT been reversed, and this test pins
+    the parts that still hold, because the reversal is easy to over-read:
+      - the same posting as HYBRID still rejects (an office pins you to the office — the
+        Munich/Berlin case that started it);
+      - the same posting pinned to Germany still rejects;
+      - the language cap and the hybrid cap are untouched.
     """
     extract = _make_extract(
         title='Senior AI Engineer', company='Finom', location='Berlin, Germany (Remote across Europe)',
@@ -4054,7 +4777,18 @@ async def test_september_2026_regression_remote_germany_is_hard_ruled():
     )
     assert agent.foreign_posting_language(extract) == '', 'the posting is in English — cap must not fire'
     assert agent.derive_workplace_type(extract) == 'remote', 'remote — the hybrid cap must not fire'
-    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert agent.derive_residency_scope(extract) == 'area_wide'
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None, 'kept: residence is open'
+
+    # ...but the office case, which is what the gate was built for, is unchanged.
+    onsite = dict(extract, workplace_type='hybrid', description='Hybrid — 2 days a week in the Berlin office.')
+    reason = await agent.apply_hard_rules(_make_candidate(), onsite)
+    assert reason is not None and 'germany' in reason
+    assert agent._hard_rule_category(reason) == 'hard_ruled_location'
+
+    # ...and so is a remote posting that pins residence to Germany.
+    pinned = dict(extract, location='Berlin, Germany (Remote within country)')
+    reason = await agent.apply_hard_rules(_make_candidate(), pinned)
     assert reason is not None and 'germany' in reason
     assert agent._hard_rule_category(reason) == 'hard_ruled_location'
 
@@ -5317,7 +6051,7 @@ async def test_company_matches_applied_raises_on_api_error(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
     # Force the Anthropic path: the OpenRouter branch swallows every exception by design, and
     # a name that normalizes to an exact match would short-circuit before any LLM call at all.
-    monkeypatch.setattr(tools, 'COMPANY_MATCH_PROVIDER', 'anthropic')
+    monkeypatch.setattr(tools, 'MODEL_NAME_COMPANY_MATCH', ANTHROPIC_MODEL_NAME_LOW)
 
     async def fake_sdk_query(**kwargs):
         yield _errored_result(401)

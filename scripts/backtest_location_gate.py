@@ -27,7 +27,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from agentic_job_search import preferences  # noqa: E402
-from agentic_job_search.agent import rejected_location  # noqa: E402
+from agentic_job_search.agent import (  # noqa: E402
+    derive_residency_scope, rejected_location, residency_spare,
+)
 from agentic_job_search.location import classify_location  # noqa: E402
 
 logger = logging.getLogger('backtest')
@@ -43,6 +45,8 @@ FIELD_RE = {
     'workplace': re.compile(r'^Workplace:[ \t]*(\S.*)$', re.MULTILINE),
 }
 RATING_RE = re.compile(r'-rating_(\d)-')
+# The condensed description is everything after the header block, i.e. after the URL line.
+DESCRIPTION_RE = re.compile(r'^URL:[ \t]*\S+[ \t]*$(.*)', re.MULTILINE | re.DOTALL)
 
 
 def load_postings(root: Path) -> list[dict]:
@@ -53,6 +57,7 @@ def load_postings(root: Path) -> list[dict]:
         record = {'path': path, 'rating': int(m.group(1)) if (m := RATING_RE.search(path.name)) else 0}
         for field, pattern in FIELD_RE.items():
             record[field] = (m.group(1).strip() if (m := pattern.search(text)) else '')
+        record['description'] = (m.group(1).strip() if (m := DESCRIPTION_RE.search(text)) else '')
         if record['location']:
             postings.append(record)
     return postings
@@ -107,35 +112,102 @@ async def main() -> int:
     print(f'  exclude:        {list(preferences.excluded_locations())}')
     print(f'  exempt:         {list(preferences.hybrid_acceptable_locations())[:6]}...\n')
 
-    rejected = kept = 0
-    flipped: list[dict] = []
+    rejected = kept = failed_open = 0
+    to_reject: list[dict] = []
+    to_keep: list[dict] = []
     for record in sample:
-        reason = await rejected_location(record['location'])
+        extract = {
+            'location': record['location'], 'relocation': record['relocation'],
+            'description': record['description'], 'workplace_type': record['workplace'],
+            # Deliberately absent: every saved posting predates the field, so this exercises
+            # derive_residency_scope() alone -- the half with no live model to hide behind.
+            'residency_scope': '',
+        }
+        scope = derive_residency_scope(extract)
+        spare = residency_spare(extract)
+
+        # The two changes push in OPPOSITE directions -- whole-word matching is monotonically
+        # restrictive, the residency spare monotonically permissive -- so a single before/after
+        # count nets them out to nearly nothing and proves neither. Attribute them separately.
+        # The baseline must evaluate BOTH halves, exactly as apply_hard_rules does. Comparing a
+        # location-only baseline against location-or-relocation made every relocation rejection
+        # look like a flip caused by this change.
+        legacy = await _legacy_rejected_location(record['location'])
+        if not legacy and record['relocation']:
+            legacy = await _legacy_rejected_location(record['relocation'])
+        reason = await rejected_location(record['location'], residency_spare=spare)
         relocation_reason = ''
-        if record['relocation']:
+        if not reason and record['relocation']:
             relocation_reason = await rejected_location(record['relocation'])
         facts = await classify_location(record['location'])
+        if facts.get('source') == 'error':
+            failed_open += 1
 
-        verdict = 'REJECT' if (reason or relocation_reason) else 'keep'
-        if reason or relocation_reason:
-            rejected += 1
-            if record['rating'] >= 4:
-                flipped.append(record)
-        else:
-            kept += 1
+        was_rejected = bool(legacy)
+        now_rejected = bool(reason or relocation_reason)
+        verdict = 'REJECT' if now_rejected else 'keep'
+        rejected, kept = (rejected + 1, kept) if now_rejected else (rejected, kept + 1)
+        if now_rejected and not was_rejected:
+            to_reject.append({**record, 'why': reason or relocation_reason})
+        if was_rejected and not now_rejected:
+            to_keep.append({**record, 'why': f'scope={scope or "unspecified"} spare={spare}', 'legacy': legacy})
 
         print(
-            f'{verdict:7} was {record["rating"]}/5  {record["location"][:52]:52} '
-            f'-> {",".join(facts.get("countries") or ["-"]):22} {",".join(facts.get("regions") or ["-"]):16} '
+            f'{verdict:7} was {record["rating"]}/5  {record["location"][:46]:46} '
+            f'{(scope or "-"):13}'
+            f'-> {",".join(facts.get("countries") or ["-"]):20} {",".join(facts.get("regions") or ["-"]):16} '
             f'{(reason or relocation_reason) or ""}'
         )
 
-    print(f'\n{rejected} rejected, {kept} kept.')
-    print(f'{len(flipped)} posting(s) previously rated >=4 are now rejected:')
-    for record in flipped:
-        print(f'  {record["rating"]}/5  {record["location"][:60]}  {record["path"].name[:70]}')
+    print(f'\n{rejected} rejected, {kept} kept (of {len(sample)}).')
+    if failed_open:
+        print(
+            f'\n!! {failed_open} of {len(sample)} location(s) could not be classified — the '
+            f'OpenRouter MCP server on :8006 is not answering. The gate FAILS OPEN, so every one '
+            f'of those reads as "keep" here regardless of the rules. Start the server and re-run; '
+            f'until then only cached locations mean anything.'
+        )
+
+    print(f'\nFLIPPED TO REJECT — the whole-word matcher ({len(to_reject)}):')
+    for record in to_reject:
+        print(f'  {record["rating"]}/5  {record["location"][:52]:52} {record["why"]}')
+    print('  (every one of these should be a posting the old substring matcher wrongly exempted)')
+
+    print(f'\nFLIPPED TO KEEP — the residency rule ({len(to_keep)}):')
+    for record in to_keep:
+        print(f'  {record["rating"]}/5  {record["location"][:52]:52} {record["why"]}  was: {record["legacy"]}')
+    print('  (each must be a REMOTE posting, in an EU country, with no stated residency requirement,')
+    print('   OR one that explicitly offers a multi-country area. Anything else is a bug.)')
+
     print('\nRun again: every line should be identical and cost nothing (all cache hits).')
     return 0
+
+
+async def _legacy_rejected_location(text: str) -> str:
+    """The pre-2026-09-09 gate: substring matching, no residency spare.
+
+    Deliberately a frozen copy here rather than a mode flag in production -- a comparison harness
+    owning its own baseline beats shipping a compatibility switch nobody uses.
+    """
+    haystack = ' '.join(str(text or '').split()).lower()
+    if not haystack:
+        return ''
+    if not (preferences.excluded_locations() or preferences.rejected_regions()):
+        return ''
+    if any(token in haystack for token in preferences.hybrid_acceptable_locations()):
+        return ''
+    for token in preferences.excluded_locations():
+        if token in haystack:
+            return token
+    unwanted = preferences.rejected_regions()
+    facts = await classify_location(haystack)
+    if facts.get('broad_area'):
+        return ''
+    regions = facts.get('regions') or []
+    if not regions or not all(region in unwanted for region in regions):
+        return ''
+    countries = facts.get('countries') or []
+    return f'{(countries[0] if countries else regions[0])} ({regions[0]})'
 
 
 if __name__ == '__main__':

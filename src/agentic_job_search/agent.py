@@ -15,6 +15,7 @@ from urllib.parse import quote_plus
 import requests
 import yaml
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 from utils_tools_n_agents_common.logging_setup import setup_logging
@@ -22,21 +23,23 @@ from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_HIGH,
     ANTHROPIC_MODEL_NAME_LOW,
     ANTHROPIC_MODEL_NAME_MEDIUM,
+    route_for,
 )
 
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_OPUS_SAMPLE_SIZE,
-    EXTRACTOR_PROVIDER,
     JOB_STALE_AGE_DAYS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
+    MODEL_NAME_EXTRACTOR,
+    MODEL_NAME_QUERY,
+    MODEL_NAME_RATING,
+    MODEL_NAME_SCRAPER,
     PLAYWRIGHT_MCP_PACKAGE,
     PLAYWRIGHT_MCP_REGISTRY_URL,
     PLAYWRIGHT_MCP_VERSION,
     PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
-    QUERY_PROVIDER,
-    RATING_PROVIDER,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_INTER_QUERY_DELAY_SECONDS,
     SCRAPER_DATE_POSTED_LABEL,
@@ -48,7 +51,6 @@ from agentic_job_search.config import (
     SATURATION_MIN_NEW_RATIO,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_MAX_TURNS_PER_QUERY,
-    SCRAPER_PROVIDER,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
@@ -56,7 +58,9 @@ from agentic_job_search.config import (
     TRIAGE_ENABLED,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
-from agentic_job_search.location import classify_location
+from agentic_job_search import location
+from agentic_job_search import location_review
+from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search import scrape_openrouter
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
@@ -461,6 +465,7 @@ Also capture:
 - language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
 - posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely undeterminable.
 - local_language: the dominant local WORKING/BUSINESS language of the job's location, lowercase English name, e.g. "french" for Quebec/Montreal, "spanish" for Spain, "english" for Toronto or London. Use location references anywhere in the posting body, not just the location field — a remote-Canada role whose text mentions "colleagues outside Quebec" is "french". Leave empty for work-from-anywhere roles or when the location is unknown.
+- residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany", "open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere", "any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is advertised: "Romania (Remote)" on its own says nothing here.
 - relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
 - education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required.
 
@@ -592,6 +597,8 @@ EXTRACT_OUTPUT_SCHEMA = {
         'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
         'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
         'local_language': {'type': 'string', 'description': "Dominant local working language of the job's location, lowercase e.g. 'french' for Quebec, 'spanish' for Spain; empty for work-from-anywhere or unknown location"},
+        'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
+                            'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
         'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
         'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement (e.g. 'MSc required', 'PhD is a must'); empty when merely preferred, when equivalent experience is accepted, or when only a Bachelor's is required"},
     },
@@ -697,8 +704,8 @@ QUERY_JSON_INSTRUCTIONS = (
 
 
 async def _generate_queries_openrouter(prompt: str, stage_stats: dict | None) -> list[str]:
-    """Query generation via the OpenRouter MCP server (glm). Raises on any failure."""
-    content, cost_usd = await chat_openrouter(f'{prompt}\n\n{QUERY_JSON_INSTRUCTIONS}')
+    """Query generation via the OpenRouter MCP server. Raises on any failure."""
+    content, cost_usd = await chat_openrouter(f'{prompt}\n\n{QUERY_JSON_INSTRUCTIONS}', model=MODEL_NAME_QUERY)
     if stage_stats is not None:
         stage_stats['cost'] += cost_usd
     queries = extract_json_object(content).get('queries') or []
@@ -753,7 +760,7 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
     prompt = f'{context}\n\n{build_query_generation_instructions()}'
 
     provider = ''
-    if QUERY_PROVIDER == 'openrouter':
+    if route_for(MODEL_NAME_QUERY) == 'openrouter':
         try:
             captured = await _generate_queries_openrouter(prompt, stage_stats)
             provider = 'openrouter'
@@ -1198,6 +1205,8 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'LOCAL TRIAGE DISABLED: {alert.get("detail")}')
         elif kind == 'playwright_mcp_outdated':
             alerts.append(f'BROWSER TOOLCHAIN OUTDATED: {alert.get("detail")}')
+        elif kind == 'location_recommendations':
+            alerts.append(f'COUNTRY LISTS: {alert.get("detail")}')
 
     # 1b. Queries that failed outright. Deliberately ahead of saturation: saturation is measured
     #     against DISTINCT listings and is skipped entirely when there are none (`if distinct:`
@@ -1697,6 +1706,7 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         'posting_language': (structured.get('posting_language') or '').strip().lower(),
         'local_language': (structured.get('local_language') or '').strip().lower(),
         'relocation': structured.get('relocation', ''),
+        'residency_scope': (structured.get('residency_scope') or '').strip().lower(),
         'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
         'education_requirement': (structured.get('education_requirement') or '').strip().lower(),
     }
@@ -1719,6 +1729,108 @@ _HYBRID_RE = re.compile(
     re.IGNORECASE,
 )
 _REMOTE_RE = re.compile(r'\b(?:fully\s+)?remote\b|\bwork\s+from\s+(?:home|anywhere)\b', re.IGNORECASE)
+
+
+# Residency scope: does the posting pin you to the country it is anchored in, or offer a whole
+# area? Judged from the JD's own words, read over `location` + `relocation` + the head of the
+# description, because the wording lands in any of the three -- the extractors have always glued
+# it into `location` as prose ('Romania (Remote within country)', 'Portugal (Remote - anywhere in
+# the EU/Europe)', 'Netherlands (Remote; can be based in any EMEA Red Hat country)').
+
+# Names of AREAS rather than countries. Every country-pinning pattern below requires an object
+# that is NOT one of these, which is the whole trick: "must be based in Germany" pins you,
+# "must be based in Europe" does not, and both are the same eight words up to the last one.
+#
+# WHAT BELONGS HERE, and it is not "every regional acronym". `area_wide` passes UNCONDITIONALLY,
+# mirroring `broad_area`, whose justification is that "a posting offering a whole multi-country
+# area is not limited to the countries it happens to name". That holds for an open-ended region
+# and FAILS for a small closed bloc: "remote within DACH" is limited to exactly Germany, Austria
+# and Switzerland, so it is closer to a country list than to an area, and listing it here would
+# turn a role you must live in one of three specific countries for into an automatic pass.
+# Closed blocs (DACH, Benelux, the Nordics, CEE, Iberia) are therefore deliberately absent and are
+# judged on the anchor instead; `test_small_closed_blocs_are_judged_on_the_anchor` pins that.
+#
+# These patterns are matched case-INSENSITIVELY, unlike the place-name lists. That split is
+# deliberate: this reads prose, where "remote within europe" is written every way imaginable,
+# while the lists hold proper names, where 'Nice' the city is not 'nice' the adjective.
+_AREA_WORDS = (
+    r'(?:eu|e\.u\.|eea|emea|europ(?:e|ean)|american?s?|north\s+america|south\s+america|'
+    r'schengen|latam|latin\s+america|apac|asia[\s-]pacific|mena|'
+    r'anywhere|world|globe|worldwide|country\s+where|countries\s+where)'
+)
+# What may sit between a preposition and an area name: one determiner and one adjective, so
+# "within our EMEA region" and "in the wider Europe" still read as area wording. Deliberately only
+# ONE filler word -- widen it and "based in Germany or Europe" starts reading as area-wide, where
+# country_only is the conservative answer for a mixed statement.
+#
+# Shared by both patterns ON PURPOSE. The negative lookahead below and the area patterns must
+# agree on what an area name looks like: when they drifted apart, "remote within our EMEA region"
+# fell through BOTH -- the country branch stopped claiming it and no area branch picked it up.
+_AREA_LEAD = r'(?:the\s+|an?\s+|our\s+|your\s+)?(?:\w+\s+)?'
+_NOT_AREA = r'(?!' + _AREA_LEAD + _AREA_WORDS + r'\b)'
+
+_AREA_WIDE_RE = re.compile(
+    r'\b(?:work|working|remote|based|located|reside|residing|hire[sd]?|employed|eligible)\s+'
+    r'(?:from|in|within|across|throughout|anywhere\s+in|to)\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
+    r'|\banywhere\s+in\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
+    r'|\b(?:work|remote|based|hire[sd]?|located)\s+(?:from\s+)?anywhere\b'
+    r'|\bany\s+(?:\w+\s+){0,2}?(?:eu|eea|emea|european)(?:\s+\w+){0,2}?\s+country\b'
+    r'|\b(?:emea|europe|eu)\s+(?:or|and)\s+(?:the\s+)?'
+    r'(?:americas|north\s+america|south\s+america|eastern\s+us|us|usa|united\s+states)\b'
+    r'|\b(?:eu|europe)\s*/\s*(?:eu|europe)\b'
+    r'|\bremote\s*[-–—,;]\s*' + _AREA_LEAD + _AREA_WORDS + r'\b',
+    re.IGNORECASE,
+)
+
+_COUNTRY_ONLY_RE = re.compile(
+    r'\bremote\s+(?:only\s+)?(?:(?:with)?in|across|throughout)\s+(?:the\s+)?' + _NOT_AREA
+    + r'(?:country|[a-zÀ-ɏ]+)\b'
+    r'|\bmust\s+(?:be\s+)?(?:based|located|resident|reside|residing|live|living|work|working)'
+    r'(?:\s+\w+){0,2}?\s+(?:in|from|within)\s+' + _NOT_AREA + r'(?:the\s+|an?\s+)?[a-zÀ-ɏ]'
+    r'|\b(?:open\s+)?only\s+to\s+candidates\s+(?:residing|located|based)\s+in\s+'
+    r'(?:the\s+|an?\s+)?' + _NOT_AREA + r'[a-zÀ-ɏ]'
+    r'|\b(?:based|located|residing|resident)\s+in\s+' + _NOT_AREA + r'[a-zÀ-ɏ]+\s+only\b'
+    r'|\bresidenc[ey]\s+in\s+' + _NOT_AREA + r'[a-zÀ-ɏ]+\s+(?:is\s+)?(?:required|mandatory)\b'
+    r'|\bin[\s-]country\s+residenc[ey]\b'
+    r'|\banywhere\s+(?:with)?in\s+(?:the\s+)?' + _NOT_AREA + r'[a-zÀ-ɏ]',
+    re.IGNORECASE,
+)
+
+RESIDENCY_SCOPES = ('country_only', 'area_wide')
+
+
+def derive_residency_scope(extract: dict) -> str:
+    """'country_only' | 'area_wide' | '' -- where the posting says the holder must actually LIVE.
+
+    This is not the anchor. "Romania (Remote)" anchors the role in Romania while the holder could
+    live anywhere in the EU; "Romania (Remote within country)" does not. The geographic gate needs
+    the second fact, and only the JD can supply it.
+
+    Precedence is deliberately asymmetric, and the asymmetry is the OPPOSITE of `is_agency`'s
+    (where the extractor's False is a judgement that wins): a `country_only` finding from EITHER
+    the extractor or the text sticks, and it is checked before the area patterns. A wrong
+    `area_wide` silently switches the geographic gate off for that job -- the exact failure this
+    field exists to close -- while a wrong `country_only` surfaces as a rejection with a stated
+    reason in the audit log and the run funnel. Same shape as the `local_language` rule that may
+    only ever ADD a finding, never erase one.
+
+    The regexes are a fallback for when the extractor leaves the field unset; they carry the load
+    only until the field is populated, which is why the patterns are anchored on a concrete
+    non-area object rather than trying to parse the sentence.
+    """
+    explicit = str(extract.get('residency_scope') or '').strip().lower()
+    if explicit not in RESIDENCY_SCOPES:
+        explicit = ''
+
+    haystack = (
+        f"{extract.get('location', '')}\n{extract.get('relocation', '')}\n"
+        f"{str(extract.get('description', ''))[:2000]}"
+    )
+    if explicit == 'country_only' or _COUNTRY_ONLY_RE.search(haystack):
+        return 'country_only'
+    if explicit == 'area_wide' or _AREA_WIDE_RE.search(haystack):
+        return 'area_wide'
+    return ''
 
 
 def derive_workplace_type(extract: dict) -> str:
@@ -1956,7 +2068,7 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     # Where the role is ANCHORED, and separately whether the JD demands a move. A bare location is
     # NOT a residency requirement — "Germany (Remote)" means the role sits in Germany and you could
     # live anywhere in the EU — so the two are judged apart, on different fields.
-    if region := await rejected_location(extract.get('location', '')):
+    if region := await location_rejection_reason(extract):
         return f'located in an excluded region: {region}'
     if relocation := str(extract.get('relocation') or '').strip():
         if region := await rejected_location(relocation):
@@ -2010,13 +2122,30 @@ async def derive_local_language(extract: dict) -> str:
     return str(facts.get('local_language') or '').strip().lower() or stated
 
 
-def hybrid_location_is_acceptable(location: str) -> bool:
-    """True if a hybrid/on-site role in this location is one the user would actually take."""
-    haystack = (location or '').lower()
-    return any(token in haystack for token in preferences.hybrid_acceptable_locations())
+def hybrid_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
+    """True if a hybrid/on-site role in this location is one the user would actually take.
+
+    `place_names` are the other names the classifier says this place goes by, resolved once per
+    candidate into `extract['place_names']`. Passing them matters here and not only in the gate:
+    these three sync consumers (this, `apply_rating_caps`, `build_deterministic_warnings`) would
+    otherwise keep the exact-only match, so a hybrid role in `Sevilla` would be gated correctly by
+    the async path and still capped and warned about by this one.
+
+    Whole-token matching, not `in`: this list is also tier 1 of the geographic gate and exempts
+    OUTRIGHT, so a substring hit disables every rule below it. 'roma' (Rome) matched 'romania' and
+    'emilia-romagna' that way, and every Romanian posting skipped the deny list, the classifier
+    and the region policy — one was rated 4 and notified while Bulgaria, Poland, Czechia and
+    Lithuania rejected correctly in the same run.
+    """
+    candidates = (location, *place_names)
+    return any(
+        location_token_matches(token, candidate)
+        for token in preferences.hybrid_acceptable_locations()
+        for candidate in candidates
+    )
 
 
-async def rejected_location(text: str) -> str:
+async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
     """The rejected region named in `text`, or '' when acceptable, unrecognised, or unconfigured.
 
     Purely geographic. This deliberately reads NO language field: an earlier design rejected on
@@ -2033,8 +2162,20 @@ async def rejected_location(text: str) -> str:
       4. otherwise the cached classifier, and a rejection only when EVERY named country is in a
          rejected region — so 'the UK or the Netherlands' passes, and so does anything naming no
          country at all ('European Union', 'Remote (EMEA)')
+
+    `residency_spare` says how far the JD lets the holder live from the anchor, and applies in
+    tier 4 ONLY, beside `broad_area`. Deliberately not above: `locations.exclude` is the one
+    mechanism no classifier variance can reach, and after this change it is the only way to drop
+    a single EU country for remote roles, so it has to stay absolute.
+      - 'none'     — judge the anchor (hybrid/on-site, or the JD pins residence to it)
+      - 'any_area' — the JD offers a multi-country area; keep, exactly like `broad_area`
+      - 'eu_only'  — the JD is silent; keep IF every named country is an EU member state, because
+                     an EU anchor implies work rights the user has and a UK or Serbian one does not
     """
-    haystack = ' '.join(str(text or '').split()).lower()
+    # Whitespace only. The text is NOT lowercased any more: the lists hold proper names ('Málaga',
+    # not 'malaga') and are matched against the text as written. `classify_location` is unaffected
+    # -- `cache_key` lowercases for its own key, because case is not geography.
+    haystack = ' '.join(str(text or '').split())
     if not haystack:
         return ''
     if not (preferences.excluded_locations() or preferences.rejected_regions()):
@@ -2042,18 +2183,37 @@ async def rejected_location(text: str) -> str:
     if hybrid_location_is_acceptable(haystack):
         return ''
     for token in preferences.excluded_locations():
-        if token in haystack:
+        if location_token_matches(token, haystack):
             return token
 
     unwanted = preferences.rejected_regions()
     if not unwanted:
         return ''
     facts = await classify_location(haystack)
+    # Tier 3a: the same two lists again, now against every name the classifier says this place goes
+    # by. This is what reaches an exonym no normalization can ('Sevilla' -> the listed 'Seville',
+    # 'Torino' -> 'Turin'), and it is why the lists no longer need hand-maintained spelling pairs.
+    # Order matches tiers 1 and 2 exactly: exempt wins over deny.
+    place_names = facts.get('place_names') or []
+    if any(hybrid_location_is_acceptable(name) for name in place_names):
+        return ''
+    for token in preferences.excluded_locations():
+        if any(location_token_matches(token, name) for name in place_names):
+            return token
     # A whole multi-country area on offer is itself an unrejected option: "European Union (Remote,
     # UK and EU)" is not a UK-only role just because the UK is the one country it names. Found by
     # the live backtest, which flipped a 5/5 posting of exactly that shape. A single country phrased
     # expansively ("Berlin, Germany (Remote across Europe)") is NOT this — it stays anchored.
     if facts.get('broad_area'):
+        return ''
+    # The JD's own statement about residence, where broad_area is the location string's. Same
+    # idea, two sources: the classifier reads the location, the extractor reads the body.
+    if residency_spare == 'any_area':
+        return ''
+    countries_named = facts.get('countries') or []
+    if residency_spare == 'eu_only' and countries_named and all(
+        is_eu_member(country) for country in countries_named
+    ):
         return ''
     regions = facts.get('regions') or []
     if not regions:
@@ -2063,6 +2223,33 @@ async def rejected_location(text: str) -> str:
     countries = facts.get('countries') or []
     named = countries[0] if countries else regions[0]
     return f'{named} ({regions[0]})'
+
+
+def residency_spare(extract: dict) -> str:
+    """'none' | 'eu_only' | 'any_area' — how far the JD lets the holder live from the anchor."""
+    if derive_workplace_type(extract) in {'hybrid', 'onsite'}:
+        return 'none'          # an office pins you regardless of what the text says
+    return {'country_only': 'none', 'area_wide': 'any_area'}.get(derive_residency_scope(extract), 'eu_only')
+
+
+async def location_rejection_reason(extract: dict) -> str:
+    """The geographic reason to reject this posting, or '' to keep it.
+
+    `rejected_location` asks "would the user live in the place this text names". That is the right
+    question only once you know the posting actually requires living there. A remote role ANCHORED
+    in Romania may mean "live in Romania" or "live anywhere in the EU", and those are opposite
+    answers to the same location string — which is why the anchor alone was the wrong input.
+
+    The `relocation` hard rule is unchanged and still runs separately, unspared: it is the JD
+    asserting a categorical requirement rather than code inferring one from a location string.
+    """
+    spare = residency_spare(extract)
+    reason = await rejected_location(extract.get('location', ''), residency_spare=spare)
+    if not reason or spare != 'none' or derive_residency_scope(extract) != 'country_only':
+        return reason
+    # No 'relocation required' and no 'language' in this suffix: _hard_rule_category is an ordered
+    # substring dispatcher and either phrase would misbucket the funnel counter.
+    return f'{reason} — residency pinned to the anchor country'
 
 
 def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
@@ -2080,7 +2267,9 @@ def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
     caps: list[tuple[int, str]] = []
 
     workplace_type = derive_workplace_type(extract)
-    if workplace_type in {'hybrid', 'onsite'} and not hybrid_location_is_acceptable(extract.get('location', '')):
+    if workplace_type in {'hybrid', 'onsite'} and not hybrid_location_is_acceptable(
+        extract.get('location', ''), extract.get('place_names') or ()
+    ):
         location = extract.get('location') or 'unspecified location'
         caps.append((
             preferences.hybrid_rating_cap(),
@@ -2118,7 +2307,7 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
         label = 'Hybrid' if workplace_type == 'hybrid' else 'On-site'
         location = extract.get('location') or 'location not stated'
         warning = f'{label} — {location}'
-        if not hybrid_location_is_acceptable(extract.get('location', '')):
+        if not hybrid_location_is_acceptable(extract.get('location', ''), extract.get('place_names') or ()):
             warning += ' (not an acceptable hybrid location)'
         warnings.append(warning)
 
@@ -2195,12 +2384,13 @@ def format_job_notification(
     return '\n\n'.join(sections)
 
 
-async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
+async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_stats: dict,
+                               model: str = ANTHROPIC_MODEL_NAME_MEDIUM) -> dict:
     options = ClaudeAgentOptions(
         setting_sources=[],
         strict_mcp_config=True,
         skills=[],
-        model=ANTHROPIC_MODEL_NAME_MEDIUM,
+        model=model,
         effort='low',
         tools=[],
         system_prompt=evaluator_prompt,
@@ -2221,14 +2411,18 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
 
 
 async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
-    """Stage 2d: one non-agentic rating call, provider selected by RATING_PROVIDER."""
-    if RATING_PROVIDER == 'openrouter':
-        result, cost_usd = await rate_with_openrouter(evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}')
+    """Stage 2d: one non-agentic rating call; MODEL_NAME_RATING's family prefix picks the
+    route (route_for) and the model together."""
+    route = route_for(MODEL_NAME_RATING)
+    if route == 'openrouter':
+        result, cost_usd = await rate_with_openrouter(
+            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=MODEL_NAME_RATING)
         stage_stats['cost'] += cost_usd
         return result
-    if RATING_PROVIDER == 'ollama':
-        return await rate_with_ollama(evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}')
-    return await _rate_with_anthropic(evaluator_prompt, extract_text, stage_stats)
+    if route == 'ollama':
+        return await rate_with_ollama(
+            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=MODEL_NAME_RATING)
+    return await _rate_with_anthropic(evaluator_prompt, extract_text, stage_stats, model=MODEL_NAME_RATING)
 
 
 async def _save_and_notify(
@@ -2282,8 +2476,9 @@ async def evaluate_all_candidates(
     ``funnel`` (if provided) accumulates per-stage drop counts for the run summary.
 
     ``triage_enabled`` is the run-level switch the local-model preflight turns off: a missing
-    LOCAL_MODEL is reported ONCE and triage is skipped, rather than every job re-discovering the
-    same misconfiguration and logging an identical warning (2026-08-25, 63 of them in one run).
+    OLLAMA_MODEL_NAME_TRIAGE is reported ONCE and triage is skipped, rather than every job
+    re-discovering the same misconfiguration and logging an identical warning (2026-08-25, 63 of
+    them in one run).
     """
     if funnel is None:
         funnel = {}
@@ -2311,7 +2506,7 @@ async def evaluate_all_candidates(
     for candidate in candidates:
         console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
         try:
-            if EXTRACTOR_PROVIDER == 'openrouter':
+            if route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
                 extract = await extract_job_page_openrouter(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], EXTRACTOR_INSTRUCTIONS
                 )
@@ -2332,6 +2527,17 @@ async def evaluate_all_candidates(
             # no gate reads local_language, by design.
             raw_local_language = str(extract.get('local_language') or '')
             extract['local_language'] = await derive_local_language(extract)
+            # Same treatment for residency_scope, and for the same reason: resolve once here so
+            # the sync consumers (the gate, the warnings) read a plain field, and log raw->derived
+            # so a fallback that silently overrides the extractor stays countable.
+            raw_residency_scope = str(extract.get('residency_scope') or '')
+            extract['residency_scope'] = derive_residency_scope(extract)
+            # Every other name this place goes by, resolved ONCE (the classifier answer is already
+            # cached from derive_local_language above, so this is free) and written back, so the
+            # sync consumers below read a plain field instead of each needing to be async.
+            extract['place_names'] = (
+                await classify_location(extract.get('location', ''))
+            ).get('place_names') or []
             extract_text = format_extract_text(candidate, extract)
             logger.info(
                 f"Extract signal: {candidate['company']} — {candidate['title']}: "
@@ -2340,6 +2546,8 @@ async def evaluate_all_candidates(
                 f"posting_language={extract.get('posting_language')!r} "
                 f"local_language={raw_local_language!r}->{extract.get('local_language')!r} "
                 f"relocation={extract.get('relocation')!r} "
+                f"residency_scope={raw_residency_scope!r}->{extract.get('residency_scope')!r} "
+                f"place_names={extract.get('place_names')} "
                 f"education_requirement={extract.get('education_requirement')!r} "
                 f"is_agency={derive_agency_posting(extract)} end_client={extract.get('end_client')!r}"
             )
@@ -2432,7 +2640,7 @@ async def evaluate_all_candidates(
             triage_note = f" (triage said {triage_result['score']})" if triage_result else ''
             logger.info(
                 f"Rating: {candidate['company']} — {candidate['title']}: "
-                f"{rating}/5 via {RATING_PROVIDER}{triage_note} — {result['reasoning']}"
+                f"{rating}/5 via {MODEL_NAME_RATING}{triage_note} — {result['reasoning']}"
             )
             pros = [str(p) for p in (result.get('pros') or [])]
             warnings = merge_warnings(
@@ -2700,7 +2908,10 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
 
 
 async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scraping_stats: dict) -> bool:
-    """Run Stage 1b on the configured provider, falling back to the Anthropic scraper on failure.
+    """Run Stage 1b, falling back to the Anthropic scraper on failure.
+
+    The route (and model) is MODEL_NAME_SCRAPER: an OPENROUTER_* family value runs the
+    function-calling loop; anything else routes Stage 1b straight to the Anthropic scraper.
 
     Extracted from `run_non_interactive` so the fallback is REACHABLE BY A TEST. It was previously
     inline, and the bug it hides is not hypothetical: on 2026-09-02 an OpenRouter 402 was swallowed
@@ -2710,7 +2921,7 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
 
     Returns True if the OpenRouter path completed, False if the Anthropic fallback ran.
     """
-    if SCRAPER_PROVIDER == 'openrouter':
+    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
         # Browser tools come from the running Playwright server's own schemas rather than a
         # hand-transcribed constant, so a server-side change cannot drift silently.
         try:
@@ -2718,7 +2929,7 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
                 tool_defs = (scrape_openrouter.browser_tool_defs(await browser_call.list_tools())
                              + scrape_openrouter.LOCAL_TOOL_DEFS)
                 logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
-                            f'{scrape_openrouter.MODEL_NAME_SCRAPER}')
+                            f'{MODEL_NAME_SCRAPER}')
                 await run_scraper(
                     _openrouter_run_pass(browser_call, tool_defs, scraping_stats,
                                          tools_module._scrape_per_query),
@@ -2753,6 +2964,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._search_ids = {}
     tools_module._search_reports = []
     tools_module._ui_alerts = list(_startup_ui_alerts)
+    location.reset_countries_seen()
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -2768,6 +2980,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         "reference_summary": new_stage_stats(),
         "extraction": new_stage_stats(),
         "rating": new_stage_stats(),
+        "location_review": new_stage_stats(),
     }
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 
@@ -2823,6 +3036,13 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
             # Health is assessed HERE too, not only on the main path below: this branch returns
             # before that code, so without this a run whose every query failed reported itself as
             # healthy in both the audit log and Telegram.
+            # Advisory review of the country lists. Must run BEFORE the funnel snapshots
+            # `ui_alerts`, and on BOTH exit paths -- two copies of an alert-raising step is
+            # exactly how one of them came to be missing before.
+            if detail := await location_review.review_location_lists(stage_stats.get('location_review')):
+                tools_module._ui_alerts.append(
+                    {'kind': 'location_recommendations', 'query': '', 'region': '', 'detail': detail}
+                )
             zero_funnel = {
                 "queries_generated": len(queries),
                 "listings_seen": sum(check_status_counts.values()),
@@ -2875,8 +3095,8 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         evaluator_prompt = build_evaluator_prompt(reference_block)
         profile_block = build_profile_block(reference_block)
 
-        # One check, before the per-job loop: a LOCAL_MODEL that is not installed silently
-        # disables the free triage gate on every candidate, and the run still looks normal.
+        # One check, before the per-job loop: an OLLAMA_MODEL_NAME_TRIAGE that is not installed
+        # silently disables the free triage gate on every candidate, and the run still looks normal.
         triage_enabled = True
         if TRIAGE_ENABLED:
             preflight_problem = await preflight_local_model()
@@ -2908,6 +3128,11 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     total_cost = sum(s["cost"] for s in stage_stats.values())
 
     check_status_counts = dict(tools_module._check_status_counts)
+    if detail := await location_review.review_location_lists(stage_stats.get('location_review')):
+        tools_module._ui_alerts.append(
+            {'kind': 'location_recommendations', 'query': '', 'region': '', 'detail': detail}
+        )
+
     funnel_summary = {
         "queries_generated": len(queries),
         "listings_seen": sum(check_status_counts.values()),

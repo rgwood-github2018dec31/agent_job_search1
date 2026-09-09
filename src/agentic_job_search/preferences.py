@@ -45,12 +45,12 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     # anything neither list names goes to the cached classifier in location.py. BOTH empty means
     # no geographic gate at all and, deliberately, not a single classifier call.
     'locations': {
-        'exclude': [],         # lowercase location substrings that always reject
+        'exclude': [],         # place names that always reject (case-sensitive, accent-exact)
         'reject_regions': [],  # region names from location.LOCATION_REGIONS
     },
     'hybrid': {
         'rating_cap': 3,
-        'acceptable_locations': [],  # empty = every hybrid/on-site job is capped
+        'acceptable_locations': [],  # place names; empty = every hybrid/on-site job is capped
     },
     'titles': {
         'prefer': '',    # free text appended to the query-generation prompt
@@ -149,8 +149,13 @@ def sponsorship_required_in() -> tuple[str, ...]:
 
 
 def excluded_locations() -> tuple[str, ...]:
-    '''Lowercase location substrings that reject outright, ahead of any classifier call.'''
-    return tuple(str(loc).lower() for loc in load_preferences()['locations']['exclude'])
+    '''Place names that reject outright, ahead of any classifier call.
+
+    Returned **as written**, like the company blacklist and unlike every other list here: these
+    are proper names, matched case-sensitively and accent-exactly against a posting's location.
+    Lowercasing them is what made `malaga` an entry that could never match `Málaga`.
+    '''
+    return tuple(str(loc).strip() for loc in load_preferences()['locations']['exclude'] if str(loc).strip())
 
 
 def rejected_regions() -> tuple[str, ...]:
@@ -178,8 +183,15 @@ def hybrid_rating_cap() -> int:
 
 
 def hybrid_acceptable_locations() -> tuple[str, ...]:
-    '''Lowercase location substrings where a hybrid/on-site role is acceptable.'''
-    return tuple(str(loc).lower() for loc in load_preferences()['hybrid']['acceptable_locations'])
+    '''Place names where a hybrid/on-site role is acceptable. Also tier 1 of the geographic gate.
+
+    Returned **as written** — see `excluded_locations`. List the local and the English form when
+    they differ ('Seville' and 'Sevilla'); anything still unmatched is resolved through the
+    classifier's `place_names`.
+    '''
+    return tuple(
+        str(loc).strip() for loc in load_preferences()['hybrid']['acceptable_locations'] if str(loc).strip()
+    )
 
 
 def preferred_titles_note() -> str:

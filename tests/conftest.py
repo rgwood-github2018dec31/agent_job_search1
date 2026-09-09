@@ -11,6 +11,8 @@ import pytest
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools
 from agentic_job_search import agent
+from agentic_job_search import location
+from agentic_job_search import location_review
 from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
 from agentic_job_search.agent import load_env
 load_env()
@@ -31,15 +33,17 @@ TEST_PREFERENCES = {
     'foreign_language_rating_cap': 3,
     'reject_required_degrees': ['master', 'phd'],
     # Fictional places, so no test can depend on the real classifier or on real geography.
-    # 'blockedland' is on the deny list; 'testville'/'exampleton' are exempt; anything else
+    # 'Blockedland' is on the deny list; 'Testville'/'Exampleton' are exempt; anything else
     # reaches the classifier, which tests stub via the `stub_location_classifier` fixture.
+    # PROPER NAMES, like the real config: these lists are matched case-sensitively, so a lowercase
+    # fixture would test a matching rule production does not have.
     'locations': {
-        'exclude': ['blockedland'],
+        'exclude': ['Blockedland'],
         'reject_regions': ['northern_europe', 'western_europe', 'eastern_europe'],
     },
     'hybrid': {
         'rating_cap': 3,
-        'acceptable_locations': ['testville', 'exampleton'],
+        'acceptable_locations': ['Testville', 'Exampleton'],
     },
     'titles': {
         'prefer': 'Prefer INDIVIDUAL CONTRIBUTOR titles (Principal / Staff / Lead / Senior).',
@@ -101,6 +105,27 @@ FAKE_GEOGRAPHY = {
     'czechia': ('czechia', 'eastern_europe', 'czech'),
     'prague': ('czechia', 'eastern_europe', 'czech'),
     'sweden': ('sweden', 'northern_europe', 'swedish'),
+    # An exonym pair: the posting says one, the list may say the other.
+    'sevilla': ('spain', 'southern_europe', 'spanish'),
+    'seville': ('spain', 'southern_europe', 'spanish'),
+    'torino': ('italy', 'southern_europe', 'italian'),
+    # A rejected-region place whose exonym is the only thing that can rescue it.
+    'münchen': ('germany', 'western_europe', 'german'),
+    'bulgaria': ('bulgaria', 'eastern_europe', 'bulgarian'),
+    'lithuania': ('lithuania', 'eastern_europe', 'lithuanian'),
+    'romania': ('romania', 'eastern_europe', 'romanian'),
+    'bucharest': ('romania', 'eastern_europe', 'romanian'),
+    'italy': ('italy', 'southern_europe', 'italian'),
+    'rome': ('italy', 'southern_europe', 'italian'),
+    # Non-EU countries in rejected regions. These are the four the "a silent remote posting in an
+    # EU country is assumed remote-from-the-EU" default deliberately does NOT cover, so the stub
+    # has to be able to name them or the counterpart test proves nothing.
+    'serbia': ('serbia', 'eastern_europe', 'serbian'),
+    'belgrade': ('serbia', 'eastern_europe', 'serbian'),
+    'norway': ('norway', 'northern_europe', 'norwegian'),
+    'oslo': ('norway', 'northern_europe', 'norwegian'),
+    'switzerland': ('switzerland', 'western_europe', 'german'),
+    'zurich': ('switzerland', 'western_europe', 'german'),
 }
 
 # Word boundaries, because 'nice' is inside 'Venice' and 'uk' is inside almost everything. The
@@ -108,6 +133,17 @@ FAKE_GEOGRAPHY = {
 _GEO_RE = re.compile(
     r'\b(' + '|'.join(sorted((re.escape(n) for n in FAKE_GEOGRAPHY), key=len, reverse=True)) + r')\b'
 )
+
+
+# Other names a place goes by, for the alias tier. The real classifier returns these for every
+# location; the stub only needs them where a test turns on an exonym.
+FAKE_EXONYMS = {
+    'sevilla': ['Seville', 'Sevilla'],
+    'seville': ['Seville', 'Sevilla'],
+    'torino': ['Turin', 'Torino'],
+    'munich': ['Munich', 'München'],
+    'münchen': ['Munich', 'München'],
+}
 
 
 # Multi-country areas: an offer of one of these is an unrejected option in its own right.
@@ -131,9 +167,18 @@ def fake_classify(text):
     broad = any(area in f' {haystack} ' for area in FAKE_BROAD_AREAS[:4]) or (
         not countries and any(area in f' {haystack} ' for area in FAKE_BROAD_AREAS)
     )
+    # `place_names` must be present, or every test exercises a contract production does not have.
+    # The stub returns the matched names capitalised plus their country, which is enough shape for
+    # the alias tier: a test wanting a real exonym pair adds it to FAKE_EXONYMS below.
+    place_names = []
+    for match in _GEO_RE.finditer(haystack):
+        name = match.group(1)
+        place_names += [name.title(), FAKE_GEOGRAPHY[name][0].title()]
+        place_names += FAKE_EXONYMS.get(name, [])
     return {
         'countries': countries, 'regions': regions, 'broad_area': broad,
-        'local_language': language, 'source': 'stub',
+        'local_language': language, 'place_names': list(dict.fromkeys(place_names)),
+        'source': 'stub',
     }
 
 
@@ -199,6 +244,31 @@ def _no_human_pacing(monkeypatch):
     ):
         monkeypatch.setattr(agent, name, (0.0, 0.0))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_countries_seen():
+    """The run-scoped country accumulator must not leak between tests.
+
+    Same shape as _reset_scraper_run_state below, and as the _startup_ui_alerts bug CLAUDE.md
+    calls the most-repeated one in this project: a module global that a run resets, but a test
+    does not, so the second test sees the first one's data.
+    """
+    location.reset_countries_seen()
+    yield
+    location.reset_countries_seen()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_location_recommendations(monkeypatch, tmp_path):
+    """No test may read or write the developer's real run_dir/location_recommendations.yaml.
+
+    Autouse for the same reason `save_dir` points at /nonexistent above: a test that forgets would
+    silently rewrite a file holding the user's own accept/reject decisions.
+    """
+    monkeypatch.setattr(
+        location_review, 'LOCATION_RECOMMENDATIONS_PATH', tmp_path / 'location_recommendations.yaml'
+    )
 
 
 @pytest.fixture(autouse=True)

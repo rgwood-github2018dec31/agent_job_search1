@@ -30,7 +30,7 @@ search_regions:
     linkedin_location: Example Country
     geo_id: '000000'
 
-# Locations (lowercase substrings, matched against the posting's location) where you would need
+# Locations (lowercase, matched as whole words against the posting's location) where you would need
 # visa sponsorship. A job there that does not explicitly offer sponsorship is auto-rated 1.
 # Leave empty if you are authorized everywhere you search.
 sponsorship_required_in: []
@@ -70,7 +70,20 @@ reject_required_degrees: []
 #   2. `exclude` rejects outright.
 #   3. Anything neither list names goes to a cached LLM classifier (run_dir/location_cache.yaml),
 #      which returns the country and one of: southern_europe, northern_europe, western_europe,
-#      eastern_europe, north_america, other, unknown. `reject_regions` then decides.
+#      eastern_europe, north_america, other, unknown, plus every other name the place goes by.
+#      Both lists are then re-checked against those names — that is what matches a posting saying
+#      `Torino` against a list entry saying `Turin` — and `reject_regions` decides the rest.
+#   4. ...except that for a REMOTE role the anchor is only judged when the posting actually pins
+#      you to it. A remote job advertised in Romania may mean "live in Romania" or "live anywhere
+#      in the EU", and those are opposite answers to the same location string. The extractor
+#      captures which (`residency_scope`):
+#        - the JD pins residence to the country ("Remote within country", "must be based in
+#          Germany") -> the anchor is judged, as in tier 3
+#        - the JD offers a whole area ("anywhere in the EU", "Work from Anywhere") -> kept
+#        - the JD says nothing -> kept IF every country named is an EU member state, because an EU
+#          anchor implies EU work rights while a UK, Serbian, Norwegian or Swiss one does not
+#      Hybrid and on-site roles are NOT spared any of this: an office pins you to the office.
+#      Neither is a stated `relocation`, which is the JD asserting a requirement outright.
 # A job is rejected only when EVERY country named is in a rejected region, so "Spain or the
 # Netherlands" passes; so does anything naming no country ("European Union", "Remote (EMEA)"), and
 # so does a posting offering a whole multi-country area even when it names one country inside it.
@@ -83,6 +96,7 @@ reject_required_degrees: []
 # -> northern_europe), so a country can sit in two different regions depending on how a posting
 # writes it. Regions are for the coarse decision; the lists are for named exceptions.
 locations:
+  # Place names, written the way places are written — see the note on acceptable_locations below.
   exclude: []
   reject_regions: []
 
@@ -91,8 +105,26 @@ hybrid:
   # ceiling, not a rejection: the job is still saved and auditable, it just cannot reach the
   # notification threshold of 4.
   rating_cap: 3
-  # Places where you would actually accept commuting to an office, as lowercase substrings.
-  # List both countries and their major cities. Empty caps every hybrid/on-site job.
+  # Places where you would actually accept commuting to an office. List both countries and their
+  # major cities. Empty caps every hybrid/on-site job.
+  #
+  # WRITE PLACE NAMES THE WAY PLACES ARE WRITTEN. Matching is whole-word, case-SENSITIVE and
+  # accent-EXACT: `Málaga`, not `malaga`; `Nice`, not `nice`. Two reasons, both learned the hard
+  # way:
+  #   - `malaga` was an entry that could never match anything, because LinkedIn writes `Málaga`.
+  #     It looked exactly like an entry that simply had not come up yet.
+  #   - This list exempts OUTRIGHT, so a short lowercase entry that is a prefix of a country name
+  #     used to switch the whole geographic gate off for that country before any other rule ran.
+  #     `roma` (for Rome) matched `romania`, and every Romanian posting sailed through — one was
+  #     rated 4 and notified.
+  #
+  # You do NOT need to list every spelling. Where a place has a different local and English name
+  # the cached classifier resolves it (a posting saying `Torino` matches `Turin` here, `München`
+  # matches `Munich`), so hand-maintained spelling pairs are optional — and it was exactly such a
+  # hand-added pair that introduced `roma`. Listing both is still free and deterministic.
+  #
+  # The agent reports entries that never match, and entries that read as ambiguous, in
+  # run_dir/location_recommendations.yaml.
   # This list does double duty: it is also tier 1 of the `locations` gate above, exempting a
   # REMOTE role anchored in one of these places.
   acceptable_locations: []
@@ -130,3 +162,16 @@ companies:
   #   - name: Example Corp
   #     reason: bad Glassdoor reviews
   #     added: 2026-01-01
+
+# ---------------------------------------------------------------------------
+# run_dir/location_recommendations.yaml — written by the agent, ADVISORY ONLY
+# ---------------------------------------------------------------------------
+# Once per non-interactive run the agent compares the countries it actually saw against the two
+# lists above and records what it would suggest, plus any list entry that looks ambiguous. It is
+# NEVER read as policy and it never edits this file — an auto-reject is unappealable, so a
+# recommendation waits until you act on it.
+#
+# To accept one: add the country to `exclude` or `hybrid.acceptable_locations` here yourself, then
+# set `status: accepted` on that entry. To dismiss one: set `status: rejected`. Either way the
+# agent stops asking. Countries you have not ruled on stay `pending` and are re-reported only when
+# they are first written, so an unread backlog does not warn on every run.

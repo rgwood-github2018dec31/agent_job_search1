@@ -18,10 +18,10 @@ from mcp.client.streamable_http import streamable_http_client
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
     LLM_OPENROUTER_MCP_URL,
-    LOCAL_MODEL,
-    OPENROUTER_MODEL,
+    OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
 )
+from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ def provider_error(context: str, error_text: str) -> RuntimeError:
 
 
 class LocalModelMissingError(RuntimeError):
-    """LOCAL_MODEL is not installed on the Ollama server behind the local MCP tool server.
+    """OLLAMA_MODEL_NAME_TRIAGE is not installed on the Ollama server behind the local MCP tool server.
 
     Distinct from the server being down: that is the fail-open case this module is designed
     around, while this is a misconfiguration that silently disables triage on every job.
@@ -192,7 +192,7 @@ def extract_json_object(text: str) -> dict:
 
 
 async def chat_openrouter(
-    prompt: str, system: str = '', model: str = OPENROUTER_MODEL, max_tokens: int | None = None
+    prompt: str, system: str = '', model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, max_tokens: int | None = None
 ) -> tuple[str, float]:
     """One completion via the OpenRouter MCP server. Returns (content, cost_usd).
 
@@ -261,12 +261,12 @@ async def _describe_missing_model(model: str) -> str:
     return (
         f'Local model {model!r} is not installed on the Ollama server behind '
         f'{LLM_LOCAL_MCP_URL}. Installed models: {listed}. '
-        f'Set LOCAL_MODEL in config.py to one of these, or pull the missing model.'
+        f'Set OLLAMA_MODEL_NAME_TRIAGE in config.py to one of these, or pull the missing model.'
     )
 
 
 async def generate_local(
-    prompt: str, system: str = '', model: str = LOCAL_MODEL, max_tokens: int | None = None
+    prompt: str, system: str = '', model: str = OLLAMA_MODEL_NAME_TRIAGE, max_tokens: int | None = None
 ) -> str:
     """One completion via the local Ollama MCP server. Returns the response text.
 
@@ -290,7 +290,7 @@ async def generate_local(
     return response
 
 
-async def preflight_local_model(model: str = LOCAL_MODEL) -> str | None:
+async def preflight_local_model(model: str = OLLAMA_MODEL_NAME_TRIAGE) -> str | None:
     """None when `model` is installed, otherwise a message naming what IS installed.
 
     Also None when the server itself is unreachable - that is the already-handled fail-open
@@ -353,7 +353,7 @@ RATING_JSON_INSTRUCTIONS = (
 _TRUNCATION_RETRY_MAX_TOKENS = 32_000
 
 
-async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = OPENROUTER_MODEL) -> tuple[dict, float]:
+async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE) -> tuple[dict, float]:
     """Rate a job via OpenRouter. Returns (rating dict, cost_usd).
 
     Retries once on truncation because losing this call is not recoverable later: the job was
@@ -374,7 +374,7 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
     return result, cost_usd
 
 
-async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = LOCAL_MODEL) -> dict:
+async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OLLAMA_MODEL_NAME_TRIAGE) -> dict:
     """Rate a job via the local Ollama server. Returns the rating dict (cost is zero)."""
     response = await generate_local(
         f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}', system=system_prompt, model=model
