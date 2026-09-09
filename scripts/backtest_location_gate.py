@@ -26,11 +26,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from agentic_job_search import preferences  # noqa: E402
-from agentic_job_search.agent import (  # noqa: E402
+from agentic_job_search import preferences
+from agentic_job_search.agent import (
     derive_residency_scope, rejected_location, residency_spare,
 )
-from agentic_job_search.location import classify_location  # noqa: E402
+from agentic_job_search.location import classify_location
 
 logger = logging.getLogger('backtest')
 

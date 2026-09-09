@@ -15,7 +15,8 @@ Two design rules hold this file together, both learned the hard way (see CLAUDE.
 """
 import json
 import logging
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
