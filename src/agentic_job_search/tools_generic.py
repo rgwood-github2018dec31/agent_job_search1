@@ -1049,6 +1049,10 @@ def write_run_audit_log(
                 status = '**FAILED**'
                 if reason := _query_errors.get(q):
                     status += f' — {reason[:200]}'
+                # A query can fail after finishing some of its searches; what it recorded first
+                # is real and already queued, so say so rather than implying it found nothing.
+                if partial := _check_status_per_query.get(q):
+                    status += f' (after recording {format_status_counts(partial)})'
             else:
                 breakdown = format_status_counts(_check_status_per_query.get(q, {}))
                 status = f'{searched} listing(s) inspected ({breakdown})'
@@ -1809,6 +1813,12 @@ async def report_search(args: dict) -> dict:
             'FILTERS NOT APPLIED: ' + '; '.join(filter_problems) + '. Re-apply the missing filter '
             'by clicking its chip, then call report_search again. If a chip is genuinely absent, '
             'say so and stop this search.'}]}
+
+    # A filter caught missing and then re-clicked is the check working, not a problem: the
+    # harvest can only follow this passing report. Only an alert never followed by one is real.
+    for alert in _ui_alerts:
+        if alert.get('kind') == 'filters' and alert.get('query') == query and alert.get('region') == region_name:
+            alert['resolved'] = True
 
     return {"content": [{"type": "text", "text": "ok — page looks sound, filters applied; harvest it"}]}
 

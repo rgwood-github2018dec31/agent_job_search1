@@ -29,6 +29,7 @@ user wrote down matched this location, so a tool-server outage must not start re
 would otherwise have kept.
 """
 
+import collections
 import functools
 import logging
 import re
@@ -174,7 +175,11 @@ _cache: dict[str, Any] | None = None
 # Countries this run actually encountered, country -> region. Run-scoped, NOT the disk cache: the
 # cache accumulates forever and says nothing about what today's postings named. Reset explicitly
 # at the top of a run (an un-reset module global is the most-repeated bug in CLAUDE.md).
-_countries_seen_this_run: dict[str, str] = {}
+# country -> Counter(region -> times seen). A COUNTER, not a single value: the classifier is a
+# model, and a rare wrong region gets frozen by the cache forever. Taking the first answer made the
+# region reported for such a country a coin flip -- Austria came back `eastern_europe` off one
+# Vienna entry while six others said `western_europe`.
+_countries_seen_this_run: dict[str, collections.Counter] = {}
 _place_names_seen_this_run: set[str] = set()
 
 
@@ -187,13 +192,35 @@ def _record_countries(result: dict[str, Any]) -> None:
     """
     regions = result.get('regions') or []
     for index, country in enumerate(result.get('countries') or []):
-        _countries_seen_this_run.setdefault(country, regions[index] if index < len(regions) else 'unknown')
+        region = regions[index] if index < len(regions) else 'unknown'
+        _countries_seen_this_run.setdefault(country, collections.Counter())[region] += 1
     _place_names_seen_this_run.update(result.get('place_names') or [])
 
 
 def countries_seen_this_run() -> dict[str, str]:
-    """Countries encountered this run, country -> region."""
-    return dict(_countries_seen_this_run)
+    """Countries encountered this run, country -> its MOST COMMON region this run."""
+    return {
+        country: counts.most_common(1)[0][0]
+        for country, counts in _countries_seen_this_run.items() if counts
+    }
+
+
+def region_disagreements() -> dict[str, dict[str, int]]:
+    """Countries the CACHE places in more than one region, country -> {region: times}.
+
+    Deterministic, free, and reads the whole cache rather than one run. A country is in exactly one
+    region -- that is what makes it world knowledge -- so two answers means at least one is wrong,
+    and the cache has frozen it. Measured on the real cache: 5 of 40 countries, three of them clear
+    outliers (Ireland 17:1, United Kingdom 10:1, Austria 6:1) and two genuinely split 1:1, which is
+    the phrasing sensitivity at the margins already documented for this classifier.
+    """
+    tally: dict[str, collections.Counter] = {}
+    for entry in _load_cache().values():
+        regions = entry.get('regions') or []
+        for index, country in enumerate(entry.get('countries') or []):
+            if index < len(regions):
+                tally.setdefault(str(country), collections.Counter())[regions[index]] += 1
+    return {c: dict(v) for c, v in sorted(tally.items()) if len(v) > 1}
 
 
 def place_names_seen_this_run() -> set[str]:

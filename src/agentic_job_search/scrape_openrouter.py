@@ -13,6 +13,7 @@ Two design rules hold this file together, both learned the hard way (see CLAUDE.
    prompted -- the accessibility tree disguises each card's Dismiss button as the card itself, and
    that already destroyed three real jobs.
 """
+import asyncio
 import json
 import logging
 from typing import Any
@@ -27,9 +28,14 @@ from agentic_job_search.config import (
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     UI_BLOCK_SIGNATURES,
 )
-from agentic_job_search.triage import call_mcp_tool, provider_error
+from agentic_job_search.triage import call_mcp_tool, http_status_of, provider_error
 
 logger = logging.getLogger(__name__)
+
+# Gateway/server errors worth one retry of the same chat call. Deliberately disjoint from
+# PROVIDER_UNAVAILABLE_STATUSES (401/402/403/429): those break every query and must abort at once.
+TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+TRANSIENT_RETRY_DELAY_SECONDS = 5
 
 # Substrings that mean a click would land inside the results list. `Dismiss` is the dangerous one:
 # it is the only real <button> in a card and removes the job from the user's feed permanently.
@@ -249,9 +255,17 @@ class ScrapeSession:
         ]
         for i in range(SCRAPER_OPENROUTER_MAX_ITERATIONS):
             self.iterations = i + 1
-            raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', {
-                'messages': messages, 'model': self.model, 'tools': tools})
+            chat_args = {'messages': messages, 'model': self.model, 'tools': tools}
+            raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args)
             data = json.loads(raw)
+            if not data.get('ok') and http_status_of(str(data.get('error') or '')) in TRANSIENT_HTTP_STATUSES:
+                # A gateway hiccup is not this query failing. Without a retry one 502 discarded a
+                # query's whole conversation 71 iterations in (2026-09-10), losing its second region.
+                logger.warning(f'Stage 1b: transient OpenRouter error, retrying once in '
+                               f'{TRANSIENT_RETRY_DELAY_SECONDS}s: {data.get("error")}')
+                await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+                raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args)
+                data = json.loads(raw)
             if not data.get('ok'):
                 # A 402/401/403/429 is the PROVIDER refusing, not this query failing: every
                 # remaining query would fail identically, so this must reach run_scraper as a

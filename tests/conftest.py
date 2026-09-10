@@ -260,6 +260,18 @@ def _reset_countries_seen():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_location_cache(monkeypatch, tmp_path):
+    """No test may read the developer's real run_dir/location_cache.yaml.
+
+    Until `region_disagreements()` existed nothing read the cache in aggregate, so the real file
+    leaking in was invisible; the moment something did, a unit test started asserting on whatever
+    locations happened to be on this machine.
+    """
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {})
+
+
+@pytest.fixture(autouse=True)
 def _isolated_location_recommendations(monkeypatch, tmp_path):
     """No test may read or write the developer's real run_dir/location_recommendations.yaml.
 

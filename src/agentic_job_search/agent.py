@@ -383,6 +383,16 @@ Two things to keep straight:
 - After choosing a value, a chip's label changes from "Date posted" to "Past week", and from
   "Experience level" to "Senior". That relabelling is how you know the click landed.
 
+Two things that look wrong and are not:
+
+- After "Show results", LinkedIn puts a salary value back into the URL
+  (`f_SAL=f_SA_id_…`). That is LinkedIn's own account setting re-attaching itself. It is
+  expected. **Do not navigate again to remove it.**
+- **Once you have clicked any filter, do not navigate again during this search.** Navigating
+  throws away every filter you clicked, but the location chip keeps *showing* the old region, so
+  the page looks filtered when it is not. If you truly must start the search over, click every
+  chip again — the location chip included, even when it already shows the right region.
+
 ### Step 3 — confirm what you are actually looking at
 
 Call **run_ui_contract** with the region name for this search.
@@ -1187,6 +1197,10 @@ def assess_run_health(funnel: dict) -> list[str]:
         elif kind == 'contract':
             alerts.append(f'UI CHANGED on {where}: {alert.get("detail")}')
         elif kind == 'filters':
+            if alert.get('resolved'):
+                # Re-clicked and confirmed by a later passing report before harvest; audit §1b
+                # still lists both reports, so the fail -> ok trail is not lost.
+                continue
             alerts.append(f'FILTERS DID NOT APPLY on {where}: {alert.get("detail")}')
         elif kind == 'drift':
             alerts.append(f'UI drift on {where}: {alert.get("detail")}')
@@ -1215,12 +1229,22 @@ def assess_run_health(funnel: dict) -> list[str]:
     failed = funnel.get('queries_failed') or {}
     if failed:
         total = funnel.get('queries_generated') or len(failed)
-        scope = f'ALL {total}' if len(failed) >= total else f'{len(failed)} of {total}'
-        first_reason = next(iter(failed.values()), '')
-        alerts.append(
-            f'{scope} QUERIES FAILED — no search completed, so 0 listings is not "nothing new '
-            f'today". First error: {str(first_reason)[:300]}'
-        )
+        first_reason = str(next(iter(failed.values()), ''))[:300]
+        if len(failed) >= total:
+            alerts.append(
+                f'ALL {total} QUERIES FAILED — no search completed, so 0 listings is not "nothing '
+                f'new today". First error: {first_reason}'
+            )
+        else:
+            # A partial failure is not the 2026-09-02 shape. On 2026-09-10 one 502 cost one query
+            # its second region while the other five ran normally (156 distinct listings), and the
+            # all-failed wording above told the reader that no search had completed.
+            names = list(failed)
+            shown = ', '.join(names[:3]) + (f' +{len(names) - 3} more' if len(names) > 3 else '')
+            alerts.append(
+                f'{len(failed)} of {total} QUERIES FAILED ({shown}) — their unfinished searches '
+                f'did not run; the other {total - len(failed)} completed. First error: {first_reason}'
+            )
 
     # 2. A dead region axis: two regions returning the same jobs is not "the query is exhausted".
     for query, overlap in (funnel.get('region_overlap') or {}).items():
@@ -1444,6 +1468,8 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
             )
             # A query the loop never reached must not read as "searched, found nothing" in the
             # audit log; _queries_searched is what sections 2 and 3 report from.
+            if partial := _check_status_delta(before):
+                tools_module._check_status_per_query[query] = partial
             for pending in queries[i - 1:]:
                 tools_module._queries_searched.setdefault(pending, 'error')
                 tools_module._query_errors.setdefault(pending, str(ex))
@@ -1453,6 +1479,10 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
             logger.warning(f'Stage 1b: query "{query}" failed: {ex}')
             tools_module._queries_searched[query] = 'error'
             tools_module._query_errors[query] = str(ex)
+            # What it recorded before failing is real and already queued for Stage 2. Dropping it
+            # left audit §3 reading "error | 0 listings | 2 queued" on 2026-09-10.
+            if partial := _check_status_delta(before):
+                tools_module._check_status_per_query[query] = partial
             continue
 
         # Every configured region must actually be searched, and each search must have been
@@ -1779,6 +1809,9 @@ _AREA_WIDE_RE = re.compile(
     r'|\b(?:emea|europe|eu)\s+(?:or|and)\s+(?:the\s+)?'
     r'(?:americas|north\s+america|south\s+america|eastern\s+us|us|usa|united\s+states)\b'
     r'|\b(?:eu|europe)\s*/\s*(?:eu|europe)\b'
+    # Adjectival form, which has no preposition for the branches above to hang on:
+    # "must be Europe-based", "EU-based candidates only".
+    r'|\b' + _AREA_WORDS + r'[-\s]based\b'
     r'|\bremote\s*[-–—,;]\s*' + _AREA_LEAD + _AREA_WORDS + r'\b',
     re.IGNORECASE,
 )

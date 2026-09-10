@@ -197,10 +197,14 @@ async def _legacy_rejected_location(text: str) -> str:
         return ''
     if not (preferences.excluded_locations() or preferences.rejected_regions()):
         return ''
-    if any(token in haystack for token in preferences.hybrid_acceptable_locations()):
+    # `.lower()` on the TOKENS as well as the haystack. The old lists were stored lowercase; the
+    # migrated ones are proper names. Without folding them here the baseline stops reproducing the
+    # world it exists to reproduce -- 'Roma' does not appear in 'romania (remote within country)',
+    # so the very exemption this whole change was made to remove would look like it never existed.
+    if any(token.lower() in haystack for token in preferences.hybrid_acceptable_locations()):
         return ''
     for token in preferences.excluded_locations():
-        if token in haystack:
+        if token.lower() in haystack:
             return token
     unwanted = preferences.rejected_regions()
     facts = await classify_location(haystack)

@@ -31,7 +31,7 @@ from typing import Any
 import yaml
 
 from agentic_job_search.location import (
-    countries_seen_this_run, location_token_matches, place_names_seen_this_run,
+    countries_seen_this_run, location_token_matches, place_names_seen_this_run, region_disagreements,
 )
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search import preferences
@@ -50,28 +50,36 @@ RECOMMENDATIONS = ('exclude', 'hybrid_acceptable', 'keep_as_is')
 # unusual happened; a payload that can grow without bound is a truncation waiting to happen.
 MAX_COUNTRIES_PER_REVIEW = 40
 
-_PROMPT = """You are helping someone tune the country lists of an automated job-search filter.
+_PROMPT = """You are helping someone audit the country lists of their own job-search filter.
 
-Their own stated policy on where they will work, in their words:
-\"\"\"{relocation_note}\"\"\"
+THE LISTS BELOW ARE THEIR DECISIONS AND ARE CORRECT. `reject_regions` in particular is a
+deliberate choice about where this person is willing to LIVE -- it is not a bug, and a
+recommendation that contradicts it is wrong. Your job is narrow: for each country that neither
+list names, say whether the region policy already gives the right answer, or whether that one
+country is a genuine exception to it.
 
-Lists as they stand today:
 - exclude (a job anchored here is auto-rejected): {exclude}
 - acceptable_locations (places they would actually be, exempt from every geographic rule): {acceptable}
-- reject_regions (regions rejected when neither list names the country): {reject_regions}
+- reject_regions (regions they will not live in, so jobs there are rejected): {reject_regions}
 
 Countries that showed up in job postings this run and that NEITHER list names, with the region the
 classifier assigned each:
 {countries}
 
 For EACH of those countries, recommend one of:
-- "exclude"           -- they would not live there; put it on the exclude list
-- "hybrid_acceptable" -- they would live there; put it on acceptable_locations
-- "keep_as_is"        -- the region policy above already handles it correctly; no list entry needed
+- "keep_as_is"        -- the region policy already handles it correctly. THIS IS THE DEFAULT and
+                         the right answer for almost every country. A country whose region is in
+                         `reject_regions` is being rejected ON PURPOSE.
+- "exclude"           -- the region policy would KEEP it, but it is somewhere they would not live,
+                         so it needs an explicit entry
+- "hybrid_acceptable" -- the region policy would REJECT it, but it is somewhere they clearly would
+                         live, judging by the places already on `acceptable_locations`. Use this
+                         only when the country is a close match for that list -- never merely
+                         because it is nearby, in the same trade bloc, or convenient to reach.
 
 Return ONLY a JSON object, no prose and no code fence:
 {{"recommendations": [{{"country": "<one of the countries listed above>",
-                       "recommendation": "<exclude|hybrid_acceptable|keep_as_is>",
+                       "recommendation": "<keep_as_is|exclude|hybrid_acceptable>",
                        "reason": "<one short sentence>"}}, ...]}}
 """
 
@@ -149,7 +157,14 @@ def substring_collisions(countries: dict[str, str]) -> list[dict[str, str]]:
     ] + [
         ('hybrid.acceptable_locations', token) for token in preferences.hybrid_acceptable_locations()
     ]
-    haystacks = set(countries) | {token for _list, token in listed}
+    # Countries the user did NOT list, only. Checking an entry against its SIBLINGS is what made
+    # this warning useless: 'Valencia'/'València', 'Málaga'/'Malaga' and 'Milan'/'Milano' are
+    # deliberate spelling pairs, so each flagged the other -- and both directions -- for 5 false
+    # positives against 1 real finding. An entry sitting inside another LISTED place is harmless:
+    # both are places the user wants, and whole-token matching keeps them apart anyway. The danger
+    # is only an entry sitting inside a place they never listed, which is 'Roma' in 'Romania'.
+    listed_folded = {_fold(token) for _list, token in listed}
+    haystacks = {c for c in countries if _fold(c) not in listed_folded}
     collisions: list[dict[str, str]] = []
     for list_name, token in listed:
         for other in sorted(haystacks):
@@ -166,6 +181,7 @@ def substring_collisions(countries: dict[str, str]) -> list[dict[str, str]]:
                     f'{token!r} is a substring of {other!r}. Whole-word matching keeps them apart '
                     f'today, but the entry reads as ambiguous — prefer an unambiguous spelling.'
                 ),
+                'kind': 'collision',
                 'status': 'pending',
             })
     return collisions
@@ -211,8 +227,36 @@ def dead_entries(place_names: set[str]) -> list[dict[str, str]]:
                     f'case-sensitive and accent-exact, so write the entry the way the place is '
                     f'written.'
                 ),
+                'kind': 'dead_entry',
                 'status': 'pending',
             })
+    return findings
+
+
+def inconsistent_regions() -> list[dict[str, str]]:
+    """Countries the cache places in two different regions. Deterministic and free.
+
+    A country belongs to exactly one region -- that is what makes it world knowledge rather than a
+    judgement -- so a second answer means one of them is wrong AND the cache has frozen it. Only
+    the minority answers are reported, since those are the ones to evict.
+    """
+    findings: list[dict[str, str]] = []
+    for country, counts in region_disagreements().items():
+        majority, top = max(counts.items(), key=lambda kv: kv[1])
+        outliers = {region: n for region, n in counts.items() if region != majority}
+        findings.append({
+            'entry': country,
+            'list': 'location_cache.yaml',
+            'collides_with': majority,
+            'detail': (
+                f'{country} is cached as {majority} {top}x but also as '
+                f'{", ".join(f"{r} {n}x" for r, n in outliers.items())}. A country has one region, '
+                f'so the minority answer is a classifier slip the cache has frozen — evict those '
+                f'entries to have them reclassified.'
+            ),
+            'kind': 'region',
+            'status': 'pending',
+        })
     return findings
 
 
@@ -278,7 +322,11 @@ async def _review(stage_stats: dict[str, Any] | None) -> str:
     doc = _load()
     seen = countries_seen_this_run()
 
-    findings = substring_collisions(seen) + dead_entries(place_names_seen_this_run())
+    findings = (
+        substring_collisions(seen)
+        + dead_entries(place_names_seen_this_run())
+        + inconsistent_regions()
+    )
     new_collisions = [
         collision for collision in findings
         if not any(
@@ -307,7 +355,6 @@ async def _review(stage_stats: dict[str, Any] | None) -> str:
     if undecided:
         asked = dict(sorted(undecided.items())[:MAX_COUNTRIES_PER_REVIEW])
         content, cost = await chat_openrouter(_PROMPT.format(
-            relocation_note=preferences.relocation_note() or '(not stated)',
             exclude=list(preferences.excluded_locations()) or '(empty)',
             acceptable=list(preferences.hybrid_acceptable_locations()) or '(empty)',
             reject_regions=list(preferences.rejected_regions()) or '(empty)',
@@ -350,9 +397,24 @@ async def _review(stage_stats: dict[str, Any] | None) -> str:
             f"{len(recommendations)} country list recommendation(s): "
             + ', '.join(f"{item['country']} -> {item['recommendation']}" for item in recommendations)
         )
-    if new_collisions:
+    # Phrased per kind. One template for all three read as "'Austria' inside 'western_europe'",
+    # which is not a sentence about anything.
+    by_kind = {'collision': [], 'dead_entry': [], 'region': []}
+    for finding in new_collisions:
+        by_kind.setdefault(finding.get('kind', 'collision'), []).append(finding)
+    if by_kind['collision']:
         parts.append(
-            f"{len(new_collisions)} ambiguous list entr(y/ies): "
-            + ', '.join(f"{c['entry']!r} inside {c['collides_with']!r}" for c in new_collisions)
+            f"{len(by_kind['collision'])} ambiguous list entr(y/ies): "
+            + ', '.join(f"{c['entry']!r} sits inside {c['collides_with']!r}" for c in by_kind['collision'])
+        )
+    if by_kind['dead_entry']:
+        parts.append(
+            f"{len(by_kind['dead_entry'])} list entr(y/ies) that never match: "
+            + ', '.join(f"{c['entry']!r} (postings say {c['collides_with']!r})" for c in by_kind['dead_entry'])
+        )
+    if by_kind['region']:
+        parts.append(
+            f"{len(by_kind['region'])} country/countries cached in two regions: "
+            + ', '.join(f"{c['entry']} (mostly {c['collides_with']})" for c in by_kind['region'])
         )
     return f"{'; '.join(parts)} — see {LOCATION_RECOMMENDATIONS_PATH.name} (advisory; nothing changed)"

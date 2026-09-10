@@ -2848,6 +2848,106 @@ def test_assess_run_health_reports_a_partial_query_failure():
     assert any('2 of 6' in a for a in alerts)
 
 
+def test_partial_query_failure_alert_does_not_claim_no_search_completed():
+    """Regression for 2026-09-10: one 502 on one query, five queries fine, 156 distinct listings.
+
+    The alert said "no search completed, so 0 listings is not 'nothing new today'" -- wording
+    written for the all-failed case, false on both counts here.
+    """
+    alerts = agent.assess_run_health({
+        'queries_generated': 6, 'listings_distinct': 156,
+        'check_status': {'new': 58, 'already_processed': 197, 'already_applied': 20},
+        'queries_failed': {'Principal Data Scientist': 'OpenRouter chat failed: 502 Server Error: Bad Gateway'},
+    })
+    failure = next(a for a in alerts if 'QUERIES FAILED' in a)
+    assert '1 of 6' in failure
+    assert 'Principal Data Scientist' in failure, 'name the query so the reader need not open the audit log'
+    assert 'the other 5 completed' in failure
+    assert 'no search completed' not in failure
+    assert '0 listings' not in failure
+    assert '502' in failure
+
+
+def test_partial_query_failure_alert_caps_the_names_it_lists():
+    alerts = agent.assess_run_health({
+        'queries_generated': 6,
+        'queries_failed': {f'Q{i}': 'boom' for i in range(1, 6)},
+    })
+    failure = next(a for a in alerts if 'QUERIES FAILED' in a)
+    assert 'Q1, Q2, Q3 +2 more' in failure
+
+
+async def test_failed_query_keeps_the_counts_it_recorded_before_failing(monkeypatch):
+    """Regression for 2026-09-10: a 502 at iteration 71 hit after the Canada search was recorded.
+
+    Those 25 listings (2 queued) were in the run-global counts but not the per-query ones, so
+    audit section 3 read "error | 0 listings | ... | 2 queued".
+    """
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_query_errors', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+
+    async def run_pass(instruction):
+        tools._check_status_counts['already_processed'] = 20
+        tools._check_status_counts['new'] = 2
+        raise RuntimeError('OpenRouter chat failed: 502 Server Error: Bad Gateway')
+
+    await agent.run_scraper(run_pass, ['Q1'], {'cost': 0.0})
+
+    assert tools._queries_searched['Q1'] == 'error', 'the sentinel audit sections 2/3 switch on must stay'
+    assert tools._check_status_per_query['Q1'] == {'already_processed': 20, 'new': 2}
+
+
+async def test_provider_abort_keeps_the_in_flight_query_counts(monkeypatch):
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_query_errors', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+
+    async def run_pass(instruction):
+        tools._check_status_counts['new'] = 3
+        raise triage.ProviderUnavailableError('402 Client Error: Payment Required', status=402)
+
+    with pytest.raises(triage.ProviderUnavailableError):
+        await agent.run_scraper(run_pass, ['Q1', 'Q2'], {'cost': 0.0})
+
+    assert tools._check_status_per_query['Q1'] == {'new': 3}
+    assert 'Q2' not in tools._check_status_per_query, 'a query never reached recorded nothing'
+
+
+def test_audit_log_reports_what_a_failed_query_recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, '_queries_searched', {'Q1': 'error'})
+    monkeypatch.setattr(tools, '_query_errors', {'Q1': '502 Server Error: Bad Gateway'})
+    monkeypatch.setattr(tools, '_check_status_per_query', {'Q1': {'already_processed': 20, 'new': 2}})
+    monkeypatch.setattr(tools, '_candidates_per_query', {'Q1': 2})
+    monkeypatch.setattr(tools, '_listing_records', {})
+    monkeypatch.setattr(tools, '_search_reports', [])
+
+    path = tools.write_run_audit_log(
+        queries=['Q1'], applied_jobs_in_horizon=0, applied_jobs_total=0,
+        funnel={'queries_generated': 1, 'queries_failed': {'Q1': '502 Server Error: Bad Gateway'}},
+        run_dir=tmp_path)
+
+    body = Path(path).read_text(encoding='utf-8')
+    assert '**FAILED** — 502 Server Error: Bad Gateway (after recording' in body
+    assert '| Q1 | error | 2 | 20 | 0 | 0 | 2 |' in body
+
+
 def test_assess_run_health_stays_quiet_when_no_query_failed():
     assert agent.assess_run_health({'queries_generated': 6, 'queries_failed': {}}) == []
 
@@ -3171,6 +3271,16 @@ def test_scraper_instructions_never_craft_filter_urls():
         assert forbidden not in text, 'filter params must never appear in a URL to navigate to'
     assert 'Never put `geoId`' in text, 'the prohibition must be stated explicitly'
     assert 'clicking the chips' in text
+
+
+def test_scraper_instructions_forbid_renavigating_after_filters_are_clicked():
+    """2026-09-10: LinkedIn re-appended its salary param after "Show results", the model
+    re-navigated to strip it, and that silently dropped the location it had just clicked — the
+    sticky location chip kept showing "Canada", so the page looked filtered when it was not."""
+    text = agent.build_scraper_instructions()
+    assert 'Do not navigate again to remove it' in text, 'the re-appearing f_SAL must be declared expected'
+    assert 'do not navigate again during this search' in text
+    assert 'the location chip included' in text, 'a restart must re-click the location too'
 
 
 def test_scraper_instructions_keep_the_results_list_unclickable_while_chips_are_clicked():
@@ -4054,6 +4164,64 @@ async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatc
     assert unseen['source'] == 'error' and unseen['countries'] == []
 
 
+def test_collisions_ignore_deliberate_spelling_pairs(monkeypatch):
+    """The lists carry intentional variants; each used to flag the other, in both directions.
+
+    'Valencia'/'València', 'Málaga'/'Malaga' and 'Milan'/'Milano' produced 5 false findings against
+    1 real one on the first live run — an 83% false-positive rate, which is the cry-wolf failure
+    this alert is supposed to avoid. An entry sitting inside another LISTED place is harmless: both
+    are places the user wants, and whole-token matching keeps them apart. Only an entry sitting
+    inside a place they never listed is dangerous.
+    """
+    monkeypatch.setattr(preferences, 'hybrid_acceptable_locations',
+                        lambda: ('Valencia', 'València', 'Málaga', 'Malaga', 'Milan', 'Milano', 'Roma'))
+    monkeypatch.setattr(preferences, 'excluded_locations', lambda: ())
+    found = location_review.substring_collisions({'Romania': 'eastern_europe', 'Spain': 'southern_europe'})
+    assert [(c['entry'], c['collides_with']) for c in found] == [('Roma', 'Romania')]
+
+
+def test_countries_seen_takes_the_majority_region_not_the_first():
+    """A rare wrong region must not decide what the reviewer reports.
+
+    Austria came back `eastern_europe` from one Vienna entry while six others said
+    `western_europe`; `setdefault` meant whichever was seen first won.
+    """
+    location.reset_countries_seen()
+    location._record_countries({'countries': ['Austria'], 'regions': ['eastern_europe']})
+    location._record_countries({'countries': ['Austria'], 'regions': ['western_europe']})
+    location._record_countries({'countries': ['Austria'], 'regions': ['western_europe']})
+    assert location.countries_seen_this_run() == {'Austria': 'western_europe'}
+
+
+def test_region_disagreements_reports_a_country_cached_in_two_regions(monkeypatch):
+    """A country has exactly one region — that is what makes it world knowledge rather than a
+    judgement — so a second answer means one is wrong and the cache has frozen it."""
+    monkeypatch.setattr(location, '_cache', {
+        'vienna, austria (hybrid)': {'countries': ['Austria'], 'regions': ['eastern_europe']},
+        'austria (remote)':         {'countries': ['Austria'], 'regions': ['western_europe']},
+        'graz, austria':            {'countries': ['Austria'], 'regions': ['western_europe']},
+        'madrid, spain':            {'countries': ['Spain'],   'regions': ['southern_europe']},
+    })
+    assert location.region_disagreements() == {
+        'Austria': {'eastern_europe': 1, 'western_europe': 2},
+    }, 'Spain is consistent and must not be reported'
+    finding = location_review.inconsistent_regions()[0]
+    assert finding['entry'] == 'Austria' and finding['collides_with'] == 'western_europe'
+    assert finding['kind'] == 'region'
+
+
+def test_reviewer_prompt_does_not_second_guess_reject_regions():
+    """The prompt used to hand the model `relocation_note` as "their stated policy" and the lists
+    as merely current, so it resolved the apparent contradiction against the config — recommending
+    Germany, France, Poland and Romania as ACCEPTABLE, i.e. advising the user to switch off their
+    own geographic gate. 10 of 11 recommendations on the first live run were wrong that way.
+    """
+    prompt = location_review._PROMPT
+    assert 'relocation_note' not in prompt, 'a note about relocation is not a list of countries'
+    assert 'THEIR DECISIONS AND ARE CORRECT' in prompt
+    assert 'THIS IS THE DEFAULT' in prompt, 'keep_as_is must be the default answer'
+
+
 def test_reviewer_never_advises_writing_roma_as_romania(monkeypatch):
     """The folded comparison must stay WHOLE-TOKEN, or the reviewer recommends the original bug.
 
@@ -4347,6 +4515,24 @@ def test_small_closed_blocs_are_judged_on_the_anchor(location):
     """
     extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
     assert agent.derive_residency_scope(extract) == 'country_only'
+
+
+@pytest.mark.parametrize('location,expected', [
+    # The adjectival form has no preposition for the other branches to hang on. 8 real postings
+    # in the corpus say "Europe-based".
+    ('Warsaw, Poland (Remote) — must be Europe-based', 'area_wide'),
+    ('Poland (Remote) — EU-based candidates only', 'area_wide'),
+    ('Spain (Remote) — EMEA-based', 'area_wide'),
+    # ...and there is deliberately NO generic "<word>-based means country_only" counterpart.
+    # Measured over the corpus, that rule would fire on 'Milestone-based', 'remote based', 'role
+    # based' and 'team based' -- more false positives than true ones, in the RESTRICTIVE direction
+    # where a mistake costs a job rather than a warning.
+    ('Germany (Remote) — Milestone-based contract', ''),
+    ('Germany (Remote) — remote based role', ''),
+])
+def test_adjectival_area_form(location, expected):
+    extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
+    assert agent.derive_residency_scope(extract) == expected
 
 
 def test_area_words_are_matched_case_insensitively_unlike_place_names():
@@ -4812,7 +4998,10 @@ async def test_location_gate_ignores_implied_local_language():
     The classifier really does imply Spanish here — the gate must not consult it.
     """
     extract = _make_extract(location='Spain (Remote)')
-    assert (await location.classify_location('Spain (Remote)'))['implied_local_language'] == 'spanish'
+    # `agent.classify_location`, which is the stub. Calling `location.classify_location` here made
+    # this test pass only on a machine whose real cache happened to hold 'spain (remote)' — on a
+    # clean checkout it would have made a live, paid call, or failed open and asserted on that.
+    assert (await agent.classify_location('Spain (Remote)'))['implied_local_language'] == 'spanish'
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
@@ -5327,6 +5516,62 @@ def test_missing_date_and_experience_chips_are_caught():
     assert any('experience level' in p for p in problems)
 
 
+_GEO_REGIONS = [
+    {'name': 'Canada', 'linkedin_location': 'Canada', 'geo_id': '101174742'},
+    {'name': 'European Union', 'linkedin_location': 'European Union', 'geo_id': '91000000'},
+]
+_CANADA_OK_URL = 'https://www.linkedin.com/jobs/search-results/?keywords=X&geoId=101174742&f_TPR=r604800'
+_CANADA_NO_GEO_URL = 'https://www.linkedin.com/jobs/search-results/?keywords=X&f_TPR=r604800'
+
+
+def _report_search(query, region, url, pin):
+    report = _sound_report(url=url, location_pin=pin)
+    return asyncio.run(tools.report_search.handler({'query': query, 'region': region, 'report': report}))
+
+
+def _filter_health_alerts():
+    funnel = {'ui_alerts': list(tools._ui_alerts), 'queries_generated': 1,
+              'listings_seen': 25, 'listings_distinct': 25, 'region_overlap': {}, 'check_status': {}}
+    return [a for a in agent.assess_run_health(funnel) if 'FILTERS DID NOT APPLY' in a]
+
+
+@pytest.fixture
+def geo_regions(monkeypatch, tmp_path):
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)   # check_fingerprint_drift writes here
+    monkeypatch.setattr(preferences, 'search_regions', lambda: _GEO_REGIONS)
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+
+
+def test_filter_alert_fixed_before_harvest_does_not_need_attention(geo_regions):
+    """The 2026-09-10 run: the model re-navigated to shed a self-injected f_SAL, which dropped geoId
+    while the sticky chip still showed "Canada". The check caught it, the model re-clicked the chip,
+    the next check passed and only then did it harvest. That is the check working, not an alert."""
+    first = _report_search('Principal Data Scientist', 'Canada', _CANADA_NO_GEO_URL, 'Canada')
+    assert 'FILTERS NOT APPLIED' in first['content'][0]['text']
+    second = _report_search('Principal Data Scientist', 'Canada', _CANADA_OK_URL, 'Canada')
+    assert second['content'][0]['text'].startswith('ok')
+
+    assert _filter_health_alerts() == []
+    assert [bool(r['filter_problems']) for r in tools._search_reports] == [True, False], \
+        'audit §1b must still show the fail -> ok trail'
+
+
+def test_filter_alert_never_followed_by_a_passing_check_still_alerts(geo_regions):
+    _report_search('Principal Data Scientist', 'Canada', _CANADA_NO_GEO_URL, 'Canada')
+    assert len(_filter_health_alerts()) == 1
+
+
+def test_filter_alert_is_not_resolved_by_a_pass_on_another_search(geo_regions):
+    """A sound EU page says nothing about whether the Canada search was ever filtered."""
+    _report_search('Principal Data Scientist', 'Canada', _CANADA_NO_GEO_URL, 'Canada')
+    _report_search('Principal Data Scientist', 'European Union',
+                   'https://www.linkedin.com/jobs/search-results/?keywords=X&geoId=91000000&f_TPR=r604800',
+                   'European Union')
+    _report_search('Staff AI Engineer', 'Canada', _CANADA_OK_URL, 'Canada')
+    assert len(_filter_health_alerts()) == 1
+
+
 def test_region_overlap_detects_a_dead_location_axis(monkeypatch):
     """Two regions returning the same ids means the filter did nothing — not 'query exhausted'."""
     monkeypatch.setattr(tools, '_search_ids', {
@@ -5837,6 +6082,43 @@ def _session(browser_reply):
     async def browser(name, args):
         return browser_reply
     return scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer')
+
+
+_CHAT_502 = json.dumps({'ok': False, 'error': '502 Server Error: Bad Gateway for url: https://openrouter.ai/api/v1/chat/completions'})
+_CHAT_402 = json.dumps({'ok': False, 'error': '402 Client Error: Payment Required for url: https://openrouter.ai/api/v1/chat/completions'})
+_CHAT_DONE = json.dumps({'ok': True, 'content': 'done', 'tool_calls': None, 'finish_reason': 'stop', 'usage': {}})
+
+
+def _run_with_chat_replies(monkeypatch, replies):
+    """Drive ScrapeSession.run against canned chat replies; returns how many chat calls were made."""
+    calls = []
+
+    async def fake_call_mcp_tool(url, tool_name, args):
+        calls.append(tool_name)
+        return replies[len(calls) - 1]
+
+    monkeypatch.setattr(scrape_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    monkeypatch.setattr(scrape_openrouter, 'TRANSIENT_RETRY_DELAY_SECONDS', 0)
+    asyncio.run(_session('').run('sys', 'user', []))
+    return len(calls)
+
+
+def test_scraper_retries_a_transient_502_once(monkeypatch):
+    """2026-09-10: one 502 discarded a query 71 iterations in, and its second region never ran."""
+    assert _run_with_chat_replies(monkeypatch, [_CHAT_502, _CHAT_DONE]) == 2
+
+
+def test_scraper_gives_up_after_a_second_502_as_a_one_query_failure(monkeypatch):
+    with pytest.raises(RuntimeError) as info:
+        _run_with_chat_replies(monkeypatch, [_CHAT_502, _CHAT_502])
+    assert not isinstance(info.value, triage.ProviderUnavailableError), \
+        'a 502 must not abort every remaining query'
+
+
+def test_scraper_does_not_retry_a_provider_refusal(monkeypatch):
+    """A 402 breaks every query; retrying it only burns pacing before the fallback runs."""
+    with pytest.raises(triage.ProviderUnavailableError):
+        _run_with_chat_replies(monkeypatch, [_CHAT_402, _CHAT_DONE])
 
 
 # playwright-mcp echoes the evaluated SCRIPT after the result, braces included. Fixtures that omit
