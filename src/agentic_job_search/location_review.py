@@ -377,6 +377,16 @@ async def _review(stage_stats: dict[str, Any] | None) -> str:
             f'Location list review: {len(recommendations)} recommendation(s) for '
             f'{sorted(asked)} (${cost:.6f})'
         )
+        if not recommendations:
+            # Paid for an answer and kept none of it. Without this line the run records zero
+            # recommendations and reports only the entry warnings, which is indistinguishable from
+            # "there was nothing to recommend" -- a paid call that silently did nothing.
+            logger.warning(
+                f'Location list review asked about {len(asked)} country/countries and kept NONE of '
+                f'the reply (${cost:.6f} spent). Either the model answered about countries it was '
+                f'not asked about, or it used a verdict outside {RECOMMENDATIONS}. '
+                f'Reply began: {content[:200]!r}'
+            )
 
     if not (new_collisions or recommendations):
         if lists_changed:

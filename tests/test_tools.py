@@ -4222,6 +4222,22 @@ def test_reviewer_prompt_does_not_second_guess_reject_regions():
     assert 'THIS IS THE DEFAULT' in prompt, 'keep_as_is must be the default answer'
 
 
+async def test_review_warns_when_it_keeps_none_of_a_paid_reply(monkeypatch, caplog):
+    """A paid call that yields nothing must not look like "nothing to recommend".
+
+    Both outcomes write `countries: {}` and report only the entry warnings, so without a log line
+    a review that silently discarded everything is invisible.
+    """
+    async def _chat(prompt, **kwargs):
+        return '{"recommendations": [{"country": "Atlantis", "recommendation": "exclude", "reason": "x"}]}', 0.004
+    monkeypatch.setattr(location_review, 'chat_openrouter', _chat)
+    location.reset_countries_seen()
+    location._record_countries({'countries': ['Serbia'], 'regions': ['eastern_europe']})
+    with caplog.at_level('WARNING'):
+        await location_review.review_location_lists({})
+    assert any('kept NONE of the reply' in r.message for r in caplog.records)
+
+
 def test_reviewer_never_advises_writing_roma_as_romania(monkeypatch):
     """The folded comparison must stay WHOLE-TOKEN, or the reviewer recommends the original bug.
 
