@@ -159,7 +159,7 @@ The project uses the **[Claude Agent SDK](https://platform.claude.com/docs/en/ag
 
 ### Model selection and routing (`config.py`)
 
-All model constants are defined once in the shared `utils_tools_n_agents_common.models` library (`ANTHROPIC_MODEL_NAME_*` for the Claude tiers, `OPENROUTER_MODEL_NAME_*` for the OpenRouter ids); call sites import them from the library directly — a model swap happens in the library, not here. **This file references const names only and never restates their values** — the library is the single source of truth for what they resolve to, so a doc value cannot drift from the code.
+All model constants are defined once in the shared `utils_tools_n_agents_common.models` library (`ANTHROPIC_MODEL_NAME_*` for the Claude tiers, `OPENROUTER_MODEL_NAME_*` for the OpenRouter ids); call sites import them from the library directly — a model swap happens in the library, not here. **This file references const names only and never restates their values** — the library is the single source of truth for what they resolve to, so a doc value cannot drift from the code. Version pins (`PLAYWRIGHT_MCP_VERSION`, `mcp<2`) follow the same single-source rule: the value is written once, at the const or the dependency pin, and comments/docs refer to it by name.
 
 **One const per stage; the family prefix IS the route.** There are no `*_PROVIDER` selector strings — two encodings of one decision drift apart, so each stage has a single `MODEL_NAME_<role>` const whose value points at a shared family const, and `models.route_for()` dispatches on the id-shape contract (`vendor/model` → OpenRouter MCP :8006, `name:tag` → Ollama MCP :8002, bare name → Anthropic SDK). Repoint a const at a different family to change the route, at a different const within a family to change only the model:
 
@@ -793,7 +793,8 @@ Three findings, in increasing order of embarrassment:
    `test_every_claude_agent_options_site_limits_context` now checks every site in the package, so
    the next one someone adds fails a test rather than quietly costing money.
 2. **Every randomised safety pause was buying a full page snapshot.** Verified in the installed
-   `@playwright/mcp` bundle (`PLAYWRIGHT_MCP_VERSION`, then 0.0.79): 18 action tools call
+   `@playwright/mcp` bundle (the pin at the time — `PLAYWRIGHT_MCP_VERSION` and its git history
+   say exactly which): 18 action tools call
    `setIncludeSnapshot()`, resolving
    `config.snapshot?.mode ?? "full"` — and **`browser_wait_for` is one of them**. The pacing added
    *for* Account safety was the thing being billed. ~20 auto-snapshots × ~8K tokens × 12 searches ≈
