@@ -1,25 +1,24 @@
-"""Advisory review of the user's country lists. Recommends; never enforces.
+"""Advisory hygiene checks on the user's place lists. Recommends; never enforces.
 
-The geographic gate decides where a role may be anchored from two hand-written lists in
-``run_dir/preferences.yaml`` -- ``locations.exclude`` and ``hybrid.acceptable_locations`` -- and,
-for anything neither names, from a cached classifier plus ``locations.reject_regions``. Region
-policy is coarse and phrasing-dependent at the margins (measured: ``Dublin, Ireland`` ->
-western_europe, bare ``Ireland`` -> northern_europe), so the lists are how a specific country is
-actually decided. Nothing previously told the user which countries had turned up and been left to
-the region tier -- ``locations.exclude`` was empty and all 26 countries seen rode on it.
+The geographic gate decides where a role may be anchored from hand-written lists in
+``run_dir/preferences.yaml`` -- ``locations.would_live_here``, ``locations.would_not_live_here``
+and ``locations.would_commute_here`` -- matched whole-word, case-sensitively and accent-exactly.
+Those rules make two kinds of bad entry possible, and neither announces itself. Both checks here
+are code, free, and run every time:
 
-Two halves, deliberately split by who can be trusted with which question:
+1. **Substring collisions.** ``'Roma' in 'Romania'`` is arithmetic, and the rule that a structural
+   fact must never be left to a model's discretion applies to a reviewer exactly as it does to the
+   rater. It also means the warning still appears when the tool server is down -- which matters,
+   because this is the check that would have caught the entry that silently disabled the gate for
+   a whole country.
+2. **Dead entries** -- one that never matches, but would with its case or accents fixed
+   (``malaga`` against postings that say ``Málaga``).
 
-1. **Substring collisions are found in code, free, every run.** ``'roma' in 'romania'`` is
-   arithmetic, and CLAUDE.md's rule that a structural fact must never be left to a model's
-   discretion applies to a reviewer exactly as it does to the rater. It also means the warning
-   still appears when the tool server is down -- which matters, because this is the check that
-   would have caught the entry that silently disabled the gate for a whole country.
-2. **"Should this country be excluded?" is a judgement**, and gets one cheap LLM call -- only when
-   there is an undecided country, or the lists changed since the last review.
+The judgement question -- "would they live in this country?" -- is not asked here. It lives in
+``agent.resolve_location_guesses``, which appends its answer to ``locations.not_yet_bucketed``.
 
-Nothing here writes ``preferences.yaml``. An auto-reject is unappealable, so a recommendation
-waits at ``status: pending`` until the user promotes it by hand.
+Nothing here writes ``preferences.yaml``. Findings wait at ``status: pending`` in
+``location_recommendations.yaml`` until the user fixes the entry by hand.
 """
 
 import logging
@@ -65,10 +64,9 @@ def _load() -> dict[str, Any]:
 _HEADER = (
     '# Advisory only. NOTHING here changes what the agent does.\n'
     '#\n'
-    '# To act on a recommendation, edit run_dir/preferences.yaml yourself and set this entry to\n'
-    '# `status: accepted`. To dismiss one, set `status: rejected`. Either way the agent stops\n'
-    "# asking about that country. Entries you have not touched stay `pending`, and the agent\n"
-    '# re-reports only ones it wrote this run.\n'
+    '# To act on a finding, fix the entry in run_dir/preferences.yaml yourself and set it to\n'
+    '# `status: accepted`. To dismiss one, set `status: rejected`. Each finding is reported once,\n'
+    '# when it is first written, so an unread backlog does not warn on every run.\n'
     '#\n'
     '# Rewritten by the agent, so comments you add below are NOT preserved.\n'
 )

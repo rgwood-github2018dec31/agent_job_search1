@@ -3,7 +3,7 @@
 Why this is a tracked script and not a scratchpad one-off
 --------------------------------------------------------
 The gate turns a stated preference into an unappealable auto-reject, and the geography behind it
-comes from a model. Both can drift: the classifier model changes, or the region policy does. The
+comes from a model. Both can drift: the classifier model changes, or the gate's rules do. The
 triage-model swap left the same lesson in docs/requirements.md (Cost efficiency) — *"Re-run that comparison before swapping this
 model again"* — after 17 real postings were what proved `granite4.1:3b` had no false rejects. This
 is that comparison for the location gate.
@@ -96,8 +96,9 @@ async def main() -> int:
 
     logging.basicConfig(level=logging.WARNING, format='%(levelname)s %(message)s')
 
-    if not (preferences.would_not_live_here() or preferences.would_not_live_here()):
-        print('locations.exclude and locations.reject_regions are both empty — the gate is inert.')
+    # The same inert condition as `rejected_location`: `would_commute_here` alone drives only the cap.
+    if not (preferences.would_live_here() or preferences.would_not_live_here()):
+        print('locations.would_live_here and locations.would_not_live_here are both empty — the gate is inert.')
         print('Nothing to backtest. Configure them in run_dir/preferences.yaml first.')
         return 1
 
@@ -112,8 +113,8 @@ async def main() -> int:
 
     print(f'Replaying {len(sample)} of {len(postings)} saved postings through the location gate.')
     print(f'  would_not_live_here: {list(preferences.would_not_live_here())}')
-    print(f'  exclude:        {list(preferences.would_not_live_here())}')
-    print(f'  exempt:         {list(preferences.would_commute_here())[:6]}...\n')
+    print(f'  would_live_here:     {list(preferences.would_live_here())[:6]}...')
+    print(f'  would_commute_here:  {list(preferences.would_commute_here())[:6]}...\n')
 
     rejected = kept = failed_open = 0
     to_reject: list[dict] = []
@@ -187,15 +188,19 @@ async def main() -> int:
 
 
 async def _legacy_rejected_location(text: str) -> str:
-    """The pre-2026-09-09 gate: substring matching, no residency spare.
+    """The pre-2026-09-09 gate's list tiers: substring matching, no residency spare.
 
     Deliberately a frozen copy here rather than a mode flag in production -- a comparison harness
     owning its own baseline beats shipping a compatibility switch nobody uses.
+
+    Only the two list tiers survive. The old gate also rejected by classifier REGION
+    (`locations.reject_regions`); that preference no longer exists, so there is nothing to
+    reproduce it from, and comparing regions against a list of place names never matched anyway.
+    The exempt tier reads `would_commute_here` because that is where the old exempt list,
+    `hybrid.acceptable_locations`, was migrated to.
     """
     haystack = ' '.join(str(text or '').split()).lower()
-    if not haystack:
-        return ''
-    if not (preferences.would_not_live_here() or preferences.would_not_live_here()):
+    if not haystack or not preferences.would_not_live_here():
         return ''
     # `.lower()` on the TOKENS as well as the haystack. The old lists were stored lowercase; the
     # migrated ones are proper names. Without folding them here the baseline stops reproducing the
@@ -203,19 +208,7 @@ async def _legacy_rejected_location(text: str) -> str:
     # so the very exemption this whole change was made to remove would look like it never existed.
     if any(token.lower() in haystack for token in preferences.would_commute_here()):
         return ''
-    for token in preferences.would_not_live_here():
-        if token.lower() in haystack:
-            return token
-    unwanted = preferences.would_not_live_here()
-    facts = await classify_location(haystack)
-    if facts.get('broad_area'):
-        return ''
-    regions = facts.get('regions') or []
-    if not regions or not all(region in unwanted for region in regions):
-        return ''
-    countries = facts.get('countries') or []
-    return f'{(countries[0] if countries else regions[0])} ({regions[0]})'
-
+    return next((token for token in preferences.would_not_live_here() if token.lower() in haystack), '')
 
 if __name__ == '__main__':
     raise SystemExit(asyncio.run(main()))

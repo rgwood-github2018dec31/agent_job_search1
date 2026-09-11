@@ -2297,27 +2297,29 @@ def location_guess_notification(rows: list[tuple[str, str, str]]) -> str:
 
 
 async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
-    """The rejected region named in `text`, or '' when acceptable, unrecognised, or unconfigured.
+    """The `would_not_live_here` entry `text` is rejected on, or '' to keep it.
 
     Purely geographic. This deliberately reads NO language field: an earlier design rejected on
     "non-English AND not on the acceptable list", which got the right answers for the wrong reason
-    and would have excluded a French-language remote role in Canada — `acceptable_locations` lists
+    and would have excluded a French-language remote role in Canada — the exempt list named
     Vancouver and British Columbia but not Canada itself. What language is spoken somewhere is a
     separate fact (`implied_local_language`), it warns only, and must never be folded back in here.
 
-    Three tiers, cheapest first:
-      1. unconfigured -> '' (no classifier call is ever made)
-      2. an exempt location (`locations.would_live_here`) wins outright, so `France` can sit on
-         the deny list while Toulouse and Nice still pass
-      3. the deny list (`locations.would_not_live_here`)
-      4. otherwise the cached classifier, and a rejection only when EVERY named country is in a
-         rejected region — so 'the UK or the Netherlands' passes, and so does anything naming no
-         country at all ('European Union', 'Remote (EMEA)')
+    In order, cheapest first:
+      1. unconfigured (`would_live_here` and `would_not_live_here` both empty) -> '', and no
+         classifier call is ever made
+      2. an exempt place (`would_live_here` or `would_commute_here`) wins outright, so `France` can
+         sit on the deny list while Toulouse and Nice still pass
+      3. the cached classifier, then the exempt lists again against its `place_names`
+      4. `broad_area`, or the residency spare below -> ''
+      5. `would_not_live_here`: a rejection only when EVERY named country is on it — so 'the UK or
+         the Netherlands' passes — and a text naming no country is rejected only on a literal match
+      6. a country no list names is queued for a guess, and the posting is kept
 
-    `residency_spare` says how far the JD lets the holder live from the anchor, and applies in
-    tier 4 ONLY, beside `broad_area`. Deliberately not above: `locations.exclude` is the one
-    mechanism no classifier variance can reach, and after this change it is the only way to drop
-    a single EU country for remote roles, so it has to stay absolute.
+    `residency_spare` says how far the JD lets the holder live from the anchor. It sits ABOVE the
+    deny list on purpose: `would_not_live_here` says where the user will not LIVE, so it bites only
+    when the job pins residence to the anchor. A silent EU anchor means living elsewhere in the EU.
+    Pinned by `test_would_not_live_here_applies_only_when_residence_is_pinned`.
       - 'none'     — judge the anchor (hybrid/on-site, or the JD pins residence to it)
       - 'any_area' — the JD offers a multi-country area; keep, exactly like `broad_area`
       - 'eu_only'  — the JD is silent; keep IF every named country is an EU member state, because

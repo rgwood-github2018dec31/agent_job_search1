@@ -132,12 +132,14 @@ companies:
 # ---------------------------------------------------------------------------
 # run_dir/location_recommendations.yaml — written by the agent, ADVISORY ONLY
 # ---------------------------------------------------------------------------
-# Once per non-interactive run the agent compares the countries it actually saw against the two
-# lists above and records what it would suggest, plus any list entry that looks ambiguous. It is
-# NEVER read as policy and it never edits this file — an auto-reject is unappealable, so a
-# recommendation waits until you act on it.
+# Once per non-interactive run the agent checks the place lists above against the places it actually
+# saw, and records any entry that looks wrong: one that sits inside another place (`Roma` inside
+# `Romania`), or one that never matches but would with its case or accents fixed (`malaga` against
+# postings that say `Málaga`). It is NEVER read as policy and it never edits this file.
 #
-# To accept one: add the country to `exclude` or `hybrid.acceptable_locations` here yourself, then
-# set `status: accepted` on that entry. To dismiss one: set `status: rejected`. Either way the
-# agent stops asking. Countries you have not ruled on stay `pending` and are re-reported only when
-# they are first written, so an unread backlog does not warn on every run.
+# To act on a finding: fix the entry here yourself, then set `status: accepted` on it. To dismiss
+# one: set `status: rejected`. Each finding is reported once, when it is first written, so an
+# unread backlog does not warn on every run.
+#
+# Countries none of your lists name are handled separately: the agent's guess is appended to
+# `locations.not_yet_bucketed` above, where you move it into would_live_here or would_not_live_here.
