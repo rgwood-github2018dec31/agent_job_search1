@@ -26,7 +26,7 @@ extracted text and metadata per filename by mtime, so the Haiku metadata call on
 or changed PDFs):
 
 - `_applied_jobs` — feeds `applied_jobs_summary()` into the Stage 1a query prompt
-- `_reference_job_texts` — feeds the ideal-role profile used by the rater. Ordered **newest applied first**, sorted by `applied_date` rather than filename, because both consumers cap it at `MAX_REFERENCE_JOBS` (20) and taking the oldest 20 meant a newly applied job could never influence the profile (see [the 2026-08-25 diagnosis](diagnoses/2026-08-25-rater-calibrated-on-oldest-jobs.md))
+- `_reference_job_texts` — feeds the ideal-role profile used by the rater. Ordered **newest applied first**, sorted by `applied_date` rather than filename, because both consumers cap it at `MAX_REFERENCE_JOBS` (20) and taking the oldest 20 meant a newly applied job could never influence the profile (2026-08-25; see Summarize Reference Jobs in [requirements.md](requirements.md))
 - `_applied_companies` — the already-applied blocklist used by `check_and_record_job`
 
 Only records within `APPLIED_JOBS_HORIZON_DAYS` (90) populate these; older PDFs stay on disk but

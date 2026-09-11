@@ -6445,7 +6445,7 @@ def test_every_claude_agent_options_site_limits_context():
 async def test_live_categorization_options_do_not_load_repo_context():
     """Measure the leak fix rather than asserting it structurally.
 
-    docs/diagnoses/2026-08-21-stage-1b-cost.md records the original measurement: 45,523 tokens on a bare options object vs 358
+    docs/requirements.md (Cost efficiency) records the original measurement: 45,523 tokens on a bare options object vs 358
     with setting_sources/strict_mcp_config/skills set. The categorization options set cwd to the
     project root, so without those flags this loads the repo's CLAUDE.md plus every global
     MCP server.

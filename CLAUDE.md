@@ -43,18 +43,18 @@ anything a rule covers.
   something code could have read itself. See Anti-fabrication in
   [docs/requirements.md](docs/requirements.md#non-functional-requirements).
 - **A structural fact is never left to a model's discretion.** Caps, gates, and alerts are
-  decided in code. See [the 2026-08-18 diagnosis](docs/diagnoses/2026-08-18-filter-chips-were-there.md)
-  and [the 2026-09-04 diagnosis](docs/diagnoses/2026-09-04-geography-had-no-field.md).
+  decided in code. See the first non-functional requirement in
+  [docs/requirements.md](docs/requirements.md#non-functional-requirements).
 - **Every `ClaudeAgentOptions` site passes `setting_sources=[]`, `strict_mcp_config=True` and
   `skills=[]`.** Without them, this file and every global MCP server get loaded into each call.
-  An AST test enforces this. See [2026-08-21](docs/diagnoses/2026-08-21-stage-1b-cost.md) and
-  [2026-08-24](docs/diagnoses/2026-08-24-error-result-success.md).
+  An AST test enforces this. See Cost efficiency in
+  [docs/requirements.md](docs/requirements.md#non-functional-requirements).
 - **Tracked files contain no personal information.** Every personal fact is a preference in
   `run_dir/preferences.yaml`, read through `preferences.py`, with neutral defaults.
 - **Store names in proper case and fold only when comparing.** Write `Málaga`, not `malaga`.
   Controlled vocabularies such as `southern_europe` are the exception.
 - **`@playwright/mcp` stays pinned** (`PLAYWRIGHT_MCP_VERSION`), never `@latest`. See
-  [2026-09-01](docs/diagnoses/2026-09-01-npx-playwright-latest-prompt.md).
+  Dependency pinning in [docs/requirements.md](docs/requirements.md#non-functional-requirements).
 
 ## Project Purpose
 
@@ -132,8 +132,7 @@ tests/
   test_tools.py                   # Unit tests for all tools
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
-  requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements
-  diagnoses/                      # One file per dated incident diagnosis; README.md is the index
+  requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)
 run_dir/
   JOB_REQUIREMENTS.md             # Agent-managed job preferences (interactive mode)
   applied_jobs/                   # Applied-job PDFs, date-prefixed, + index.yaml metadata
@@ -151,23 +150,26 @@ preferences.example.yaml          # Tracked, neutral template for run_dir/prefer
 ## Docs — read before touching
 
 These docs are **not** loaded automatically. Open the relevant one before changing the area it
-covers. Most rules there were written in response to a real incident, and several look like bugs
-until you read why they exist.
+covers. Most rules there were written in response to a real incident, tagged with its date, and
+several look like bugs until you read why they exist. The full incident write-ups (evidence, logs,
+measurements) are in git history: `git show dd14c73:docs/diagnoses/README.md`.
 
-| If you are touching… | Read first |
+| If you are touching… | Read first in [docs/requirements.md](docs/requirements.md) unless noted |
 |---|---|
 | Model constants, provider routing, pipeline stages, MCP tools, dedup, applied-job corpus | [docs/architecture.md](docs/architecture.md) |
-| Stage 1b scraping, `scrape_openrouter.py`, Playwright, anything that drives LinkedIn | Scrape Job Postings, Verify Search UI Contract, Harvest Job Listings, and Account safety in [docs/requirements.md](docs/requirements.md); diagnoses [08-11](docs/diagnoses/2026-08-11-linkedin-ai-job-search.md), [08-18](docs/diagnoses/2026-08-18-filter-chips-were-there.md), [08-21](docs/diagnoses/2026-08-21-stage-1b-cost.md), [09-10](docs/diagnoses/2026-09-10-filter-alert-already-fixed.md) |
-| Location gate, `location.py`, `location_review.py`, the `locations.*` preferences | Reject Excluded Location, Classify Job Location, Detect Residency Scope, and Review Country Lists in [docs/requirements.md](docs/requirements.md); diagnoses [09-04](docs/diagnoses/2026-09-04-geography-had-no-field.md), [09-09](docs/diagnoses/2026-09-09-roma-matched-romania.md) |
-| Hard rules, rating caps, warnings, notifications | Apply Hard Rules, Rate Job Fit, Build Deterministic Warnings, and the Rating hard rules/caps NFRs in [docs/requirements.md](docs/requirements.md); diagnosis [08-13](docs/diagnoses/2026-08-13-extractor-translates.md) |
-| `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks | Resilience and Observability in [docs/requirements.md](docs/requirements.md); diagnoses [08-25 (triage)](docs/diagnoses/2026-08-25-local-model-tag-disappeared.md), [09-02](docs/diagnoses/2026-09-02-fallback-could-not-fire.md), [09-04](docs/diagnoses/2026-09-04-geography-had-no-field.md) |
-| A new `ClaudeAgentOptions` / `sdk_query` site, or an SDK tool schema | Diagnoses [08-21](docs/diagnoses/2026-08-21-stage-1b-cost.md), [08-24](docs/diagnoses/2026-08-24-error-result-success.md) |
-| Applied-job ingest or the reference profile | [docs/architecture.md](docs/architecture.md); diagnosis [08-25 (rater)](docs/diagnoses/2026-08-25-rater-calibrated-on-oldest-jobs.md) |
-| `PLAYWRIGHT_MCP_VERSION`, startup checks | Check Browser Toolchain Version in [docs/requirements.md](docs/requirements.md); diagnosis [09-01](docs/diagnoses/2026-09-01-npx-playwright-latest-prompt.md) |
-| "The agent isn't finding jobs" | Diagnosis [07-23](docs/diagnoses/2026-07-23-top-of-funnel.md), then the [diagnoses index](docs/diagnoses/README.md) |
+| Stage 1b scraping, `scrape_openrouter.py`, Playwright, anything that drives LinkedIn | Scrape Job Postings, Verify Search UI Contract, Harvest Job Listings; NFRs Account safety, Search coverage, Anti-fabrication |
+| Location gate, `location.py`, `location_review.py`, the `locations.*` preferences | Reject Excluded Location, Classify Job Location, Detect Residency Scope, Review Country Lists; NFRs A matching rule fails silently permissive, Names stay proper |
+| Hard rules, rating caps, warnings, notifications | Apply Hard Rules, Rate Job Fit, Build Deterministic Warnings; NFRs A structural fact is decided in code, Rating hard rules, Rating caps |
+| `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks | NFRs Resilience, Observability |
+| A new `ClaudeAgentOptions` / `sdk_query` site, or an SDK tool schema | NFRs Cost efficiency, Observability, Anti-fabrication |
+| Applied-job ingest or the reference profile | [docs/architecture.md](docs/architecture.md); Summarize Reference Jobs |
+| Tests or test fixtures | NFR Tests must be able to fail |
+| `PLAYWRIGHT_MCP_VERSION`, the `mcp` pin, startup checks | Check Browser Toolchain Version; NFR Dependency pinning |
+| "The agent isn't finding jobs" | NFR Rejection auditability |
 
-**Adding a diagnosis:** create `docs/diagnoses/YYYY-MM-DD-<slug>.md` and add a line to the top of
-[docs/diagnoses/README.md](docs/diagnoses/README.md). If it introduces a rule that must hold even
+**Recording a lesson:** add it to the relevant non-functional requirement in
+[docs/requirements.md](docs/requirements.md), or create one. Tag it with the date and state the
+rule before the story. Unresolved problems go under Known open issues. If the rule must hold even
 when nobody opens the doc, add it to Always-on invariants above.
 
 ## Requirements

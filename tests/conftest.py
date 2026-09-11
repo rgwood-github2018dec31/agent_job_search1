@@ -75,7 +75,7 @@ TEST_PREFERENCES = {
 # real MCP tool server: it costs money, needs a network, and would make the suite's verdict depend
 # on a third party. Note the classifier fails OPEN, so an unstubbed test would have *passed* while
 # silently making a live call on every job -- which is exactly the "a skip that never becomes a
-# pass" shape docs/diagnoses/2026-08-24-error-result-success.md warns about, one layer down.
+# pass" shape docs/requirements.md (Tests must be able to fail) warns about, one layer down.
 # Fictional-but-shaped geography for the location classifier. Unit tests must never reach the
 # real MCP tool server: it costs money, needs a network, and would make the suite's verdict depend
 # on a third party. Note the classifier fails OPEN, so an unstubbed test would have *passed* while
@@ -257,8 +257,8 @@ def _no_human_pacing(monkeypatch):
 def _reset_countries_seen():
     """The run-scoped country accumulator must not leak between tests.
 
-    Same shape as _reset_scraper_run_state below, and as the _startup_ui_alerts bug docs/diagnoses/2026-09-01-npx-playwright-latest-prompt.md
-    calls the most-repeated one in this project: a module global that a run resets, but a test
+    Same shape as _reset_scraper_run_state below, and as the _startup_ui_alerts bug docs/requirements.md
+    (Tests must be able to fail) calls the most-repeated one in this project: a module global that a run resets, but a test
     does not, so the second test sees the first one's data.
     """
     location.reset_countries_seen()

@@ -291,8 +291,8 @@ REFERENCE_SUMMARY_MAX_CHARS = 2500
 #
 # The prompt was the symptom; the silent upgrade is the defect. This package is the tool surface
 # the Stage 1b scraper drives a REAL logged-in LinkedIn account through, and the --snapshot-mode
-# analysis in docs/diagnoses/2026-08-21-stage-1b-cost.md is verified against one specific bundle. `@latest` could invalidate that
-# with no commit — the same shape as the `mcp>=1.29` -> 2.0.0 re-resolution recorded in that same diagnosis.
+# analysis in docs/requirements.md (Cost efficiency) is verified against one specific bundle. `@latest` could invalidate that
+# with no commit — the same shape as the `mcp>=1.29` -> 2.0.0 re-resolution under Dependency pinning there.
 #
 # Upgrading is therefore a reviewable edit to this constant, prompted for by
 # check_playwright_mcp_version() rather than taken automatically.

@@ -4,7 +4,7 @@ Why this is a tracked script and not a scratchpad one-off
 --------------------------------------------------------
 The gate turns a stated preference into an unappealable auto-reject, and the geography behind it
 comes from a model. Both can drift: the classifier model changes, or the region policy does. The
-triage-model swap left the same lesson in docs/diagnoses/2026-08-25-local-model-tag-disappeared.md — *"Re-run that comparison before swapping this
+triage-model swap left the same lesson in docs/requirements.md (Cost efficiency) — *"Re-run that comparison before swapping this
 model again"* — after 17 real postings were what proved `granite4.1:3b` had no false rejects. This
 is that comparison for the location gate.
 
