@@ -33,7 +33,7 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     # personal fact, so this defaults to a real path rather than a neutral empty value.
     'save_dir': '~/Downloads',
     'search_regions': [],           # [{'name':…, 'linkedin_location':…, 'geo_id':…}]; empty = unfiltered search
-    'sponsorship_required_in': [],  # lowercase location substrings where the user needs visa sponsorship
+    'sponsorship_required_in': [],  # place names ('United States') where the user needs visa sponsorship; substring-matched, folded at the call site
     'languages': [],                # languages the user works in; empty = no language gate
     # Ceiling for a posting WRITTEN IN a language outside `languages`. Inert while `languages`
     # is empty, like every other language rule.

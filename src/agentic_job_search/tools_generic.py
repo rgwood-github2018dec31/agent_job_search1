@@ -1207,17 +1207,21 @@ def log_run_cost(record: dict, log_path: Path | None = None) -> None:
         f.write(json.dumps(record) + "\n")
 
 
+# Written as the name is written, like every other place name (see docs/requirements.md, Names
+# stay proper); `re.IGNORECASE` below is what makes it match "the us" too.
+_US = r'(?:US|U\.S\.|United States)'
+
 _AUTH_REQUIRED_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
-        r'must be (legally )?authorized to work in the (us|united states)',
+        rf'must be (legally )?authorized to work in the {_US}',
         r'no visa sponsorship',
         r'not able to (provide |offer )?sponsor',
         r'cannot (provide |offer )?sponsor',
         r'sponsorship (is )?not (available|provided|offered)',
         r'will not (provide |offer )?sponsor',
         r'unable to (provide |offer )?sponsor',
-        r'us citizens? and (lawful )?permanent residents?',
-        r'currently (legally )?authorized to work in the (us|united states)',
+        rf'{_US} citizens? and (lawful )?permanent residents?',
+        rf'currently (legally )?authorized to work in the {_US}',
         r"this (position|role|job) (does not|doesn't) (provide|offer|support) (visa )?sponsorship",
         r'employment authorization (without|not requiring) sponsorship',
     ]

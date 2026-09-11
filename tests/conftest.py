@@ -28,7 +28,7 @@ TEST_PREFERENCES = {
         {'name': 'Testland', 'linkedin_location': 'Testland'},
         {'name': 'Test Union', 'linkedin_location': 'Test Union'},
     ],
-    'sponsorship_required_in': ['united states'],
+    'sponsorship_required_in': ['United States'],
     'languages': ['english'],
     'foreign_language_rating_cap': 3,
     'reject_required_degrees': ['master', 'phd'],
@@ -86,83 +86,88 @@ TEST_PREFERENCES = {
 # because the real classifier returns COUNTRIES -- a stub that returned 'berlin' as a country
 # would let a test pass against behaviour the production path never produces.
 FAKE_GEOGRAPHY = {
-    'canada': ('Canada', 'north_america', 'english'),
-    'quebec': ('Canada', 'north_america', 'french'),
-    'montreal': ('Canada', 'north_america', 'french'),
-    'united states': ('United States', 'north_america', 'english'),
-    'germany': ('Germany', 'western_europe', 'german'),
-    'berlin': ('Germany', 'western_europe', 'german'),
-    'stuttgart': ('Germany', 'western_europe', 'german'),
-    'munich': ('Germany', 'western_europe', 'german'),
-    'netherlands': ('Netherlands', 'western_europe', 'dutch'),
-    'amsterdam': ('Netherlands', 'western_europe', 'dutch'),
-    'ireland': ('Ireland', 'western_europe', 'english'),
-    'dublin': ('Ireland', 'western_europe', 'english'),
-    'united kingdom': ('United Kingdom', 'western_europe', 'english'),
-    'uk': ('United Kingdom', 'western_europe', 'english'),
-    'france': ('France', 'western_europe', 'french'),
-    'paris': ('France', 'western_europe', 'french'),
-    'nice': ('France', 'southern_europe', 'french'),
-    'toulouse': ('France', 'southern_europe', 'french'),
-    'spain': ('Spain', 'southern_europe', 'spanish'),
-    'barcelona': ('Spain', 'southern_europe', 'spanish'),
-    'portugal': ('Portugal', 'southern_europe', 'portuguese'),
-    'greece': ('Greece', 'southern_europe', 'greek'),
-    'poland': ('Poland', 'eastern_europe', 'polish'),
-    'czechia': ('Czechia', 'eastern_europe', 'czech'),
-    'prague': ('Czechia', 'eastern_europe', 'czech'),
-    'sweden': ('Sweden', 'northern_europe', 'swedish'),
+    'Canada': ('Canada', 'north_america', 'english'),
+    'Quebec': ('Canada', 'north_america', 'french'),
+    'Montreal': ('Canada', 'north_america', 'french'),
+    'United States': ('United States', 'north_america', 'english'),
+    'Germany': ('Germany', 'western_europe', 'german'),
+    'Berlin': ('Germany', 'western_europe', 'german'),
+    'Stuttgart': ('Germany', 'western_europe', 'german'),
+    'Munich': ('Germany', 'western_europe', 'german'),
+    'Netherlands': ('Netherlands', 'western_europe', 'dutch'),
+    'Amsterdam': ('Netherlands', 'western_europe', 'dutch'),
+    'Ireland': ('Ireland', 'western_europe', 'english'),
+    'Dublin': ('Ireland', 'western_europe', 'english'),
+    'United Kingdom': ('United Kingdom', 'western_europe', 'english'),
+    'UK': ('United Kingdom', 'western_europe', 'english'),
+    'France': ('France', 'western_europe', 'french'),
+    'Paris': ('France', 'western_europe', 'french'),
+    'Nice': ('France', 'southern_europe', 'french'),
+    'Toulouse': ('France', 'southern_europe', 'french'),
+    'Spain': ('Spain', 'southern_europe', 'spanish'),
+    'Barcelona': ('Spain', 'southern_europe', 'spanish'),
+    'Portugal': ('Portugal', 'southern_europe', 'portuguese'),
+    'Greece': ('Greece', 'southern_europe', 'greek'),
+    'Poland': ('Poland', 'eastern_europe', 'polish'),
+    'Czechia': ('Czechia', 'eastern_europe', 'czech'),
+    'Prague': ('Czechia', 'eastern_europe', 'czech'),
+    'Sweden': ('Sweden', 'northern_europe', 'swedish'),
     # An exonym pair: the posting says one, the list may say the other.
-    'sevilla': ('Spain', 'southern_europe', 'spanish'),
-    'seville': ('Spain', 'southern_europe', 'spanish'),
-    'torino': ('Italy', 'southern_europe', 'italian'),
+    'Sevilla': ('Spain', 'southern_europe', 'spanish'),
+    'Seville': ('Spain', 'southern_europe', 'spanish'),
+    'Torino': ('Italy', 'southern_europe', 'italian'),
     # A rejected-region place whose exonym is the only thing that can rescue it.
-    'münchen': ('Germany', 'western_europe', 'german'),
-    'bulgaria': ('Bulgaria', 'eastern_europe', 'bulgarian'),
-    'lithuania': ('Lithuania', 'eastern_europe', 'lithuanian'),
-    'romania': ('Romania', 'eastern_europe', 'romanian'),
-    'bucharest': ('Romania', 'eastern_europe', 'romanian'),
-    'italy': ('Italy', 'southern_europe', 'italian'),
-    'rome': ('Italy', 'southern_europe', 'italian'),
+    'München': ('Germany', 'western_europe', 'german'),
+    'Bulgaria': ('Bulgaria', 'eastern_europe', 'bulgarian'),
+    'Lithuania': ('Lithuania', 'eastern_europe', 'lithuanian'),
+    'Romania': ('Romania', 'eastern_europe', 'romanian'),
+    'Bucharest': ('Romania', 'eastern_europe', 'romanian'),
+    'Italy': ('Italy', 'southern_europe', 'italian'),
+    'Rome': ('Italy', 'southern_europe', 'italian'),
     # Non-EU countries in rejected regions. These are the four the "a silent remote posting in an
     # EU country is assumed remote-from-the-EU" default deliberately does NOT cover, so the stub
     # has to be able to name them or the counterpart test proves nothing.
-    'serbia': ('Serbia', 'eastern_europe', 'serbian'),
-    'belgrade': ('Serbia', 'eastern_europe', 'serbian'),
-    'norway': ('Norway', 'northern_europe', 'norwegian'),
-    'oslo': ('Norway', 'northern_europe', 'norwegian'),
-    'switzerland': ('Switzerland', 'western_europe', 'german'),
-    'zurich': ('Switzerland', 'western_europe', 'german'),
+    'Serbia': ('Serbia', 'eastern_europe', 'serbian'),
+    'Belgrade': ('Serbia', 'eastern_europe', 'serbian'),
+    'Norway': ('Norway', 'northern_europe', 'norwegian'),
+    'Oslo': ('Norway', 'northern_europe', 'norwegian'),
+    'Switzerland': ('Switzerland', 'western_europe', 'german'),
+    'Zurich': ('Switzerland', 'western_europe', 'german'),
 }
 
 # Word boundaries, because 'nice' is inside 'Venice' and 'uk' is inside almost everything. The
 # production classifier is an LLM and has no such problem; the stub must not invent one.
+# Case-insensitive so the keys can stay proper names: folding happens at the comparison, and
+# `_GEO_KEYS` maps a folded match back to the name as written.
 _GEO_RE = re.compile(
-    r'\b(' + '|'.join(sorted((re.escape(n) for n in FAKE_GEOGRAPHY), key=len, reverse=True)) + r')\b'
+    r'\b(' + '|'.join(sorted((re.escape(n) for n in FAKE_GEOGRAPHY), key=len, reverse=True)) + r')\b',
+    re.IGNORECASE,
 )
+_GEO_KEYS = {name.casefold(): name for name in FAKE_GEOGRAPHY}
 
 
 # Other names a place goes by, for the alias tier. The real classifier returns these for every
 # location; the stub only needs them where a test turns on an exonym.
 FAKE_EXONYMS = {
-    'sevilla': ['Seville', 'Sevilla'],
-    'seville': ['Seville', 'Sevilla'],
-    'torino': ['Turin', 'Torino'],
-    'munich': ['Munich', 'München'],
-    'münchen': ['Munich', 'München'],
+    'Sevilla': ['Seville', 'Sevilla'],
+    'Seville': ['Seville', 'Sevilla'],
+    'Torino': ['Turin', 'Torino'],
+    'Munich': ['Munich', 'München'],
+    'München': ['Munich', 'München'],
 }
 
 
 # Multi-country areas: an offer of one of these is an unrejected option in its own right.
-FAKE_BROAD_AREAS = ('european union', ' eu ', 'emea', 'anywhere', 'worldwide', 'across europe')
+FAKE_BROAD_AREAS = ('European Union', ' EU ', 'EMEA', 'anywhere', 'worldwide', 'across Europe')
 
 
 def fake_classify(text):
     """Every COUNTRY named in `text`, first mention first, deduped. Unmatched text names none."""
-    haystack = ' '.join(str(text or '').split()).lower()
+    haystack = ' '.join(str(text or '').split())
+    names = [_GEO_KEYS[match.group(1).casefold()] for match in _GEO_RE.finditer(haystack)]
     countries, regions, language = [], [], ''
-    for match in _GEO_RE.finditer(haystack):
-        country, region, implied_local_language = FAKE_GEOGRAPHY[match.group(1)]
+    for name in names:
+        country, region, implied_local_language = FAKE_GEOGRAPHY[name]
         if not language:
             language = implied_local_language
         if country in countries:
@@ -171,16 +176,16 @@ def fake_classify(text):
         regions.append(region)
     # 'across europe' qualifies a single anchored country ("Berlin, Germany (Remote across
     # Europe)") rather than offering the whole area, so it only counts when no country is named.
-    broad = any(area in f' {haystack} ' for area in FAKE_BROAD_AREAS[:4]) or (
-        not countries and any(area in f' {haystack} ' for area in FAKE_BROAD_AREAS)
+    folded = f' {haystack.casefold()} '
+    broad = any(area.casefold() in folded for area in FAKE_BROAD_AREAS[:4]) or (
+        not countries and any(area.casefold() in folded for area in FAKE_BROAD_AREAS)
     )
     # `place_names` must be present, or every test exercises a contract production does not have.
-    # The stub returns the matched names capitalised plus their country, which is enough shape for
-    # the alias tier: a test wanting a real exonym pair adds it to FAKE_EXONYMS below.
+    # The stub returns the matched names as written plus their country, which is enough shape for
+    # the alias tier: a test wanting a real exonym pair adds it to FAKE_EXONYMS above.
     place_names = []
-    for match in _GEO_RE.finditer(haystack):
-        name = match.group(1)
-        place_names += [name.title(), FAKE_GEOGRAPHY[name][0].title()]
+    for name in names:
+        place_names += [name, FAKE_GEOGRAPHY[name][0]]
         place_names += FAKE_EXONYMS.get(name, [])
     return {
         'countries': countries, 'regions': regions, 'broad_area': broad,

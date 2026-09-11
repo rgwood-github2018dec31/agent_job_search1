@@ -338,6 +338,8 @@ async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
     "This position does not provide visa sponsorship",
     'Employment authorization without sponsorship required',
     'must be legally authorized to work in the united states',
+    'Must be authorized to work in the U.S.',
+    'U.S. citizens and lawful permanent residents only',
 ])
 def test_requires_current_us_auth_matches(text):
     assert tools._requires_current_us_auth(text), f'Expected match for: {text!r}'
@@ -4030,6 +4032,14 @@ async def test_hard_rules_still_reject_impersonal_conditions(neutral_preferences
     assert 'older than' in await agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
 
 
+def test_sponsorship_prompt_prints_place_names_as_written(monkeypatch):
+    """Never `.title()` a place name: it already has its case, and `.title()` makes 'USA' 'Usa'."""
+    monkeypatch.setattr(preferences, 'sponsorship_required_in', lambda: ('USA', 'United Kingdom'))
+    section = agent._sponsorship_prompt_section()
+    assert 'located in USA, United Kingdom and' in section
+    assert 'Usa' not in section
+
+
 def test_prompts_omit_personal_sections_without_preferences(neutral_preferences):
     evaluator = agent.build_evaluator_instructions()
     assert 'visa sponsorship' not in evaluator
@@ -4128,7 +4138,7 @@ def test_place_names_rule_asks_for_omitted_levels_not_proximity():
 def test_classifier_returns_place_names_on_every_path():
     """Every return path must have the same shape, or a consumer reads a missing key as 'no aliases'."""
     assert location._empty('error')['place_names'] == []
-    coerced = location._coerce({'countries': ['spain'], 'regions': ['southern_europe'],
+    coerced = location._coerce({'countries': ['Spain'], 'regions': ['southern_europe'],
                                 'place_names': ['  Sevilla ', 'Seville', 'Sevilla', '']})
     assert coerced['place_names'] == ['Sevilla', 'Seville'], 'trimmed, deduped, order preserved'
     assert location._coerce({})['place_names'] == []
@@ -4143,7 +4153,7 @@ def test_reviewer_flags_an_entry_that_only_matches_when_folded(monkeypatch):
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('malaga', 'Bologna'))
     monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ())
     location.reset_countries_seen()
-    location._record_countries({'countries': ['spain'], 'regions': ['southern_europe'],
+    location._record_countries({'countries': ['Spain'], 'regions': ['southern_europe'],
                                 'place_names': ['Málaga', 'Andalusia', 'Spain']})
     findings = location_review.dead_entries(location.place_names_seen_this_run())
     assert [f['entry'] for f in findings] == ['malaga'], "'Bologna' merely did not come up"
@@ -4223,7 +4233,7 @@ def test_reviewer_never_advises_writing_roma_as_romania(monkeypatch):
     monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ())
     assert location_review.dead_entries({'Romania', 'Bucharest'}) == []
     # ...but it is still reported as an ambiguous entry by the collision check.
-    collisions = location_review.substring_collisions({'romania': 'eastern_europe'})
+    collisions = location_review.substring_collisions({'Romania': 'eastern_europe'})
     assert [c['entry'] for c in collisions] == ['Roma']
 
 
@@ -4231,8 +4241,8 @@ def test_reviewer_never_advises_writing_roma_as_romania(monkeypatch):
 # country list review — advisory, never enforced
 # ---------------------------------------------------------------------------
 
-def _seen(**countries):
-    """Seed the run-scoped accumulator the way classify_location would."""
+def _seen(countries: dict[str, str]):
+    """Seed the run-scoped accumulator the way classify_location would: country -> region."""
     location.reset_countries_seen()
     location._record_countries({
         'countries': list(countries), 'regions': list(countries.values()),
@@ -4246,18 +4256,18 @@ def test_substring_collisions_flags_roma_against_romania(monkeypatch):
     be left to a model's discretion applies to the reviewer as much as to the rater. It also means
     the warning still appears with the tool server down.
     """
-    monkeypatch.setattr(preferences, 'would_live_here', lambda: ('roma', 'spain'))
-    monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ('romania',))
+    monkeypatch.setattr(preferences, 'would_live_here', lambda: ('Roma', 'Spain'))
+    monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ('Romania',))
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ())
-    collisions = location_review.substring_collisions({'romania': 'eastern_europe', 'spain': 'southern_europe'})
-    assert [c['entry'] for c in collisions] == ['roma']
-    assert collisions[0]['collides_with'] == 'romania'
+    collisions = location_review.substring_collisions({'Romania': 'eastern_europe', 'Spain': 'southern_europe'})
+    assert [c['entry'] for c in collisions] == ['Roma']
+    assert collisions[0]['collides_with'] == 'Romania'
     assert collisions[0]['list'] == 'locations.would_live_here'
 
 
 def test_substring_collisions_ignores_a_whole_word_entry(monkeypatch):
-    monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('spain',))
-    assert location_review.substring_collisions({'spain': 'southern_europe'}) == []
+    monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('Spain',))
+    assert location_review.substring_collisions({'Spain': 'southern_europe'}) == []
 
 
 def test_classifier_keeps_country_names_proper():
@@ -4278,7 +4288,7 @@ async def test_review_skips_rather_than_rebuilds_a_corrupt_file(monkeypatch):
     silently discard every entry they accepted or rejected.
     """
     location_review.LOCATION_RECOMMENDATIONS_PATH.write_text('[not, a, mapping]')
-    _seen(serbia='eastern_europe')
+    _seen({'Serbia': 'eastern_europe'})
     assert await location_review.review_location_lists({}) == ''
     assert location_review.LOCATION_RECOMMENDATIONS_PATH.read_text() == '[not, a, mapping]'
 
@@ -4287,16 +4297,16 @@ def test_location_recommendations_alert_reaches_assess_run_health():
     """An unrecognised `ui_alerts` kind is silently dropped by assess_run_health's if/elif chain."""
     alerts = agent.assess_run_health({
         'ui_alerts': [{'kind': 'location_recommendations', 'query': '', 'region': '',
-                       'detail': '1 country list recommendation(s): serbia -> exclude'}],
+                       'detail': '1 country list recommendation(s): Serbia -> exclude'}],
     })
-    assert any('COUNTRY LISTS' in alert and 'serbia' in alert for alert in alerts)
+    assert any('COUNTRY LISTS' in alert and 'Serbia' in alert for alert in alerts)
 
 
 def test_countries_seen_is_recorded_on_a_cache_hit_too():
     """In steady state almost every location is a cache hit, so an llm-only accumulator sees nothing."""
     location.reset_countries_seen()
-    location._record_countries({'countries': ['romania'], 'regions': ['eastern_europe']})
-    assert location.countries_seen_this_run() == {'romania': 'eastern_europe'}
+    location._record_countries({'countries': ['Romania'], 'regions': ['eastern_europe']})
+    assert location.countries_seen_this_run() == {'Romania': 'eastern_europe'}
     location.reset_countries_seen()
     assert location.countries_seen_this_run() == {}
 
@@ -4373,6 +4383,28 @@ def test_open_ended_areas_are_area_wide(location):
     """An area too large to enumerate is what `area_wide` is for."""
     extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
     assert agent.derive_residency_scope(extract) == 'area_wide'
+
+
+@pytest.mark.parametrize('location', [
+    'Germany (Hybrid) — candidates in the EEA or US welcome',
+    'Poland (Remote) — EMEA/EU',
+    'Spain (Remote) — open to any E.U. member country',
+])
+def test_every_europe_branch_shares_one_definition_of_europe(location):
+    """`_EUROPE_WORDS` feeds every Europe branch, so each accepts every European area name.
+
+    The branches used to carry their own lowercase subsets (`eu|europe` in one, `eu|eea|emea|european`
+    in another), so 'EEA or US' and 'EMEA/EU' fell through where 'EU or US' and 'EU/Europe' did not.
+    """
+    extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
+    assert agent.derive_residency_scope(extract) == 'area_wide'
+
+
+def test_us_alone_is_not_an_area():
+    """US/USA stay out of `_AREA_WORDS`: alone they name one country, not an area to live in."""
+    extract = _make_extract(location='United States (Remote) — must be based in the US', relocation='',
+                            description=_NEUTRAL_DESCRIPTION)
+    assert agent.derive_residency_scope(extract) == 'country_only'
 
 
 @pytest.mark.parametrize('location', [
@@ -4716,7 +4748,11 @@ def test_accented_place_name_matches_itself_and_folding_is_not_a_match():
 
 
 def test_roma_does_not_match_romania_in_any_case_or_accent():
-    """The named regression, extended to the two forms case-sensitivity newly exposes.
+    """'Roma' (Rome) on the exempt list must not exempt Romanian postings, in any case or accent.
+
+    Tier 1 short-circuits before the deny list and the classifier, so a Romanian role was never
+    gated at all: job_posting-4453702157 was rated 4 and notified while Bulgaria, Poland, Czechia
+    and Lithuania rejected correctly in the same run.
 
     THIS is the test that fails if the boundary class is left as `[a-z0-9]` while the lowercasing
     is removed. That class only blocks lowercase ASCII neighbours, so it was correct only in
@@ -4727,45 +4763,32 @@ def test_roma_does_not_match_romania_in_any_case_or_accent():
     assert not location.location_token_matches('ROMA', 'ROMANIA (REMOTE)')
     assert not location.location_token_matches('Roma', 'Romaña, Spain')
     assert not location.location_token_matches('Roma', 'Parma, Emilia-Romagna, Italy')
-    # ...while still matching the city it was added for.
+    # ...while still matching the city it was added for, in either spelling.
     assert location.location_token_matches('Roma', 'Roma, Lazio, Italy')
-
-
-def test_roma_does_not_match_romania():
-    """'roma' (Rome) on the acceptable list exempted every Romanian posting from the gate.
-
-    Tier 1 short-circuits before the deny list, the classifier and reject_regions, so a Romanian
-    role was never gated at all: job_posting-4453702157 was rated 4 and notified while Bulgaria,
-    Poland, Czechia and Lithuania rejected correctly in the same run.
-    """
-    assert not location.location_token_matches('roma', 'romania (remote within country)')
-    assert not location.location_token_matches('roma', 'parma, emilia-romagna, italy')
-    # ...while still matching the city it was added for.
-    assert location.location_token_matches('roma', 'roma, lazio, italy')
-    assert location.location_token_matches('rome', 'rome, italy (remote)')
+    assert location.location_token_matches('Rome', 'Rome, Italy (Remote)')
 
 
 def test_location_token_matcher_handles_punctuation():
-    r"""'u.s.' is a real entry, and  cannot match it — the boundary after '.' needs a word char.
+    r"""'U.S.' is a real entry, and  cannot match it — the boundary after '.' needs a word char.
 
     A matcher written as r'' + token + r'' returns False for BOTH strings below, silently
     switching off an entry the user wrote down. That is why the matcher uses letter/digit
     lookarounds instead.
     """
-    assert location.location_token_matches('u.s.', 'remote, u.s. only')
-    assert location.location_token_matches('u.s.', 'u.s.')
-    assert location.location_token_matches('usa', 'usa (remote)')
+    assert location.location_token_matches('U.S.', 'Remote, U.S. only')
+    assert location.location_token_matches('U.S.', 'U.S.')
+    assert location.location_token_matches('USA', 'USA (Remote)')
 
 
 def test_location_token_matcher_rejects_substring_collisions():
-    assert not location.location_token_matches('nice', 'venice, veneto, italy')
-    assert location.location_token_matches('nice', 'nice, france (remote)')
-    # 'milan' no longer matches 'milano' — harmless, because both spellings are listed separately.
-    assert not location.location_token_matches('milan', 'milano, lombardy, italy')
-    assert location.location_token_matches('milan', 'milan, italy')
+    assert not location.location_token_matches('Nice', 'Venice, Veneto, Italy')
+    assert location.location_token_matches('Nice', 'Nice, France (Remote)')
+    # 'Milan' does not match 'Milano' — the classifier's `place_names` bridges the two.
+    assert not location.location_token_matches('Milan', 'Milano, Lombardy, Italy')
+    assert location.location_token_matches('Milan', 'Milan, Italy')
     # Multi-word entries and hyphen-adjacent hits still work.
-    assert location.location_token_matches('british columbia', 'vancouver, british columbia')
-    assert location.location_token_matches('porto', 'portugal / porto-based (remote)')
+    assert location.location_token_matches('British Columbia', 'Vancouver, British Columbia')
+    assert location.location_token_matches('Porto', 'Portugal / Porto-based (Remote)')
 
 
 def test_location_token_matcher_ignores_empty_tokens():
@@ -4775,10 +4798,10 @@ def test_location_token_matcher_ignores_empty_tokens():
 
 def test_eu_member_states_covers_the_countries_the_default_turns_on():
     assert len(location.EU_MEMBER_STATES) == 27
-    for member in ('poland', 'romania', 'germany', 'bulgaria', 'ireland', 'sweden'):
+    for member in ('Poland', 'Romania', 'Germany', 'Bulgaria', 'Ireland', 'Sweden'):
         assert location.is_eu_member(member), member
     # The four the "bare remote anchor is assumed EU-wide" default deliberately excludes.
-    for outsider in ('united kingdom', 'norway', 'switzerland', 'serbia'):
+    for outsider in ('United Kingdom', 'Norway', 'Switzerland', 'Serbia'):
         assert not location.is_eu_member(outsider), outsider
 
 
@@ -5102,14 +5125,14 @@ def test_location_cache_rebuilds_a_corrupt_file(monkeypatch, tmp_path):
 def test_location_classifier_defaults_broad_area_to_false():
     """A model that omits the field must not accidentally wave every job through."""
     from agentic_job_search import location
-    assert location._coerce({'countries': ['germany'], 'regions': ['western_europe']})['broad_area'] is False
+    assert location._coerce({'countries': ['Germany'], 'regions': ['western_europe']})['broad_area'] is False
 
 
 def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_through():
     """An out-of-vocabulary region must read as 'I could not tell', not as 'acceptable'."""
     from agentic_job_search import location
     coerced = location._coerce(
-        {'countries': ['germany'], 'regions': ['middle_earth'], 'implied_local_language': 'german'})
+        {'countries': ['Germany'], 'regions': ['middle_earth'], 'implied_local_language': 'german'})
     assert coerced['regions'] == ['unknown']
 
 

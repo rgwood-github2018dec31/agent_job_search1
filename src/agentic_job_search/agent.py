@@ -180,7 +180,8 @@ def _sponsorship_prompt_section() -> str:
     locations = preferences.sponsorship_required_in()
     if not locations:
         return ''
-    joined = ', '.join(loc.title() for loc in locations)
+    # As written, never `.title()`d: these are proper names already, and `.title()` makes 'USA' 'Usa'.
+    joined = ', '.join(locations)
     return (
         '\n## Hard rule — jobs requiring visa sponsorship\n'
         f'If the job is located in {joined} and the posting does NOT explicitly state that visa '
@@ -1797,8 +1798,11 @@ _REMOTE_RE = re.compile(r'\b(?:fully\s+)?remote\b|\bwork\s+from\s+(?:home|anywhe
 # patterns below means the case is not what does the matching. Folding is something you do at the
 # point of comparison; a name stored folded can never be unfolded, and reading 'emea' in source
 # gives no hint whether it is an acronym, a country or a typo.
+# The European area names, named once: `_AREA_WORDS` and the three pairing branches of
+# `_AREA_WIDE_RE` all use this one constant, so what counts as "Europe" cannot drift between them.
+_EUROPE_WORDS = r'(?:EU|E\.U\.|EEA|EMEA|Europ(?:e|ean))'
 _AREA_WORDS = (
-    r'(?:EU|E\.U\.|EEA|EMEA|Europ(?:e|ean)|American?s?|North\s+America|South\s+America|'
+    r'(?:' + _EUROPE_WORDS + r'|American?s?|North\s+America|South\s+America|'
     r'Schengen|LATAM|Latin\s+America|APAC|Asia[\s-]Pacific|MENA|'
     r'anywhere|world|globe|worldwide|country\s+where|countries\s+where)'
 )
@@ -1818,10 +1822,12 @@ _AREA_WIDE_RE = re.compile(
     r'(?:from|in|within|across|throughout|anywhere\s+in|to)\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
     r'|\banywhere\s+in\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
     r'|\b(?:work|remote|based|hire[sd]?|located)\s+(?:from\s+)?anywhere\b'
-    r'|\bany\s+(?:\w+\s+){0,2}?(?:eu|eea|emea|european)(?:\s+\w+){0,2}?\s+country\b'
-    r'|\b(?:emea|europe|eu)\s+(?:or|and)\s+(?:the\s+)?'
-    r'(?:americas|north\s+america|south\s+america|eastern\s+us|us|usa|united\s+states)\b'
-    r'|\b(?:eu|europe)\s*/\s*(?:eu|europe)\b'
+    r'|\bany\s+(?:\w+\s+){0,2}?' + _EUROPE_WORDS + r'(?:\s+\w+){0,2}?\s+country\b'
+    r'|\b' + _EUROPE_WORDS + r'\s+(?:or|and)\s+(?:the\s+)?'
+    # US/USA stay OUT of `_AREA_WORDS`: alone they name one country, and "must be based in the
+    # US" is `country_only`. Only paired with a European area do they widen the offer.
+    r'(?:Americas|North\s+America|South\s+America|Eastern\s+US|US|USA|United\s+States)\b'
+    r'|\b' + _EUROPE_WORDS + r'\s*/\s*' + _EUROPE_WORDS + r'\b'
     # Adjectival form, which has no preposition for the branches above to hang on:
     # "must be Europe-based", "EU-based candidates only".
     r'|\b' + _AREA_WORDS + r'[-\s]based\b'
@@ -2301,9 +2307,9 @@ async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
 
     Three tiers, cheapest first:
       1. unconfigured -> '' (no classifier call is ever made)
-      2. an exempt location (`hybrid.acceptable_locations`) wins outright, so `france` can sit on
+      2. an exempt location (`locations.would_live_here`) wins outright, so `France` can sit on
          the deny list while Toulouse and Nice still pass
-      3. the deny list (`locations.exclude`)
+      3. the deny list (`locations.would_not_live_here`)
       4. otherwise the cached classifier, and a rejection only when EVERY named country is in a
          rejected region — so 'the UK or the Netherlands' passes, and so does anything naming no
          country at all ('European Union', 'Remote (EMEA)')
