@@ -56,79 +56,44 @@ foreign_language_rating_cap: 3
 # never does.
 reject_required_degrees: []
 
-# WHERE A ROLE MAY BE ANCHORED. Purely geographic — this asks "is this a place I would be",
-# and deliberately nothing about the language spoken there (that is `languages`, above, and the
-# two must never be folded together: a rule keyed on "non-English" would exclude a French-language
-# remote role in Canada).
+# WHERE A ROLE MAY BE ANCHORED, as three lists — plus a fourth for a different question.
 #
-# A bare location is NOT read as a residency requirement. "Germany (Remote)" means the role is
-# anchored in Germany while you could live anywhere in the EU, so `location` and an explicit
-# `relocation` statement in the JD are judged separately, against the same lists.
+#   would_live_here      places you WOULD live. Exempts a posting from the geographic gate.
+#   would_not_live_here  places you would NOT. Rejects.
+#   not_yet_bucketed     the agent's guesses, awaiting your decision. GATES NOTHING.
+#   would_commute_here   places you would travel to an OFFICE. Drives the hybrid/on-site cap only.
 #
-# Resolution is three-tier, cheapest first:
-#   1. `hybrid.acceptable_locations` below exempts outright — so you can put `france` in `exclude`
-#      and still keep Nice and Toulouse, by listing those cities there.
-#   2. `exclude` rejects outright.
-#   3. Anything neither list names goes to a cached LLM classifier (run_dir/location_cache.yaml),
-#      which returns the country and one of: southern_europe, northern_europe, western_europe,
-#      eastern_europe, north_america, other, unknown, plus every other name the place goes by.
-#      Both lists are then re-checked against those names — that is what matches a posting saying
-#      `Torino` against a list entry saying `Turin` — and `reject_regions` decides the rest.
-#   4. ...except that for a REMOTE role the anchor is only judged when the posting actually pins
-#      you to it. A remote job advertised in Romania may mean "live in Romania" or "live anywhere
-#      in the EU", and those are opposite answers to the same location string. The extractor
-#      captures which (`residency_scope`):
-#        - the JD pins residence to the country ("Remote within country", "must be based in
-#          Germany") -> the anchor is judged, as in tier 3
-#        - the JD offers a whole area ("anywhere in the EU", "Work from Anywhere") -> kept
-#        - the JD says nothing -> kept IF every country named is an EU member state, because an EU
-#          anchor implies EU work rights while a UK, Serbian, Norwegian or Swiss one does not
-#      Hybrid and on-site roles are NOT spared any of this: an office pins you to the office.
-#      Neither is a stated `relocation`, which is the JD asserting a requirement outright.
-# A job is rejected only when EVERY country named is in a rejected region, so "Spain or the
-# Netherlands" passes; so does anything naming no country ("European Union", "Remote (EMEA)"), and
-# so does a posting offering a whole multi-country area even when it names one country inside it.
-# Classifier failure fails OPEN — an outage must not start rejecting jobs.
+# Anything none of the first three names is guessed at ONCE by a cheap LLM call, appended to
+# `not_yet_bucketed` with its guess as a comment, and reported to you on Telegram. **A guess never
+# rejects a job** — the posting is still rated and shown, just flagged — because you correct a
+# guess by looking at it, and you cannot look at a job you were never shown. Move each line up
+# into one of the two real lists to turn it into a rule.
 #
-# BOTH lists empty means no geographic gate and, deliberately, not a single classifier call.
-# To keep or drop ONE specific country, use `exclude` or `hybrid.acceptable_locations` — both are
-# plain string matches. Do NOT try to do it by adjusting `reject_regions`: the classifier is
-# phrasing-dependent at the margins (measured: "Dublin, Ireland" -> western_europe, bare "Ireland"
-# -> northern_europe), so a country can sit in two different regions depending on how a posting
-# writes it. Regions are for the coarse decision; the lists are for named exceptions.
+# WHY COMMUTING IS A SEPARATE LIST. Living somewhere is not the same as travelling across it. One
+# list used to answer both questions, and because `Spain` was on it (somewhere you would live) an
+# ON-SITE role in any Spanish town inherited the exemption and could score 5. The gate reads
+# would_live_here + would_commute_here together, since commuting somewhere implies being there.
+#
+# WRITE PLACE NAMES THE WAY PLACES ARE WRITTEN. Matching is whole-word, case-SENSITIVE and
+# accent-EXACT: `Málaga`, not `malaga`; `Nice`, not `nice`. You do not need every spelling — a
+# posting saying `Torino` matches a list saying `Turin` through the cached classifier.
+#
+# A job is rejected only when EVERY country it names is on would_not_live_here, so "Spain or the
+# Netherlands" survives, and so does an offer of a whole area. And these lists say where you would
+# LIVE: a remote posting that does not pin you to its anchor country is judged on where you could
+# actually be, not on where it was advertised.
 locations:
-  # Place names, written the way places are written — see the note on acceptable_locations below.
-  exclude: []
-  reject_regions: []
+  would_live_here: []
+  would_not_live_here: []
+  not_yet_bucketed: []
+  would_commute_here: []
 
 hybrid:
-  # Highest rating a hybrid/on-site job outside `acceptable_locations` can receive. This is a
-  # ceiling, not a rejection: the job is still saved and auditable, it just cannot reach the
-  # notification threshold of 4.
+  # Highest rating a hybrid/on-site job OUTSIDE would_commute_here can reach. A ceiling, not a
+  # rejection: the job is still saved and auditable, it just cannot reach the notification
+  # threshold of 4. An office means uncompensated travel time and permanently living within reach
+  # of it, so this is a real cost even where the role is good.
   rating_cap: 3
-  # Places where you would actually accept commuting to an office. List both countries and their
-  # major cities. Empty caps every hybrid/on-site job.
-  #
-  # WRITE PLACE NAMES THE WAY PLACES ARE WRITTEN. Matching is whole-word, case-SENSITIVE and
-  # accent-EXACT: `Málaga`, not `malaga`; `Nice`, not `nice`. Two reasons, both learned the hard
-  # way:
-  #   - `malaga` was an entry that could never match anything, because LinkedIn writes `Málaga`.
-  #     It looked exactly like an entry that simply had not come up yet.
-  #   - This list exempts OUTRIGHT, so a short lowercase entry that is a prefix of a country name
-  #     used to switch the whole geographic gate off for that country before any other rule ran.
-  #     `roma` (for Rome) matched `romania`, and every Romanian posting sailed through — one was
-  #     rated 4 and notified.
-  #
-  # You do NOT need to list every spelling. Where a place has a different local and English name
-  # the cached classifier resolves it (a posting saying `Torino` matches `Turin` here, `München`
-  # matches `Munich`), so hand-maintained spelling pairs are optional — and it was exactly such a
-  # hand-added pair that introduced `roma`. Listing both is still free and deterministic.
-  #
-  # The agent reports entries that never match, and entries that read as ambiguous, in
-  # run_dir/location_recommendations.yaml.
-  # This list does double duty: it is also tier 1 of the `locations` gate above, exempting a
-  # REMOTE role anchored in one of these places.
-  acceptable_locations: []
 
 titles:
   # Free text appended to the query-generation prompt describing the kind of role you want.

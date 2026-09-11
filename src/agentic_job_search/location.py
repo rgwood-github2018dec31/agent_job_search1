@@ -166,8 +166,12 @@ Rules:
 - `place_names` lists every place the text refers to at EVERY level -- city, region/state, country
   -- in BOTH the common English form and the local form, properly capitalised and accented, e.g.
   "Sevilla, Andalusia, Spain" -> ["Sevilla", "Seville", "Andalucia", "Andalucía", "Andalusia",
-  "Spain", "España"]. Include the form as written in the text. Omit workplace words ("Remote",
-  "Hybrid"), and return an empty list when the text names no place.
+  "Spain", "España"]. Include the form as written in the text, and SUPPLY THE LEVELS IT OMITS:
+  when only a city is named, add the region or state that contains it and the country, e.g.
+  "Grasse, France" -> ["Grasse", "Alpes-Maritimes", "Provence-Alpes-Cote d Azur", "France"].
+  This is administrative containment, a checkable fact -- never proximity, which is a
+  judgement. Omit workplace words ("Remote", "Hybrid"), and return an empty list when the
+  text names no place.
 """
 
 _cache: dict[str, Any] | None = None

@@ -22,7 +22,6 @@ Nothing here writes ``preferences.yaml``. An auto-reject is unappealable, so a r
 waits at ``status: pending`` until the user promotes it by hand.
 """
 
-import hashlib
 import logging
 import unicodedata
 from datetime import date
@@ -31,57 +30,15 @@ from typing import Any
 import yaml
 
 from agentic_job_search.location import (
-    countries_seen_this_run, location_token_matches, place_names_seen_this_run, region_disagreements,
+    countries_seen_this_run, location_token_matches, place_names_seen_this_run,
 )
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search import preferences
-from agentic_job_search.triage import chat_openrouter, extract_json_object, unwrap_exception
-from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+from agentic_job_search.triage import unwrap_exception
 
 logger = logging.getLogger(__name__)
 
 LOCATION_RECOMMENDATIONS_PATH = RUN_DIR / 'location_recommendations.yaml'
-
-# Recommendation vocabulary. Closed in code, because this is a generative call whose output is
-# persisted -- an open string invites a fourth value nothing handles (the location._coerce shape).
-RECOMMENDATIONS = ('exclude', 'hybrid_acceptable', 'keep_as_is')
-
-# A country nobody has decided on is asked about once. More than this in one run means something
-# unusual happened; a payload that can grow without bound is a truncation waiting to happen.
-MAX_COUNTRIES_PER_REVIEW = 40
-
-_PROMPT = """You are helping someone audit the country lists of their own job-search filter.
-
-THE LISTS BELOW ARE THEIR DECISIONS AND ARE CORRECT. `reject_regions` in particular is a
-deliberate choice about where this person is willing to LIVE -- it is not a bug, and a
-recommendation that contradicts it is wrong. Your job is narrow: for each country that neither
-list names, say whether the region policy already gives the right answer, or whether that one
-country is a genuine exception to it.
-
-- exclude (a job anchored here is auto-rejected): {exclude}
-- acceptable_locations (places they would actually be, exempt from every geographic rule): {acceptable}
-- reject_regions (regions they will not live in, so jobs there are rejected): {reject_regions}
-
-Countries that showed up in job postings this run and that NEITHER list names, with the region the
-classifier assigned each:
-{countries}
-
-For EACH of those countries, recommend one of:
-- "keep_as_is"        -- the region policy already handles it correctly. THIS IS THE DEFAULT and
-                         the right answer for almost every country. A country whose region is in
-                         `reject_regions` is being rejected ON PURPOSE.
-- "exclude"           -- the region policy would KEEP it, but it is somewhere they would not live,
-                         so it needs an explicit entry
-- "hybrid_acceptable" -- the region policy would REJECT it, but it is somewhere they clearly would
-                         live, judging by the places already on `acceptable_locations`. Use this
-                         only when the country is a close match for that list -- never merely
-                         because it is nearby, in the same trade bloc, or convenient to reach.
-
-Return ONLY a JSON object, no prose and no code fence:
-{{"recommendations": [{{"country": "<one of the countries listed above>",
-                       "recommendation": "<keep_as_is|exclude|hybrid_acceptable>",
-                       "reason": "<one short sentence>"}}, ...]}}
-"""
 
 
 def _load() -> dict[str, Any]:
@@ -127,64 +84,60 @@ def _write(doc: dict[str, Any]) -> None:
         logger.warning(f'Could not write {LOCATION_RECOMMENDATIONS_PATH}: {ex}')
 
 
-def _list_fingerprint() -> str:
-    """md5 of the three lists, so EDITING them re-opens the pending recommendations.
-
-    Keyed on the country universe alone, a recommendation made under the old lists would stand
-    forever: the countries did not change, so nothing would ask again. Editing the lists is
-    exactly when a not-yet-acted-on recommendation is worth revisiting.
-    """
-    material = '|'.join(
-        ','.join(sorted(tokens)) for tokens in (
-            preferences.excluded_locations(),
-            preferences.hybrid_acceptable_locations(),
-            preferences.rejected_regions(),
-        )
-    )
-    return hashlib.md5(material.encode('utf-8')).hexdigest()
-
-
 def substring_collisions(countries: dict[str, str]) -> list[dict[str, str]]:
-    """List entries that are a proper substring of a country name, or of another entry.
+    """List entries that sit inside a place they do not mean. Deterministic and free.
 
-    Deterministic and free. This is the check that catches `roma` inside `romania` -- the entry
-    that exempted every Romanian posting at tier 1, before the deny list, the classifier and the
-    region policy were consulted. It is code and not a prompt because it is a checkable fact, and
-    because it must keep working when the tool server does not.
+    This is the check that catches `Roma` inside `Romania` -- the entry that exempted every
+    Romanian posting before the deny list, the classifier and the region policy were consulted. It
+    is code and not a prompt because it is a checkable fact, and because it must keep working when
+    the tool server does not.
+
+    An entry is skipped against places on its OWN list: `Valencia`/`València` and `Málaga`/`Malaga`
+    are deliberate spelling variants, and each flagging the other produced 5 false findings against
+    1 real one. Across lists it is the dangerous case and is always reported -- allow beats deny, so
+    `Roma` on `would_live_here` sitting inside `Romania` on `would_not_live_here` is exactly how a
+    whole country gets silently exempted.
     """
-    listed = [
-        ('locations.exclude', token) for token in preferences.excluded_locations()
-    ] + [
-        ('hybrid.acceptable_locations', token) for token in preferences.hybrid_acceptable_locations()
-    ]
-    # Countries the user did NOT list, only. Checking an entry against its SIBLINGS is what made
-    # this warning useless: 'Valencia'/'València', 'Málaga'/'Malaga' and 'Milan'/'Milano' are
-    # deliberate spelling pairs, so each flagged the other -- and both directions -- for 5 false
-    # positives against 1 real finding. An entry sitting inside another LISTED place is harmless:
-    # both are places the user wants, and whole-token matching keeps them apart anyway. The danger
-    # is only an entry sitting inside a place they never listed, which is 'Roma' in 'Romania'.
-    listed_folded = {_fold(token) for _list, token in listed}
-    haystacks = {c for c in countries if _fold(c) not in listed_folded}
+    listed = _all_listed_places()
+    own_list: dict[str, set[str]] = {}
+    for list_name, token in listed:
+        own_list.setdefault(list_name, set()).add(_fold(token))
+
+    places = set(countries) | {token for _list, token in listed}
     collisions: list[dict[str, str]] = []
     for list_name, token in listed:
-        for other in sorted(haystacks):
-            # Fold for DETECTION -- entries are proper names while the classifier's countries come
-            # back lowercase, so an exact comparison would see no collision at all. The exact
-            # matcher still decides whether it is a genuine whole-token match.
-            if other == token or _fold(token) not in _fold(other) or location_token_matches(token, other):
+        for other in sorted(places):
+            if other == token or _fold(other) in own_list[list_name]:
+                continue
+            if _fold(token) not in _fold(other) or location_token_matches(token, other):
                 continue
             collisions.append({
                 'entry': token,
                 'list': list_name,
                 'collides_with': other,
                 'detail': (
-                    f'{token!r} is a substring of {other!r}. Whole-word matching keeps them apart '
-                    f'today, but the entry reads as ambiguous — prefer an unambiguous spelling.'
+                    f'{token!r} on {list_name} is a substring of {other!r}. Whole-token matching '
+                    f'keeps them apart today, but the entry reads as ambiguous — prefer an '
+                    f'unambiguous spelling.'
                 ),
                 'kind': 'collision',
                 'status': 'pending',
             })
     return collisions
+
+
+
+def _all_listed_places() -> list[tuple[str, str]]:
+    """(list name, entry) for every user-authored place list, for the hygiene checks."""
+    return [
+        (f'locations.{name}', token)
+        for name, getter in (
+            ('would_live_here', preferences.would_live_here),
+            ('would_not_live_here', preferences.would_not_live_here),
+            ('would_commute_here', preferences.would_commute_here),
+        )
+        for token in getter()
+    ]
 
 
 def _fold(text: str) -> str:
@@ -202,11 +155,7 @@ def dead_entries(place_names: set[str]) -> list[dict[str, str]]:
     in the corpus -- while looking exactly like an entry that simply had not come up yet. That is
     the distinction this check makes and a plain "never matched" count cannot.
     """
-    listed = [
-        ('locations.exclude', token) for token in preferences.excluded_locations()
-    ] + [
-        ('hybrid.acceptable_locations', token) for token in preferences.hybrid_acceptable_locations()
-    ]
+    listed = _all_listed_places()
     findings: list[dict[str, str]] = []
     for list_name, token in listed:
         if any(location_token_matches(token, name) for name in place_names):
@@ -233,76 +182,6 @@ def dead_entries(place_names: set[str]) -> list[dict[str, str]]:
     return findings
 
 
-def inconsistent_regions() -> list[dict[str, str]]:
-    """Countries the cache places in two different regions. Deterministic and free.
-
-    A country belongs to exactly one region -- that is what makes it world knowledge rather than a
-    judgement -- so a second answer means one of them is wrong AND the cache has frozen it. Only
-    the minority answers are reported, since those are the ones to evict.
-    """
-    findings: list[dict[str, str]] = []
-    for country, counts in region_disagreements().items():
-        majority, top = max(counts.items(), key=lambda kv: kv[1])
-        outliers = {region: n for region, n in counts.items() if region != majority}
-        findings.append({
-            'entry': country,
-            'list': 'location_cache.yaml',
-            'collides_with': majority,
-            'detail': (
-                f'{country} is cached as {majority} {top}x but also as '
-                f'{", ".join(f"{r} {n}x" for r, n in outliers.items())}. A country has one region, '
-                f'so the minority answer is a classifier slip the cache has frozen — evict those '
-                f'entries to have them reclassified.'
-            ),
-            'kind': 'region',
-            'status': 'pending',
-        })
-    return findings
-
-
-def undecided_countries(seen: dict[str, str], doc: dict[str, Any]) -> dict[str, str]:
-    """Countries neither list names and that no recommendation already covers."""
-    named = tuple(preferences.excluded_locations()) + tuple(preferences.hybrid_acceptable_locations())
-    recorded = doc.get('countries') or {}
-    recorded_folded = {str(key).casefold() for key in recorded}
-    return {
-        country: region
-        for country, region in sorted(seen.items())
-        if country.casefold() not in recorded_folded
-        # Folded at the COMPARISON, not at either source. Both sides are proper names today, but a
-        # cache entry written before that was true still holds 'spain', and a country that reads as
-        # undecided because of its casing is one the reviewer asks the LLM about on every run --
-        # silently turning "zero calls in steady state" into a call per country per run.
-        and not any(location_token_matches(token.casefold(), country.casefold()) for token in named)
-    }
-
-
-def _coerce_recommendations(raw: Any, allowed: dict[str, str]) -> list[dict[str, str]]:
-    """Keep only well-formed recommendations about countries we actually asked about.
-
-    Anti-fabrication: the model is being asked a judgement question and its answer is persisted, so
-    the country must be one we named and the verdict must be in the closed vocabulary.
-    """
-    kept: list[dict[str, str]] = []
-    for item in (raw.get('recommendations') if isinstance(raw, dict) else None) or []:
-        if not isinstance(item, dict):
-            continue
-        # The country keeps its proper name; only the ENUM is folded, because that is a
-        # vocabulary rather than a name. Matching back to what we asked about is done
-        # case-insensitively here, at the comparison.
-        country = ' '.join(str(item.get('country') or '').split())
-        recommendation = str(item.get('recommendation') or '').strip().casefold()
-        canonical = next((a for a in allowed if a.casefold() == country.casefold()), '')
-        if not canonical or recommendation not in RECOMMENDATIONS:
-            continue
-        kept.append({
-            'country': canonical,
-            'recommendation': recommendation,
-            'reason': ' '.join(str(item.get('reason') or '').split())[:300],
-        })
-    return kept
-
-
 async def review_location_lists(stage_stats: dict[str, Any] | None = None) -> str:
     """Review the country lists against what this run saw. Returns an alert detail, or ''.
 
@@ -316,102 +195,42 @@ async def review_location_lists(stage_stats: dict[str, Any] | None = None) -> st
 
 
 async def _review(stage_stats: dict[str, Any] | None) -> str:
-    if not (preferences.excluded_locations() or preferences.rejected_regions()):
-        return ''  # no geographic gate configured, so there are no lists to tune
+    """Deterministic hygiene on the user's place lists. No LLM, no cost, every run.
+
+    The judgement half -- "would they live in this country?" -- moved to
+    `agent.resolve_location_guesses`, which answers it inline, appends the answer to
+    `locations.not_yet_bucketed` where the user acts on it, and sends one Telegram. Asking the same
+    question twice in two places would have been two sources of truth for one decision.
+
+    What is left has no equivalent and cannot be asked of a model anyway: `'Roma' in 'Romania'` is
+    arithmetic, and an entry that never matches anything is a fact about the corpus.
+    """
+    if not (preferences.would_live_here() or preferences.would_not_live_here()):
+        return ''
 
     doc = _load()
     seen = countries_seen_this_run()
-
-    findings = (
-        substring_collisions(seen)
-        + dead_entries(place_names_seen_this_run())
-        + inconsistent_regions()
-    )
-    new_collisions = [
-        collision for collision in findings
+    findings = substring_collisions(seen) + dead_entries(place_names_seen_this_run())
+    new_findings = [
+        finding for finding in findings
         if not any(
-            existing.get('entry') == collision['entry']
-            and existing.get('list') == collision['list']
-            and existing.get('collides_with') == collision['collides_with']
+            existing.get('entry') == finding['entry']
+            and existing.get('list') == finding['list']
+            and existing.get('collides_with') == finding['collides_with']
             for existing in doc['entry_warnings']
         )
     ]
-
-    fingerprint = _list_fingerprint()
-    lists_changed = doc['reviewed'].get('lists_fingerprint') != fingerprint
-    if lists_changed:
-        # The lists moved, so a recommendation the user has not acted on was made against a policy
-        # that no longer holds -- drop it and ask again. Anything they DID act on (accepted or
-        # rejected) is their decision and is never rewritten. Without this the fingerprint would
-        # record a change it never responded to.
-        doc['countries'] = {
-            country: entry for country, entry in doc['countries'].items()
-            if (entry or {}).get('status') != 'pending'
-        }
-
-    undecided = undecided_countries(seen, doc)
-    recommendations: list[dict[str, str]] = []
-
-    if undecided:
-        asked = dict(sorted(undecided.items())[:MAX_COUNTRIES_PER_REVIEW])
-        content, cost = await chat_openrouter(_PROMPT.format(
-            exclude=list(preferences.excluded_locations()) or '(empty)',
-            acceptable=list(preferences.hybrid_acceptable_locations()) or '(empty)',
-            reject_regions=list(preferences.rejected_regions()) or '(empty)',
-            countries='\n'.join(f'- {country} ({region})' for country, region in asked.items()),
-        ))
-        if stage_stats is not None:
-            stage_stats['cost'] = stage_stats.get('cost', 0.0) + cost
-        recommendations = _coerce_recommendations(extract_json_object(content), asked)
-        today = date.today().isoformat()
-        for item in recommendations:
-            doc['countries'][item['country']] = {
-                'first_seen': today,
-                'region': asked.get(item['country'], 'unknown'),
-                'recommendation': item['recommendation'],
-                'reason': item['reason'],
-                'status': 'pending',
-                'model': OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
-            }
-        logger.info(
-            f'Location list review: {len(recommendations)} recommendation(s) for '
-            f'{sorted(asked)} (${cost:.6f})'
-        )
-        if not recommendations:
-            # Paid for an answer and kept none of it. Without this line the run records zero
-            # recommendations and reports only the entry warnings, which is indistinguishable from
-            # "there was nothing to recommend" -- a paid call that silently did nothing.
-            logger.warning(
-                f'Location list review asked about {len(asked)} country/countries and kept NONE of '
-                f'the reply (${cost:.6f} spent). Either the model answered about countries it was '
-                f'not asked about, or it used a verdict outside {RECOMMENDATIONS}. '
-                f'Reply began: {content[:200]!r}'
-            )
-
-    if not (new_collisions or recommendations):
-        if lists_changed:
-            doc['reviewed'] = {'lists_fingerprint': fingerprint, 'on': date.today().isoformat()}
-            _write(doc)
+    if not new_findings:
         return ''
 
-    doc['entry_warnings'].extend(new_collisions)
-    doc['reviewed'] = {'lists_fingerprint': fingerprint, 'on': date.today().isoformat()}
+    doc['entry_warnings'].extend(new_findings)
+    doc['reviewed'] = {'on': date.today().isoformat()}
     _write(doc)
 
-    # Only NEW findings raise an alert. A permanently-pending set that puts a warning in every
-    # Telegram summary trains the user to ignore the block -- the same cry-wolf reasoning the
-    # Resilience requirement applies to a tool server that is merely down.
-    parts = []
-    if recommendations:
-        parts.append(
-            f"{len(recommendations)} country list recommendation(s): "
-            + ', '.join(f"{item['country']} -> {item['recommendation']}" for item in recommendations)
-        )
-    # Phrased per kind. One template for all three read as "'Austria' inside 'western_europe'",
-    # which is not a sentence about anything.
-    by_kind = {'collision': [], 'dead_entry': [], 'region': []}
-    for finding in new_collisions:
+    by_kind: dict[str, list] = {'collision': [], 'dead_entry': []}
+    for finding in new_findings:
         by_kind.setdefault(finding.get('kind', 'collision'), []).append(finding)
+    parts = []
     if by_kind['collision']:
         parts.append(
             f"{len(by_kind['collision'])} ambiguous list entr(y/ies): "
@@ -421,10 +240,5 @@ async def _review(stage_stats: dict[str, Any] | None) -> str:
         parts.append(
             f"{len(by_kind['dead_entry'])} list entr(y/ies) that never match: "
             + ', '.join(f"{c['entry']!r} (postings say {c['collides_with']!r})" for c in by_kind['dead_entry'])
-        )
-    if by_kind['region']:
-        parts.append(
-            f"{len(by_kind['region'])} country/countries cached in two regions: "
-            + ', '.join(f"{c['entry']} (mostly {c['collides_with']})" for c in by_kind['region'])
         )
     return f"{'; '.join(parts)} — see {LOCATION_RECOMMENDATIONS_PATH.name} (advisory; nothing changed)"

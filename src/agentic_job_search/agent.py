@@ -519,7 +519,7 @@ def build_scraper_instructions() -> str:
     Filters are applied by CLICKING the chip row, never by putting `geoId`/`f_TPR` in a URL.
     Both work; only one is something a person does. Hand-assembled filter parameters are a cheap
     fingerprint for anti-automation, and this drives a real logged-in account (see the Account
-    safety requirement in CLAUDE.md).
+    safety requirement in docs/requirements.md).
 
     The region must NOT go into the query text. That was the pre-2026-08-18 design and LinkedIn
     silently ignored it: every "European Union" search returned the account's home metro for days,
@@ -571,17 +571,23 @@ def build_evaluator_instructions() -> str:
     note = preferences.relocation_note()
     relocation_section = f'\n## Relocation (applies to REMOTE roles only)\n{note}\n' if note else ''
 
-    locations = preferences.hybrid_acceptable_locations()
+    locations = preferences.would_commute_here()
+    commute_cost = (
+        '- An office — hybrid, on-site, on location, in-person — means a daily commute whose '
+        'travel time is NOT compensated, and it means permanently living close enough to that '
+        'office. It constrains where the candidate can live AND costs them hours. Treat that as a '
+        'real, substantial drawback in its own right, not a formatting detail.\n'
+    )
     if locations:
-        joined = ', '.join(loc.title() for loc in locations)
-        hybrid_locations_section = (
-            f'- Acceptable hybrid/on-site locations: {joined}.\n'
+        joined = ', '.join(locations)
+        hybrid_locations_section = commute_cost + (
+            f'- The only places worth commuting to are: {joined}.\n'
             '- Hybrid or on-site anywhere else is **not a fit** however well the role itself '
             'matches. Never rate those 4 or 5.\n'
         )
     else:
-        hybrid_locations_section = (
-            '- No hybrid/on-site location is acceptable: rate every hybrid or on-site role '
+        hybrid_locations_section = commute_cost + (
+            '- There is nowhere the candidate would commute to: rate every hybrid or on-site role '
             '**3 at most**.\n'
         )
 
@@ -1744,7 +1750,14 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
     return extract
 
 
-_ONSITE_RE = re.compile(r'\bon[\s-]?site\b|\bin[\s-]?office\b|\bin[\s-]?person\b', re.IGNORECASE)
+_ONSITE_RE = re.compile(
+    r'\bon[\s-]?site\b|\bin[\s-]?office\b|\bin[\s-]?person\b'
+    # Phrasings that mean "you must be at the office" without using the usual words. All of these
+    # returned '' before, which earned them the remote benefit of the doubt AND no commute cap.
+    r'|\bon[\s-]?location\b|\boffice[\s-]?based\b|\bwork(?:ing)?\s+from\s+(?:our|the)\s+office'
+    r'|\bpresence\s+in\s+the\s+office\b|\bbased\s+(?:out\s+)?of\s+(?:our|the)\s+\w+\s+office\b',
+    re.IGNORECASE,
+)
 # "N days" wording is the tell for hybrid and must beat the on-site check: a posting saying
 # "on site 3 days per week" is hybrid, and one saying "2-3 days onsite" often also carries a
 # "Remote" badge from the job board's own filter.
@@ -2012,8 +2025,8 @@ def derive_agency_posting(extract: dict) -> bool:
     model that looked at the page and said "no" is never overridden by a regex.
 
     Conservative by design, but the cost of being wrong is asymmetric and small: this drives a
-    WARNING only. It never rejects a job and never changes a rating (see the Account of decisions
-    in CLAUDE.md) — so a false positive is a stray bullet in a notification, not a lost job.
+    WARNING only. It never rejects a job and never changes a rating (see the Rating hard rules
+    requirement in docs/requirements.md) — so a false positive is a stray bullet in a notification, not a lost job.
     """
     explicit = extract.get('is_agency')
     if explicit is not None:
@@ -2159,27 +2172,122 @@ async def derive_implied_local_language(extract: dict) -> str:
     return str(facts.get('implied_local_language') or '').strip().lower()
 
 
-def hybrid_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
-    """True if a hybrid/on-site role in this location is one the user would actually take.
+def commute_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
+    """True if the user would travel to an OFFICE here. Drives the hybrid/on-site cap only.
+
+    Deliberately NOT the same question as `location_is_allowed`. One list used to answer both, and
+    because `Spain` was on it (somewhere the user would live), an on-site role in Ourense inherited
+    the exemption and could score 5.
 
     `place_names` are the other names the classifier says this place goes by, resolved once per
-    candidate into `extract['place_names']`. Passing them matters here and not only in the gate:
-    these three sync consumers (this, `apply_rating_caps`, `build_deterministic_warnings`) would
-    otherwise keep the exact-only match, so a hybrid role in `Sevilla` would be gated correctly by
-    the async path and still capped and warned about by this one.
-
-    Whole-token matching, not `in`: this list is also tier 1 of the geographic gate and exempts
-    OUTRIGHT, so a substring hit disables every rule below it. 'roma' (Rome) matched 'romania' and
-    'emilia-romagna' that way, and every Romanian posting skipped the deny list, the classifier
-    and the region policy — one was rated 4 and notified while Bulgaria, Poland, Czechia and
-    Lithuania rejected correctly in the same run.
+    candidate into `extract['place_names']`; passing them is what lets a posting saying `Torino`
+    match a list saying `Turin`.
     """
     candidates = (location, *place_names)
     return any(
         location_token_matches(token, candidate)
-        for token in preferences.hybrid_acceptable_locations()
+        for token in preferences.would_commute_here()
         for candidate in candidates
     )
+
+
+def location_is_allowed(location: str, place_names: Sequence[str] = ()) -> bool:
+    """True if the user would BE here — the geographic gate's exemption.
+
+    Reads the union of `would_live_here` and `would_commute_here`: commuting somewhere implies
+    being there, so a city on the commute list never needs repeating on the live list.
+    """
+    candidates = (location, *place_names)
+    return any(
+        location_token_matches(token, candidate)
+        for token in preferences.would_live_here() + preferences.would_commute_here()
+        for candidate in candidates
+    )
+
+
+# Countries this run guessed about, in order: country -> (guess, reason). Resolved at the end of
+# the run into one appended block and one Telegram, rather than a call and a message per posting.
+_location_guesses: dict[str, tuple[str, str]] = {}
+
+_GUESS_PROMPT = """Someone filters job postings by where the role is anchored. These are the places
+they have told us about:
+
+- would live here: {live}
+- would NOT live here: {not_live}
+
+They have said nothing about "{country}". Judging ONLY by the pattern of the two lists above, which
+is it more like?
+
+Return ONLY a JSON object, no prose and no code fence:
+{{"guess": "<would_live|would_not_live>", "reason": "<one short sentence>"}}
+"""
+
+
+def _trim(text: str, limit: int) -> str:
+    """Cut at a word boundary. This string lands in a YAML comment and a Telegram message, and a
+    mid-word cut ('...northern and western European countries l') reads as a bug in both."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(' ', 1)[0].rstrip(',;:') + '…'
+
+
+def queue_location_guess(country: str) -> None:
+    """Note a country nothing on the lists names. Guessed once per run, resolved at run end."""
+    if country and country not in _location_guesses:
+        _location_guesses[country] = ('', '')
+
+
+def reset_location_guesses() -> None:
+    _location_guesses.clear()
+
+
+async def resolve_location_guesses(stage_stats: dict | None = None) -> list[tuple[str, str, str]]:
+    """Ask about each queued country, record the answers, return (place, guess, reason) rows.
+
+    Fails open and quietly: no guess, nothing appended, nothing reported, every posting already
+    passed. Same stance as the location classifier, for the same reason -- nothing the user wrote
+    down matched, so an outage must not begin rejecting.
+    """
+    pending = [c for c, (guess, _r) in _location_guesses.items() if not guess]
+    if not pending:
+        return []
+    live = list(preferences.would_live_here()) or ['(none)']
+    not_live = list(preferences.would_not_live_here()) or ['(none)']
+    for country in pending:
+        try:
+            content, cost = await chat_openrouter(
+                _GUESS_PROMPT.format(live=live, not_live=not_live, country=country)
+            )
+            if stage_stats is not None:
+                stage_stats['cost'] = stage_stats.get('cost', 0.0) + cost
+            answer = extract_json_object(content)
+            guess = str(answer.get('guess') or '').strip().lower()
+            if guess not in {'would_live', 'would_not_live'}:
+                raise ValueError(f'guess outside the vocabulary: {guess!r}')
+            _location_guesses[country] = (
+                'would live' if guess == 'would_live' else 'would NOT live',
+                _trim(' '.join(str(answer.get('reason') or '').split()), 150),
+            )
+            logger.info(f'Location guess: {country} -> {_location_guesses[country][0]} (${cost:.6f})')
+        except Exception as ex:
+            logger.warning(f'Could not guess about {country!r}: {unwrap_exception(ex)}')
+            _location_guesses.pop(country, None)
+    return [(c, guess, reason) for c, (guess, reason) in _location_guesses.items() if guess]
+
+
+def location_guess_notification(rows: list[tuple[str, str, str]]) -> str:
+    """The batched Telegram. One message per run, not one per posting."""
+    lines = [f'\u2753 Location guesses needing your confirmation ({len(rows)})', '']
+    for place, guess, reason in rows:
+        lines.append(f'\u2022 {place} \u2192 {guess}')
+        if reason:
+            lines.append(f'    {reason}')
+    lines += [
+        '',
+        'These are GUESSES and gate nothing — those jobs were still rated and shown.',
+        'Move each into would_live_here or would_not_live_here in preferences.yaml.',
+    ]
+    return '\n'.join(lines)
 
 
 async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
@@ -2215,28 +2323,23 @@ async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
     haystack = ' '.join(str(text or '').split())
     if not haystack:
         return ''
-    if not (preferences.excluded_locations() or preferences.rejected_regions()):
+    if not (preferences.would_live_here() or preferences.would_not_live_here()):
         return ''
-    if hybrid_location_is_acceptable(haystack):
+    if location_is_allowed(haystack):
         return ''
-    for token in preferences.excluded_locations():
-        if location_token_matches(token, haystack):
-            return token
 
-    unwanted = preferences.rejected_regions()
-    if not unwanted:
-        return ''
+    # Everything below needs to know EVERY country the text names, so it happens after the
+    # (cached) classifier rather than against the raw string. Matching the deny list on the raw
+    # text alone would reject "Germany or Spain (Remote)" on Germany while Spain is right there,
+    # and "European Union (Remote, UK and EU)" on a country it only mentions in passing.
     facts = await classify_location(haystack)
     # Tier 3a: the same two lists again, now against every name the classifier says this place goes
     # by. This is what reaches an exonym no normalization can ('Sevilla' -> the listed 'Seville',
     # 'Torino' -> 'Turin'), and it is why the lists no longer need hand-maintained spelling pairs.
     # Order matches tiers 1 and 2 exactly: exempt wins over deny.
     place_names = facts.get('place_names') or []
-    if any(hybrid_location_is_acceptable(name) for name in place_names):
+    if any(location_is_allowed(name) for name in place_names):
         return ''
-    for token in preferences.excluded_locations():
-        if any(location_token_matches(token, name) for name in place_names):
-            return token
     # A whole multi-country area on offer is itself an unrejected option: "European Union (Remote,
     # UK and EU)" is not a UK-only role just because the UK is the one country it names. Found by
     # the live backtest, which flipped a 5/5 posting of exactly that shape. A single country phrased
@@ -2252,14 +2355,46 @@ async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
         is_eu_member(country) for country in countries_named
     ):
         return ''
-    regions = facts.get('regions') or []
-    if not regions:
-        return ''
-    if not all(region in unwanted for region in regions):
-        return ''
-    countries = facts.get('countries') or []
-    named = countries[0] if countries else regions[0]
-    return f'{named} ({regions[0]})'
+    deny_tokens = preferences.would_not_live_here()
+
+    if not countries_named:
+        # The classifier resolved no country, so there is nothing to reason about per-country --
+        # but the text may still literally name a place on the list ('Blockedland (Remote)').
+        return next(
+            (token for token in deny_tokens
+             if location_token_matches(token, haystack)
+             or any(location_token_matches(token, name) for name in place_names)),
+            '',
+        )
+
+    def _denied(country: str) -> str:
+        # Against the country AND, when only one is named, the other names it goes by -- so a
+        # posting saying 'Praha, Czech Republic' is denied by a list saying 'Czechia'.
+        names = [country, *(place_names if len(countries_named) == 1 else ())]
+        return next(
+            (token for token in deny_tokens
+             if any(location_token_matches(token, name) for name in names)), '',
+        )
+
+    # Rejected only when EVERY country on offer is one you would not live in -- "Spain or the
+    # Netherlands" leaves you somewhere to be, and so does a whole area. Same rule the region
+    # policy used before the lists replaced it.
+    denials = [_denied(country) for country in countries_named]
+    if all(denials):
+        return denials[0]
+
+    undecided = [
+        country for country, denial in zip(countries_named, denials)
+        if not denial
+        and not any(location_token_matches(t, country) for t in preferences.would_live_here())
+        and not any(location_token_matches(t, country) for t in preferences.not_yet_bucketed())
+    ]
+    # Nothing the user wrote down names these. Guess once, record it, tell them -- and KEEP the
+    # posting. A guess must never reject: the point of the bucketing loop is that the user
+    # corrects it, which they cannot do for a job they were never shown.
+    for country in undecided:
+        queue_location_guess(country)
+    return ''
 
 
 def residency_spare(extract: dict) -> str:
@@ -2304,7 +2439,7 @@ def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
     caps: list[tuple[int, str]] = []
 
     workplace_type = derive_workplace_type(extract)
-    if workplace_type in {'hybrid', 'onsite'} and not hybrid_location_is_acceptable(
+    if workplace_type in {'hybrid', 'onsite'} and not commute_location_is_acceptable(
         extract.get('location', ''), extract.get('place_names') or ()
     ):
         location = extract.get('location') or 'unspecified location'
@@ -2344,8 +2479,8 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
         label = 'Hybrid' if workplace_type == 'hybrid' else 'On-site'
         location = extract.get('location') or 'location not stated'
         warning = f'{label} — {location}'
-        if not hybrid_location_is_acceptable(extract.get('location', ''), extract.get('place_names') or ()):
-            warning += ' (not an acceptable hybrid location)'
+        if not commute_location_is_acceptable(extract.get('location', ''), extract.get('place_names') or ()):
+            warning += ' (not somewhere you would commute)'
         warnings.append(warning)
 
     # Two independent language facts. A posting written in another language gets the first (and a
@@ -2358,6 +2493,18 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if implied_local_language := foreign_implied_local_language(extract):
         location = extract.get('location') or 'location not stated'
         warnings.append(f'Implied local language: {implied_local_language.title()} — {location}')
+
+    location = extract.get('location') or ''
+    if guessed := next(
+        (token for token in preferences.not_yet_bucketed()
+         if location_token_matches(token, location)
+         or any(location_token_matches(token, n) for n in extract.get('place_names') or ())),
+        '',
+    ):
+        warnings.append(
+            f'Location not yet bucketed: {guessed} — the agent guessed about it; confirm it in '
+            f'preferences.yaml'
+        )
 
     if extract.get('relocation'):
         warnings.append(f"Relocation required: {extract['relocation']}")
@@ -3002,6 +3149,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._search_reports = []
     tools_module._ui_alerts = list(_startup_ui_alerts)
     location.reset_countries_seen()
+    reset_location_guesses()
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -3076,6 +3224,15 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
             # Advisory review of the country lists. Must run BEFORE the funnel snapshots
             # `ui_alerts`, and on BOTH exit paths -- two copies of an alert-raising step is
             # exactly how one of them came to be missing before.
+            if guess_rows := await resolve_location_guesses(stage_stats.get('location_review')):
+                preferences.append_not_yet_bucketed(guess_rows)
+                await _send_pipeline_notification(location_guess_notification(guess_rows))
+                tools_module._ui_alerts.append({
+                    'kind': 'location_recommendations', 'query': '', 'region': '',
+                    'detail': f'{len(guess_rows)} location guess(es) appended to not_yet_bucketed: '
+                              + ', '.join(f'{p} -> {g}' for p, g, _r in guess_rows),
+                })
+
             if detail := await location_review.review_location_lists(stage_stats.get('location_review')):
                 tools_module._ui_alerts.append(
                     {'kind': 'location_recommendations', 'query': '', 'region': '', 'detail': detail}
@@ -3165,6 +3322,15 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     total_cost = sum(s["cost"] for s in stage_stats.values())
 
     check_status_counts = dict(tools_module._check_status_counts)
+    if guess_rows := await resolve_location_guesses(stage_stats.get('location_review')):
+        preferences.append_not_yet_bucketed(guess_rows)
+        await _send_pipeline_notification(location_guess_notification(guess_rows))
+        tools_module._ui_alerts.append({
+            'kind': 'location_recommendations', 'query': '', 'region': '',
+            'detail': f'{len(guess_rows)} location guess(es) appended to not_yet_bucketed: '
+                      + ', '.join(f'{p} -> {g}' for p, g, _r in guess_rows),
+        })
+
     if detail := await location_review.review_location_lists(stage_stats.get('location_review')):
         tools_module._ui_alerts.append(
             {'kind': 'location_recommendations', 'query': '', 'region': '', 'detail': detail}

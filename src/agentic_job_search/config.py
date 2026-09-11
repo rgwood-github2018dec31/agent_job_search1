@@ -57,7 +57,7 @@ MAX_SEARCH_QUERIES = 6  # hard cap; every query costs one LinkedIn search per co
 # regions that is ~80 record turns plus ~28 chip turns before overhead. Starvation is silent — the
 # model simply stops and the run reports "N listings inspected" with no error — so this is set with
 # headroom rather than tuned tight. Turns are cheap here; account safety is not (see the Account
-# safety requirement in CLAUDE.md).
+# safety requirement in docs/requirements.md).
 SCRAPER_MAX_TURNS_PER_QUERY = 260
 
 # Floor below which a query clearly bailed before finishing one harvest cycle (navigate, snapshot,
@@ -190,7 +190,7 @@ REGION_OVERLAP_ALERT_THRESHOLD = 0.5
 # option that removes a tool from the model's context.
 #
 # This list is deliberately conservative. Scraping is NOT a deterministic problem — see the
-# "Scrape Job Postings" use case in CLAUDE.md — so anything the model might need to get past a
+# "Scrape Job Postings" use case in docs/requirements.md — so anything the model might need to get past a
 # changing page, a consent dialog, a login wall, or a bot check stays available. Measured on a
 # live LinkedIn search-results page:
 #   - browser_evaluate is REQUIRED: scrolling the inner results container lazy-loads more
@@ -198,7 +198,7 @@ REGION_OVERLAP_ALERT_THRESHOLD = 0.5
 #     working scroll. Removing it silently cuts discovery.
 #   - browser_click is REQUIRED: the filter chips (location, date posted, experience level) are
 #     clicked to apply a search's filters. Nothing in the RESULTS LIST is ever clicked — the only
-#     real <button> in a result card is Dismiss (see CLAUDE.md, Account safety).
+#     real <button> in a result card is Dismiss (see docs/requirements.md, Account safety).
 #   - Kept for obstacle handling even though unused in the happy path: fill_form, type, hover,
 #     select_option, handle_dialog, console_messages.
 #   - Kept for diagnosing and working around a changed or hostile page: take_screenshot (the
@@ -291,8 +291,8 @@ REFERENCE_SUMMARY_MAX_CHARS = 2500
 #
 # The prompt was the symptom; the silent upgrade is the defect. This package is the tool surface
 # the Stage 1b scraper drives a REAL logged-in LinkedIn account through, and the --snapshot-mode
-# analysis in CLAUDE.md is verified against one specific bundle. `@latest` could invalidate that
-# with no commit — the same shape as the `mcp>=1.29` -> 2.0.0 re-resolution in Known diagnoses.
+# analysis in docs/diagnoses/2026-08-21-stage-1b-cost.md is verified against one specific bundle. `@latest` could invalidate that
+# with no commit — the same shape as the `mcp>=1.29` -> 2.0.0 re-resolution recorded in that same diagnosis.
 #
 # Upgrading is therefore a reviewable edit to this constant, prompted for by
 # check_playwright_mcp_version() rather than taken automatically.

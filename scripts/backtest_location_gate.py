@@ -4,7 +4,7 @@ Why this is a tracked script and not a scratchpad one-off
 --------------------------------------------------------
 The gate turns a stated preference into an unappealable auto-reject, and the geography behind it
 comes from a model. Both can drift: the classifier model changes, or the region policy does. The
-triage-model swap left the same lesson in CLAUDE.md — *"Re-run that comparison before swapping this
+triage-model swap left the same lesson in docs/diagnoses/2026-08-25-local-model-tag-disappeared.md — *"Re-run that comparison before swapping this
 model again"* — after 17 real postings were what proved `granite4.1:3b` had no false rejects. This
 is that comparison for the location gate.
 
@@ -96,7 +96,7 @@ async def main() -> int:
 
     logging.basicConfig(level=logging.WARNING, format='%(levelname)s %(message)s')
 
-    if not (preferences.excluded_locations() or preferences.rejected_regions()):
+    if not (preferences.would_not_live_here() or preferences.would_not_live_here()):
         print('locations.exclude and locations.reject_regions are both empty — the gate is inert.')
         print('Nothing to backtest. Configure them in run_dir/preferences.yaml first.')
         return 1
@@ -111,9 +111,9 @@ async def main() -> int:
     sample = postings if (args.all or args.match) else spread(postings, args.limit)
 
     print(f'Replaying {len(sample)} of {len(postings)} saved postings through the location gate.')
-    print(f'  reject_regions: {list(preferences.rejected_regions())}')
-    print(f'  exclude:        {list(preferences.excluded_locations())}')
-    print(f'  exempt:         {list(preferences.hybrid_acceptable_locations())[:6]}...\n')
+    print(f'  would_not_live_here: {list(preferences.would_not_live_here())}')
+    print(f'  exclude:        {list(preferences.would_not_live_here())}')
+    print(f'  exempt:         {list(preferences.would_commute_here())[:6]}...\n')
 
     rejected = kept = failed_open = 0
     to_reject: list[dict] = []
@@ -195,18 +195,18 @@ async def _legacy_rejected_location(text: str) -> str:
     haystack = ' '.join(str(text or '').split()).lower()
     if not haystack:
         return ''
-    if not (preferences.excluded_locations() or preferences.rejected_regions()):
+    if not (preferences.would_not_live_here() or preferences.would_not_live_here()):
         return ''
     # `.lower()` on the TOKENS as well as the haystack. The old lists were stored lowercase; the
     # migrated ones are proper names. Without folding them here the baseline stops reproducing the
     # world it exists to reproduce -- 'Roma' does not appear in 'romania (remote within country)',
     # so the very exemption this whole change was made to remove would look like it never existed.
-    if any(token.lower() in haystack for token in preferences.hybrid_acceptable_locations()):
+    if any(token.lower() in haystack for token in preferences.would_commute_here()):
         return ''
-    for token in preferences.excluded_locations():
+    for token in preferences.would_not_live_here():
         if token.lower() in haystack:
             return token
-    unwanted = preferences.rejected_regions()
+    unwanted = preferences.would_not_live_here()
     facts = await classify_location(haystack)
     if facts.get('broad_area'):
         return ''
