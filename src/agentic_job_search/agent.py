@@ -40,6 +40,7 @@ from agentic_job_search.config import (
     PLAYWRIGHT_MCP_REGISTRY_URL,
     PLAYWRIGHT_MCP_VERSION,
     PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
+    RATING_AUTO_REJECT,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_INTER_QUERY_DELAY_SECONDS,
     SCRAPER_DATE_POSTED_LABEL,
@@ -56,6 +57,7 @@ from agentic_job_search.config import (
     REFERENCE_SUMMARY_MAX_CHARS,
     THINKING_MAX_CHARS,
     TRIAGE_ENABLED,
+    should_notify_based_on_rating,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
 from agentic_job_search import location
@@ -1124,7 +1126,7 @@ def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
     num_evaluated = len(new_jobs)
     num_high_rated = sum(
         1 for f in new_jobs
-        if (m := _RATING_RE.search(f.name)) and int(m.group(1)) >= 4
+        if (m := _RATING_RE.search(f.name)) and should_notify_based_on_rating(int(m.group(1)))
     )
     return num_evaluated, num_high_rated
 
@@ -2439,7 +2441,7 @@ def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
     """Deterministic post-rating ceilings. Returns (rating, reason) — reason is '' if uncapped.
 
     A cap is not a rejection: the job is still saved and still appears in the audit log, it just
-    never crosses the >=4 notification threshold. This backstops the evaluator prompt, which has
+    never crosses the RATING_NOTIFICATION_THRESHOLD (should_notify_based_on_rating). This backstops the evaluator prompt, which has
     demonstrably rated a hybrid role in an unacceptable location 4/5 while naming the hybrid
     location as a drawback in its own reasoning — and, on the Valtech posting, rated a
     French-language JD 4/5 after silently translating it into English while condensing.
@@ -2643,7 +2645,7 @@ async def _save_and_notify(
         company=candidate['company'], description=summary, rating=rating,
         content=content, job_id=candidate['job_id'],
     )
-    if notify and rating >= 4:
+    if notify and should_notify_based_on_rating(rating):
         await _send_pipeline_notification(
             format_job_notification(candidate, extract or {}, rating, pros or [], warnings or [])
         )
@@ -2783,7 +2785,7 @@ async def evaluate_all_candidates(
                         f"{candidate['title']}: hiring company {end_client!r} matches {matched_pdf}"
                     )
                     await _save_and_notify(
-                        candidate, rating=1,
+                        candidate, rating=RATING_AUTO_REJECT,
                         summary=f"already applied to end client {end_client}",
                         content=(
                             f"# Already applied — posted by {candidate['company']} on behalf of "
@@ -2792,7 +2794,7 @@ async def evaluate_all_candidates(
                         notify=False,
                     )
                     tools_module.record_job_outcome(
-                        candidate['site'], candidate['job_id'], 'already_applied', rating=1,
+                        candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
                         summary=f'end client {end_client} already applied to',
                     )
                     continue
@@ -2802,11 +2804,11 @@ async def evaluate_all_candidates(
                 bump(_hard_rule_category(hard_rule_reason))
                 logger.info(f"Hard rule: {candidate['company']} — {candidate['title']}: rated 1 ({hard_rule_reason})")
                 await _save_and_notify(
-                    candidate, rating=1, summary=f"auto rejected {hard_rule_reason}",
-                    content=f"# Auto-rated 1 — {hard_rule_reason}\n\n{extract_text}", notify=False,
+                    candidate, rating=RATING_AUTO_REJECT, summary=f"auto rejected {hard_rule_reason}",
+                    content=f"# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}", notify=False,
                 )
                 tools_module.record_job_outcome(
-                    candidate['site'], candidate['job_id'], 'hard_ruled', rating=1, summary=hard_rule_reason
+                    candidate['site'], candidate['job_id'], 'hard_ruled', rating=RATING_AUTO_REJECT, summary=hard_rule_reason
                 )
                 await audit_gate(candidate, extract_text, 'hard_rule', hard_rule_reason)
                 continue
@@ -2863,7 +2865,7 @@ async def evaluate_all_candidates(
             # the saved file and the audit entry are all unchanged, and it fails open.
             is_agency = derive_agency_posting(extract)
             repost = None
-            if rating >= 4 and is_agency:
+            if should_notify_based_on_rating(rating) and is_agency:
                 repost = await tools_module.recruiter_repost_of(
                     candidate, extract, stage_stats['recruiter_repost']
                 )
@@ -2899,7 +2901,7 @@ async def evaluate_all_candidates(
             )
             # Only what was actually SENT is recorded: a role first rated 3 never reached the user,
             # so a later repost of it that rates 4 must still notify.
-            if rating >= 4 and is_agency and not repost:
+            if should_notify_based_on_rating(rating) and is_agency and not repost:
                 tools_module.record_recruiter_notification(candidate, extract)
         except Exception as ex:
             bump('eval_error')
@@ -2953,7 +2955,7 @@ async def audit_unsurfaced_with_opus(
 ) -> list[dict]:
     """Sample jobs the pipeline never surfaced and re-rate them with Opus.
 
-    Three pools (filtered at Stage 1, seen but never queued, mid-rated 2-3). A high Opus
+    Three pools (filtered at Stage 1, seen but never queued, mid-rated per is_mid_rated). A high Opus
     rating on any of them is a FALSE NEGATIVE: a job the funnel should have delivered.
     Diagnostic only — nothing is saved or notified.
     """
@@ -2982,7 +2984,7 @@ async def audit_unsurfaced_with_opus(
                 logger.warning(f'Opus audit failed for {record["company"]} — {record["title"]}: {ex}')
                 continue
 
-            verdict = 'FALSE NEGATIVE' if result['rating'] >= 4 else 'confirmed drop'
+            verdict = 'FALSE NEGATIVE' if should_notify_based_on_rating(result['rating']) else 'confirmed drop'
             findings.append({
                 'pool': pool_name, 'company': record['company'], 'title': record['title'],
                 'url': record['url'], 'opus_rating': result['rating'],

@@ -6,7 +6,7 @@ from utils_tools_n_agents_common.models import (
 
 # Job search parameters
 JOB_MAX_AGE_DAYS = 21
-JOB_STALE_AGE_DAYS = 30  # hard rule: postings older than this are auto-rated 1
+JOB_STALE_AGE_DAYS = 30  # hard rule: postings older than this are auto-rated RATING_AUTO_REJECT
 MAX_REFERENCE_JOBS = 20
 THINKING_MAX_CHARS = 1000
 # Applied-job corpus: only records applied to within this window feed query generation,
@@ -27,6 +27,38 @@ RECRUITER_REPOST_WINDOW_DAYS = 14
 # chars, and every prior carries a description capped at RECRUITER_DESCRIPTION_MAX_CHARS. A repost
 # is re-advertised within days of the original, so the newest few are the ones that can match.
 RECRUITER_REPOST_MAX_PRIORS = 8
+
+# Job-fit rating scale (1-5). The threshold and rejection rating are structural facts decided
+# in code, not model discretion points (docs/requirements.md, "A structural fact is decided
+# in code") — the predicates below are the only way call sites touch them.
+RATING_MIN = 1
+RATING_MAX = 5
+# Jobs at/above this rating reach the user (Telegram notification, high-rated count, recruiter-
+# repost checks, Opus-audit FALSE NEGATIVE verdicts). If this ever moves off 4, update the
+# "rated 4 or 5" prose in CLAUDE.md and docs/requirements.md to match.
+RATING_NOTIFICATION_THRESHOLD = 4
+# The rating recorded for every deterministic rejection (hard rules, already-applied): the job
+# is saved and audited, never notified.
+RATING_AUTO_REJECT = RATING_MIN
+# Surfaced but not acted on — the --audit-opus mid_rated pool. Derived from the two ratings it
+# sits between so it can never drift out of step with them.
+RATINGS_MID_RATED = frozenset(range(RATING_AUTO_REJECT + 1, RATING_NOTIFICATION_THRESHOLD))
+
+
+def should_notify_based_on_rating(rating: int) -> bool:
+    """True when a job at/above RATING_NOTIFICATION_THRESHOLD reaches the user."""
+    return rating >= RATING_NOTIFICATION_THRESHOLD
+
+
+def is_auto_reject_rating(rating: int) -> bool:
+    """True for the deterministic-rejection rating (hard rules, already-applied)."""
+    return rating == RATING_AUTO_REJECT
+
+
+def is_mid_rated(rating: int) -> bool:
+    """True when the job surfaced but was not acted on — the --audit-opus mid_rated pool."""
+    return rating in RATINGS_MID_RATED
+
 
 # NOTE: personal preferences — search regions, acceptable hybrid locations, the hybrid rating cap,
 # work-authorization/language/education gates, and target titles — deliberately do NOT live here.
