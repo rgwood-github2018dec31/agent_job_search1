@@ -29,6 +29,7 @@ from agentic_job_search.config import (
     UI_CONTRACT_ELEMENTS,
     UI_FINGERPRINT_FILENAME,
     UI_STRUCTURAL_CHIPS,
+    is_mid_rated,
 )
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 from agentic_job_search import location_review
@@ -1397,7 +1398,7 @@ def unsurfaced_pools(saved_ratings: dict[tuple[str, str], int] | None = None) ->
     Feeds --audit-opus. Three pools, matching the three ways a good job can go unseen:
       - filtered: dropped by check_and_record_job (too_old / already_applied / auth_required)
       - never_queued: check said 'new' but the scraper never called queue_candidate on it
-      - mid_rated: rated 2-3 by the normal rater, i.e. surfaced but not acted on
+      - mid_rated: rated in is_mid_rated (RATINGS_MID_RATED) by the normal rater, i.e. surfaced but not acted on
     """
     pools: dict[str, list[dict]] = {'filtered': [], 'never_queued': [], 'mid_rated': []}
     for record in _listing_records.values():
@@ -1405,7 +1406,7 @@ def unsurfaced_pools(saved_ratings: dict[tuple[str, str], int] | None = None) ->
             pools['filtered'].append(record)
         elif record['check_status'] == 'new' and not record['queued']:
             pools['never_queued'].append(record)
-        elif record['rating'] in (2, 3):
+        elif is_mid_rated(record['rating']):
             pools['mid_rated'].append(record)
     return pools
 

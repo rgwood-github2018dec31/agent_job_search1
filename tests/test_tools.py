@@ -2205,6 +2205,7 @@ def test_unsurfaced_pools_groups_by_drop_reason(monkeypatch):
         ('linkedin', '2'): _listing('2', 'Applied', status='already_applied', queued=False, outcome='already_applied'),
         ('linkedin', '3'): _listing('3', 'NeverQueued', status='new', queued=False, outcome='new'),
         ('linkedin', '4'): _listing('4', 'MidRated', status='new', queued=True, rating=3),
+        ('linkedin', '4b'): _listing('4b', 'MidRated2', status='new', queued=True, rating=2),
         ('linkedin', '5'): _listing('5', 'GoodJob', status='new', queued=True, rating=5),
         ('linkedin', '6'): _listing('6', 'Dupe', status='already_processed', queued=False, outcome='already_processed'),
     })
@@ -2212,8 +2213,43 @@ def test_unsurfaced_pools_groups_by_drop_reason(monkeypatch):
 
     assert {r['company'] for r in pools['filtered']} == {'TooOld', 'Applied'}
     assert {r['company'] for r in pools['never_queued']} == {'NeverQueued'}
-    assert {r['company'] for r in pools['mid_rated']} == {'MidRated'}
+    assert {r['company'] for r in pools['mid_rated']} == {'MidRated', 'MidRated2'}
     assert 'GoodJob' not in {r['company'] for pool in pools.values() for r in pool}
+
+
+# ---------------------------------------------------------------------------
+# rating thresholds (config constants + predicates)
+# ---------------------------------------------------------------------------
+
+def test_should_notify_based_on_rating_boundary():
+    assert not config.should_notify_based_on_rating(config.RATING_NOTIFICATION_THRESHOLD - 1)
+    assert config.should_notify_based_on_rating(config.RATING_NOTIFICATION_THRESHOLD)
+    assert config.should_notify_based_on_rating(config.RATING_MAX)
+    assert not config.should_notify_based_on_rating(config.RATING_AUTO_REJECT)
+
+
+def test_is_auto_reject_rating_boundary():
+    assert config.is_auto_reject_rating(config.RATING_AUTO_REJECT)
+    assert not config.is_auto_reject_rating(config.RATING_AUTO_REJECT + 1)
+    assert not config.is_auto_reject_rating(config.RATING_NOTIFICATION_THRESHOLD)
+
+
+def test_is_mid_rated_boundary():
+    assert config.is_mid_rated(config.RATING_AUTO_REJECT + 1)
+    assert config.is_mid_rated(config.RATING_NOTIFICATION_THRESHOLD - 1)
+    assert not config.is_mid_rated(config.RATING_AUTO_REJECT)
+    assert not config.is_mid_rated(config.RATING_NOTIFICATION_THRESHOLD)
+    assert not config.is_mid_rated(0)
+    assert not config.is_mid_rated(config.RATING_MAX + 1)
+
+
+def test_ratings_mid_rated_derived_from_thresholds():
+    # The band must be exactly the ratings between the two threshold constants: if either
+    # threshold moves and the derivation was replaced by a literal, this fails loudly.
+    assert config.RATINGS_MID_RATED == frozenset(
+        range(config.RATING_AUTO_REJECT + 1, config.RATING_NOTIFICATION_THRESHOLD)
+    )
+    assert config.RATINGS_MID_RATED == frozenset({2, 3})
 
 
 def test_write_run_audit_log_covers_all_four_sections(tmp_path, monkeypatch):
