@@ -17,6 +17,16 @@ APPLIED_JOBS_HORIZON_DAYS = 90
 # "never show me this company" decision goes stale — six months on, the reason for it may not
 # hold any more — so the entry lapses and is reported rather than silently outliving its reason.
 COMPANY_BLACKLIST_EXPIRY_DAYS = 180
+# Recruiter reposts: how far back to look for an already-notified posting from the SAME agency
+# before deciding a new one is the same role. Agencies re-advertise one role under a new LinkedIn
+# job id every few days with a different country and day rate — six notifications for one pharma
+# role between 2026-09-02 and 09-10 — and each new id defeats (site, job_id) deduplication.
+RECRUITER_REPOST_WINDOW_DAYS = 14
+# ...and how many of those postings the judgement call is shown, newest first. An agency that posts
+# daily would otherwise grow the prompt without bound: measured at 7 priors the prompt is ~9.7K
+# chars, and every prior carries a description capped at RECRUITER_DESCRIPTION_MAX_CHARS. A repost
+# is re-advertised within days of the original, so the newest few are the ones that can match.
+RECRUITER_REPOST_MAX_PRIORS = 8
 
 # NOTE: personal preferences — search regions, acceptable hybrid locations, the hybrid rating cap,
 # work-authorization/language/education gates, and target titles — deliberately do NOT live here.

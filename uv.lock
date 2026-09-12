@@ -844,11 +844,18 @@ wheels = [
 name = "utils-tools-n-agents-common"
 version = "0.1.0"
 source = { editable = "../utils_tools_n_agents_common" }
+dependencies = [
+    { name = "httpx" },
+]
 
 [package.metadata]
+requires-dist = [{ name = "httpx", specifier = ">=0.28" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.3" }]
+dev = [
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+]
 
 [[package]]
 name = "uvicorn"

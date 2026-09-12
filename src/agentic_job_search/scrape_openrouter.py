@@ -28,7 +28,8 @@ from agentic_job_search.config import (
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     UI_BLOCK_SIGNATURES,
 )
-from agentic_job_search.triage import call_mcp_tool, http_status_of, provider_error
+from agentic_job_search.triage import http_status_of, provider_error
+from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +110,15 @@ def _guard_call(name: str, args: dict) -> str | None:
     return None
 
 
-def browser_tool_defs(mcp_tools: list) -> list[dict]:
-    """Convert the Playwright server's own schemas into OpenAI-style function definitions."""
+def browser_tool_defs(mcp_tools: list[dict]) -> list[dict]:
+    """Convert the Playwright server's own schemas (mcp_client.list_tools dicts:
+    name / description / inputSchema) into OpenAI-style function definitions."""
     disallowed = {t.replace('mcp__playwright__', '') for t in SCRAPER_DISALLOWED_BROWSER_TOOLS}
     return [
         {'type': 'function', 'function': {
-            'name': t.name, 'description': (t.description or '')[:1024],
-            'parameters': t.inputSchema or {'type': 'object', 'properties': {}}}}
-        for t in mcp_tools if t.name not in disallowed
+            'name': t['name'], 'description': (t['description'] or '')[:1024],
+            'parameters': t['inputSchema'] or {'type': 'object', 'properties': {}}}}
+        for t in mcp_tools if t['name'] not in disallowed
     ]
 
 

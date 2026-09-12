@@ -1,19 +1,20 @@
-"""Cheap-LLM helpers for Stage 2: MCP tool-server client, local triage, and
-non-Anthropic rating calls.
+"""Cheap-LLM helpers for Stage 2: local triage, and non-Anthropic rating calls.
 
 OpenRouter and local Ollama models are reached through the pre-existing FastMCP
 HTTP tool servers (tools_llm_remote_openrouter on :8006, tools_llm_local on
 :8002), not through their raw HTTP APIs. A server that is down raises, and
 callers treat that as a provider failure (fall through / fail open).
+
+The generic MCP client (`call_mcp_tool`, `mcp_session`, `unwrap_exception`)
+lives in utils_tools_n_agents_common.mcp_client, shared with agent_meta1 and
+agent_stock_trends1.
 """
 
 import json
 import logging
 import re
-from contextlib import asynccontextmanager
 
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
 
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
@@ -99,74 +100,6 @@ class LocalModelMissingError(RuntimeError):
     Distinct from the server being down: that is the fail-open case this module is designed
     around, while this is a misconfiguration that silently disables triage on every job.
     """
-
-
-def unwrap_exception(ex: BaseException) -> str:
-    """Flatten an exception's real messages out of any ExceptionGroup / __cause__ nesting.
-
-    Every MCP failure in this codebase arrives wrapped: `streamable_http_client` and
-    `ClientSession` each open an anyio task group, so a RuntimeError raised inside `call()`
-    surfaces to the caller as an ExceptionGroup whose str() is the useless
-    "unhandled errors in a TaskGroup (1 sub-exception)". Logging `ex` directly therefore
-    discards the only informative text there is - which is exactly how
-    `model 'qwen3.6:latest' not found` stayed invisible across ten runs and 250+ warnings.
-    """
-    messages: list[str] = []
-    seen: set[int] = set()
-
-    def walk(err: BaseException | None) -> None:
-        if err is None or id(err) in seen:
-            return
-        seen.add(id(err))
-        children = getattr(err, 'exceptions', None)
-        if children:
-            for child in children:
-                walk(child)
-        else:
-            text = str(err).strip()
-            messages.append(f'{type(err).__name__}: {text}' if text else type(err).__name__)
-        walk(err.__cause__)
-        walk(err.__context__)
-
-    walk(ex)
-    return ' | '.join(messages) if messages else repr(ex)
-
-
-@asynccontextmanager
-async def mcp_session(url: str):
-    """Open one MCP session and yield a call(tool_name, args) -> str function.
-
-    Use this when consecutive tool calls must share server-side state (e.g. the
-    Playwright browser tab persists within a session, not across sessions)."""
-    async with streamable_http_client(url) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-
-            async def call(tool_name: str, args: dict) -> str:
-                result = await session.call_tool(tool_name, args)
-                texts = [c.text for c in result.content if getattr(c, 'text', None)]
-                joined = '\n'.join(texts)
-                if getattr(result, 'isError', False):
-                    raise RuntimeError(f'MCP tool {tool_name!r} at {url} returned an error: {joined[:500]}')
-                return joined
-
-            async def list_tools() -> list:
-                """The server's own tool schemas.
-
-                Used to build the OpenAI-style function definitions for the non-Anthropic loops, so
-                the schemas come from the running server instead of being transcribed by hand into a
-                constant that nothing keeps in sync when the server changes.
-                """
-                return list((await session.list_tools()).tools)
-
-            call.list_tools = list_tools
-            yield call
-
-
-async def call_mcp_tool(url: str, tool_name: str, args: dict) -> str:
-    """Call a single tool on a streamable-HTTP MCP server and return its text content."""
-    async with mcp_session(url) as call:
-        return await call(tool_name, args)
 
 
 def extract_json_object(text: str) -> dict:

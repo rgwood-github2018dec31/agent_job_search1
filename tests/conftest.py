@@ -296,6 +296,17 @@ def _isolated_location_recommendations(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_recruiter_notifications(monkeypatch, tmp_path):
+    """No test may read or write the developer's real run_dir/recruiter_notifications.yaml.
+
+    Autouse for the same reason as the two fixtures above: a test that forgot would decide whether
+    a real posting is a repost from whatever happens to be on this machine, and a test that RECORDS
+    would append to it. Both directions are silent.
+    """
+    monkeypatch.setattr(tools, 'RECRUITER_NOTIFICATIONS_PATH', tmp_path / 'recruiter_notifications.yaml')
+
+
+@pytest.fixture(autouse=True)
 def _reset_scraper_run_state(monkeypatch):
     """Clear Stage 1b module state that run_scraper writes, so tests cannot leak into each other.
 

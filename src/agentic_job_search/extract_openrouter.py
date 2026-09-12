@@ -17,7 +17,7 @@ from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_EXTRACTOR,
 )
-from agentic_job_search.triage import call_mcp_tool, mcp_session
+from utils_tools_n_agents_common.mcp_client import call_mcp_tool, mcp_session
 
 logger = logging.getLogger(__name__)
 

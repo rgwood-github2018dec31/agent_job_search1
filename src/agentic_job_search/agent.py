@@ -79,18 +79,20 @@ from agentic_job_search.tools_generic import (
 )
 from agentic_job_search.triage import (
     ProviderUnavailableError,
-    call_mcp_tool,
     chat_openrouter,
     extract_json_object,
     generate_local,
-    mcp_session,
     preflight_local_model,
     rate_with_ollama,
     rate_with_openrouter,
     triage_job_fit,
     triage_rejects,
+)
+from utils_tools_n_agents_common.mcp_client import (
+    mcp_session,
     unwrap_exception,
 )
+from utils_tools_n_agents_common.telegram_client import send_message as telegram_send_message
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -123,13 +125,12 @@ logger = logging.getLogger(__name__)
 BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
 # Playwright MCP snapshot/screenshot output — kept out of the repo tree
 PLAYWRIGHT_OUTPUT_DIR = Path(tempfile.gettempdir()) / 'linkedin-agent-playwright-output'
-TELEGRAM_MCP_URL = 'http://localhost:8004/mcp'
 REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
 
 
 async def _send_pipeline_notification(text: str) -> None:
     try:
-        await call_mcp_tool(TELEGRAM_MCP_URL, 'send_message', {'text': text})
+        await telegram_send_message(text)
     except Exception as ex:
         console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
 
@@ -2030,9 +2031,11 @@ def derive_agency_posting(extract: dict) -> bool:
     which is a judgement and not a gap. Only when it is None do we fall back to scanning, so a
     model that looked at the page and said "no" is never overridden by a regex.
 
-    Conservative by design, but the cost of being wrong is asymmetric and small: this drives a
-    WARNING only. It never rejects a job and never changes a rating (see the Rating hard rules
-    requirement in docs/requirements.md) — so a false positive is a stray bullet in a notification, not a lost job.
+    Conservative by design, but the cost of being wrong is asymmetric and small: it never rejects a
+    job and never changes a rating (see the Rating hard rules requirement in docs/requirements.md).
+    It drives a WARNING, and it gates the repost check that can withhold a REPEAT notification for a
+    role already sent — so a false positive costs a stray bullet, or at worst one duplicate
+    notification not being suppressed, never a lost job.
     """
     explicit = extract.get('is_agency')
     if explicit is not None:
@@ -2537,6 +2540,21 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     return warnings
 
 
+def repost_warning(repost: dict) -> str:
+    """The warning naming the earlier posting a suppressed repost re-advertises.
+
+    Built in code, like every other deterministic warning, and written into the saved job as well as
+    the audit log: a notification that never arrives is invisible, so the reason it did not has to
+    be somewhere the user can find it later.
+    """
+    context = ', '.join(str(repost.get(k) or '').strip() for k in ('notified', 'location', 'salary') if repost.get(k))
+    return (
+        f"Likely repost of job {repost.get('job_id', '')}"
+        + (f' (notified {context})' if context else '')
+        + ' — not notified again'
+    )
+
+
 def merge_warnings(deterministic: list[str], llm_warnings: list[str]) -> list[str]:
     """Deterministic warnings first, then the rater's, dropping case-insensitive duplicates."""
     merged: list[str] = []
@@ -2753,8 +2771,9 @@ async def evaluate_all_candidates(
             # Deliberately NOT extended to the agency's own name: applying once through a staffing
             # firm must never suppress every other company it posts for. That is the whole reason
             # load_applied_jobs() keeps agency names out of _applied_companies
-            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status also
-            # never changes the rating and never rejects on its own.
+            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status still
+            # never changes the rating and never rejects on its own; the one thing it now gates is a
+            # REPEAT notification for a role already sent (see recruiter_repost_of below).
             end_client = derive_end_client(extract)
             if end_client:
                 if matched_pdf := await tools_module.company_matches_applied(end_client):
@@ -2835,8 +2854,30 @@ async def evaluate_all_candidates(
                 f"{rating}/5 via {MODEL_NAME_RATING}{triage_note} — {result['reasoning']}"
             )
             pros = [str(p) for p in (result.get('pros') or [])]
+            deterministic = build_deterministic_warnings(candidate, extract)
+
+            # A recruiter re-advertising ONE role under a new job id defeats (site, job_id) dedup,
+            # which is how six notifications for one pharma programme arrived in nine days
+            # (2026-09-10). Checked only when a notification is about to fire, and only for agency
+            # postings, so it is free on every other job. It withholds the MESSAGE only: the rating,
+            # the saved file and the audit entry are all unchanged, and it fails open.
+            is_agency = derive_agency_posting(extract)
+            repost = None
+            if rating >= 4 and is_agency:
+                repost = await tools_module.recruiter_repost_of(
+                    candidate, extract, stage_stats['recruiter_repost']
+                )
+            if repost:
+                bump('recruiter_repost_suppressed')
+                logger.info(
+                    f"Recruiter repost: {candidate['company']} — {candidate['title']}: rated "
+                    f"{rating}/5 but NOT notified — same role as job {repost.get('job_id')} "
+                    f"notified {repost.get('notified')} ({repost.get('reason') or 'no reason given'})"
+                )
+                deterministic.insert(0, repost_warning(repost))
+
             warnings = merge_warnings(
-                build_deterministic_warnings(candidate, extract),
+                deterministic,
                 [str(w) for w in (result.get('warnings') or [])],
             )
             content = (
@@ -2849,13 +2890,17 @@ async def evaluate_all_candidates(
                 + f"\n{extract_text}"
             )
             tools_module.record_job_outcome(
-                candidate['site'], candidate['job_id'], 'rated',
+                candidate['site'], candidate['job_id'], 'recruiter_repost' if repost else 'rated',
                 rating=rating, summary=result['reasoning'],
             )
             await _save_and_notify(
                 candidate, rating=rating, summary=result['summary'], content=content,
-                extract=extract, pros=pros, warnings=warnings,
+                extract=extract, pros=pros, warnings=warnings, notify=not repost,
             )
+            # Only what was actually SENT is recorded: a role first rated 3 never reached the user,
+            # so a later repost of it that rates 4 must still notify.
+            if rating >= 4 and is_agency and not repost:
+                tools_module.record_recruiter_notification(candidate, extract)
         except Exception as ex:
             bump('eval_error')
             tools_module.record_job_outcome(
@@ -3174,6 +3219,8 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         "extraction": new_stage_stats(),
         "rating": new_stage_stats(),
         "location_review": new_stage_stats(),
+        # $0.0000 on a run where no agency posted twice, which is most of them.
+        "recruiter_repost": new_stage_stats(),
     }
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 

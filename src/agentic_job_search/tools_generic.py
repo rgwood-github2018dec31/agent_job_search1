@@ -19,6 +19,8 @@ from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
+    RECRUITER_REPOST_MAX_PRIORS,
+    RECRUITER_REPOST_WINDOW_DAYS,
     SCRAPER_DATE_POSTED_LABEL,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_DATE_POSTED_SECONDS,
@@ -32,6 +34,7 @@ from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_f
 from agentic_job_search import location_review
 import agentic_job_search.preferences as preferences
 from agentic_job_search.triage import chat_openrouter, extract_json_object
+from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
@@ -458,6 +461,282 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
 
     logger.info(f'Blacklisted company confirmed: {candidate!r} ({label})')
     return label
+
+
+# ---------------------------------------------------------------------------
+# Recruiter reposts: one role advertised under many job ids
+# ---------------------------------------------------------------------------
+#
+# An agency re-advertises one role every few days under a new LinkedIn job id, a different country
+# and a different day rate. `(site, job_id)` dedup cannot see it, the already-applied blocklist
+# deliberately never holds agency names (applying once through a staffing firm must not suppress
+# every other company it posts for), and the end client is usually anonymised — so one pharma
+# programme produced SIX notifications between 2026-09-02 and 09-10.
+#
+# Text matching was measured and rejected. The extractor REWRITES each description as it condenses,
+# so word-shingle containment across those six postings ran 0.62-0.86 for three of them and ~0.0 for
+# the other three, while unrelated repostings by direct employers (Datadog, Pipedrive) scored 0.7+.
+# No threshold separates the two cases.
+#
+# So: a free deterministic gate (same agency, notified inside the window), then at most one cheap
+# LLM call that picks a prior job_id out of a list it was shown. It withholds a NOTIFICATION only —
+# the job is still rated, saved and audited — and it fails open, because a duplicate ping costs a
+# glance while a missed one costs a real role.
+
+RECRUITER_NOTIFICATIONS_PATH = RUN_DIR / 'recruiter_notifications.yaml'
+RECRUITER_DESCRIPTION_MAX_CHARS = 1500
+
+_RECRUITER_NOTIFICATIONS_HEADER = (
+    '# Agency postings the user has been notified about, pruned to the last\n'
+    '# RECRUITER_REPOST_WINDOW_DAYS days. Used ONLY to decide whether a later posting by the same\n'
+    '# agency is the same role re-advertised, and so should not be notified a second time.\n'
+    '#\n'
+    '# Gates nothing else: no rating, no rejection. Rewritten by the agent; safe to delete.\n'
+)
+
+
+def _parse_iso_date(raw: Any) -> date | None:
+    """A `date` from an ISO string, or None. PyYAML already parses an unquoted date as a date."""
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    try:
+        return date.fromisoformat(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def load_recruiter_notifications(today: date | None = None) -> list[dict]:
+    """Notified agency postings still inside the repost window, newest first.
+
+    Fails open to an empty list on anything unreadable. Deliberately NOT the "skip, never rebuild"
+    treatment `location_recommendations.yaml` gets: that file holds decisions the user made by hand,
+    this one is rebuilt by the next notification — and an unreadable file must never be able to
+    suppress a notification.
+    """
+    if not RECRUITER_NOTIFICATIONS_PATH.exists():
+        return []
+    try:
+        loaded = yaml.safe_load(RECRUITER_NOTIFICATIONS_PATH.read_text(encoding='utf-8')) or []
+    except Exception as ex:
+        logger.warning(
+            f'Could not read {RECRUITER_NOTIFICATIONS_PATH} ({unwrap_exception(ex)}) — treating it '
+            f'as empty, so agency postings notify normally this run.'
+        )
+        return []
+    if not isinstance(loaded, list):
+        logger.warning(
+            f'{RECRUITER_NOTIFICATIONS_PATH} must contain a YAML list, got '
+            f'{type(loaded).__name__} — treating it as empty.'
+        )
+        return []
+
+    cutoff = (today or date.today()) - timedelta(days=RECRUITER_REPOST_WINDOW_DAYS)
+    fresh = [
+        entry for entry in loaded
+        if isinstance(entry, dict)
+        and (notified := _parse_iso_date(entry.get('notified'))) is not None
+        and notified >= cutoff
+    ]
+    fresh.sort(key=lambda e: str(e.get('notified') or ''), reverse=True)
+    return fresh
+
+
+def record_recruiter_notification(candidate: dict, extract: dict, today: date | None = None) -> dict:
+    """Record one notified agency posting so a later repost of it can be recognised.
+
+    Only postings actually NOTIFIED are recorded. A role first rated 3 was never sent to the user,
+    so a later repost that rates 4 must still notify.
+    """
+    agency = str(extract.get('company') or candidate.get('company') or '').strip()
+    job_id = str(candidate.get('job_id') or '')
+    entry = {
+        # The name as written: folding happens at the comparison, via `agency_key`.
+        'agency': agency,
+        'agency_key': _normalize_company(agency),
+        'job_id': job_id,
+        'title': str(extract.get('title') or candidate.get('title') or ''),
+        'location': str(extract.get('location') or ''),
+        'salary': str(extract.get('salary') or ''),
+        'end_client': str(extract.get('end_client') or ''),
+        'notified': (today or date.today()).isoformat(),
+        'description': str(extract.get('description') or '')[:RECRUITER_DESCRIPTION_MAX_CHARS],
+    }
+    entries = [e for e in load_recruiter_notifications(today=today) if str(e.get('job_id') or '') != job_id]
+    entries.insert(0, entry)
+    try:
+        RECRUITER_NOTIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RECRUITER_NOTIFICATIONS_PATH.write_text(
+            _RECRUITER_NOTIFICATIONS_HEADER
+            + yaml.safe_dump(entries, sort_keys=True, allow_unicode=True),
+            encoding='utf-8',
+        )
+    except OSError as ex:
+        logger.warning(f'Could not write {RECRUITER_NOTIFICATIONS_PATH}: {ex}')
+    return entry
+
+
+def _posting_block(posting: dict, header: str) -> str:
+    return '\n'.join([
+        header,
+        f"job_id: {posting.get('job_id', '')}",
+        f"title: {posting.get('title', '')}",
+        f"location: {posting.get('location', '')}",
+        f"salary: {posting.get('salary', '')}",
+        f"hiring company named in the posting: {posting.get('end_client') or '(not named)'}",
+        f"description: {posting.get('description', '')}",
+    ])
+
+
+def _repost_match_prompt(new_posting: dict, priors: list[dict]) -> str:
+    prior_blocks = '\n\n'.join(
+        _posting_block(p, f'--- PRIOR POSTING {i} ---') for i, p in enumerate(priors, start=1)
+    )
+    return (
+        'A recruitment agency posted the NEW job below. The same agency already advertised the '
+        'PRIOR jobs, and the user was notified about each of those.\n\n'
+        f"{_posting_block(new_posting, '--- NEW POSTING ---')}\n\n{prior_blocks}\n\n"
+        'Is the NEW posting the SAME ROLE as one of the prior postings — the same position at the '
+        'same hiring organization or programme, re-advertised? A different country, a different '
+        'day rate, or different wording in the title does NOT make it a different role: agencies '
+        'routinely re-post one role across several countries. A different position, a different '
+        'client, or a different programme DOES make it a different role.\n\n'
+        'Judge it on the BODY: the responsibilities, the requirements, the client named or '
+        'described, and concrete details such as a contact address, a rate, or a named programme. '
+        'Being posted by the same agency is NOT evidence — an aggregator advertises many unrelated '
+        'roles — and neither are adjacent job ids, a shared seniority level, or both postings '
+        'being remote AI engineering jobs.\n\n'
+        'If you are not sure, answer with an empty string. The two mistakes are not equal: a match '
+        'you miss costs one duplicate notification, while a match you invent hides a real job from '
+        'the user entirely.\n\n'
+        'Respond with ONLY a JSON object: {"same_as_job_id": "<the job_id of the matching PRIOR '
+        'POSTING above, copied exactly, or an empty string if none matches>", "reason": "<one '
+        'short sentence>"}'
+    )
+
+
+async def _repost_match_openrouter(prompt: str, stage_stats: dict | None) -> dict:
+    """Judge a repost via the OpenRouter MCP server. Raises on any failure."""
+    content, cost_usd = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
+    if stage_stats is not None:
+        stage_stats['cost'] += cost_usd
+    return extract_json_object(content)
+
+
+async def recruiter_repost_of(
+    candidate: dict, extract: dict, stage_stats: dict | None = None,
+) -> dict | None:
+    """The already-notified posting this one re-advertises, or None to notify normally.
+
+    Two steps, and the first is free: unless this agency already had a posting notified inside the
+    window, no LLM call is made at all — which is every job on essentially every run.
+
+    The model only ever picks a `job_id` out of the list it was shown, and an id that is not in that
+    list is treated as NO match (see the Anti-fabrication requirement): it chooses, it never
+    supplies. Everything else — the window, who is compared, and what happens on a match — is code.
+
+    Fails OPEN, the opposite of the blacklist confirmation above. A blacklist hit means a name the
+    user wrote down already matched, so an outage must not readmit it; here nothing has been
+    established except that the same agency posted before, and an outage must not silence a real
+    role.
+    """
+    agency = str(extract.get('company') or candidate.get('company') or '').strip()
+    if not agency:
+        return None
+    job_id = str(candidate.get('job_id') or '')
+    agency_key = _normalize_company(agency)
+    # Newest first (load_recruiter_notifications sorts), then capped: a repost follows its original
+    # within days, so the newest few are the ones that can match, and an agency posting daily must
+    # not grow this prompt without bound.
+    priors = [
+        e for e in load_recruiter_notifications()
+        if e.get('agency_key') == agency_key and str(e.get('job_id') or '') != job_id
+    ][:RECRUITER_REPOST_MAX_PRIORS]
+    if not priors:
+        return None
+
+    new_posting = {
+        'job_id': job_id,
+        'title': str(extract.get('title') or candidate.get('title') or ''),
+        'location': str(extract.get('location') or ''),
+        'salary': str(extract.get('salary') or ''),
+        'end_client': str(extract.get('end_client') or ''),
+        'description': str(extract.get('description') or '')[:RECRUITER_DESCRIPTION_MAX_CHARS],
+    }
+    prompt = _repost_match_prompt(new_posting, priors)
+    structured: dict | None = None
+
+    try:
+        if route_for(MODEL_NAME_COMPANY_MATCH) == 'openrouter':
+            try:
+                structured = await _repost_match_openrouter(prompt, stage_stats)
+            except Exception as ex:
+                logger.warning(
+                    f'Repost check via OpenRouter failed for {agency!r}, falling back to Anthropic: '
+                    f'{unwrap_exception(ex)}'
+                )
+
+        if structured is None:
+            options = ClaudeAgentOptions(
+                model=ANTHROPIC_MODEL_NAME_LOW,
+                tools=[],
+                permission_mode='bypassPermissions',
+                setting_sources=[],
+                strict_mcp_config=True,
+                skills=[],
+                output_format={
+                    'type': 'json_schema',
+                    'schema': {
+                        'type': 'object',
+                        'properties': {
+                            'same_as_job_id': {
+                                'type': 'string',
+                                'description': (
+                                    'job_id of the matching prior posting, copied exactly, or an '
+                                    'empty string if none matches'
+                                ),
+                            },
+                            'reason': {'type': 'string', 'description': 'One short sentence'},
+                        },
+                        'required': ['same_as_job_id', 'reason'],
+                    },
+                },
+                cwd=str(PROJECT_DIR),
+            )
+            async for msg in sdk_query(prompt=prompt, options=options):
+                if not isinstance(msg, ResultMessage):
+                    continue
+                _raise_if_result_error(msg, f'Repost check failed for {agency!r}')
+                if stage_stats is not None and msg.total_cost_usd:
+                    stage_stats['cost'] += msg.total_cost_usd
+                if msg.structured_output:
+                    structured = msg.structured_output
+    except Exception as ex:
+        logger.warning(
+            f'Repost check failed for {agency!r} job {job_id} ({unwrap_exception(ex)}) — '
+            f'notifying anyway.'
+        )
+        return None
+
+    if not structured:
+        logger.warning(
+            f'Repost check returned no structured output for {agency!r} job {job_id} — '
+            f'notifying anyway.'
+        )
+        return None
+
+    matched_id = str(structured.get('same_as_job_id') or '').strip()
+    if not matched_id:
+        return None
+    match = next((p for p in priors if str(p.get('job_id') or '') == matched_id), None)
+    if match is None:
+        logger.warning(
+            f'Repost check named job id {matched_id!r}, which is not one of the {len(priors)} '
+            f'prior {agency!r} posting(s) it was shown — treating as no match and notifying.'
+        )
+        return None
+    return {**match, 'reason': str(structured.get('reason') or '').strip()}
 
 
 async def _categorize_pdf_text(text: str, filename: str) -> str | None:

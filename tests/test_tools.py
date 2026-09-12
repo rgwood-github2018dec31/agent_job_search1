@@ -3832,6 +3832,350 @@ def test_direct_posting_does_not_get_a_redundant_hiring_company_line():
     assert 'Hiring company' not in agent.format_extract_text(_make_candidate(), extract)
 
 
+# ---------------------------------------------------------------------------
+# recruiter reposts: one role advertised under many job ids
+#
+# 2026-09-10: Archer Recruitment advertised ONE pharma programme under 6+ LinkedIn job ids in nine
+# days, each a different country and day rate, and every one rated 4-5 and notified. (site, job_id)
+# dedup cannot see it and the already-applied blocklist deliberately never holds agency names.
+#
+# Text similarity cannot catch it either: the extractor REWRITES each description, so three of the
+# six overlapped 0.62-0.86 by word shingles and the other three ~0.0, while unrelated repostings by
+# direct employers scored 0.7+. So the gate is "same agency, notified recently" in code, and then
+# one cheap LLM call that PICKS a prior job_id out of a list it was shown.
+# ---------------------------------------------------------------------------
+
+_PHARMA_DESCRIPTION = (
+    'Lead the delivery of agentic AI across a global manufacturing operation at one of the most '
+    'recognised healthcare and pharmaceutical organisations, as part of a multi-year technology '
+    'transformation programme. Python, LangGraph, LangChain, RAG, tool calling, human-in-the-loop.'
+)
+
+
+def _agency_extract(**overrides) -> dict:
+    base = {
+        'company': 'Archer Recruitment', 'is_agency': True, 'end_client': '',
+        'title': 'Lead Agentic AI Engineer', 'salary': '700-750 EUR/day',
+        'location': 'European Union (Remote)', 'description': _PHARMA_DESCRIPTION,
+        'workplace_type': 'remote',
+    }
+    base.update(overrides)
+    return _make_extract(**base)
+
+
+def _repost_llm(monkeypatch, same_as_job_id: str, reason: str = 'same pharma programme') -> list:
+    """Patch both providers to answer the same way. Returns the list of prompts actually sent.
+
+    A call COUNT rather than a raising stub, deliberately: `recruiter_repost_of` fails open, so a
+    stub that raised would be swallowed and a test asserting "no call was made" would pass whether
+    or not the call happened.
+    """
+    calls: list[str] = []
+    answer = {'same_as_job_id': same_as_job_id, 'reason': reason}
+
+    async def fake_openrouter(prompt, stage_stats):
+        calls.append(prompt)
+        return answer
+
+    monkeypatch.setattr(tools, '_repost_match_openrouter', fake_openrouter)
+    _make_sdk_mock(monkeypatch, answer)
+    return calls
+
+
+async def test_recruiter_repost_check_is_free_when_that_agency_has_no_recent_posting(monkeypatch):
+    """The gate that keeps this off every other job: another agency's posting costs no LLM call."""
+    calls = _repost_llm(monkeypatch, '111')
+    tools.record_recruiter_notification(
+        _make_candidate(job_id='111'), _agency_extract(company='Other Recruiters')
+    )
+    assert await tools.recruiter_repost_of(_make_candidate(job_id='222'), _agency_extract()) is None
+    assert calls == []
+
+
+async def test_recruiter_repost_matches_a_prior_posting_of_the_same_role(monkeypatch):
+    """The Archer case: one role, a new job id, a different country and a different day rate."""
+    _repost_llm(monkeypatch, '4464637425')
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
+    match = await tools.recruiter_repost_of(
+        _make_candidate(job_id='4465094319'),
+        _agency_extract(location='Netherlands (Remote)', salary='800-850 EUR/day'),
+    )
+    assert match is not None
+    assert match['job_id'] == '4464637425'
+    assert match['reason'] == 'same pharma programme'
+
+
+async def test_recruiter_repost_ignores_a_job_id_it_was_never_shown(monkeypatch):
+    """Anti-fabrication: the model CHOOSES from a list, so an id outside that list is no match."""
+    _repost_llm(monkeypatch, '9999999999')
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
+    assert await tools.recruiter_repost_of(
+        _make_candidate(job_id='4465094319'), _agency_extract()
+    ) is None
+
+
+async def test_recruiter_repost_fails_open_when_both_providers_fail(monkeypatch):
+    """Deliberately opposite to the blacklist: a duplicate ping costs a glance, a missed
+    notification costs a real role."""
+    async def boom_openrouter(prompt, stage_stats):
+        raise RuntimeError('tool server down')
+
+    async def boom_sdk(**kwargs):
+        raise RuntimeError('anthropic down')
+        yield  # pragma: no cover — make it an async generator
+
+    monkeypatch.setattr(tools, '_repost_match_openrouter', boom_openrouter)
+    monkeypatch.setattr(tools, 'sdk_query', boom_sdk)
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
+    assert await tools.recruiter_repost_of(
+        _make_candidate(job_id='4465094319'), _agency_extract()
+    ) is None
+
+
+async def test_recruiter_repost_ignores_a_prior_outside_the_window(monkeypatch):
+    calls = _repost_llm(monkeypatch, '111')
+    stale = date.today() - timedelta(days=config.RECRUITER_REPOST_WINDOW_DAYS + 1)
+    tools.record_recruiter_notification(_make_candidate(job_id='111'), _agency_extract(), today=stale)
+    assert tools.load_recruiter_notifications() == []
+    assert await tools.recruiter_repost_of(_make_candidate(job_id='222'), _agency_extract()) is None
+    assert calls == []
+
+
+async def test_recruiter_repost_matches_the_agency_across_name_variants(monkeypatch):
+    """Folding happens at the comparison; the stored name keeps the case it arrived with."""
+    _repost_llm(monkeypatch, '111')
+    tools.record_recruiter_notification(
+        _make_candidate(job_id='111'), _agency_extract(company='Archer Recruitment Ltd.')
+    )
+    assert tools.load_recruiter_notifications()[0]['agency'] == 'Archer Recruitment Ltd.'
+    match = await tools.recruiter_repost_of(
+        _make_candidate(job_id='222'), _agency_extract(company='Archer Recruitment')
+    )
+    assert match is not None and match['job_id'] == '111'
+
+
+async def test_recruiter_repost_compares_only_the_most_recent_priors(monkeypatch):
+    """An agency that posts daily would otherwise grow the prompt without bound."""
+    calls = _repost_llm(monkeypatch, '')
+    monkeypatch.setattr(tools, 'RECRUITER_REPOST_MAX_PRIORS', 2)
+    for name, days_ago in (('prior-oldest', 5), ('prior-middle', 3), ('prior-newest', 1)):
+        tools.record_recruiter_notification(
+            _make_candidate(job_id=name), _agency_extract(),
+            today=date.today() - timedelta(days=days_ago),
+        )
+
+    await tools.recruiter_repost_of(_make_candidate(job_id='new'), _agency_extract())
+
+    assert len(calls) == 1
+    prompt = calls[0]
+    assert 'prior-newest' in prompt and 'prior-middle' in prompt
+    assert 'prior-oldest' not in prompt
+
+
+def test_repost_prompt_says_what_is_not_evidence_and_which_way_to_err():
+    """Measured 2026-09-11: replayed over the real corpus, the first version of this prompt called
+    two unrelated roles from ONE aggregator the same role, reasoning from 'adjacent job IDs' and the
+    shared agency. A false match hides a real job, so the prompt names the non-evidence explicitly
+    and says which way to err."""
+    prompt = tools._repost_match_prompt({'job_id': 'new'}, [{'job_id': '1'}])
+    assert 'NOT evidence' in prompt
+    assert 'adjacent job ids' in prompt
+    assert 'If you are not sure, answer with an empty string.' in prompt
+
+
+def test_corrupt_recruiter_notifications_file_is_treated_as_empty():
+    """Fails open, unlike location_recommendations.yaml: this file holds no decision the user made
+    by hand, and an unreadable one must never be able to SUPPRESS a notification."""
+    tools.RECRUITER_NOTIFICATIONS_PATH.write_text('not: [valid', encoding='utf-8')
+    assert tools.load_recruiter_notifications() == []
+
+
+def test_recruiter_notification_record_fields():
+    entry = tools.record_recruiter_notification(
+        _make_candidate(job_id='4464637425'), _agency_extract()
+    )
+    assert entry['agency'] == 'Archer Recruitment'
+    assert entry['agency_key'] == 'archer recruitment'
+    assert entry['notified'] == date.today().isoformat()
+    assert len(entry['description']) <= tools.RECRUITER_DESCRIPTION_MAX_CHARS
+    assert tools.load_recruiter_notifications()[0]['job_id'] == '4464637425'
+
+
+def test_repost_warning_names_the_earlier_posting():
+    warning = agent.repost_warning({
+        'job_id': '4464637425', 'notified': '2026-09-09',
+        'location': 'European Union (Remote)', 'salary': '700-750 EUR/day',
+    })
+    assert '4464637425' in warning and '2026-09-09' in warning
+
+
+@pytest.mark.live
+async def test_recruiter_repost_judgement_live():
+    """The judgement itself, against the real model: same role reworded vs. a genuinely different one.
+
+    Synthetic postings on purpose — the saved corpus is personal, and what is under test is whether
+    the model can tell a re-advertised role from a different one by the same agency, which is the
+    whole reason this is not a similarity threshold.
+    """
+    tools.record_recruiter_notification(_make_candidate(job_id='1001'), _agency_extract())
+
+    same = await tools.recruiter_repost_of(
+        _make_candidate(job_id='1002'),
+        _agency_extract(
+            title='Senior Agentic AI Engineer',
+            location='Netherlands (Remote — anywhere in the EU)',
+            salary='800-850 EUR/day',
+            description=(
+                'Senior agentic AI engineer for a multi-year technology transformation at a global '
+                'healthcare and pharmaceutical manufacturer. Design multi-agent architectures in '
+                'Python using LangGraph and LangChain, with RAG, memory, tool calling and '
+                'human-in-the-loop, and own them through to production.'
+            ),
+        ),
+    )
+    assert same is not None and same['job_id'] == '1001', 'a reworded repost of one role'
+
+    different = await tools.recruiter_repost_of(
+        _make_candidate(job_id='1003'),
+        _agency_extract(
+            title='Embedded Firmware Engineer',
+            location='Dublin, Ireland (Hybrid)',
+            salary='75,000 EUR/yr',
+            description=(
+                'Embedded firmware engineer for a medical devices manufacturer. C and C++ on ARM '
+                'microcontrollers, RTOS scheduling, board bring-up and IEC 62304 compliance.'
+            ),
+        ),
+    )
+    assert different is None, 'a different role from the same agency'
+
+
+# --- the same thing end to end, through Stage 2 -----------------------------
+
+def _stage2_stats() -> dict:
+    return {k: agent.new_stage_stats() for k in ('extraction', 'rating', 'recruiter_repost')}
+
+
+def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, list]:
+    """Everything around the repost check stubbed: extraction, triage, rating, saving, Telegram."""
+    notifications: list[str] = []
+    saved: list[dict] = []
+
+    monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
+
+    async def fake_extract(candidate, url, stats, system_prompt):
+        return dict(extract)
+
+    async def fake_triage(extract_text, profile_block):
+        return None
+
+    async def fake_rate(evaluator_prompt, extract_text, stats):
+        return {
+            'rating': rating, 'reasoning': 'strong fit', 'summary': 'strong fit',
+            'title': extract['title'], 'company': extract['company'], 'pros': [], 'warnings': [],
+        }
+
+    async def fake_save(company, description, rating, content, job_id=None):
+        saved.append({'company': company, 'rating': rating, 'content': content, 'job_id': job_id})
+        return {}
+
+    async def fake_notify(text):
+        notifications.append(text)
+
+    monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_extract)
+    monkeypatch.setattr(agent, 'triage_job_fit', fake_triage)
+    monkeypatch.setattr(agent, 'rate_job', fake_rate)
+    monkeypatch.setattr(tools, 'do_save_job_posting', fake_save)
+    monkeypatch.setattr(agent, '_send_pipeline_notification', fake_notify)
+    return notifications, saved
+
+
+async def _run_stage2(candidate: dict, funnel: dict) -> None:
+    await agent.evaluate_all_candidates(
+        [candidate], {'type': 'http', 'url': 'http://localhost:1/mcp'},
+        'prompt', 'profile', _stage2_stats(), funnel=funnel,
+    )
+
+
+async def test_stage_2_notifies_and_records_a_first_agency_posting(monkeypatch):
+    calls = _repost_llm(monkeypatch, '')
+    notifications, saved = _stage2_stubs(monkeypatch, _agency_extract())
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='4464637425', company='Archer Recruitment'), funnel)
+
+    assert len(notifications) == 1
+    assert calls == [], 'nothing to compare against yet, so no LLM call'
+    assert tools.load_recruiter_notifications()[0]['job_id'] == '4464637425'
+    assert 'recruiter_repost_suppressed' not in funnel
+
+
+async def test_stage_2_suppresses_the_notification_for_a_recruiter_repost(monkeypatch):
+    _repost_llm(monkeypatch, '4464637425')
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
+    notifications, saved = _stage2_stubs(
+        monkeypatch, _agency_extract(location='Netherlands (Remote)', salary='800-850 EUR/day')
+    )
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), funnel)
+
+    assert notifications == []
+    assert funnel.get('recruiter_repost_suppressed') == 1
+    # A cap it is not: the rating, the saved file and the audit trail are untouched.
+    assert saved and saved[0]['rating'] == 5
+    assert 'Likely repost of job 4464637425' in saved[0]['content']
+    # The suppressed repost does NOT become the new reference point.
+    assert [e['job_id'] for e in tools.load_recruiter_notifications()] == ['4464637425']
+
+
+async def test_stage_2_does_not_check_a_direct_employer(monkeypatch):
+    """Only recruiters repost one role under many ids; a direct employer must never be compared."""
+    calls = _repost_llm(monkeypatch, '111')
+    tools.record_recruiter_notification(_make_candidate(job_id='111'), _agency_extract(company='Acme'))
+    notifications, _ = _stage2_stubs(
+        monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000')
+    )
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='222', company='Acme'), funnel)
+
+    assert calls == []
+    assert len(notifications) == 1
+
+
+async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypatch):
+    """The check exists to stop a duplicate MESSAGE, so a rating below the threshold never pays."""
+    calls = _repost_llm(monkeypatch, '4464637425')
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
+    notifications, _ = _stage2_stubs(monkeypatch, _agency_extract(), rating=3)
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), funnel)
+
+    assert calls == []
+    assert notifications == []
+
+
+async def test_stage_2_compares_against_a_posting_notified_earlier_in_the_same_run(monkeypatch):
+    """Both Sep 09 Archer postings arrived in one run, so within-run recording is load-bearing."""
+    _repost_llm(monkeypatch, '4464637425')
+    notifications, _ = _stage2_stubs(monkeypatch, _agency_extract())
+    funnel: dict = {}
+
+    await agent.evaluate_all_candidates(
+        [
+            _make_candidate(job_id='4464637425', company='Archer Recruitment'),
+            _make_candidate(job_id='4465094319', company='Archer Recruitment'),
+        ],
+        {'type': 'http', 'url': 'http://localhost:1/mcp'},
+        'prompt', 'profile', _stage2_stats(), funnel=funnel,
+    )
+
+    assert len(notifications) == 1, 'the second posting is the same role as the first'
+    assert funnel.get('recruiter_repost_suppressed') == 1
+
+
 def test_extract_text_surfaces_the_hiring_company():
     extract = _make_extract(company='CyberCoders', is_agency=True, end_client='Automotive Martech Inc')
     text = agent.format_extract_text(_make_candidate(), extract)
@@ -6265,12 +6609,11 @@ async def test_record_listings_returns_counts_not_job_data(monkeypatch, tmp_path
 
 
 def test_browser_tool_defs_drop_disallowed_and_keep_required():
-    class _T:
-        def __init__(self, name):
-            self.name, self.description, self.inputSchema = name, 'd', {'type': 'object'}
+    def _t(name):
+        return {'name': name, 'description': 'd', 'inputSchema': {'type': 'object'}}
     names = ['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_wait_for',
              'browser_evaluate', 'browser_close', 'browser_run_code_unsafe']
-    defs = scrape_openrouter.browser_tool_defs([_T(n) for n in names])
+    defs = scrape_openrouter.browser_tool_defs([_t(n) for n in names])
     exposed = {d['function']['name'] for d in defs}
     assert 'browser_close' not in exposed and 'browser_run_code_unsafe' not in exposed
     for required in config.SCRAPER_REQUIRED_BROWSER_TOOLS:

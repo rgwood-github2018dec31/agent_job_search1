@@ -76,7 +76,7 @@ python main.py
 ### Non-interactive
 Designed for periodic/scheduled runs (e.g. cron). The agent searches LinkedIn autonomously, rates all jobs, and sends Telegram notifications for any rated 4 or 5. `JOB_REQUIREMENTS.md` is read but never modified.
 
-Requires the `tools_telegram` MCP server to be running on port 8004 for job-match notifications. Pipeline summary/stats are sent directly via the Telegram Bot API regardless of whether the server is up.
+Requires the `tools_telegram` MCP server to be running on port 8004 for job-match notifications; a failed send warns and continues, never aborting the run. The send itself goes through the shared lib (`utils_tools_n_agents_common.telegram_client`), which speaks MCP to tools_telegram — no Bot API code in this repo.
 
 Stage 2 also uses two LLM MCP tool servers for cheap inference (reference summarization, triage, and optionally the rating call): `tools_llm_remote_openrouter` on port 8006 and `tools_llm_local` (Ollama) on port 8002. Both are optional — a down server is treated as a provider failure and the pipeline falls back (summary chain falls through to Anthropic; triage fails open).
 
@@ -119,7 +119,7 @@ main.py                           # Entry point
 src/agentic_job_search/
   agent.py                        # Orchestration, prompts, pipeline stages
   tools_generic.py                # Tool implementations and MCP server factories
-  triage.py                       # LLM MCP-server client, local triage, non-Anthropic rating calls
+  triage.py                       # Local triage and non-Anthropic rating calls (MCP client lives in utils_tools_n_agents_common)
   scrape_openrouter.py            # Stage 1b: OpenRouter function-calling scraper loop (default path)
   extract_openrouter.py           # OpenRouter function-calling agent loop for page extraction
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
@@ -128,6 +128,7 @@ src/agentic_job_search/
 scripts/
   migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
+  backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
 tests/
   test_tools.py                   # Unit tests for all tools
 docs/
@@ -142,6 +143,7 @@ run_dir/
   reference_summary_cache.yaml    # Cached distilled ideal-role profile (md5-keyed)
   location_cache.yaml             # Cached geography per location string (country/region/language)
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
+  recruiter_notifications.yaml    # Agency postings already notified (14 days); suppresses repost pings
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
