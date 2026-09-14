@@ -1682,7 +1682,7 @@ def _wire_openrouter_loop(monkeypatch, chat_responses: list, browser_calls: list
     """Wire fake chat responses and a browser-call recorder into the loop."""
     from contextlib import asynccontextmanager
 
-    async def fake_call_mcp_tool(url, tool_name, args):
+    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
         # Deep-copy: the loop mutates its messages list in place between calls
         chat_requests.append(json.loads(json.dumps(args)))
         return chat_responses.pop(0)
@@ -1806,7 +1806,7 @@ async def test_openrouter_loop_truncates_tool_results(monkeypatch):
         _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
     ]
 
-    async def fake_call_mcp_tool(url, tool_name, args):
+    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
         chat_requests.append(json.loads(json.dumps(args)))
         return responses.pop(0)
 
@@ -1911,7 +1911,7 @@ def test_unwrap_exception_follows_cause_chain():
 
 def _patch_mcp(monkeypatch, generate=None, list_models=None):
     """Stub call_mcp_tool, dispatching on tool name. Values may be strings or exceptions."""
-    async def fake_call(url, tool_name, args):
+    async def fake_call(url, tool_name, args, timeout_seconds=None):
         result = {'generate': generate, 'list_models': list_models}[tool_name]
         if isinstance(result, BaseException):
             raise result
@@ -5588,7 +5588,7 @@ async def test_chat_openrouter_sends_no_max_tokens_by_default(monkeypatch):
     former 3000 default was inherited by all eight call sites rather than chosen by any."""
     seen = {}
 
-    async def fake_call(url, tool, args):
+    async def fake_call(url, tool, args, timeout_seconds=None):
         seen.update(args)
         return json.dumps({'ok': True, 'content': '{"ok": 1}', 'finish_reason': 'stop', 'cost_usd': 0.001})
 
@@ -5601,7 +5601,7 @@ async def test_chat_openrouter_sends_no_max_tokens_by_default(monkeypatch):
 async def test_chat_openrouter_raises_a_named_error_on_a_length_finish(monkeypatch):
     """The real payload shape from run-2026-09-02_102421.log:304 — a company-match question that
     spent its entire budget on reasoning and returned null."""
-    async def fake_call(url, tool, args):
+    async def fake_call(url, tool, args, timeout_seconds=None):
         return json.dumps({
             'ok': True, 'content': None, 'tool_calls': None, 'finish_reason': 'length',
             'model': 'z-ai/glm-5.2',
@@ -5617,7 +5617,7 @@ async def test_chat_openrouter_raises_a_named_error_on_a_length_finish(monkeypat
 
 async def test_chat_openrouter_raises_on_truncated_non_empty_content(monkeypatch):
     """The case that used to reach the JSON parser disguised as a parse failure."""
-    async def fake_call(url, tool, args):
+    async def fake_call(url, tool, args, timeout_seconds=None):
         return json.dumps({
             'ok': True, 'content': _JOBGETHER_TRUNCATED, 'finish_reason': 'length',
             'model': 'z-ai/glm-5.3-flash', 'usage': {'completion_tokens': 3000},
@@ -6486,7 +6486,7 @@ def _run_with_chat_replies(monkeypatch, replies):
     """Drive ScrapeSession.run against canned chat replies; returns how many chat calls were made."""
     calls = []
 
-    async def fake_call_mcp_tool(url, tool_name, args):
+    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
         calls.append(tool_name)
         return replies[len(calls) - 1]
 
@@ -7212,3 +7212,31 @@ def test_every_python_module_is_tracked_by_git():
         f'  git add {" ".join(untracked)}\n'
         '(a .gitignore rule matching a source file looks identical here -- check that too)'
     )
+
+
+def test_llm_mcp_call_sites_pass_long_timeout():
+    """Every chat/generate call through call_mcp_tool must pass LLM_MCP_CALL_TIMEOUT_SECONDS.
+
+    The shared client's 30s default silently cut off healthy LLM calls on 2026-09-14 (4 of 6
+    queries lost). A site that falls back to the default fails here.
+    """
+    import ast
+
+    assert config.LLM_MCP_CALL_TIMEOUT_SECONDS >= 120
+    src_dir = Path(config.__file__).parent
+    llm_sites = []
+    missing = []
+    for path in src_dir.glob('*.py'):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.Call) and getattr(node.func, 'id', None) == 'call_mcp_tool'):
+                continue
+            if len(node.args) < 2 or not isinstance(node.args[1], ast.Constant):
+                continue
+            if node.args[1].value not in ('chat', 'generate'):
+                continue
+            llm_sites.append(f'{path.name}:{node.lineno}')
+            kw = {k.arg: k.value for k in node.keywords}
+            if getattr(kw.get('timeout_seconds'), 'id', None) != 'LLM_MCP_CALL_TIMEOUT_SECONDS':
+                missing.append(f'{path.name}:{node.lineno}')
+    assert len(llm_sites) >= 5, f'expected at least 5 LLM call_mcp_tool sites, found {llm_sites}'
+    assert not missing, f'LLM call_mcp_tool sites without timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS: {missing}'

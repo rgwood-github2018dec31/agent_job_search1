@@ -68,6 +68,12 @@ def is_mid_rated(rating: int) -> bool:
 # Local/remote LLM MCP tool servers (started via their scripts/start-tool-server.sh)
 LLM_LOCAL_MCP_URL = 'http://127.0.0.1:8002/mcp'
 LLM_OPENROUTER_MCP_URL = 'http://127.0.0.1:8006/mcp'
+# Wall-clock cap for one LLM call (chat/generate) through the shared MCP client. Its own default
+# (30s) is sized for quick sends like Telegram, and silently applied to every LLM call when this
+# repo moved onto it: a Stage 1b scraper round resending a conversation full of 30k-char snapshots
+# regularly takes longer, and 2026-09-14 lost 4 of 6 queries plus most of Stage 2 to
+# "timed out after 30.0s". 300s matches the SSE read bound the previous in-repo client had.
+LLM_MCP_CALL_TIMEOUT_SECONDS = 300.0
 # Machine-local Ollama tag for Stage 2c triage (one cheap 1-5 JSON score, free and fast —
 # deliberately NOT sized to a 20-35B tier): granite4.1:3b measures 65.9 tok/s / 3.9s cold start /
 # 2.1GB on this machine and advertises structured JSON output as a first-class capability.

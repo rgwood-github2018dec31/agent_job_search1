@@ -18,6 +18,7 @@ from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_excepti
 
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
+    LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
@@ -147,7 +148,7 @@ async def chat_openrouter(
     args = {'messages': messages, 'model': model}
     if max_tokens is not None:
         args['max_tokens'] = max_tokens
-    raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args)
+    raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
     data = json.loads(raw)
     if not data.get('ok'):
         raise provider_error('OpenRouter chat failed', str(data.get('error') or raw[:300]))
@@ -211,7 +212,7 @@ async def generate_local(
         args = {'prompt': prompt, 'system': system, 'model': model, 'temperature': 0.2}
         if max_tokens is not None:
             args['max_tokens'] = max_tokens
-        raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'generate', args)
+        raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'generate', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
     except Exception as ex:
         if _looks_like_missing_model(unwrap_exception(ex)):
             raise LocalModelMissingError(await _describe_missing_model(model)) from ex

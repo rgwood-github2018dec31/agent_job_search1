@@ -14,6 +14,7 @@ import logging
 from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
     EXTRACTOR_TOOL_RESULT_MAX_CHARS,
+    LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_EXTRACTOR,
 )
@@ -189,6 +190,7 @@ async def extract_job_page_openrouter(
             raw = await call_mcp_tool(
                 LLM_OPENROUTER_MCP_URL, 'chat',
                 {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS},
+                timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS,
             )
             data = json.loads(raw)
             if not data.get('ok'):

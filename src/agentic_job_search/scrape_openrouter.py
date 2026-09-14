@@ -21,6 +21,7 @@ from collections.abc import Callable
 
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
+    LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_SCRAPER,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
@@ -258,7 +259,8 @@ class ScrapeSession:
         for i in range(SCRAPER_OPENROUTER_MAX_ITERATIONS):
             self.iterations = i + 1
             chat_args = {'messages': messages, 'model': self.model, 'tools': tools}
-            raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args)
+            raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
+                                      timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
             data = json.loads(raw)
             if not data.get('ok') and http_status_of(str(data.get('error') or '')) in TRANSIENT_HTTP_STATUSES:
                 # A gateway hiccup is not this query failing. Without a retry one 502 discarded a
@@ -266,7 +268,8 @@ class ScrapeSession:
                 logger.warning(f'Stage 1b: transient OpenRouter error, retrying once in '
                                f'{TRANSIENT_RETRY_DELAY_SECONDS}s: {data.get("error")}')
                 await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
-                raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args)
+                raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
+                                          timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
                 data = json.loads(raw)
             if not data.get('ok'):
                 # A 402/401/403/429 is the PROVIDER refusing, not this query failing: every
