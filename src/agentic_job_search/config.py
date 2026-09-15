@@ -11,8 +11,12 @@ MAX_REFERENCE_JOBS = 20
 THINKING_MAX_CHARS = 1000
 # Applied-job corpus: only records applied to within this window feed query generation,
 # the ideal-role profile, and the already-applied company blocklist. Older PDFs are kept
-# on disk but never read.
-APPLIED_JOBS_HORIZON_DAYS = 90
+# on disk but never read. An applied-to company must stay blocked long enough to cover a
+# repost cycle, so this matches COMPANY_BLACKLIST_EXPIRY_DAYS and both lapse rules read
+# alike. Was 90 until 2026-09-15: a GitLab role applied to on 2026-05-12 aged out of the
+# blocklist on 08-10, and the identical reposted role — same title, same location, a new
+# LinkedIn job id — was notified as a 5 on 09-13, 124 days after the application.
+APPLIED_JOBS_HORIZON_DAYS = 180
 # Company blacklist: an entry stops rejecting this many days after its `added` date. A standing
 # "never show me this company" decision goes stale — six months on, the reason for it may not
 # hold any more — so the entry lapses and is reported rather than silently outliving its reason.

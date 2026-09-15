@@ -29,7 +29,7 @@ or changed PDFs):
 - `_reference_job_texts` — feeds the ideal-role profile used by the rater. Ordered **newest applied first**, sorted by `applied_date` rather than filename, because both consumers cap it at `MAX_REFERENCE_JOBS` (20) and taking the oldest 20 meant a newly applied job could never influence the profile (2026-08-25; see Summarize Reference Jobs in [requirements.md](requirements.md))
 - `_applied_companies` — the already-applied blocklist used by `check_and_record_job`
 
-Only records within `APPLIED_JOBS_HORIZON_DAYS` (90) populate these; older PDFs stay on disk but
+Only records within `APPLIED_JOBS_HORIZON_DAYS` (180) populate these; older PDFs stay on disk but
 are never read.
 
 **Recruiters:** `_extract_applied_job_metadata()` returns `is_agency` and `end_client` alongside
