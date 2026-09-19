@@ -3657,6 +3657,44 @@ def test_build_deterministic_warnings_includes_relocation():
     assert 'Relocation required: Portugal' in warnings
 
 
+@pytest.mark.parametrize('salary, listed', [
+    ('', False),
+    ('Not specified', False),
+    ('Competitive salary', False),
+    ('Not stated ("competitive compensation", performance bonus, stock options)', False),
+    ('CAD 220,000', True),
+    ('zł392,000 – zł588,000 (annualized base salary)', True),
+    ('60-75K', True),
+])
+def test_salary_figure_listed_requires_an_actual_figure(salary, listed):
+    assert agent.salary_figure_listed(_make_extract(salary=salary)) is listed
+
+
+def test_build_deterministic_warnings_flags_salary_text_with_no_figure():
+    """The extractor writes 'Competitive salary' rather than leaving the field empty; a truthiness
+    check read 196 saved postings like this as salaried and warned about none of them."""
+    extract = _make_extract(salary='Competitive salary')
+    assert 'No salary listed' in agent.build_deterministic_warnings(_make_candidate(), extract)
+
+
+@pytest.mark.parametrize('description', [
+    'Temporary position up to 12 months, based in Toronto.',
+    'Work Type: Temporary Full Time.',
+])
+def test_build_deterministic_warnings_flags_temporary_roles_as_contract(description):
+    extract = _make_extract(description=description, salary='CAD 220,000')
+    assert 'Contract role — full-time preferred' in agent.build_deterministic_warnings(_make_candidate(), extract)
+
+
+@pytest.mark.parametrize('description', [
+    'If you are seeking employment on a temporary work or study permit, review the restrictions.',
+    'You must have citizenship, a valid work visa, temporary or permanent residency.',
+])
+def test_build_deterministic_warnings_ignores_temporary_visa_boilerplate(description):
+    extract = _make_extract(description=description, salary='CAD 220,000')
+    assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
+
+
 # ---------------------------------------------------------------------------
 # posting language and local working language
 # ---------------------------------------------------------------------------
@@ -4284,6 +4322,97 @@ def test_residency_scope_vocabulary_is_closed_and_identical_everywhere():
 def test_merge_warnings_dedupes_case_insensitively_and_keeps_order():
     merged = agent.merge_warnings(['Hybrid — Netherlands'], ['hybrid — netherlands', 'Below salary target'])
     assert merged == ['Hybrid — Netherlands', 'Below salary target']
+
+
+def test_merge_warnings_drops_a_restated_missing_salary():
+    """The reported Telegram pair collapses to the one code-built line."""
+    merged = agent.merge_warnings(
+        ['No salary listed'],
+        ['No salary listed — unverified against CAD $210K+ base target', 'AWS-heavy stack'],
+    )
+    assert merged == ['No salary listed', 'AWS-heavy stack']
+
+
+def test_merge_warnings_salary_estimate_replaces_the_code_line_in_place():
+    merged = agent.merge_warnings(
+        ['Hybrid — Netherlands', 'No salary listed', 'Posted by a recruiting agency — actual hiring company not named'],
+        ['No salary listed; Poland-market pay likely well below CAD $210K target'],
+    )
+    assert merged == [
+        'Hybrid — Netherlands',
+        'No salary listed; Poland-market pay likely well below CAD $210K target',
+        'Posted by a recruiting agency — actual hiring company not named',
+    ]
+
+
+def test_merge_warnings_prefixes_an_estimate_that_does_not_state_the_absence():
+    merged = agent.merge_warnings(['No salary listed'], ['Poland-market pay likely well below CAD $210K target'])
+    assert merged == ['No salary listed — Poland-market pay likely well below CAD $210K target']
+
+
+def test_merge_warnings_keeps_exactly_one_salary_line():
+    merged = agent.merge_warnings(
+        ['No salary listed'],
+        ['No salary listed — compensation unknown', 'No salary stated; Spain comp likely below CAD $210K base target'],
+    )
+    assert merged == ['No salary stated; Spain comp likely below CAD $210K base target']
+
+
+@pytest.mark.parametrize('warning', [
+    'Seniority not specified in title (no Principal/Staff label) — leveling and comp should be confirmed',
+    'Hybrid in Madrid — acceptable location, but no salary listed so the compensation condition is not met',
+])
+def test_merge_warnings_leaves_bullets_that_only_mention_pay(warning):
+    assert agent.merge_warnings(['No salary listed'], [warning]) == ['No salary listed', warning]
+
+
+def test_merge_warnings_drops_the_unclear_if_it_meets_target_restatement():
+    """The 2026-09-14 BairesDev pair."""
+    merged = agent.merge_warnings(['No salary listed'], ['No salary listed — unclear if it meets the CAD $210K+ target'])
+    assert merged == ['No salary listed']
+
+
+def test_merge_warnings_trims_a_salary_absence_clause_after_a_semicolon():
+    """The 2026-09-17 Network Solutions bullet: the salary clause trailed an unrelated one."""
+    merged = agent.merge_warnings(
+        ['No salary listed'],
+        ['Senior (not Principal/Staff) title; no pay figure to confirm the CAD $210K+ base target'],
+    )
+    assert merged == ['No salary listed', 'Senior (not Principal/Staff) title']
+
+
+def test_merge_warnings_keeps_a_trailing_salary_clause_that_carries_an_estimate():
+    warning = 'Early-stage team; no salary figure, equity-heavy offer expected'
+    merged = agent.merge_warnings(['No salary listed'], [warning])
+    assert merged == ['No salary listed', warning]
+
+
+def test_merge_warnings_does_not_trim_clauses_when_a_figure_is_listed():
+    warning = 'Senior (not Principal/Staff) title; no pay figure to confirm the CAD $210K+ base target'
+    assert agent.merge_warnings(['Hybrid — Netherlands'], [warning]) == ['Hybrid — Netherlands', warning]
+
+
+def test_merge_warnings_leaves_salary_bullets_alone_when_a_figure_is_listed():
+    """Below-target is the rater's call when a salary IS listed; nothing is folded."""
+    merged = agent.merge_warnings(['Hybrid — Netherlands'], ['Salary band tops out below the CAD $210K target'])
+    assert merged == ['Hybrid — Netherlands', 'Salary band tops out below the CAD $210K target']
+
+
+@pytest.mark.parametrize('clause', [
+    'Do not write a warning bullet for either: both are detected deterministically and added for you.',
+    'Do NOT write a warning about the poster being a recruiting agency',
+    'do not write a bullet stating that the role is hybrid or on-site',
+    'do not write a bullet that only restates that the role is a contract',
+    'Do not write a bullet that only says the salary is missing',
+])
+def test_evaluator_prompt_tells_the_rater_not_to_restate_deterministic_warnings(clause):
+    assert clause in agent.EVALUATOR_INSTRUCTIONS_TEMPLATE
+
+
+@pytest.mark.parametrize('topic', ['missing salary', 'hybrid/on-site', 'contract vs full-time', 'language expectations'])
+def test_evaluator_prompt_does_not_ask_the_rater_for_deterministic_warnings(topic):
+    warnings_line = next(line for line in agent.EVALUATOR_INSTRUCTIONS_TEMPLATE.splitlines() if line.startswith('- warnings:'))
+    assert topic not in warnings_line
 
 
 def test_format_job_notification_has_both_bullet_sections():

@@ -504,12 +504,18 @@ Also produce:
 - reasoning: 2–3 sentences on the fit
 - summary: a short label summarising the job (used in the saved filename)
 - pros: 2–4 short bullet phrases (~100 chars each) naming the concrete strengths — matching tech, seniority, compensation, domain
-- warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — hybrid/on-site, contract vs full-time, salary below target, missing salary, stack mismatch, language expectations. Every conflict you notice MUST appear here, even when you still rate the job highly.
+- warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — salary below target, stack mismatch. Every conflict you notice MUST appear here, even when you still rate the job highly.
 
 ## Language
 Check the `Posting written in:` and `Implied local language:` lines. A posting written in another language, and a workplace whose implied local working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English. Do not write a warning bullet for either: both are detected deterministically and added for you.
 
 Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
+
+## Detected for you
+Three more facts are detected deterministically and added for you. Factor each into the rating, but do not write a warning bullet that only restates it — repeating it just duplicates the bullet in different words:
+- **Workplace:** do not write a bullet stating that the role is hybrid or on-site, or whether its location is one you would commute to. Travel, or occasional on-site customer work, is a different concern: do warn about that.
+- **Contract:** do not write a bullet that only restates that the role is a contract, freelance, temporary or fixed-term position. You may still warn about contractor-style terms the posting does not label as a contract.
+- **Salary:** "No salary listed" is added for you whenever the posting gives no figure. Do not write a bullet that only says the salary is missing or that the target can't be verified. If no figure is given but you judge the pay likely below target, say that in one bullet.
 """
 
 
@@ -2474,9 +2480,27 @@ def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
 
 
 _CONTRACT_RE = re.compile(
-    r'\bcontract(?:or)?\b|\bfreelance\b|\bday\s*rate\b|\b\d+\s*-\s*\d+\s*months?\b|\bfixed[\s-]term\b',
+    r'\bcontract(?:or)?\b|\bfreelance\b|\bday\s*rate\b|\b\d+\s*-\s*\d+\s*months?\b|\bfixed[\s-]term\b'
+    # 'Temporary position up to 12 months' was caught by the rater and missed here (2026-09-15).
+    # The lookahead keeps out visa boilerplate: 'seeking employment on a temporary work permit',
+    # 'a valid work visa, temporary or permanent residency'.
+    r'|\btemporary\b(?!\s+(?:work|study|resident|foreign|visa|permit|or\s+permanent))',
     re.IGNORECASE,
 )
+
+NO_SALARY_WARNING = 'No salary listed'
+
+
+def salary_figure_listed(extract: dict) -> bool:
+    """True only when the salary field states an actual figure.
+
+    The extractor fills the field with text that says there is no salary — 'Not specified',
+    'Competitive salary', 'Not stated ("competitive compensation")' — so a truthiness check read
+    196 saved postings as salaried and warned about none of them, more than the 166 it did warn
+    about (2026-09-15). A figure always has a digit; of 1,031 saved values only
+    '12-month contract' and '90th percentile' carry one without being a salary.
+    """
+    return bool(re.search(r'\d', extract.get('salary') or ''))
 
 
 def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
@@ -2525,8 +2549,8 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')[:3000]}"):
         warnings.append('Contract role — full-time preferred')
 
-    if not extract.get('salary'):
-        warnings.append('No salary listed')
+    if not salary_figure_listed(extract):
+        warnings.append(NO_SALARY_WARNING)
 
     # Who is actually hiring changes how you apply, and the rater reports it only by luck: on the
     # 2026-08-11 run it flagged CyberCoders and Jobgether but not Hire Feed or Genius Innovation
@@ -2557,8 +2581,78 @@ def repost_warning(repost: dict) -> str:
     )
 
 
+# The rater restated the deterministic 'No salary listed' in its own words on 153 of 166 saved
+# postings (2026-09-15) — '…unverified against CAD $210K+ base target', 'compensation unknown' —
+# and the exact-match pass below cannot see a paraphrase. A bullet counts as the rater's salary
+# bullet only when it LEADS with the absence of pay, or names pay as below target: an unanchored
+# match swallowed 'Seniority not specified in title — leveling and comp should be confirmed'.
+_SALARY_ABSENCE_LEAD_RE = re.compile(
+    r'^\s*(?:no\s+(?:base\s+|specific\s+)?(?:salary|compensation|comp|pay)\b'
+    r'|(?:salary|compensation|comp|pay)(?:\s+\w+){0,2}\s+(?:not|un\w+)\b)',
+    re.IGNORECASE,
+)
+_PAY_WORD_RE = re.compile(r'\b(?:salary|salaries|compensation|comp|pay)\b', re.IGNORECASE)
+_BELOW_TARGET_RE = re.compile(r'\b(?:below|short|under|lower)\b', re.IGNORECASE)
+# Words that make a salary bullet an estimate worth keeping ('Poland-market pay likely well below
+# CAD $210K target') rather than a tautology ('CAD $210K+ target unverified'). Measured on the saved
+# corpus: 104 tautologies dropped, 49 estimates kept. Deliberately broad — a miss keeps a harmless
+# duplicate, a wrong drop loses the rater's one piece of salary judgement.
+_SALARY_JUDGEMENT_RE = re.compile(
+    r'\b(?:below|short|under|lower|likely|market|bands?|equity|startup|consult\w*|contract\w*|b2b|'
+    r'hourly|day rate|waive|offset|capped?)\b',
+    re.IGNORECASE,
+)
+
+
+def _is_salary_bullet(warning: str) -> bool:
+    return bool(
+        _SALARY_ABSENCE_LEAD_RE.search(warning)
+        or (_PAY_WORD_RE.search(warning) and _BELOW_TARGET_RE.search(warning))
+    )
+
+
+def _drop_trailing_salary_absence(warning: str) -> str:
+    """Remove '; no pay figure to confirm the target' tails from an otherwise unrelated bullet.
+
+    'Senior (not Principal/Staff) title; no pay figure to confirm the CAD $210K+ base target' got
+    past the lead-anchored match and duplicated 'No salary listed' (2026-09-17). Only ';' splits:
+    commas and dashes run through single-thought bullets, and a wrong drop loses information.
+    A tail carrying an estimate stays.
+    """
+    head, *tails = warning.split(';')
+    kept = [t for t in tails if not (_SALARY_ABSENCE_LEAD_RE.search(t) and not _SALARY_JUDGEMENT_RE.search(t))]
+    return ';'.join([head, *kept]).strip() if len(kept) < len(tails) else warning
+
+
+def merge_salary_warning(deterministic: list[str], llm_warnings: list[str]) -> tuple[list[str], list[str]]:
+    """Fold the rater's salary bullets into the one deterministic 'No salary listed' line.
+
+    A no-op unless code emitted that line. Then every rater salary bullet is removed, and the first
+    that carries an estimate replaces the code line in place — as written when it already leads with
+    the absence, otherwise prefixed with it — so the absence is always stated first and the fact
+    stays decided in code. Without an estimate the code line stands alone. A salary-absence clause
+    trailing an unrelated bullet after ';' is trimmed off it.
+    """
+    if NO_SALARY_WARNING not in deterministic:
+        return deterministic, llm_warnings
+    llm_warnings = [_drop_trailing_salary_absence(str(w)) for w in llm_warnings]
+    salary_bullets = [w for w in llm_warnings if _is_salary_bullet(str(w))]
+    others = [w for w in llm_warnings if not _is_salary_bullet(str(w))]
+    estimate = next((str(w).strip() for w in salary_bullets if _SALARY_JUDGEMENT_RE.search(str(w))), '')
+    if not estimate:
+        return deterministic, others
+    if not _SALARY_ABSENCE_LEAD_RE.search(estimate):
+        estimate = f'{NO_SALARY_WARNING} — {estimate}'
+    return [estimate if w == NO_SALARY_WARNING else w for w in deterministic], others
+
+
 def merge_warnings(deterministic: list[str], llm_warnings: list[str]) -> list[str]:
-    """Deterministic warnings first, then the rater's, dropping case-insensitive duplicates."""
+    """Deterministic warnings first, then the rater's, dropping case-insensitive duplicates.
+
+    The rater's salary bullets are folded into the deterministic salary line first (see
+    merge_salary_warning), since a paraphrase never matches exactly.
+    """
+    deterministic, llm_warnings = merge_salary_warning(deterministic, llm_warnings)
     merged: list[str] = []
     seen: set[str] = set()
     for warning in [*deterministic, *llm_warnings]:
