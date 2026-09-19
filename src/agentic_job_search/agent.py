@@ -54,6 +54,7 @@ from agentic_job_search.config import (
     SCRAPER_MAX_TURNS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SCRAPER_MIN_LISTINGS_PER_QUERY,
+    SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
     THINKING_MAX_CHARS,
     TRIAGE_ENABLED,
@@ -1338,6 +1339,60 @@ def recent_yield_history(limit: int = 5) -> list[str]:
     return out
 
 
+def _listings_distinct_per_query() -> dict[str, int]:
+    """Distinct listings per completed query, for the funnel; failed queries ('error') are left out.
+
+    Persisted so expected_listings_per_query() can estimate from distinct counts rather than from
+    check_status call counts, which a recovery pass inflates.
+    """
+    return {q: n for q, n in tools_module._queries_searched.items() if isinstance(n, int)}
+
+
+def _median(values: list[int]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return float(ordered[mid]) if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def expected_listings_per_query(query: str, limit: int = 10) -> tuple[float | None, str]:
+    """How many listings `query` usually yields, read back from cost_log.jsonl, plus a label.
+
+    Median, not mean, so one bad day of zeros does not drag the expectation down. Prefers the
+    distinct count (`listings_distinct_per_query`); runs before that field existed only have
+    `check_status_per_query` call counts, a different unit, so the label says which one the number
+    is. A query with no history falls back to the median over every query in the last `limit` runs.
+    """
+    path = RUN_DIR / 'cost_log.jsonl'
+    if not path.exists():
+        return None, 'no history yet'
+    per_run: list[tuple[dict[str, int], str]] = []
+    try:
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if not line.strip():
+                continue
+            funnel = json.loads(line).get('funnel') or {}
+            if distinct := funnel.get('listings_distinct_per_query'):
+                per_run.append((distinct, 'distinct'))
+            elif checked := funnel.get('check_status_per_query'):
+                per_run.append(({q: sum(c.values()) for q, c in checked.items()}, 'checked'))
+    except Exception as ex:
+        logger.warning(f'could not read listing history from {path} for query "{query}": {ex}')
+        return None, 'history unreadable'
+
+    def label(units: set[str], where: str) -> str:
+        return f"{'distinct' if units == {'distinct'} else 'listings checked'}, {where}"
+
+    matching = [(counts[query], unit) for counts, unit in per_run if query in counts][-limit:]
+    if matching:
+        return (_median([n for n, _u in matching]),
+                label({u for _n, u in matching}, f'median of last {len(matching)} runs'))
+    recent = per_run[-limit:]
+    if recent:
+        return (_median([n for counts, _u in recent for n in counts.values()]),
+                label({u for _c, u in recent}, 'all-query median'))
+    return None, 'no history yet'
+
+
 def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict):
     """One Stage 1b request on the shared Claude Agent SDK session (the rollback path)."""
     async def run_pass(instruction: str) -> int | None:
@@ -1433,7 +1488,9 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
       against the shared browser context, which looks exactly like an auth wall in the logs.
 
     Discovery resilience: if a query inspects fewer than SCRAPER_MIN_LISTINGS_PER_QUERY
-    listings, retry it once. The two failure shapes need opposite corrections:
+    listings, retry it once. Only a query still below SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY after
+    that retry raises a `low_listings` alert, carrying the query's historical median. The two
+    failure shapes need opposite corrections:
 
     - ZERO listings is the signature of an auth wall, block page, or empty results shell.
       Retry with the region text dropped.
@@ -1537,7 +1594,9 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
                 f'across regions or re-harvested by a recovery pass. '
                 f'See region_overlap for actual cross-region duplication.'
             )
-        if seen < SCRAPER_MIN_LISTINGS_PER_QUERY:
+        first_pass_seen = seen
+        recovered = seen < SCRAPER_MIN_LISTINGS_PER_QUERY
+        if recovered:
             if seen == 0:
                 logger.warning(
                     f'Stage 1b: query "{query}" inspected 0 distinct listings — retrying once '
@@ -1579,11 +1638,6 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
                     'return the identical list of jobs, the location filter is not applying — say '
                     'so explicitly rather than treating the query as exhausted.'
                 )
-            tools_module._ui_alerts.append({
-                'kind': 'low_listings', 'query': query, 'region': '(all)',
-                'detail': f'only {seen} distinct listing(s) on the first pass '
-                          f'(below {SCRAPER_MIN_LISTINGS_PER_QUERY}) — recovery pass attempted',
-            })
             await _human_pause(SCRAPER_INTER_SEARCH_DELAY_SECONDS, 'the recovery pass')
             try:
                 await run_pass(retry_instruction)
@@ -1596,6 +1650,17 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
             # the queries that needed rescuing, which is the "saturated run looks healthy" shape.
             seen = len(_distinct_snapshot() - before_distinct)
             calls = sum(delta.values())
+
+        if seen < SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY:
+            expected, basis = expected_listings_per_query(query)
+            expected_text = f'expected ~{expected:g} ({basis})' if expected is not None else basis
+            first_pass_text = (f'after recovery (first pass {first_pass_seen}' if recovered
+                               else '(no recovery pass')
+            tools_module._ui_alerts.append({
+                'kind': 'low_listings', 'query': query, 'region': '(all)',
+                'detail': f'only {seen} distinct listing(s) {first_pass_text}; '
+                          f'below {SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY}) — {expected_text}',
+            })
 
         tools_module._queries_searched[query] = seen
         tools_module._check_status_per_query[query] = delta
@@ -3396,6 +3461,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 "ui_alerts": list(tools_module._ui_alerts),
                 "check_status": check_status_counts,
                 "check_status_per_query": dict(tools_module._check_status_per_query),
+                "listings_distinct_per_query": _listings_distinct_per_query(),
                 "queries_failed": dict(tools_module._query_errors),
                 "queue_skipped": dict(tools_module._queue_skipped_counts),
                 "candidates_queued": 0,
@@ -3495,6 +3561,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         "ui_alerts": list(tools_module._ui_alerts),
         "check_status": check_status_counts,
         "check_status_per_query": dict(tools_module._check_status_per_query),
+        "listings_distinct_per_query": _listings_distinct_per_query(),
         "queries_failed": dict(tools_module._query_errors),
         "queue_skipped": dict(tools_module._queue_skipped_counts),
         "candidates_queued": len(candidates),

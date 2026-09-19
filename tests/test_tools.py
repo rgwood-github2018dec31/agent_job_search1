@@ -2569,6 +2569,125 @@ async def test_run_scraper_retries_low_yield_query_keeping_filters(monkeypatch):
     assert 'clear the Location filter' not in retry
 
 
+def _reset_scraper_state(monkeypatch):
+    for name, value in [
+        ('_check_status_counts', {}), ('_distinct_listing_ids', set()), ('_search_ids', {}),
+        ('_ui_alerts', []), ('_search_reports', []), ('_candidates', []),
+        ('_candidates_per_query', {}), ('_queries_searched', {}), ('_check_status_per_query', {}),
+    ]:
+        monkeypatch.setattr(tools, name, value)
+
+
+class _PerPassScraperClient:
+    """Yields a different number of NEW distinct listings on each pass of the one query."""
+
+    def __init__(self, query_name, per_pass):
+        self.query_name = query_name
+        self.per_pass = list(per_pass)
+        self.requests = []
+        self.next_id = 0
+
+    async def query(self, instruction):
+        self.requests.append(instruction)
+        count = self.per_pass[len(self.requests) - 1] if len(self.requests) <= len(self.per_pass) else 0
+        for _ in range(count):
+            tools._check_status_counts[f'k{self.next_id}'] = 1
+            tools._distinct_listing_ids.add(f'linkedin/{self.query_name}-{self.next_id}')
+            self.next_id += 1
+
+    async def receive_response(self):
+        return
+        yield
+
+
+def _low_listing_alerts():
+    return [a for a in tools._ui_alerts if a['kind'] == 'low_listings']
+
+
+async def test_low_listings_alert_not_raised_when_recovery_fixes_the_query(monkeypatch, tmp_path):
+    """First pass below the retry floor, recovery rescues it: retry yes, alert no."""
+    _reset_scraper_state(monkeypatch)
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    client = _PerPassScraperClient('Niche Query', [2, 20])
+
+    await _scrape(client, ['Niche Query'])
+
+    assert len(client.requests) == 2, 'a below-floor first pass is still retried'
+    assert tools._queries_searched['Niche Query'] == 22
+    assert _low_listing_alerts() == []
+
+
+async def test_low_listings_alert_raised_after_failed_recovery_with_expected_count(monkeypatch, tmp_path):
+    _reset_scraper_state(monkeypatch)
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    history = [{'funnel': {'listings_distinct_per_query': {'Dead Query': n}}} for n in (40, 48, 50)]
+    (tmp_path / 'cost_log.jsonl').write_text('\n'.join(json.dumps(r) for r in history) + '\n')
+    client = _PerPassScraperClient('Dead Query', [0, 1])
+
+    await _scrape(client, ['Dead Query'])
+
+    alerts = _low_listing_alerts()
+    assert len(alerts) == 1, alerts
+    detail = alerts[0]['detail']
+    assert 'only 1 distinct listing(s) after recovery (first pass 0' in detail
+    assert f'below {config.SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY}' in detail
+    assert 'expected ~48 (distinct, median of last 3 runs)' in detail
+
+
+def _write_cost_log(path, funnels):
+    lines = [json.dumps({'stage': 'other', 'cost': 0.1})]  # a non-funnel row must be skipped
+    lines += [json.dumps({'timestamp': '2026-09-01', 'funnel': f}) for f in funnels]
+    (path / 'cost_log.jsonl').write_text('\n'.join(lines) + '\n')
+
+
+def test_expected_listings_prefers_distinct_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    _write_cost_log(tmp_path, [
+        {'listings_distinct_per_query': {'Q': 10}},
+        {'listings_distinct_per_query': {'Q': 30}, 'check_status_per_query': {'Q': {'new': 999}}},
+        {'listings_distinct_per_query': {'Q': 20}},
+    ])
+    assert agent.expected_listings_per_query('Q') == (20.0, 'distinct, median of last 3 runs')
+
+
+def test_expected_listings_falls_back_to_checked_counts_and_labels_them(monkeypatch, tmp_path):
+    """Old runs only have call counts -- a different unit, so the label must say so."""
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    _write_cost_log(tmp_path, [
+        {'check_status_per_query': {'Q': {'new': 10, 'already_processed': 40}}},
+        {'check_status_per_query': {'Q': {'new': 0, 'already_processed': 0}}},
+        {'check_status_per_query': {'Q': {'new': 5, 'already_processed': 45}}},
+    ])
+    assert agent.expected_listings_per_query('Q') == (50.0, 'listings checked, median of last 3 runs')
+
+
+def test_expected_listings_uses_only_the_last_limit_runs(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    _write_cost_log(tmp_path, [{'listings_distinct_per_query': {'Q': n}} for n in (100, 100, 1, 2, 3)])
+    assert agent.expected_listings_per_query('Q', limit=3) == (2.0, 'distinct, median of last 3 runs')
+
+
+def test_expected_listings_unknown_query_uses_all_query_median(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    _write_cost_log(tmp_path, [
+        {'listings_distinct_per_query': {'A': 10, 'B': 30}},
+        {'listings_distinct_per_query': {'C': 20}},
+    ])
+    assert agent.expected_listings_per_query('New Query') == (20.0, 'distinct, all-query median')
+
+
+def test_expected_listings_without_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    assert agent.expected_listings_per_query('Q') == (None, 'no history yet')
+    (tmp_path / 'cost_log.jsonl').write_text('')
+    assert agent.expected_listings_per_query('Q') == (None, 'no history yet')
+
+
+def test_listings_distinct_per_query_leaves_out_failed_queries(monkeypatch):
+    monkeypatch.setattr(tools, '_queries_searched', {'Good': 12, 'Broken': 'error'})
+    assert agent._listings_distinct_per_query() == {'Good': 12}
+
+
 async def test_run_scraper_records_per_query_check_status(monkeypatch):
     """Per-query dedup counts: a saturated query must be distinguishable from a starved one."""
     monkeypatch.setattr(tools, '_check_status_counts', {})
@@ -3489,6 +3608,12 @@ def test_min_listings_threshold_keeps_the_recovery_pass_enabled():
     """At 0 the low-yield retry silently never fires, which is the bug it exists to catch."""
     assert config.SCRAPER_MIN_LISTINGS_PER_QUERY >= 1
     assert config.SCRAPER_MIN_LISTINGS_PER_QUERY < config.SCRAPER_MAX_TURNS_PER_QUERY
+
+
+def test_low_listings_alert_threshold_is_half_the_retry_floor():
+    """The alert is checked after recovery, so it must sit below the retry trigger and above 0."""
+    assert config.SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY == config.SCRAPER_MIN_LISTINGS_PER_QUERY // 2
+    assert 1 <= config.SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY < config.SCRAPER_MIN_LISTINGS_PER_QUERY
 
 
 # ---------------------------------------------------------------------------

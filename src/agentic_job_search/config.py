@@ -153,12 +153,19 @@ SCRAPER_MAX_LISTINGS_PER_SEARCH = 25
 # healthy two-region query lands somewhere between ~17 (heavy legitimate cross-region overlap) and
 # 50. The old floor of 5 was calibrated for the pre-chip regime and was far too low: on the first
 # live chip run a query that searched only ONE of its two regions returned 6 distinct listings and
-# sailed straight through. 12 is roughly half a single page — comfortably below a legitimately
-# overlapping query, comfortably above a half-run. Must be >= 1 or recovery is disabled.
+# sailed straight through. Must be >= 1 or recovery is disabled.
 #
-# This is a backstop, not the primary detector: a region that never ran is caught precisely by the
-# per-region report_search check in run_scraper, which does not depend on a count at all.
-SCRAPER_MIN_LISTINGS_PER_QUERY = 12
+# 12 -> 6 (2026-09-19): at 12, niche queries (e.g. "Agentic AI Engineer") that legitimately return
+# 5-11 fell below it and paid for a recovery pass most runs. A half-run is still caught by the
+# per-region report_search check below, which does not depend on a count at all — this is a
+# backstop, not the primary detector.
+SCRAPER_MIN_LISTINGS_PER_QUERY = 6
+
+# Below this many distinct listings AFTER the recovery pass, the query raises a `low_listings`
+# ui_alert (Telegram NEEDS ATTENTION). Checked after recovery so the alert means the retry did not
+# fix it: checking the first pass fired on 7 of 8 runs, mostly for queries the retry had already
+# rescued, and an alert that fires on success trains the reader to ignore it.
+SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY = SCRAPER_MIN_LISTINGS_PER_QUERY // 2
 
 # Date-posted filter applied via the "Date posted" chip. LinkedIn expresses the choice as
 # f_TPR=r<seconds>; we never navigate to that parameter ourselves (see the chip rationale above),
