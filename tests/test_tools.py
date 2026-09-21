@@ -3805,6 +3805,10 @@ def test_build_deterministic_warnings_flags_salary_text_with_no_figure():
 @pytest.mark.parametrize('description', [
     'Temporary position up to 12 months, based in Toronto.',
     'Work Type: Temporary Full Time.',
+    # Employment phrasing the original bare-stem exclusion ('work', 'or permanent') swallowed.
+    'This is a temporary work assignment with Acme.',
+    'We are hiring on a temporary or permanent basis.',
+    'Temporary workforce expansion for the holiday season.',
 ])
 def test_build_deterministic_warnings_flags_temporary_roles_as_contract(description):
     extract = _make_extract(description=description, salary='CAD 220,000')
@@ -3814,6 +3818,9 @@ def test_build_deterministic_warnings_flags_temporary_roles_as_contract(descript
 @pytest.mark.parametrize('description', [
     'If you are seeking employment on a temporary work or study permit, review the restrictions.',
     'You must have citizenship, a valid work visa, temporary or permanent residency.',
+    'Temporary visa sponsorship is not available for this role.',
+    'Applicants must hold a temporary resident permit.',
+    'We are unable to hire temporary foreign workers.',
 ])
 def test_build_deterministic_warnings_ignores_temporary_visa_boilerplate(description):
     extract = _make_extract(description=description, salary='CAD 220,000')

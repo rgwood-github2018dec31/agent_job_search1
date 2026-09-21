@@ -2547,9 +2547,12 @@ def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
 _CONTRACT_RE = re.compile(
     r'\bcontract(?:or)?\b|\bfreelance\b|\bday\s*rate\b|\b\d+\s*-\s*\d+\s*months?\b|\bfixed[\s-]term\b'
     # 'Temporary position up to 12 months' was caught by the rater and missed here (2026-09-15).
-    # The lookahead keeps out visa boilerplate: 'seeking employment on a temporary work permit',
-    # 'a valid work visa, temporary or permanent residency'.
-    r'|\btemporary\b(?!\s+(?:work|study|resident|foreign|visa|permit|or\s+permanent))',
+    # Only true immigration collocations are excluded — the original bare stems ('work', 'study',
+    # 'or permanent') were prefix matches that also swallowed employment phrasing:
+    # 'temporary work assignment', 'temporary workforce', 'temporary or permanent basis'.
+    r'|\btemporary\b(?!\s+(?:(?:foreign\s+)?(?:work|study)(?:\s+or\s+(?:work|study))?'
+    r'\s+(?:permit|visa|authoriz\w+|pass)|foreign\s+worker|residen\w*|visa|permit|entry|stay|'
+    r'migration|or\s+permanent\s+residen\w*))',
     re.IGNORECASE,
 )
 
