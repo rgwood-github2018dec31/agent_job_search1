@@ -86,6 +86,7 @@ from agentic_job_search import location_review
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search import scrape_openrouter
 from agentic_job_search.salary import (
+    count_ranges,
     resolve_salary,
     salary_digits_are_in_the_source,
     salary_facts_of,
@@ -551,7 +552,7 @@ Do NOT write a warning about the poster being a recruiting agency or the hiring 
 Three more facts are detected deterministically and added for you. Factor each into the rating, but do not write a warning bullet that only restates it — repeating it just duplicates the bullet in different words:
 - **Workplace:** do not write a bullet stating that the role is hybrid or on-site, or whether its location is one you would commute to. Travel, or occasional on-site customer work, is a different concern: do warn about that.
 - **Contract:** do not write a bullet that only restates that the role is a contract, freelance, temporary or fixed-term position. You may still warn about contractor-style terms the posting does not label as a contract.
-- **Salary:** the structure of the pay figure is added for you — "No salary listed" when there is none, and a "Partial salary" line when the posting states only a lower bound, only an upper bound, or a single figure. The `Salary structure:` line in the extract tells you which. Do not write a bullet that only says the salary is missing, that the range has one end, or that the target can't be verified. Judging the pay itself is still yours: if the figure (or its absence) makes you think the pay is likely below target, say that in one bullet.
+- **Salary:** the structure of the pay figure is added for you — "No salary listed" when there is none, and a "Partial salary" line when the posting states only a lower bound, only an upper bound, or a single figure. The `Salary structure:` line in the extract tells you which. Do not write a bullet that only says the salary is missing, that the range has one end, or that the target can't be verified. Judging the pay itself is still yours: if the figure (or its absence) makes you think the pay is likely below target, say that in one bullet. A range whose upper bound reaches the target is on target, because the band is negotiable: never warn about its midpoint, its lower half or its floor. Warn only when the whole range, converted if it is in another currency, sits below the target. When a `Salary vs target:` line is present, that comparison has already been made for you: do not write a bullet about it.
 """
 
 
@@ -2197,6 +2198,12 @@ _SALARY_STRUCTURE_NOTE_BY_KIND = {
     'unclassified': 'could not be read as a pay range',
 }
 
+# The `Salary vs target:` line, present only when code made the comparison (salary_meets_target).
+_SALARY_VS_TARGET_NOTE = {
+    True: 'meets target (the top of the range reaches it) — not a concern',
+    False: 'below target (the whole range is under it)',
+}
+
 
 def check_salary_provenance(candidate: dict, extract: dict) -> bool:
     """Warn when a reported salary figure is not in the page the extract was made from.
@@ -2255,6 +2262,8 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Salary: {salary_facts['text']}")
     if (structure := _SALARY_STRUCTURE_NOTE_BY_KIND.get(salary_facts['kind'])):
         lines.append(f'Salary structure: {structure}')
+    if (on_target := salary_meets_target(extract)) is not None:
+        lines.append(f'Salary vs target: {_SALARY_VS_TARGET_NOTE[on_target]}')
     if extract['sponsorship_note']:
         lines.append(f"Sponsorship/authorization note: {extract['sponsorship_note']}")
     if extract.get('language_requirement'):
@@ -2690,6 +2699,8 @@ NO_SALARY_WARNING = 'No salary listed'
 # and the tests have one place to ask "did code already say something about the salary here?".
 PARTIAL_SALARY_WARNING_PREFIX = 'Partial salary'
 UNREADABLE_SALARY_WARNING_PREFIX = 'Salary not interpretable'
+# Emitted only when code could make the comparison itself (see salary_meets_target).
+BELOW_TARGET_SALARY_WARNING_PREFIX = 'Salary below target'
 
 # What each reading is worth telling the user. The table is the policy, and it lives in code: the
 # classifier reports what a string says, this decides what that means (see salary.py's docstring).
@@ -2713,6 +2724,55 @@ def salary_warning(extract: dict) -> str | None:
     return template.format(text=facts['text']) if template else None
 
 
+# A range that bundles bonus or variable pay is not a base range, so it cannot be compared with a
+# BASE target: '144,600–322,500 CAD (combined base + variable incentive target)' would read as on
+# target while the rater's 'base salary could sit near or below target' was the real point
+# (replayed over the saved corpus, 2026-09-23). '…base salary, plus bonus' is still base.
+_NOT_BASE_PAY_RE = re.compile(
+    r'\bOTE\b|\bon[- ]target earnings\b|\bcombined\b|\btotal (?:target )?(?:cash|comp\w*)\b'
+    r'|\bvariable\b|\bbase (?:plus|and) bonus\b',
+    re.IGNORECASE,
+)
+
+
+def salary_meets_target(extract: dict) -> bool | None:
+    """Whether a complete annual range reaches the base target by its UPPER bound; None when code
+    cannot decide.
+
+    The rater judged ranges by their midpoint or lower half: for job 4470446597 it warned 'Base
+    target … sits in upper half of range; lower bound well below target' about a range whose top
+    cleared the target, which the user considers on target because the band is negotiable
+    (2026-09-23). Code decides only a two-ended annual range quoted in the target's own
+    currency — a bare '$', another currency or an hourly rate needs a conversion code does not
+    make, so those stay with the rater. So does a string stating several ranges (one per region or
+    per tier): the reading keeps only the first, and judging the rest is not a bound comparison. And so
+    does a range that includes bonus or variable pay, which is not comparable with a base target.
+    """
+    target = preferences.salary_target()
+    if target is None:
+        return None
+    amount, currency = target
+    facts = salary_facts_of(extract)
+    if (
+        facts['kind'] != 'range' or facts['period'] != 'year'
+        or facts['currency'] != currency or facts['maximum'] is None
+        or count_ranges(facts['text']) > 1 or _NOT_BASE_PAY_RE.search(facts['text'])
+    ):
+        return None
+    return facts['maximum'] >= amount
+
+
+def below_target_salary_warning(extract: dict) -> str | None:
+    """The code-emitted below-target line, or None unless code decided the range falls short."""
+    if salary_meets_target(extract) is not False:
+        return None
+    amount, currency = preferences.salary_target()
+    return (
+        f'{BELOW_TARGET_SALARY_WARNING_PREFIX} — whole range under {currency} {amount:,.0f}: '
+        f"{salary_facts_of(extract)['text']}"
+    )
+
+
 def is_code_emitted_salary_warning(warning: str) -> bool:
     """True for any salary line this module produced, whichever reading produced it."""
     text = str(warning).strip()
@@ -2720,6 +2780,7 @@ def is_code_emitted_salary_warning(warning: str) -> bool:
         text == NO_SALARY_WARNING
         or text.startswith(PARTIAL_SALARY_WARNING_PREFIX)
         or text.startswith(UNREADABLE_SALARY_WARNING_PREFIX)
+        or text.startswith(BELOW_TARGET_SALARY_WARNING_PREFIX)
     )
 
 
@@ -2783,7 +2844,7 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
 
     # Absent, one-ended, a lone figure or unreadable — each says something different, and a digit
     # test said the same thing about all four (2026-09-22). See salary.py.
-    if warning := salary_warning(extract):
+    if warning := salary_warning(extract) or below_target_salary_warning(extract):
         warnings.append(warning)
 
     # Who is actually hiring changes how you apply, and the rater reports it only by luck: on the
@@ -2863,7 +2924,9 @@ def _drop_trailing_salary_absence(warning: str) -> str:
     return ';'.join([head, *kept]).strip() if len(kept) < len(tails) else warning
 
 
-def merge_salary_warning(deterministic: list[str], llm_warnings: list[str]) -> tuple[list[str], list[str]]:
+def merge_salary_warning(
+    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False
+) -> tuple[list[str], list[str]]:
     """Fold the rater's salary bullets into the one salary line code emitted.
 
     A no-op unless code emitted such a line — which, for a COMPLETE range, it does not: a genuine
@@ -2874,7 +2937,14 @@ def merge_salary_warning(deterministic: list[str], llm_warnings: list[str]) -> t
     bullet led with the floor ('Base range floor ($208.6K) sits just below…') and nothing
     contradicted it (2026-09-22). A salary-absence clause trailing an unrelated bullet after ';'
     is trimmed off it.
+
+    `salary_on_target` is code's own verdict that the range reaches the target (see
+    salary_meets_target). Then every rater salary bullet is dropped: the pay question is settled,
+    and what the rater writes about it is a midpoint or lower-half complaint the user rejected.
     """
+    if salary_on_target:
+        llm_warnings = [_drop_trailing_salary_absence(str(w)) for w in llm_warnings]
+        return deterministic, [w for w in llm_warnings if not _is_salary_bullet(str(w))]
     code_line = next((w for w in deterministic if is_code_emitted_salary_warning(w)), '')
     if not code_line:
         return deterministic, llm_warnings
@@ -2893,13 +2963,15 @@ def merge_salary_warning(deterministic: list[str], llm_warnings: list[str]) -> t
     return [merged_line if w == code_line else w for w in deterministic], others
 
 
-def merge_warnings(deterministic: list[str], llm_warnings: list[str]) -> list[str]:
+def merge_warnings(
+    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False
+) -> list[str]:
     """Deterministic warnings first, then the rater's, dropping case-insensitive duplicates.
 
     The rater's salary bullets are folded into the deterministic salary line first (see
     merge_salary_warning), since a paraphrase never matches exactly.
     """
-    deterministic, llm_warnings = merge_salary_warning(deterministic, llm_warnings)
+    deterministic, llm_warnings = merge_salary_warning(deterministic, llm_warnings, salary_on_target)
     merged: list[str] = []
     seen: set[str] = set()
     for warning in [*deterministic, *llm_warnings]:
@@ -3317,6 +3389,7 @@ async def evaluate_all_candidates(
             warnings = merge_warnings(
                 deterministic,
                 [str(w) for w in (result.get('warnings') or [])],
+                salary_on_target=salary_meets_target(extract) is True,
             )
             content = (
                 f"# {result['title']} at {result['company']} — rating {rating}/5\n\n"

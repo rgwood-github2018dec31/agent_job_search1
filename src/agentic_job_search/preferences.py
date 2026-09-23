@@ -12,6 +12,7 @@ situation.
 '''
 
 import logging
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ PROJECT_DIR = Path(__file__).parent.parent.parent
 RUN_DIR = PROJECT_DIR / 'run_dir'
 PREFERENCES_PATH = RUN_DIR / 'preferences.yaml'
 EXAMPLE_PREFERENCES_PATH = PROJECT_DIR / 'preferences.example.yaml'
+_ISO_CURRENCY_RE = re.compile(r'[A-Z]{3}')
 
 # Neutral defaults: no personal situation encoded. Every gate that could reject a job is off.
 DEFAULT_PREFERENCES: dict[str, Any] = {
@@ -64,6 +66,12 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
         'exclude': [],   # title words that must never appear in a generated query
     },
     'relocation_note': '',  # free text for the evaluator on acceptable relocation
+    # Annual base pay a complete salary range must REACH (by its upper bound) to count as on
+    # target. Both unset = no code-side comparison; the rater still judges pay on its own.
+    'compensation': {
+        'base_target': None,  # annual amount, e.g. 150000
+        'currency': '',       # ISO 4217 code the target is quoted in, e.g. 'EUR'
+    },
     'companies': {
         # [{'name': ..., 'reason': ..., 'added': 'YYYY-MM-DD'}]; empty = no company is blocked
         'blacklist': [],
@@ -255,6 +263,32 @@ def excluded_title_words() -> tuple[str, ...]:
 
 def relocation_note() -> str:
     return str(load_preferences()['relocation_note'] or '')
+
+
+def salary_target() -> tuple[float, str] | None:
+    '''(annual base target, ISO currency) — or None when either is unset.
+
+    A malformed value raises rather than reading as unset: an ignored target silently switches the
+    below-target comparison off and hands it back to the rater.
+    '''
+    compensation = load_preferences()['compensation']
+    raw_target, raw_currency = compensation.get('base_target'), compensation.get('currency')
+    if raw_target in (None, '') or not raw_currency:
+        return None
+    try:
+        target = float(raw_target)
+    except (TypeError, ValueError) as ex:
+        raise ValueError(
+            f'{PREFERENCES_PATH}: `compensation.base_target` must be an annual amount such as '
+            f'150000, got {raw_target!r} ({type(ex).__name__}: {ex})'
+        ) from ex
+    currency = str(raw_currency).strip().upper()
+    if not _ISO_CURRENCY_RE.fullmatch(currency):
+        raise ValueError(
+            f'{PREFERENCES_PATH}: `compensation.currency` must be an ISO 4217 code such as EUR, '
+            f'got {raw_currency!r}'
+        )
+    return target, currency
 
 
 def _parse_added_date(raw: Any) -> date | None:

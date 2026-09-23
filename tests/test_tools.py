@@ -4046,6 +4046,93 @@ def test_merge_salary_warning_leaves_a_complete_range_to_the_rater():
     assert agent.merge_warnings([], llm) == llm
 
 
+TEST_BASE_TARGET = 200_000
+TEST_TARGET_CURRENCY = 'CAD'
+# Shaped like job 4470446597: a range whose top clears the target, which the rater warned about (2026-09-23).
+RXNT_SALARY = 'CA$170,000 - CA$240,000 per year'
+RXNT_RATER_BULLET = 'Base target sits in upper half of range; lower bound well below target'
+
+
+@pytest.fixture
+def salary_target_set(monkeypatch):
+    merged = preferences._deep_merge(
+        preferences.load_preferences(),
+        {'compensation': {'base_target': TEST_BASE_TARGET, 'currency': TEST_TARGET_CURRENCY}},
+    )
+    monkeypatch.setattr(preferences, '_cache', merged)
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+
+
+@pytest.mark.parametrize('salary_text, expected', [
+    (RXNT_SALARY, True),
+    ('CA$120,000 - CA$180,000 per year', False),
+    ('US$170,000 - US$240,000 per year', None),   # another currency needs a conversion
+    ('$170,000 - $240,000 per year', None),       # a bare '$' is ambiguous
+    ('CA$90 - CA$110 per hour', None),            # an hourly rate needs annualising
+    ('From CA$208,580 per year', None),           # one end is the partial-salary line's business
+    ('CAD 154,700 to CAD 204,700 annually (Ontario); CAD 154,700 to CAD 310,700 (British Columbia)', None),
+    ('144,600–322,500 CAD per year (combined base + variable incentive target)', None),
+    ('CA$150,000 – CA$175,000/yr (base plus bonus)', None),
+])
+def test_salary_meets_target_decides_only_same_currency_annual_ranges(
+    salary_target_set, salary_text, expected
+):
+    assert agent.salary_meets_target(_make_extract(salary=salary_text)) is expected
+
+
+def test_salary_meets_target_is_undecided_without_a_target():
+    assert agent.salary_meets_target(_make_extract(salary=RXNT_SALARY)) is None
+
+
+@pytest.mark.parametrize('compensation', [
+    {'base_target': 'lots', 'currency': 'CAD'},
+    {'base_target': TEST_BASE_TARGET, 'currency': 'Canadian dollars'},
+])
+def test_salary_target_rejects_a_malformed_preference(monkeypatch, compensation):
+    merged = preferences._deep_merge(preferences.load_preferences(), {'compensation': compensation})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    with pytest.raises(ValueError, match='compensation'):
+        preferences.salary_target()
+
+
+def test_build_deterministic_warnings_flags_only_a_whole_range_below_target(salary_target_set):
+    below = agent.build_deterministic_warnings(
+        _make_candidate(), _make_extract(salary='CA$120,000 - CA$180,000 per year'))
+    assert [w for w in below if w.startswith(agent.BELOW_TARGET_SALARY_WARNING_PREFIX)] == [
+        'Salary below target — whole range under CAD 200,000: CA$120,000 - CA$180,000 per year']
+    on_target = agent.build_deterministic_warnings(_make_candidate(), _make_extract(salary=RXNT_SALARY))
+    assert not any('salary' in w.lower() for w in on_target)
+
+
+def test_merge_warnings_drops_the_raters_salary_bullets_when_the_range_is_on_target():
+    """The incident: the top of the range clears the target, so a lower-half complaint is noise."""
+    llm = [
+        RXNT_RATER_BULLET,
+        'Base midpoint sits below target unless negotiated into upper half',
+        'Stack is mostly Java',
+    ]
+    assert agent.merge_warnings([], llm, salary_on_target=True) == ['Stack is mostly Java']
+
+
+def test_merge_warnings_folds_the_raters_estimate_after_the_below_target_line():
+    deterministic = ['Salary below target — whole range under CAD 200,000: CA$120,000 - CA$180,000 per year']
+    llm = ['Pay likely below target even at the top of the band', 'Stack is mostly Java']
+    merged = agent.merge_warnings(deterministic, llm)
+    assert merged[0].startswith('Salary below target — whole range under CAD 200,000')
+    assert merged[0].endswith('Pay likely below target even at the top of the band')
+    assert merged[1:] == ['Stack is mostly Java']
+
+
+def test_format_extract_text_tells_the_rater_the_range_is_on_target(salary_target_set):
+    text = agent.format_extract_text(_make_candidate(), _make_extract(salary=RXNT_SALARY))
+    assert 'Salary vs target: meets target' in text
+
+
+def test_format_extract_text_adds_no_target_line_it_cannot_decide(salary_target_set):
+    text = agent.format_extract_text(_make_candidate(), _make_extract(salary='$170,000 - $240,000 per year'))
+    assert 'Salary vs target:' not in text
+
+
 def test_format_job_notification_carries_the_extracted_salary():
     """The message used to contain no salary field at all — only the rater's paraphrase of one."""
     extract = _make_extract(salary='CA$208,580–$273,770 annually (typical hiring range)')

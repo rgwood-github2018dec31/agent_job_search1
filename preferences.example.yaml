@@ -111,6 +111,16 @@ titles:
 # is given no relocation guidance and judges the role on its own merits.
 relocation_note: ''
 
+compensation:
+  # Annual base pay you are targeting, and the ISO 4217 currency it is quoted in. When BOTH are set
+  # and a posting states a complete annual range in that same currency, code decides the pay
+  # question: the range is on target when its UPPER bound reaches base_target (the band is
+  # negotiable), and a "Salary below target" warning is added only when the whole range sits
+  # under it. Other currencies, hourly/day rates and partial figures stay with the rater.
+  # Leave both empty for no code-side comparison.
+  base_target:      # e.g. 150000
+  currency: ''      # e.g. EUR
+
 companies:
   # Companies to always auto-reject, whatever the posting says. Matched on an EXACT,
   # case-sensitive company name — 'acme' does not match 'Acme' — so list each variant a

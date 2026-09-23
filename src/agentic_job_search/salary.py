@@ -349,6 +349,16 @@ def classify_salary(text: str) -> dict[str, Any]:
     return _facts('unclassified', raw, 'deterministic', currency=currency, period=period)
 
 
+def count_ranges(text: str) -> int:
+    """How many low–high ranges the string states.
+
+    A reading keeps the FIRST range only, so a string quoting one per region — 'CAD 154,700 to CAD
+    204,700 (Ontario); CAD 154,700 to CAD 310,700 (British Columbia)' — has a `maximum` that is not
+    the top of what the posting offers. A caller comparing bounds needs to know there is more.
+    """
+    return sum(1 for _ in _RANGE_RE.finditer(str(text or '')))
+
+
 def compensation_context(description: str) -> str:
     """Sentences of the description that mention money, for the classifier to read.
 
