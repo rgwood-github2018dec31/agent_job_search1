@@ -20,9 +20,12 @@ from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
+    LOCAL_LLM_TEMPERATURE,
+    LOG_SNIPPET_MAX_CHARS,
     OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
 )
+from agentic_job_search.text_budget import snippet
 from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 logger = logging.getLogger(__name__)
@@ -107,13 +110,16 @@ def extract_json_object(text: str) -> dict:
     """Extract the first JSON object from text that may contain prose around it."""
     decoder = json.JSONDecoder()
     start = text.find('{')
+    # A '{' that does not start valid JSON is expected in prose; only the last failure matters,
+    # and it is chained onto the final error below rather than logged per candidate.
+    last_error: json.JSONDecodeError | None = None
     while start != -1:
         try:
             obj, _ = decoder.raw_decode(text, start)
             if isinstance(obj, dict):
                 return obj
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as ex:
+            last_error = ex
         start = text.find('{', start + 1)
     # Head AND tail, deliberately. The head-only message is why this was first misdiagnosed as a
     # ```json fence problem: the fence is at the head and the fault is always in the tail (a
@@ -121,8 +127,9 @@ def extract_json_object(text: str) -> dict:
     # always parsed here — raw_decode scans from the first '{' and ignores everything around it.
     raise ValueError(
         f'No JSON object found in LLM response ({len(text)} chars). '
-        f'Head: {text[:200]!r} ... Tail: {text[-200:]!r}'
-    )
+        f'Head: {text[:LOG_SNIPPET_MAX_CHARS]!r} ... Tail: {text[-LOG_SNIPPET_MAX_CHARS:]!r}'
+        + (f' Last decode error: {last_error}' if last_error else '')
+    ) from last_error
 
 
 async def chat_openrouter(
@@ -151,7 +158,7 @@ async def chat_openrouter(
     raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
     data = json.loads(raw)
     if not data.get('ok'):
-        raise provider_error('OpenRouter chat failed', str(data.get('error') or raw[:300]))
+        raise provider_error('OpenRouter chat failed', str(data.get('error') or snippet(raw)))
     # Checked BEFORE the content test, and regardless of whether content is empty: a truncated
     # non-empty body is the case that used to reach the JSON parser disguised as a parse failure.
     if data.get('finish_reason') == 'length':
@@ -163,7 +170,7 @@ async def chat_openrouter(
             max_tokens=max_tokens,
         )
     if not data.get('content'):
-        raise RuntimeError(f'OpenRouter chat returned empty content: {raw[:300]}')
+        raise RuntimeError(f'OpenRouter chat returned empty content: {snippet(raw)}')
     return data['content'], float(data.get('cost_usd') or 0.0)
 
 
@@ -209,7 +216,7 @@ async def generate_local(
     re-raised untouched: a down server must keep reading as a down server.
     """
     try:
-        args = {'prompt': prompt, 'system': system, 'model': model, 'temperature': 0.2}
+        args = {'prompt': prompt, 'system': system, 'model': model, 'temperature': LOCAL_LLM_TEMPERATURE}
         if max_tokens is not None:
             args['max_tokens'] = max_tokens
         raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'generate', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
@@ -220,7 +227,7 @@ async def generate_local(
     data = json.loads(raw)
     response = data.get('response', '')
     if not response:
-        raise RuntimeError(f'Local LLM returned empty response: {raw[:300]}')
+        raise RuntimeError(f'Local LLM returned empty response: {snippet(raw)}')
     return response
 
 

@@ -355,7 +355,7 @@ REFERENCE_SUMMARY_MAX_CHARS = 2500
 #
 # Upgrading is therefore a reviewable edit to this constant, prompted for by
 # check_playwright_mcp_version() rather than taken automatically.
-PLAYWRIGHT_MCP_VERSION = '0.0.82'
+PLAYWRIGHT_MCP_VERSION = '0.0.81'
 PLAYWRIGHT_MCP_PACKAGE = f'@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}'
 # Queried directly over HTTPS rather than via `npm view`, which shells out through the npm cache
 # and can fail for reasons unrelated to the registry (a root-owned cache file, for one).
@@ -364,3 +364,59 @@ PLAYWRIGHT_MCP_REGISTRY_URL = 'https://registry.npmjs.org/@playwright/mcp/latest
 # a 3s one; DNS resolution is bounded by neither. The measured cost against a healthy
 # registry is ~0.25s. The call fails open, so a slow registry delays a run, never fails it.
 PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS = 3
+
+# Text budgets. A cap on text is a decision, so each one is named here, and every cut goes through
+# text_budget.truncate_reported() so it is logged and marked rather than silent (2026-09-21: the
+# PDF categorizer read only the first 3000 raw chars, whitespace included, and said nothing).
+# Deterministic checks (regex gates) are never truncated at all: scanning the full text is free.
+#
+# Model-derived cap for PDF text sent to ANTHROPIC_MODEL_NAME_LOW (claude-haiku-4-5, 200K-token
+# context window per https://platform.claude.com/docs/en/about-claude/models/overview). The
+# chars-per-token figure is a deliberately low estimate for English prose, so the char cap errs
+# toward fitting; the share leaves the rest of the window for the prompt scaffolding and output.
+ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS = 200_000
+CHARS_PER_TOKEN_ESTIMATE = 3
+PDF_PROMPT_CONTEXT_SHARE = 0.5
+PDF_PROMPT_MAX_CHARS = int(ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS * CHARS_PER_TOKEN_ESTIMATE * PDF_PROMPT_CONTEXT_SHARE)
+# Per reference job, in the full reference block and the summarization prompt. Up to
+# MAX_REFERENCE_JOBS of these are concatenated, so this budget is per job, not per prompt.
+REFERENCE_JOB_PROMPT_MAX_CHARS = 3000
+# The accessibility snapshot handed to the extract-fallback condensation call.
+EXTRACT_SNAPSHOT_MAX_CHARS = 80_000
+# The description excerpt shown to the blacklist confirmation call alongside company/location/title.
+BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS = 500
+# OpenAI-compatible function-calling APIs reject a tool description longer than this.
+OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS = 1024
+# The scraper's report_blocked `what_happened` argument, echoed into logs and the audit.
+SCRAPER_WHAT_HAPPENED_MAX_CHARS = 500
+# Diagnostic excerpts of a response, error or command in log lines and exception messages.
+LOG_SNIPPET_MAX_CHARS = 300
+
+SECONDS_PER_MINUTE = 60
+# Waiting for a freshly launched @playwright/mcp to answer: this many polls, this far apart. A
+# server that never answers raises rather than being handed back to fail later with no context.
+PLAYWRIGHT_MCP_READY_POLL_ATTEMPTS = 30
+PLAYWRIGHT_MCP_READY_POLL_INTERVAL_SECONDS = 1
+# Stage 2 restarts a dead @playwright/mcp this many times per run, then stops and hands the
+# unevaluated jobs back to the next run. On 2026-09-21 its node process died of a V8 heap OOM
+# 1h38m in, and the 23 remaining jobs each failed in milliseconds and were lost to dedup.
+PLAYWRIGHT_MAX_RESTARTS_PER_RUN = 1
+
+# Run reporting
+YIELD_HISTORY_RUNS_SHOWN = 5          # recent runs listed in the yield-history section of alerts
+LISTING_ESTIMATE_HISTORY_RUNS = 10    # past runs whose per-query listing counts feed the median estimate
+FAILED_QUERIES_NAMED_MAX = 3          # failed queries named in a partial-failure alert before "+N more"
+CONSOLE_BANNER_WIDTH = 40
+# Two cost figures closer than this are the same number printed twice; only a real gap is shown.
+COST_DELTA_DISPLAY_TOLERANCE_USD = 1e-9
+# --audit: a gate-killed job the strong rater scores at or above this is reported as a false negative.
+AUDIT_FALSE_NEGATIVE_MIN_RATING = 3
+# Guess Unbucketed Location: the model's reason, cut at a word boundary for a YAML comment and Telegram.
+LOCATION_GUESS_REASON_MAX_CHARS = 150
+
+# Stage 2 extract fallback (Anthropic, deterministic Playwright)
+EXTRACT_FALLBACK_MAX_TURNS = 16
+EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after navigation
+
+# Local LLM sampling: low for the 1-5 triage score and JSON answers, which should be repeatable.
+LOCAL_LLM_TEMPERATURE = 0.2

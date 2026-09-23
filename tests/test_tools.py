@@ -28,6 +28,7 @@ from agentic_job_search import config
 from agentic_job_search import extract_openrouter
 from agentic_job_search import preferences
 from agentic_job_search import scrape_openrouter
+from agentic_job_search import text_budget
 from agentic_job_search import tools_generic as tools
 from agentic_job_search import triage
 
@@ -622,6 +623,11 @@ def _no_legacy_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, 'LEGACY_DOWNLOADS_CACHE_PATH', tmp_path / 'missing_legacy_cache.yaml')
 
 
+def _reference_texts() -> list[str]:
+    """Each in-horizon reference job's pages joined, newest first, for readable assertions."""
+    return ['\n\n'.join(pages) for pages in tools._reference_job_pages]
+
+
 async def test_ingest_date_prefixes_from_mtime_and_preserves_it(tmp_path, monkeypatch):
     _no_legacy_cache(monkeypatch, tmp_path)
     save_dir = tmp_path / 'saved_pdfs'
@@ -746,7 +752,7 @@ async def test_load_applied_jobs_uses_index_without_llm_call(tmp_path, monkeypat
 
     assert extract_called == [], 'LLM should not be called on an index hit'
     assert 'CachedCorp' in tools._applied_companies
-    assert tools._reference_job_texts == ['job description text']
+    assert _reference_texts() == ['job description text']
     assert len(tools._applied_jobs) == 1
 
 
@@ -772,7 +778,7 @@ async def test_load_applied_jobs_ignores_the_save_dir(tmp_path, monkeypatch):
     await tools.load_applied_jobs(applied_to_dir=applied, index_path=applied / 'index.yaml')
 
     assert tools._applied_companies == {}
-    assert tools._reference_job_texts == []
+    assert _reference_texts() == []
     assert tools._applied_jobs == []
 
 
@@ -826,7 +832,7 @@ async def test_load_applied_jobs_excludes_beyond_horizon(tmp_path, monkeypatch):
 
     assert stale.exists(), 'aged-out PDFs are kept on disk, only excluded from use'
     assert tools._applied_companies == {'NewCorp': fresh.name}
-    assert tools._reference_job_texts == ['new text']
+    assert _reference_texts() == ['new text']
     assert [j['filename'] for j in tools._applied_jobs] == [fresh.name]
 
 
@@ -844,7 +850,7 @@ async def test_load_applied_jobs_does_not_blocklist_recruiting_agency(tmp_path, 
     await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
     assert tools._applied_companies == {}, 'an agency name must never block its other postings'
-    assert tools._reference_job_texts == ['job description text'], 'still useful as reference signal'
+    assert _reference_texts() == ['job description text'], 'still useful as reference signal'
 
 
 async def test_load_applied_jobs_blocklists_end_client_not_agency(tmp_path, monkeypatch):
@@ -893,13 +899,13 @@ def test_applied_jobs_summary_empty_when_no_jobs(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_build_reference_block_empty_when_no_texts(monkeypatch):
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [])
     assert agent.build_reference_block() == ''
 
 
 def test_build_reference_block_includes_text(monkeypatch):
     from agentic_job_search import agent
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['This is a great remote job at Acme.'])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['This is a great remote job at Acme.']])
     block = agent.build_reference_block()
     assert 'Acme' in block
     assert 'REFERENCE JOBS' in block
@@ -929,7 +935,7 @@ def test_build_reference_block_caps_at_max_pdfs(monkeypatch):
     from agentic_job_search import agent
     from agentic_job_search.config import MAX_REFERENCE_JOBS
     n = MAX_REFERENCE_JOBS + 5
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [f'job text {i}' for i in range(n)])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [[f'job text {i}'] for i in range(n)])
     block = agent.build_reference_block()
     assert block.count('[Reference Job') == MAX_REFERENCE_JOBS
 
@@ -1443,7 +1449,7 @@ def test_triage_rejects_passes_above_threshold_and_none():
 # ---------------------------------------------------------------------------
 
 async def test_build_reference_summary_openrouter_first(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
@@ -1462,7 +1468,7 @@ async def test_build_reference_summary_openrouter_first(tmp_path, monkeypatch):
 
 
 async def test_build_reference_summary_falls_back_to_local(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
@@ -1483,7 +1489,7 @@ async def test_build_reference_summary_falls_back_to_local(tmp_path, monkeypatch
 
 
 async def test_build_reference_summary_falls_back_to_anthropic(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
@@ -1509,7 +1515,7 @@ async def test_build_reference_summary_falls_back_to_anthropic(tmp_path, monkeyp
 
 
 async def test_build_reference_summary_falls_back_to_full_block_when_all_fail(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
 
     async def fail(*args, **kwargs):
@@ -1525,7 +1531,7 @@ async def test_build_reference_summary_falls_back_to_full_block_when_all_fail(tm
 
 
 async def test_build_reference_summary_cache_hit_skips_llm(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', ['Great AI job at Acme.'])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
@@ -1542,7 +1548,7 @@ async def test_build_reference_summary_cache_hit_skips_llm(tmp_path, monkeypatch
 
 
 async def test_build_reference_summary_empty_without_texts(monkeypatch):
-    monkeypatch.setattr(agent.tools_module, '_reference_job_texts', [])
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [])
     assert await agent.build_reference_summary() == ''
 
 
@@ -1797,7 +1803,7 @@ async def test_openrouter_loop_returns_none_on_chat_error(monkeypatch):
     assert extract is None
 
 
-async def test_openrouter_loop_truncates_tool_results(monkeypatch):
+async def test_openrouter_loop_truncates_tool_results(monkeypatch, caplog):
     from contextlib import asynccontextmanager
     from agentic_job_search.config import EXTRACTOR_TOOL_RESULT_MAX_CHARS
     chat_requests = []
@@ -1824,7 +1830,12 @@ async def test_openrouter_loop_truncates_tool_results(monkeypatch):
         _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
     )
     tool_msg = chat_requests[1]['messages'][-1]
-    assert len(tool_msg['content']) == EXTRACTOR_TOOL_RESULT_MAX_CHARS
+    kept, _, marker = tool_msg['content'].rpartition('\n')
+    assert len(kept) == EXTRACTOR_TOOL_RESULT_MAX_CHARS
+    assert marker.startswith(f'[truncated: kept {EXTRACTOR_TOOL_RESULT_MAX_CHARS} of '), \
+        'the model must be told its tool result was cut'
+    assert any('Truncating browser_snapshot result' in r.message and r.levelname == 'WARNING'
+               for r in caplog.records), 'a cut must be logged, never silent'
 
 
 async def test_extractor_provider_dispatch_openrouter(monkeypatch):
@@ -7235,8 +7246,8 @@ async def test_reference_texts_keep_the_newest_and_drop_the_oldest(tmp_path, mon
 
     await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
-    kept = tools._reference_job_texts[:MAX_REFERENCE_JOBS]
-    assert tools._reference_job_texts[0] == f'job text day{total - 1}', 'newest must come first'
+    kept = _reference_texts()[:MAX_REFERENCE_JOBS]
+    assert _reference_texts()[0] == f'job text day{total - 1}', 'newest must come first'
     assert f'job text day{total - 1}' in kept, 'the newest record must reach the profile'
     assert 'job text day0' not in kept, 'the oldest record must fall outside the cap'
     # The five oldest are exactly the ones dropped.
@@ -7260,7 +7271,7 @@ async def test_reference_texts_order_by_applied_date_not_filename(tmp_path, monk
 
     await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
 
-    assert tools._reference_job_texts == ['recent text', 'old text']
+    assert _reference_texts() == ['recent text', 'old text']
 
 
 async def test_a_newly_applied_job_changes_the_reference_set(tmp_path, monkeypatch):
@@ -7284,14 +7295,14 @@ async def test_a_newly_applied_job_changes_the_reference_set(tmp_path, monkeypat
     ]
     index_path = _corpus(applied, records)
     await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
-    before = tools._reference_job_texts[:MAX_REFERENCE_JOBS]
+    before = _reference_texts()[:MAX_REFERENCE_JOBS]
 
     # Apply to one more job today, on top of an already-full corpus.
     index_path = _corpus(applied, records + [
         (date.today(), 'brand new job text', f'{date.today().isoformat()}-cat-saved_jd-newest.pdf'),
     ])
     await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)
-    after = tools._reference_job_texts[:MAX_REFERENCE_JOBS]
+    after = _reference_texts()[:MAX_REFERENCE_JOBS]
 
     assert 'brand new job text' in after, 'a new application must be able to reach the profile'
     assert before != after, 'the reference set must change when a newer job is applied to'
@@ -7501,3 +7512,389 @@ def test_llm_mcp_call_sites_pass_long_timeout():
                 missing.append(f'{path.name}:{node.lineno}')
     assert len(llm_sites) >= 5, f'expected at least 5 LLM call_mcp_tool sites, found {llm_sites}'
     assert not missing, f'LLM call_mcp_tool sites without timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS: {missing}'
+
+
+
+# ---------------------------------------------------------------------------
+# Code hygiene (2026-09-21): no silent truncation, no swallowed exceptions
+# ---------------------------------------------------------------------------
+
+# Neutral text long enough to push anything after it past every cap the regex gates used to apply.
+_GATE_FILLER = 'We build reliable software with a friendly team and ship it every week. ' * 90
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_truncate_reported_leaves_short_text_alone(caplog):
+    assert text_budget.truncate_reported('short', 10, 'thing') == 'short'
+    assert not _warnings(caplog)
+
+
+def test_truncate_reported_logs_and_marks_a_cut(caplog):
+    out = text_budget.truncate_reported('x' * 50, 10, 'the thing')
+    assert out.startswith('x' * 10) and '[truncated: kept 10 of 50 chars]' in out
+    assert any('Truncating the thing: 50 chars' in m for m in _warnings(caplog))
+
+
+def test_snippet_says_how_much_it_hid():
+    assert text_budget.snippet('abc', max_chars=5) == 'abc'
+    shown = text_budget.snippet('a' * 20, max_chars=5)
+    assert shown.startswith('aaaaa') and '+15 of 20 chars not shown' in shown
+
+
+def test_pages_to_prompt_reports_chars_per_page(caplog):
+    caplog.set_level(logging.INFO)
+    out = text_budget.pages_to_prompt(['page one', 'page two!'], 'PDF x.pdf', 1000)
+    assert out == 'page one\n\npage two!'
+    assert any('2 page(s), 17 chars' in r.getMessage() and '[8, 9]' in r.getMessage()
+               for r in caplog.records)
+    assert not _warnings(caplog)
+
+
+def test_pages_to_prompt_keeps_content_behind_whitespace_padding(caplog):
+    """The categorizer read the first 3000 RAW chars: a PDF opening with padding lost its content."""
+    padded = ' ' * 5000 + '\n\n\n' * 500 + 'Staff AI Engineer at Acme'
+    out = text_budget.pages_to_prompt([padded], 'PDF padded.pdf', 3000)
+    assert 'Staff AI Engineer at Acme' in out
+    assert '[truncated' not in out
+    assert any('normalized whitespace' in m for m in _warnings(caplog))
+
+
+def test_pages_to_prompt_truncates_after_normalizing_and_says_so(caplog):
+    pages = ['word ' * 400, 'more ' * 400, 'last ' * 400]
+    out = text_budget.pages_to_prompt(pages, 'PDF big.pdf', 2500)
+    assert '[truncated: kept 2500 of' in out and 'pages 1–1 of 3 complete' in out
+    warnings = _warnings(caplog)
+    assert any('normalized whitespace' in m for m in warnings)
+    assert any('still' in m and 'truncating' in m for m in warnings)
+
+
+def test_pdf_prompt_cap_is_derived_from_the_model_context():
+    assert config.PDF_PROMPT_MAX_CHARS == int(
+        config.ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS * config.CHARS_PER_TOKEN_ESTIMATE
+        * config.PDF_PROMPT_CONTEXT_SHARE)
+    assert config.PDF_PROMPT_MAX_CHARS > config.REFERENCE_JOB_PROMPT_MAX_CHARS
+
+
+async def test_categorize_sends_text_past_the_old_3000_char_cap(tmp_path, monkeypatch):
+    save_dir = tmp_path / 'save'
+    save_dir.mkdir()
+    (save_dir / 'posting.pdf').write_bytes(b'%PDF-fake')
+    monkeypatch.setattr(tools, 'read_pdf_pages', lambda pdf: ['intro ' * 1000, 'the real title'])
+    seen = {}
+
+    async def fake_categorize(text, filename):
+        seen['text'] = text
+        return 'saved_jd'
+
+    monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
+    await tools.categorize_save_dir_pdfs(save_dir)
+    assert 'the real title' in seen['text']
+    assert (save_dir / 'cat-saved_jd-posting.pdf').exists()
+
+
+def test_residency_gate_reads_past_the_old_cap():
+    extract = _make_extract(location='Germany (Remote)',
+                            description=_GATE_FILLER + 'Candidates must be based in Germany.')
+    assert agent.derive_residency_scope(extract) == 'country_only'
+
+
+def test_workplace_gate_reads_past_the_old_cap():
+    extract = _make_extract(location='Germany', description=_GATE_FILLER + 'This role is hybrid.')
+    assert agent.derive_workplace_type(extract) == 'hybrid'
+
+
+def test_education_gate_reads_past_the_old_cap():
+    extract = _make_extract(description=_GATE_FILLER + 'PhD in Machine Learning is required.')
+    assert agent.derive_education_requirement(extract) == 'phd'
+
+
+def test_agency_gate_reads_past_the_old_cap():
+    extract = _make_extract(description=_GATE_FILLER + 'Our client is a leading fintech.')
+    assert agent.derive_agency_posting(extract) is True
+
+
+def test_contract_warning_reads_past_the_old_cap():
+    extract = _make_extract(description=_GATE_FILLER + 'This is a 6-month contract.', salary='CAD 200,000')
+    assert 'Contract role — full-time preferred' in agent.build_deterministic_warnings(_make_candidate(), extract)
+
+
+def test_gate_filler_is_longer_than_every_old_cap():
+    assert len(_GATE_FILLER) > 4000
+
+
+async def test_sdk_stream_is_closed_when_an_api_error_aborts(monkeypatch):
+    """Raising mid-`async for` left the generator open; asyncio.run() then failed closing it."""
+    closed = []
+
+    async def fake_sdk_query(**kwargs):
+        try:
+            yield ResultMessage(subtype='success', duration_ms=1, duration_api_ms=1, is_error=True,
+                                num_turns=1, session_id='s')
+            yield ResultMessage(subtype='success', duration_ms=1, duration_api_ms=1, is_error=False,
+                                num_turns=1, session_id='s', structured_output={'category': 'x'})
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
+    with pytest.raises(tools.AgentApiError) as info:
+        await tools._categorize_pdf_text('text', 'a.pdf')
+    assert closed == [True], 'the SDK stream must be closed before the error propagates'
+    assert 'no HTTP status reported' in str(info.value) and 'claude /login' in str(info.value)
+
+
+async def test_playwright_server_that_never_answers_raises(monkeypatch):
+    class FakeProc:
+        returncode = None
+        terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    proc = FakeProc()
+
+    async def fake_exec(*cmd):
+        return proc
+
+    async def no_sleep(_seconds):
+        return None
+
+    def refuse(*args, **kwargs):
+        raise requests.ConnectionError('connection refused')
+
+    monkeypatch.setattr(agent.asyncio, 'create_subprocess_exec', fake_exec)
+    monkeypatch.setattr(agent.asyncio, 'sleep', no_sleep)
+    monkeypatch.setattr(agent.requests, 'get', refuse)
+    with pytest.raises(RuntimeError, match='did not answer') as info:
+        await agent.start_playwright_server(9999, browser_mode='headless')
+    assert 'connection refused' in str(info.value)
+    assert proc.terminated, 'a server that never answered must not be left running'
+
+
+# ---------------------------------------------------------------------------
+# Browser death during Stage 2 (2026-09-21: @playwright/mcp died of a heap OOM mid-run)
+# ---------------------------------------------------------------------------
+
+class _ExitedProc:
+    returncode = -6
+    terminated = False
+
+    def terminate(self):
+        raise ProcessLookupError('terminate() on an exited process')
+
+    async def wait(self):
+        return self.returncode
+
+
+async def test_browser_server_stop_tolerates_an_exited_process():
+    """terminate() on an exited process raised and cost the 2026-09-21 run its summary."""
+    browser = agent.BrowserServer('headless')
+    browser.proc = _ExitedProc()
+    await browser.stop()   # must not raise
+
+
+class _FakeBrowser:
+    """Duck-typed BrowserServer whose liveness the test drives."""
+
+    def __init__(self):
+        self.dead = False
+        self.restarts = 0
+        self.mcp = {'type': 'http', 'url': 'http://localhost:1/mcp'}
+
+    def is_dead(self):
+        return self.dead
+
+    async def restart(self):
+        self.restarts += 1
+        self.dead = False
+        self.mcp['url'] = 'http://localhost:2/mcp'
+
+
+def _stage2_with_dying_browser(monkeypatch, browser, dies_on: list[str]):
+    """Stub extraction so each job id in ``dies_on`` kills the browser once, then fails normally."""
+    monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
+    calls = []
+
+    async def fake_extract(candidate, url, stats, system_prompt):
+        calls.append((candidate['job_id'], url))
+        if candidate['job_id'] in dies_on:
+            dies_on.remove(candidate['job_id'])
+            browser.dead = True
+            raise ConnectionError('All connection attempts failed')
+        return None
+
+    async def fake_direct(candidate, url, stats):
+        return None
+
+    monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_extract)
+    monkeypatch.setattr(agent, 'extract_job_page_direct', fake_direct)
+    monkeypatch.setattr(agent.tools_module, '_ui_alerts', [])
+    return calls
+
+
+async def test_stage2_restarts_a_dead_browser_and_retries_the_same_job(monkeypatch):
+    browser = _FakeBrowser()
+    calls = _stage2_with_dying_browser(monkeypatch, browser, dies_on=['1'])
+    released = []
+    monkeypatch.setattr(agent.tools_module, 'forget_processed_job', lambda s, j: released.append(j))
+    funnel = {}
+    stats = {'extraction': agent.new_stage_stats(), 'rating': agent.new_stage_stats()}
+
+    await agent.evaluate_all_candidates(
+        [_make_candidate(job_id='1'), _make_candidate(job_id='2')], browser.mcp, 'prompt', 'profile',
+        stats, funnel=funnel, browser=browser,
+    )
+
+    assert [job for job, _ in calls] == ['1', '1', '2'], 'the job the browser died on must be retried'
+    assert calls[1][1] == 'http://localhost:2/mcp', 'the retry must use the restarted server'
+    assert browser.restarts == 1
+    assert 'eval_error' not in funnel, 'a dead browser is not the job\'s fault'
+    assert funnel.get('extract_failed') == 2
+    assert released == []
+    assert [a['kind'] for a in agent.tools_module._ui_alerts] == ['browser_restarted']
+
+
+async def test_stage2_stops_and_releases_jobs_when_the_browser_stays_dead(monkeypatch, caplog):
+    browser = _FakeBrowser()
+    calls = _stage2_with_dying_browser(monkeypatch, browser, dies_on=['1', '2'])
+    released = []
+    monkeypatch.setattr(agent.tools_module, 'forget_processed_job', lambda s, j: released.append(j))
+    funnel = {}
+    stats = {'extraction': agent.new_stage_stats(), 'rating': agent.new_stage_stats()}
+    candidates = [_make_candidate(job_id=str(n)) for n in range(1, 5)]
+
+    with caplog.at_level(logging.ERROR, logger=agent.logger.name):
+        await agent.evaluate_all_candidates(
+            candidates, browser.mcp, 'prompt', 'profile', stats, funnel=funnel, browser=browser,
+        )
+
+    assert [job for job, _ in calls] == ['1', '1', '2'], 'nothing may run after the browser stays dead'
+    assert released == ['2', '3', '4'], 'every unevaluated job, including the failing one, goes back'
+    assert funnel['browser_dead'] == 3
+    assert 'eval_error' not in funnel
+    stop_lines = [r for r in caplog.records if 'Stage 2 stopped' in r.message]
+    assert len(stop_lines) == 1, 'one error line, not one per remaining job'
+    assert 'browser_dead' in [a['kind'] for a in agent.tools_module._ui_alerts]
+    assert any('BROWSER DIED' in a for a in agent.assess_run_health(
+        {'ui_alerts': agent.tools_module._ui_alerts}))
+
+
+def test_forget_processed_job_removes_the_record(tmp_path, monkeypatch):
+    processed = tmp_path / 'processed_jobs'
+    processed.mkdir()
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', processed)
+    monkeypatch.setattr(tools, '_processed_jobs', {('linkedin', '42'), ('linkedin', '420')})
+    (processed / 'job_posting-linkedin-42-2026Sep21-1-acme-engineer.yaml').write_text('site: linkedin\n')
+    (processed / 'job_posting-linkedin-420-2026Sep21-1-acme-engineer.yaml').write_text('site: linkedin\n')
+
+    assert tools.forget_processed_job('linkedin', '42') == 1
+
+    assert [f.name for f in processed.iterdir()] == ['job_posting-linkedin-420-2026Sep21-1-acme-engineer.yaml'], \
+        'a job id that is a prefix of another must not take the other with it'
+    assert tools._processed_jobs == {('linkedin', '420')}
+    with pytest.raises(FileNotFoundError, match='linkedin/42'):
+        tools.forget_processed_job('linkedin', '42')
+
+
+async def test_main_logs_an_exception_that_ends_the_run(monkeypatch, caplog, tmp_path):
+    """On 2026-09-21 the cause of a dead run reached only the terminal, never the run log."""
+    requirements = tmp_path / 'JOB_REQUIREMENTS.md'
+    requirements.write_text('x')
+    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', requirements)
+    monkeypatch.setattr(agent.sys, 'argv', ['main.py', '-n', '--no-version-check'])
+    monkeypatch.setattr(agent, 'setup_logging', lambda *args, **kwargs: None)   # keeps caplog attached
+    released = []
+    monkeypatch.setattr(agent.tools_module, 'acquire_run_lock', lambda **kwargs: None)
+    monkeypatch.setattr(agent.tools_module, 'release_run_lock', lambda: released.append(True))
+    monkeypatch.setattr(agent, 'load_processed_jobs', lambda: None)
+
+    async def no_op():
+        return None
+
+    for name in ('categorize_save_dir_pdfs', 'ingest_save_dir_applied_pdfs', 'load_applied_jobs'):
+        monkeypatch.setattr(agent.tools_module, name, no_op)
+
+    async def crash(**kwargs):
+        raise ProcessLookupError('terminate() on an exited process')
+
+    monkeypatch.setattr(agent, 'run_non_interactive', crash)
+
+    with caplog.at_level(logging.ERROR, logger=agent.logger.name), pytest.raises(ProcessLookupError):
+        await agent.main()
+
+    assert any('Run aborted by ProcessLookupError' in r.message and r.exc_info for r in caplog.records)
+    assert released == [True], 'the run lock must still be released'
+
+
+def test_scraper_bad_tool_json_is_logged_and_returned_to_the_model(monkeypatch, caplog):
+    """It used to become {} silently, running the tool with arguments the model never chose."""
+    bad_call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
+                           'tool_calls': [{'id': 'c1', 'function': {'name': 'browser_snapshot',
+                                                                    'arguments': '{not json'}}]})
+    sent = []
+
+    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
+        sent.append(args)
+        return [bad_call, _CHAT_DONE][len(sent) - 1]
+
+    browser_calls = []
+
+    async def browser(name, args):
+        browser_calls.append(name)
+        return ''
+
+    monkeypatch.setattr(scrape_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    asyncio.run(scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer').run('sys', 'user', []))
+    assert browser_calls == [], 'a call with unparseable arguments must not run'
+    tool_reply = sent[1]['messages'][-1]
+    assert tool_reply['role'] == 'tool' and 'invalid JSON arguments' in tool_reply['content']
+    assert any('invalid JSON arguments' in m and '{not json' in m for m in _warnings(caplog))
+
+
+def test_parse_posting_date_raises_on_an_unknown_format():
+    assert tools.parse_posting_date('') is None
+    assert tools.parse_posting_date('2026-09-01') == date(2026, 9, 1)
+    assert tools.parse_posting_date('3 days ago') == date.today() - timedelta(days=3)
+    with pytest.raises(ValueError, match="'last Tuesday'"):
+        tools.parse_posting_date('last Tuesday')
+
+
+async def test_hard_rules_log_an_unparseable_posting_date_once(caplog):
+    extract = _make_extract(date_posted='last Tuesday')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+    assert sum("'last Tuesday'" in m for m in _warnings(caplog)) == 1
+
+
+def test_parse_iso_date_raises_naming_the_value():
+    with pytest.raises(ValueError, match="'09/01/2026'"):
+        tools._parse_iso_date('09/01/2026')
+
+
+def test_recruiter_notification_with_a_bad_date_is_dropped_and_logged(tmp_path, monkeypatch, caplog):
+    path = tmp_path / 'recruiter_notifications.yaml'
+    path.write_text(yaml.dump([
+        {'job_id': '1', 'notified': date.today().isoformat()},
+        {'job_id': '2', 'notified': 'yesterday'},
+    ]), encoding='utf-8')
+    monkeypatch.setattr(tools, 'RECRUITER_NOTIFICATIONS_PATH', path)
+    assert [e['job_id'] for e in tools.load_recruiter_notifications()] == ['1']
+    assert any("'2'" in m and "'yesterday'" in m for m in _warnings(caplog))
+
+
+def test_parse_added_date_raises_and_the_blacklist_warns_with_the_value(monkeypatch, caplog):
+    with pytest.raises(ValueError, match="'not-a-date'"):
+        preferences._parse_added_date('not-a-date')
+    assert preferences._parse_added_date(None) is None
+    prefs = preferences.load_preferences()
+    prefs['companies']['blacklist'] = [{'name': 'Initech', 'reason': 'r', 'added': 'not-a-date'}]
+    monkeypatch.setattr(preferences, 'load_preferences', lambda: prefs)
+    assert ('Initech', 'r') in preferences.blacklisted_companies(), 'a bad date keeps the entry active'
+    assert any('Initech' in m and "'not-a-date'" in m for m in _warnings(caplog))
+
+
+def test_extract_json_object_chains_the_last_decode_error():
+    with pytest.raises(ValueError) as info:
+        triage.extract_json_object('prose {not json} more prose')
+    assert isinstance(info.value.__cause__, json.JSONDecodeError)

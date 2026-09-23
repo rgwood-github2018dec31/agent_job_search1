@@ -125,6 +125,7 @@ src/agentic_job_search/
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
   location.py                     # Cached geographic classifier for a job's location
+  text_budget.py                  # Reported truncation: truncate_reported, pages_to_prompt, snippet
 scripts/
   migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
@@ -143,7 +144,7 @@ run_dir/
   reference_summary_cache.yaml    # Cached distilled ideal-role profile (md5-keyed)
   location_cache.yaml             # Cached geography per location string (country/region/language)
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
-  recruiter_notifications.yaml    # Agency postings already notified (14 days); suppresses repost pings
+  recruiter_notifications.yaml    # Agency postings already notified (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml

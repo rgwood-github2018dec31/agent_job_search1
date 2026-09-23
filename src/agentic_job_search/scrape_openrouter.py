@@ -24,11 +24,14 @@ from agentic_job_search.config import (
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_SCRAPER,
+    OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
     SCRAPER_TOOL_RESULT_MAX_CHARS,
+    SCRAPER_WHAT_HAPPENED_MAX_CHARS,
     UI_BLOCK_SIGNATURES,
 )
+from agentic_job_search.text_budget import snippet, truncate_reported
 from agentic_job_search.triage import http_status_of, provider_error
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
@@ -117,7 +120,10 @@ def browser_tool_defs(mcp_tools: list[dict]) -> list[dict]:
     disallowed = {t.replace('mcp__playwright__', '') for t in SCRAPER_DISALLOWED_BROWSER_TOOLS}
     return [
         {'type': 'function', 'function': {
-            'name': t['name'], 'description': (t['description'] or '')[:1024],
+            'name': t['name'],
+            'description': truncate_reported(
+                t['description'] or '', OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS,
+                f"description of browser tool {t['name']}"),
             'parameters': t['inputSchema'] or {'type': 'object', 'properties': {}}}}
         for t in mcp_tools if t['name'] not in disallowed
     ]
@@ -241,7 +247,9 @@ class ScrapeSession:
             return summary
 
         if name == 'report_problem':
-            what = str(args.get('what_happened', ''))[:500]
+            what = truncate_reported(
+                str(args.get('what_happened', '')), SCRAPER_WHAT_HAPPENED_MAX_CHARS,
+                'report_problem what_happened')
             self.problems.append(what)
             logger.warning(f'Stage 1b: model reported a problem: {what}')
             tools_generic._ui_alerts.append({
@@ -276,7 +284,7 @@ class ScrapeSession:
                 # remaining query would fail identically, so this must reach run_scraper as a
                 # distinct type rather than be swallowed by its per-query handler.
                 raise provider_error('OpenRouter chat failed',
-                                     str(data.get('error') or raw[:300]))
+                                     str(data.get('error') or snippet(raw)))
 
             usage = data.get('usage') or {}
             self.cost += float(data.get('cost_usd') or 0.0)
@@ -297,10 +305,19 @@ class ScrapeSession:
 
             for call in tool_calls:
                 name = call['function']['name']
+                raw_args = call['function'].get('arguments') or '{}'
                 try:
-                    args = json.loads(call['function'].get('arguments') or '{}')
-                except Exception:
-                    args = {}
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError as ex:
+                    # Calling the tool with {} instead would run it with arguments the model never
+                    # chose. Tell the model, as the extractor loop does, and let it retry.
+                    logger.warning(
+                        f'Stage 1b: {name} called with invalid JSON arguments ({ex}) for query '
+                        f'{self.query!r}: {snippet(raw_args)}'
+                    )
+                    retry_message = f'ERROR: invalid JSON arguments ({ex}). Retry the call with valid JSON.'
+                    messages.append({'role': 'tool', 'tool_call_id': call.get('id', ''), 'content': retry_message})
+                    continue
                 if (refusal := _guard_call(name, args)) is not None:
                     out = refusal
                 elif name in LOCAL_TOOL_NAMES:
@@ -313,9 +330,14 @@ class ScrapeSession:
                     try:
                         out = await self._browser(name, args)
                     except Exception as ex:
+                        logger.warning(
+                            f'Stage 1b: browser tool {name} failed for query {self.query!r} '
+                            f'(args {snippet(args)}): {type(ex).__name__}: {ex}'
+                        )
                         out = f'ERROR calling {name}: {ex}'
                 messages.append({'role': 'tool', 'tool_call_id': call.get('id', ''),
-                                 'content': out[:SCRAPER_TOOL_RESULT_MAX_CHARS]})
+                                 'content': truncate_reported(out, SCRAPER_TOOL_RESULT_MAX_CHARS,
+                                                              f'{name} result for query {self.query!r}')})
 
             if self.blocked:
                 logger.error('Stage 1b: block signature detected — stopping this query, not retrying')

@@ -7,7 +7,9 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import aclosing
 from datetime import date, datetime, timedelta
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +21,14 @@ from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
+    PDF_PROMPT_MAX_CHARS,
     RECRUITER_REPOST_MAX_PRIORS,
     RECRUITER_REPOST_WINDOW_DAYS,
     SCRAPER_DATE_POSTED_LABEL,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_DATE_POSTED_SECONDS,
     SCRAPER_EXPERIENCE_LABEL,
+    SECONDS_PER_MINUTE,
     UI_BLOCK_SIGNATURES,
     UI_CONTRACT_ELEMENTS,
     UI_FINGERPRINT_FILENAME,
@@ -33,6 +37,7 @@ from agentic_job_search.config import (
 )
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 from agentic_job_search import location_review
+from agentic_job_search.text_budget import pages_to_prompt, snippet, truncate_reported
 import agentic_job_search.preferences as preferences
 from agentic_job_search.triage import chat_openrouter, extract_json_object
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
@@ -72,13 +77,27 @@ LEGACY_DOWNLOADS_CACHE_PATH = RUN_DIR / "downloads_pdf_cache.yaml"
 APPLIED_PDF_GLOB = '*cat-saved_jd-*.pdf'
 _DATE_PREFIX_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})-')
 
+# index.yaml caches a PDF's extraction keyed by mtime; filesystems round mtimes differently, so
+# a difference under this is the same file.
+INDEX_MTIME_TOLERANCE_SECONDS = 1.0
+# Saved-job filename components. A long description (e.g. a full triage-reason sentence) would
+# otherwise push the filename past the filesystem's 255-byte limit; the file body keeps it all.
+SAVED_JOB_FILENAME_COMPANY_MAX_CHARS = 40
+SAVED_JOB_FILENAME_DESCRIPTION_MAX_CHARS = 120
+JSON_INDENT = 2
+# Region overlap needs at least two regions' result sets to compare.
+MIN_REGIONS_FOR_OVERLAP = 2
+REGION_OVERLAP_DECIMALS = 3
+
 logger = logging.getLogger(__name__)
 
 _processed_jobs: set[tuple[str, str]] = set()
 _candidates: list[dict] = []
 _candidates_per_query: dict[str, int] = {}
 _applied_companies: dict[str, str] = {}  # company_name -> PDF filename
-_reference_job_texts: list[str] = []     # extracted text for evaluator prompt injection
+# Per-page extracted text of each in-horizon applied job, newest first, for the reference profile.
+# Kept as pages until a prompt serializes it (text_budget.pages_to_prompt), so size is reportable.
+_reference_job_pages: list[list[str]] = []
 # In-horizon applied-job records: filename, applied_date, company, job_title, is_agency, end_client
 _applied_jobs: list[dict] = []
 _job_extracts: list[dict] = []           # condensed page extracts captured from the Stage 2 extractor
@@ -183,6 +202,15 @@ class AgentApiError(Exception):
         self.api_error_status = api_error_status
 
 
+_AUTH_FAILURE_STATUSES = {HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN}
+# 529 is Anthropic's "overloaded", which has no HTTPStatus member.
+ANTHROPIC_OVERLOADED_STATUS = 529
+_TRANSIENT_FAILURE_STATUSES = {
+    HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.INTERNAL_SERVER_ERROR, HTTPStatus.BAD_GATEWAY,
+    HTTPStatus.SERVICE_UNAVAILABLE, ANTHROPIC_OVERLOADED_STATUS,
+}
+
+
 def _raise_if_result_error(msg: ResultMessage, context: str) -> None:
     """Raise AgentApiError if the SDK reported an API-level failure for this result.
 
@@ -198,10 +226,13 @@ def _raise_if_result_error(msg: ResultMessage, context: str) -> None:
         parts.append(f'terminal_reason={terminal_reason!r}')
     if (errors := getattr(msg, 'errors', None)):
         parts.append(f'errors={"; ".join(errors)}')
-    if status in (401, 403):
+    if status in _AUTH_FAILURE_STATUSES:
         parts.append('not authenticated — run `claude /login`')
-    elif status in (429, 500, 502, 503, 529):
+    elif status in _TRANSIENT_FAILURE_STATUSES:
         parts.append('rate limited or overloaded — retry later')
+    elif status is None:
+        # Seen 2026-09-21 on a lapsed login: api_error with no status, so neither hint above fired.
+        parts.append('no HTTP status reported — check the Claude login (`claude /login`) and network')
     detail = f'{context}: ' + ' | '.join(parts)
     raise AgentApiError(detail, api_error_status=status)
 
@@ -247,22 +278,23 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
     )
     prompt = (
         f'Filename: {filename}\n\n'
-        f'Job posting text:\n{text[:3000]}\n\n'
+        f'Job posting text:\n{text}\n\n'
         'Identify the organization posting this job, the job title, whether the poster is a '
         'recruiting agency/aggregator rather than the hiring employer, and the end client if named.'
     )
-    async for msg in sdk_query(prompt=prompt, options=options):
-        if not isinstance(msg, ResultMessage):
-            continue
-        _raise_if_result_error(msg, f'Applied-job metadata extraction failed for {filename}')
-        if msg.structured_output:
-            out = msg.structured_output
-            return {
-                'company': out.get('company_name', ''),
-                'job_title': out.get('job_title', ''),
-                'is_agency': bool(out.get('is_recruiting_agency', False)),
-                'end_client': out.get('end_client_name', ''),
-            }
+    async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
+        async for msg in stream:
+            if not isinstance(msg, ResultMessage):
+                continue
+            _raise_if_result_error(msg, f'Applied-job metadata extraction failed for {filename}')
+            if msg.structured_output:
+                out = msg.structured_output
+                return {
+                    'company': out.get('company_name', ''),
+                    'job_title': out.get('job_title', ''),
+                    'is_agency': bool(out.get('is_recruiting_agency', False)),
+                    'end_client': out.get('end_client_name', ''),
+                }
     logger.warning(f'No structured output extracting applied-job metadata for {filename}')
     console.print(f'[yellow]Warning: no structured output extracting metadata for {filename}[/yellow]')
     return {'company': '', 'job_title': '', 'is_agency': False, 'end_client': ''}
@@ -341,15 +373,16 @@ async def company_matches_applied(candidate: str) -> str | None:
         cwd=str(PROJECT_DIR),
     )
     structured: dict | None = None
-    async for msg in sdk_query(
-        prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}',
-        options=options,
-    ):
-        if not isinstance(msg, ResultMessage):
-            continue
-        _raise_if_result_error(msg, f'Company match check failed for {candidate!r}')
-        if msg.structured_output:
-            structured = msg.structured_output
+    async with aclosing(sdk_query(
+            prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}',
+            options=options,
+        )) as stream:
+        async for msg in stream:
+            if not isinstance(msg, ResultMessage):
+                continue
+            _raise_if_result_error(msg, f'Company match check failed for {candidate!r}')
+            if msg.structured_output:
+                structured = msg.structured_output
     if not structured or not structured.get('matches'):
         return None
     matched = structured.get('matched_company_name', '')
@@ -433,12 +466,13 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
             cwd=str(PROJECT_DIR),
         )
         try:
-            async for msg in sdk_query(prompt=prompt, options=options):
-                if not isinstance(msg, ResultMessage):
-                    continue
-                _raise_if_result_error(msg, f'Blacklist confirmation failed for {candidate!r}')
-                if msg.structured_output:
-                    structured = msg.structured_output
+            async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
+                async for msg in stream:
+                    if not isinstance(msg, ResultMessage):
+                        continue
+                    _raise_if_result_error(msg, f'Blacklist confirmation failed for {candidate!r}')
+                    if msg.structured_output:
+                        structured = msg.structured_output
         except Exception as ex:
             logger.warning(
                 f'Blacklist confirmation failed for {candidate!r} ({ex}) — rejecting on the exact '
@@ -496,16 +530,16 @@ _RECRUITER_NOTIFICATIONS_HEADER = (
 )
 
 
-def _parse_iso_date(raw: Any) -> date | None:
-    """A `date` from an ISO string, or None. PyYAML already parses an unquoted date as a date."""
+def _parse_iso_date(raw: Any) -> date:
+    """A `date` from an ISO string; raises ValueError otherwise. PyYAML already parses an unquoted date."""
     if isinstance(raw, datetime):
         return raw.date()
     if isinstance(raw, date):
         return raw
     try:
         return date.fromisoformat(str(raw).strip())
-    except (TypeError, ValueError):
-        return None
+    except ValueError as ex:
+        raise ValueError(f'{raw!r} is not an ISO YYYY-MM-DD date: {ex}') from ex
 
 
 def load_recruiter_notifications(today: date | None = None) -> list[dict]:
@@ -534,12 +568,21 @@ def load_recruiter_notifications(today: date | None = None) -> list[dict]:
         return []
 
     cutoff = (today or date.today()) - timedelta(days=RECRUITER_REPOST_WINDOW_DAYS)
-    fresh = [
-        entry for entry in loaded
-        if isinstance(entry, dict)
-        and (notified := _parse_iso_date(entry.get('notified'))) is not None
-        and notified >= cutoff
-    ]
+    fresh = []
+    for entry in loaded:
+        if not isinstance(entry, dict):
+            logger.warning(f'Ignoring non-mapping entry in {RECRUITER_NOTIFICATIONS_PATH}: {snippet(entry)}')
+            continue
+        try:
+            notified = _parse_iso_date(entry.get('notified'))
+        except ValueError as ex:
+            logger.warning(
+                f'Ignoring entry for job {entry.get("job_id")!r} in {RECRUITER_NOTIFICATIONS_PATH}: '
+                f'bad `notified` date ({ex})'
+            )
+            continue
+        if notified >= cutoff:
+            fresh.append(entry)
     fresh.sort(key=lambda e: str(e.get('notified') or ''), reverse=True)
     return fresh
 
@@ -562,7 +605,9 @@ def record_recruiter_notification(candidate: dict, extract: dict, today: date | 
         'salary': str(extract.get('salary') or ''),
         'end_client': str(extract.get('end_client') or ''),
         'notified': (today or date.today()).isoformat(),
-        'description': str(extract.get('description') or '')[:RECRUITER_DESCRIPTION_MAX_CHARS],
+        'description': truncate_reported(
+            str(extract.get('description') or ''), RECRUITER_DESCRIPTION_MAX_CHARS,
+            f'recruiter-notification description for job {job_id}'),
     }
     entries = [e for e in load_recruiter_notifications(today=today) if str(e.get('job_id') or '') != job_id]
     entries.insert(0, entry)
@@ -663,7 +708,9 @@ async def recruiter_repost_of(
         'location': str(extract.get('location') or ''),
         'salary': str(extract.get('salary') or ''),
         'end_client': str(extract.get('end_client') or ''),
-        'description': str(extract.get('description') or '')[:RECRUITER_DESCRIPTION_MAX_CHARS],
+        'description': truncate_reported(
+            str(extract.get('description') or ''), RECRUITER_DESCRIPTION_MAX_CHARS,
+            f'repost-check description for job {job_id}'),
     }
     prompt = _repost_match_prompt(new_posting, priors)
     structured: dict | None = None
@@ -705,14 +752,15 @@ async def recruiter_repost_of(
                 },
                 cwd=str(PROJECT_DIR),
             )
-            async for msg in sdk_query(prompt=prompt, options=options):
-                if not isinstance(msg, ResultMessage):
-                    continue
-                _raise_if_result_error(msg, f'Repost check failed for {agency!r}')
-                if stage_stats is not None and msg.total_cost_usd:
-                    stage_stats['cost'] += msg.total_cost_usd
-                if msg.structured_output:
-                    structured = msg.structured_output
+            async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
+                async for msg in stream:
+                    if not isinstance(msg, ResultMessage):
+                        continue
+                    _raise_if_result_error(msg, f'Repost check failed for {agency!r}')
+                    if stage_stats is not None and msg.total_cost_usd:
+                        stage_stats['cost'] += msg.total_cost_usd
+                    if msg.structured_output:
+                        structured = msg.structured_output
     except Exception as ex:
         logger.warning(
             f'Repost check failed for {agency!r} job {job_id} ({unwrap_exception(ex)}) — '
@@ -738,6 +786,17 @@ async def recruiter_repost_of(
         )
         return None
     return {**match, 'reason': str(structured.get('reason') or '').strip()}
+
+
+def read_pdf_pages(pdf: Path) -> list[str]:
+    """Extracted text of each page of a PDF, null bytes stripped.
+
+    Pages stay separate until a prompt serializes them (text_budget.pages_to_prompt), so size per
+    page can be reported and a cap applied after whitespace normalization rather than to raw text.
+    Null bytes are stripped because they make text unusable as a CLI subprocess argument.
+    """
+    reader = pypdf.PdfReader(pdf)
+    return [(page.extract_text() or '').replace('\x00', '') for page in reader.pages]
 
 
 async def _categorize_pdf_text(text: str, filename: str) -> str | None:
@@ -770,12 +829,13 @@ async def _categorize_pdf_text(text: str, filename: str) -> str | None:
     )
     prompt = f'Filename: {filename}\n\nContent:\n{text}'
     category: str | None = None
-    async for msg in sdk_query(prompt=prompt, options=options):
-        if not isinstance(msg, ResultMessage):
-            continue
-        _raise_if_result_error(msg, f'PDF categorization failed for {filename}')
-        if msg.structured_output:
-            category = msg.structured_output.get('category', '')
+    async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
+        async for msg in stream:
+            if not isinstance(msg, ResultMessage):
+                continue
+            _raise_if_result_error(msg, f'PDF categorization failed for {filename}')
+            if msg.structured_output:
+                category = msg.structured_output.get('category', '')
     if category is not None:
         return underscorify(category) or 'other'
     logger.warning(f'No structured output categorizing {filename}; leaving uncategorized')
@@ -796,15 +856,17 @@ async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
     console.print(f'[dim]Categorizing {len(uncategorized)} uncategorized PDF(s) in {directory}...[/dim]')
     for index, pdf in enumerate(uncategorized):
         try:
-            reader = pypdf.PdfReader(pdf)
-            text = '\n'.join(page.extract_text() or '' for page in reader.pages)
-        except Exception as e:
-            logger.warning(f'Could not read {pdf.name}, leaving uncategorized: {e}')
-            console.print(f'[yellow]Warning: could not read {pdf.name}: {e}[/yellow]')
+            pages = read_pdf_pages(pdf)
+        except Exception as ex:
+            logger.warning(f'Could not read {pdf}, leaving uncategorized: {type(ex).__name__}: {ex}')
+            console.print(f'[yellow]Warning: could not read {pdf.name}: {ex}[/yellow]')
             continue
         console.print(f'[dim]  Categorizing {pdf.name}...[/dim]')
+        prompt_text = pages_to_prompt(pages, f'PDF {pdf.name} (categorization)', PDF_PROMPT_MAX_CHARS)
+        if sum(len(p) for p in pages) > PDF_PROMPT_MAX_CHARS:
+            console.print(f'[yellow]Warning: {pdf.name} is over PDF_PROMPT_MAX_CHARS; see the log for sizes[/yellow]')
         try:
-            category = await _categorize_pdf_text(text[:3000], pdf.name)
+            category = await _categorize_pdf_text(prompt_text, pdf.name)
         except AgentApiError as ex:
             # Systemic, not per-file: the next PDF would fail identically. Retrying per file is
             # what turned one API failure into nine identical warnings and nine doomed CLI
@@ -838,6 +900,7 @@ def _read_yaml_mapping(path: Path) -> dict:
     try:
         return yaml.safe_load(path.read_text(encoding='utf-8')) or {}
     except Exception as ex:
+        logger.warning(f'Could not read YAML mapping {path}, using an empty one: {type(ex).__name__}: {ex}')
         console.print(f'[yellow]Warning: could not read {path}: {ex}[/yellow]')
         return {}
 
@@ -853,6 +916,7 @@ def _resolve_applied_date(pdf: Path, index: dict, legacy_cache: dict) -> date:
         try:
             return datetime.strptime(prefix_match.group(1), '%Y-%m-%d').date()
         except ValueError as ex:
+            logger.warning(f'Bad date prefix on {pdf}, falling back to the index/mtime: {ex}')
             console.print(f'[yellow]Warning: bad date prefix on {pdf.name}: {ex}[/yellow]')
 
     indexed = index.get(pdf.name, {}).get('applied_date')
@@ -862,6 +926,7 @@ def _resolve_applied_date(pdf: Path, index: dict, legacy_cache: dict) -> date:
         try:
             return datetime.strptime(indexed, '%Y-%m-%d').date()
         except ValueError as ex:
+            logger.warning(f'Bad applied_date {indexed!r} for {pdf.name} in the index, falling back to mtime: {ex}')
             console.print(f'[yellow]Warning: bad applied_date for {pdf.name} in index: {ex}[/yellow]')
 
     legacy_mtime = legacy_cache.get(str(pdf), {}).get('mtime')
@@ -925,10 +990,15 @@ async def ingest_save_dir_applied_pdfs(
                 try:
                     destination.unlink()
                 except Exception as cleanup_ex:
+                    logger.error(
+                        f'{pdf} was copied to {destination} but not removed, and the partial copy '
+                        f'could not be rolled back: {type(cleanup_ex).__name__}: {cleanup_ex}'
+                    )
                     console.print(
                         f'[yellow]Warning: {pdf.name} was copied but not removed from '
                         f'{pdf.parent}, and the partial copy could not be rolled back: {cleanup_ex}[/yellow]'
                     )
+            logger.warning(f'Could not move {pdf} to {destination}: {type(ex).__name__}: {ex}')
             console.print(f'[yellow]Warning: could not move {pdf.name}: {ex}[/yellow]')
             continue
         logger.info(f'Ingested applied job: {pdf.name} → {destination.name}')
@@ -950,7 +1020,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     metadata LLM call only runs for new or changed PDFs. Records applied to longer ago than
     APPLIED_JOBS_HORIZON_DAYS stay on disk but are not read into any global.
     """
-    global _applied_companies, _reference_job_texts, _applied_jobs
+    global _applied_companies, _reference_job_pages, _applied_jobs
 
     applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
     index_file = index_path or (applied_to_dir / 'index.yaml')
@@ -960,7 +1030,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     cutoff = date.today() - timedelta(days=APPLIED_JOBS_HORIZON_DAYS)
 
     companies: dict[str, str] = {}  # company_name -> pdf filename
-    texts: list[str] = []
+    texts: list[tuple[date, list[str]]] = []
     jobs: list[dict] = []
     index_dirty = False
     total = 0
@@ -972,8 +1042,9 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         mtime = pdf.stat().st_mtime
         entry = index.get(pdf.name)
 
-        if entry and abs(entry.get('mtime', 0) - mtime) < 1.0:
-            text = entry.get('text', '')
+        if entry and abs(entry.get('mtime', 0) - mtime) < INDEX_MTIME_TOLERANCE_SECONDS:
+            # Entries written before per-page storage hold one joined `text`; treat it as one page.
+            pages = entry.get('pages') or ([entry['text']] if entry.get('text') else [])
             metadata = {
                 'company': entry.get('company', ''),
                 'job_title': entry.get('job_title', ''),
@@ -982,17 +1053,20 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
             }
         else:
             try:
-                reader = pypdf.PdfReader(pdf)
-                text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+                pages = read_pdf_pages(pdf)
             except Exception as ex:
+                logger.warning(f'Could not read applied-job PDF {pdf}, skipping it: {type(ex).__name__}: {ex}')
                 console.print(f'[yellow]Warning: could not read {pdf.name}: {ex}[/yellow]')
                 continue
 
-            metadata = await _extract_applied_job_metadata(text, pdf.name)
+            metadata = await _extract_applied_job_metadata(
+                pages_to_prompt(pages, f'PDF {pdf.name} (applied-job metadata)', PDF_PROMPT_MAX_CHARS),
+                pdf.name,
+            )
             index[pdf.name] = {
                 'applied_date': applied_date,
                 'mtime': mtime,
-                'text': text,
+                'pages': pages,
                 **metadata,
             }
             index_dirty = True
@@ -1004,7 +1078,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         # PDF extraction can yield null bytes; they make the text unusable as a
         # CLI subprocess argument (system prompt) — strip on load, covering
         # both fresh extractions and previously cached entries.
-        text = text.replace('\x00', '')
+        pages = [page.replace('\x00', '') for page in pages]
 
         # A recruiting agency's own name must never enter the blocklist: applying to one role
         # through an aggregator would otherwise suppress every other company it posts for.
@@ -1012,8 +1086,8 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
             companies[metadata['company']] = pdf.name
         if metadata['end_client']:
             companies[metadata['end_client']] = pdf.name
-        if text:
-            texts.append((applied_date, text))
+        if any(pages):
+            texts.append((applied_date, pages))
         jobs.append({'filename': pdf.name, 'applied_date': applied_date, **metadata})
 
     if index_dirty:
@@ -1026,7 +1100,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     # records aged out of the horizon, so the rater calibrated against jobs the user had moved on
     # from. Sorted by applied_date rather than left in filename order, because a legacy file
     # without a YYYY-MM-DD prefix sorts arbitrarily.
-    _reference_job_texts = [text for _date, text in sorted(texts, key=lambda pair: pair[0], reverse=True)]
+    _reference_job_pages = [pages for _date, pages in sorted(texts, key=lambda pair: pair[0], reverse=True)]
     _applied_jobs = jobs
     console.print(
         f'[dim]Loaded {len(jobs)} applied job(s) within {APPLIED_JOBS_HORIZON_DAYS} days '
@@ -1104,7 +1178,7 @@ def acquire_run_lock(mode: str, force: bool = False, lock_path: Path | None = No
         'mode': mode,
         'argv': ' '.join(sys.argv),
     }
-    path.write_text(json.dumps(record, indent=2), encoding='utf-8')
+    path.write_text(json.dumps(record, indent=JSON_INDENT), encoding='utf-8')
     logger.info(f'Acquired run lock (pid {record["pid"]}, mode {mode})')
     return None
 
@@ -1116,8 +1190,10 @@ def release_run_lock(lock_path: Path | None = None) -> None:
         return
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
-    except Exception:
-        data = {}
+    except Exception as ex:
+        # Unreadable means the holder is unknown, so it is left in place (acquire treats it as stale).
+        logger.warning(f'Run lock at {path} is unreadable, leaving it in place: {type(ex).__name__}: {ex}')
+        return
     if data.get('pid') != os.getpid():
         logger.warning(f'Not releasing run lock at {path}: held by pid {data.get("pid")}, not us')
         return
@@ -1126,6 +1202,10 @@ def release_run_lock(lock_path: Path | None = None) -> None:
 
 
 RUN_PROCESS_PATTERNS = ('job-search', 'main.py')
+# A process's command line as shown in the "is a run active?" report.
+RUN_PROCESS_COMMAND_DISPLAY_MAX_CHARS = 160
+# `ps` normally answers instantly; this only stops a wedged process table from hanging the check.
+PROCESS_SCAN_TIMEOUT_SECONDS = 10
 
 
 def find_run_processes() -> list[str]:
@@ -1137,7 +1217,7 @@ def find_run_processes() -> list[str]:
     """
     try:
         output = subprocess.run(
-            ['ps', '-axo', 'pid=,command='], capture_output=True, text=True, timeout=10,
+            ['ps', '-axo', 'pid=,command='], capture_output=True, text=True, timeout=PROCESS_SCAN_TIMEOUT_SECONDS,
         ).stdout
     except Exception as ex:
         logger.warning(f'Could not scan for running processes: {ex}')
@@ -1154,7 +1234,7 @@ def find_run_processes() -> list[str]:
             continue
         # Require an agentic-job-search entry point, not merely any file called main.py
         if any(pat in command for pat in RUN_PROCESS_PATTERNS) and 'agent_job_search' in command:
-            matches.append(f'{pid}  {command[:160]}')
+            matches.append(f'{pid}  {snippet(command, RUN_PROCESS_COMMAND_DISPLAY_MAX_CHARS)}')
     return matches
 
 
@@ -1174,8 +1254,10 @@ def describe_run_status(lock_path: Path | None = None) -> str:
         return 'No job search run is currently active.'
     started = active.get('started_at', '?')
     try:
-        elapsed = f' ({(datetime.now() - datetime.fromisoformat(started)).total_seconds() / 60:.1f} min ago)'
-    except Exception:
+        elapsed_minutes = (datetime.now() - datetime.fromisoformat(started)).total_seconds() / SECONDS_PER_MINUTE
+        elapsed = f' ({elapsed_minutes:.1f} min ago)'
+    except (TypeError, ValueError) as ex:
+        logger.warning(f'Run lock started_at {started!r} is not an ISO timestamp, elapsed time omitted: {ex}')
         elapsed = ''
     return (
         f'A run IS active:\n'
@@ -1283,12 +1365,17 @@ def write_run_audit_log(
     # the audit log rather than only in the alert because the alert carries a count and this
     # carries the reasoning, which is what the user needs in order to promote or dismiss an entry.
     lines += ['', '## 1c. Country list review (advisory)', '']
-    try:
-        review = yaml.safe_load(
-            location_review.LOCATION_RECOMMENDATIONS_PATH.read_text(encoding='utf-8')
-        ) or {}
-    except (OSError, yaml.YAMLError):
-        review = {}
+    review: dict = {}
+    if location_review.LOCATION_RECOMMENDATIONS_PATH.exists():
+        try:
+            review = yaml.safe_load(
+                location_review.LOCATION_RECOMMENDATIONS_PATH.read_text(encoding='utf-8')
+            ) or {}
+        except (OSError, yaml.YAMLError) as ex:
+            logger.warning(
+                f'Could not read {location_review.LOCATION_RECOMMENDATIONS_PATH} for the audit '
+                f'log; section 1c will list no pending countries: {type(ex).__name__}: {ex}'
+            )
     pending = {
         country: entry for country, entry in (review.get('countries') or {}).items()
         if (entry or {}).get('status') == 'pending'
@@ -1328,7 +1415,7 @@ def write_run_audit_log(
                 # 402 that killed all of them recorded nowhere but the run log.
                 status = '**FAILED**'
                 if reason := _query_errors.get(q):
-                    status += f' — {reason[:200]}'
+                    status += f' — {snippet(reason)}'
                 # A query can fail after finishing some of its searches; what it recorded first
                 # is real and already queued, so say so rather than implying it found nothing.
                 if partial := _check_status_per_query.get(q):
@@ -1364,7 +1451,7 @@ def write_run_audit_log(
             key=lambda r: (-(r['rating'] or 0), r['company'].lower()),
         ):
             rating = record['rating'] if record['rating'] is not None else ''
-            summary = (record.get('summary') or '').replace('|', '\\|').replace('\n', ' ')[:200]
+            summary = snippet((record.get('summary') or '').replace('|', '\\|').replace('\n', ' '))
             title = (record['title'] or '').replace('|', '\\|')
             company = (record['company'] or '').replace('|', '\\|')
             lines.append(
@@ -1373,7 +1460,7 @@ def write_run_audit_log(
     else:
         lines.append('_No listings inspected._')
 
-    lines += ['', '## 5. Funnel counters', '', '```json', json.dumps(funnel, indent=2), '```']
+    lines += ['', '## 5. Funnel counters', '', '```json', json.dumps(funnel, indent=JSON_INDENT), '```']
 
     if audit_findings:
         lines += ['', '## 6. Opus audit of un-surfaced jobs', '']
@@ -1438,11 +1525,33 @@ def load_processed_jobs() -> None:
             data = yaml.safe_load(f.read_text(encoding="utf-8"))
             if data and "site" in data and "job_id" in data:
                 ids.add((data["site"], str(data["job_id"])))
-        except Exception as e:
-            console.print(f'[yellow]Warning: could not read {f}: {e}[/yellow]')
+        except Exception as ex:
+            logger.warning(
+                f'Could not read processed-job record {f}; that job may be re-evaluated: {type(ex).__name__}: {ex}'
+            )
+            console.print(f'[yellow]Warning: could not read {f}: {ex}[/yellow]')
 
     _processed_jobs = ids
     console.print(f"[dim]Loaded {len(_processed_jobs)} previously processed job(s).[/dim]")
+
+
+def forget_processed_job(site: str, job_id: str) -> int:
+    """Undo check_and_record_job for a job Stage 2 never evaluated, so the next run retries it.
+
+    Stage 1 marks a job processed the moment it is queued. Without this, a job that Stage 2 could
+    not reach (on 2026-09-21 a dead browser left 23 of them) is deduped away forever.
+    Returns the number of record files removed; raises FileNotFoundError when there were none.
+    """
+    records = list(PROCESSED_JOBS_DIR.glob(f'job_posting-{site}-{job_id}-*.yaml'))
+    if not records:
+        raise FileNotFoundError(
+            f'No processed-job record for {site}/{job_id} in {PROCESSED_JOBS_DIR}; '
+            f'cannot release it for the next run'
+        )
+    for record in records:
+        record.unlink()
+    _processed_jobs.discard((site, job_id))
+    return len(records)
 
 
 # --- Tool implementations (plain async functions, directly testable) ---
@@ -1457,10 +1566,9 @@ async def do_save_job_posting(
     ts = int(time.time())
     id_part = job_id if job_id else "noid"
     rating_part = f"-rating_{rating}" if rating is not None else ""
-    # Cap name components — a long description (e.g. a full triage-reason sentence)
-    # can push the filename past the filesystem's 255-byte limit.
-    company_part = underscorify(company)[:40].rstrip('_')
-    description_part = underscorify(description)[:120].rstrip('_')
+    # Cap name components (SAVED_JOB_FILENAME_*); the full text is in the file itself.
+    company_part = underscorify(company)[:SAVED_JOB_FILENAME_COMPANY_MAX_CHARS].rstrip('_')
+    description_part = underscorify(description)[:SAVED_JOB_FILENAME_DESCRIPTION_MAX_CHARS].rstrip('_')
     filename = f"job_posting-{id_part}{rating_part}-{company_part}-{description_part}-{ts}.md"
     (dir_path / filename).write_text(content, encoding="utf-8")
 
@@ -1513,27 +1621,39 @@ def _requires_current_us_auth(text: str) -> bool:
     return any(p.search(text) for p in _AUTH_REQUIRED_PATTERNS)
 
 
+_ISO_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+_RELATIVE_DATE_RE = re.compile(r"(?P<count>\d+)\s+(?P<unit>hour|day|week|month)s?\s+ago")
+_JUST_POSTED_PHRASES = ("just now", "today", "moments ago")
+# "N months ago" is approximate by nature; a calendar-exact month would imply false precision.
+DAYS_PER_MONTH_APPROX = 30
+
+
 def parse_posting_date(date_posted: str | None) -> date | None:
-    """Parse an absolute (YYYY-MM-DD) or relative ('4 days ago') posting date."""
+    """Parse an absolute (YYYY-MM-DD) or relative ('4 days ago') posting date.
+
+    None when no date was given. Raises ValueError for a non-empty string in no known format, so
+    the caller, which knows the job, decides how to report it.
+    """
     if not date_posted:
         return None
     s = date_posted.strip().lower()
-    # Absolute ISO date
-    try:
-        return date.fromisoformat(s)
-    except ValueError:
-        pass
-    # Relative: "N unit(s) ago"
-    m = re.match(r"(\d+)\s+(hour|day|week|month)s?\s+ago", s)
+    if _ISO_DATE_RE.match(s):
+        try:
+            return date.fromisoformat(s)
+        except ValueError as ex:
+            raise ValueError(f'posting date {date_posted!r} looks ISO but is not a real date: {ex}') from ex
+    m = _RELATIVE_DATE_RE.match(s)
     if m:
-        n, unit = int(m.group(1)), m.group(2)
+        n, unit = int(m.group('count')), m.group('unit')
         deltas = {"hour": timedelta(hours=n), "day": timedelta(days=n),
-                  "week": timedelta(weeks=n), "month": timedelta(days=n * 30)}
+                  "week": timedelta(weeks=n), "month": timedelta(days=n * DAYS_PER_MONTH_APPROX)}
         return (datetime.now() - deltas[unit]).date()
-    # "just now" / "today"
-    if s in ("just now", "today", "moments ago"):
+    if s in _JUST_POSTED_PHRASES:
         return date.today()
-    return None
+    raise ValueError(
+        f'posting date {date_posted!r} is neither YYYY-MM-DD, "N hours/days/weeks/months ago", '
+        f'nor one of {_JUST_POSTED_PHRASES}'
+    )
 
 
 async def do_check_and_record_job(
@@ -1567,7 +1687,12 @@ async def do_check_and_record_job(
         console.print(f"[dim]Skipping {company} — already applied ({matched_pdf}).[/dim]")
         return _result("already_applied")
 
-    posted = parse_posting_date(date_posted)
+    try:
+        posted = parse_posting_date(date_posted)
+    except ValueError as ex:
+        # Unknown age is not a reason to skip; the Stage 2 stale rule gets another look.
+        logger.warning(f'{site} job {job_id} ({company}): {ex} — treating its age as unknown')
+        posted = None
     if posted and (date.today() - posted).days > JOB_MAX_AGE_DAYS:
         return _result("too_old")
 
@@ -2119,7 +2244,7 @@ def region_overlap_report() -> dict[str, float]:
 
     overlaps: dict[str, float] = {}
     for query, id_sets in by_query.items():
-        if len(id_sets) < 2:
+        if len(id_sets) < MIN_REGIONS_FOR_OVERLAP:
             continue
         worst = 0.0
         for i in range(len(id_sets)):
@@ -2128,7 +2253,7 @@ def region_overlap_report() -> dict[str, float]:
                 if not union:
                     continue
                 worst = max(worst, len(id_sets[i] & id_sets[j]) / len(union))
-        overlaps[query] = round(worst, 3)
+        overlaps[query] = round(worst, REGION_OVERLAP_DECIMALS)
     return overlaps
 
 

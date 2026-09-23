@@ -34,6 +34,13 @@ from agentic_job_search.location import classify_location
 
 logger = logging.getLogger('backtest')
 
+DEFAULT_REPLAY_LIMIT = 20
+# Locations sharing this many leading chars count as one when spreading the sample.
+LOCATION_DEDUPE_KEY_CHARS = 40
+PREFERENCE_PREVIEW_COUNT = 6
+VERDICT_LOCATION_COLUMN_WIDTH = 46
+LIST_LOCATION_COLUMN_WIDTH = 52
+
 # `[ \t]*`, never `\s*`: \s matches a newline, so on a posting with an empty `Location:` field the
 # group happily swallowed the line break and captured the NEXT line instead — one real saved job
 # was being judged on its `Posted: Within the past 24 hours` line.
@@ -78,7 +85,7 @@ def spread(postings: list[dict], limit: int) -> list[dict]:
     """
     by_location: dict[str, dict] = {}
     for record in sorted(postings, key=lambda r: -r['rating']):
-        key = record['location'].lower()[:40]
+        key = record['location'].lower()[:LOCATION_DEDUPE_KEY_CHARS]
         by_location.setdefault(key, record)
     distinct = sorted(by_location.values(), key=lambda r: r['location'].lower())
     if limit >= len(distinct):
@@ -89,7 +96,8 @@ def spread(postings: list[dict], limit: int) -> list[dict]:
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--limit', type=int, default=20, help='how many postings to replay (default 20)')
+    parser.add_argument('--limit', type=int, default=DEFAULT_REPLAY_LIMIT,
+                        help=f'how many postings to replay (default {DEFAULT_REPLAY_LIMIT})')
     parser.add_argument('--all', action='store_true', help='replay every saved posting')
     parser.add_argument('--match', default='', help='only postings whose filename contains this')
     args = parser.parse_args()
@@ -113,8 +121,8 @@ async def main() -> int:
 
     print(f'Replaying {len(sample)} of {len(postings)} saved postings through the location gate.')
     print(f'  would_not_live_here: {list(preferences.would_not_live_here())}')
-    print(f'  would_live_here:     {list(preferences.would_live_here())[:6]}...')
-    print(f'  would_commute_here:  {list(preferences.would_commute_here())[:6]}...\n')
+    print(f'  would_live_here:     {list(preferences.would_live_here())[:PREFERENCE_PREVIEW_COUNT]}...')
+    print(f'  would_commute_here:  {list(preferences.would_commute_here())[:PREFERENCE_PREVIEW_COUNT]}...\n')
 
     rejected = kept = failed_open = 0
     to_reject: list[dict] = []
@@ -156,8 +164,9 @@ async def main() -> int:
         if was_rejected and not now_rejected:
             to_keep.append({**record, 'why': f'scope={scope or "unspecified"} spare={spare}', 'legacy': legacy})
 
+        location_column = record['location'][:VERDICT_LOCATION_COLUMN_WIDTH]
         print(
-            f'{verdict:7} was {record["rating"]}/5  {record["location"][:46]:46} '
+            f'{verdict:7} was {record["rating"]}/5  {location_column:{VERDICT_LOCATION_COLUMN_WIDTH}} '
             f'{(scope or "-"):13}'
             f'-> {",".join(facts.get("countries") or ["-"]):20} {",".join(facts.get("regions") or ["-"]):16} '
             f'{(reason or relocation_reason) or ""}'
@@ -174,12 +183,17 @@ async def main() -> int:
 
     print(f'\nFLIPPED TO REJECT — the whole-word matcher ({len(to_reject)}):')
     for record in to_reject:
-        print(f'  {record["rating"]}/5  {record["location"][:52]:52} {record["why"]}')
+        location_column = record['location'][:LIST_LOCATION_COLUMN_WIDTH]
+        print(f'  {record["rating"]}/5  {location_column:{LIST_LOCATION_COLUMN_WIDTH}} {record["why"]}')
     print('  (every one of these should be a posting the old substring matcher wrongly exempted)')
 
     print(f'\nFLIPPED TO KEEP — the residency rule ({len(to_keep)}):')
     for record in to_keep:
-        print(f'  {record["rating"]}/5  {record["location"][:52]:52} {record["why"]}  was: {record["legacy"]}')
+        location_column = record['location'][:LIST_LOCATION_COLUMN_WIDTH]
+        print(
+            f'  {record["rating"]}/5  {location_column:{LIST_LOCATION_COLUMN_WIDTH}} {record["why"]}  '
+            f'was: {record["legacy"]}'
+        )
     print('  (each must be a REMOTE posting, in an EU country, with no stated residency requirement,')
     print('   OR one that explicitly offers a multi-country area. Anything else is a bug.)')
 

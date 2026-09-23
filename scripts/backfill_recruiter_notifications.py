@@ -27,15 +27,15 @@ logger = logging.getLogger(__name__)
 _AGENCY_WARNING = 'Posted by a recruiting agency'
 _JOB_ID_RE = re.compile(r'job_posting-(\d+)-rating_([45])-')
 # "Title: ...", "Hiring company: ...". The extract header block that format_extract_text() writes.
-_FIELD_RE = re.compile(r'^([A-Z][A-Za-z -]{1,30}): (.*)$')
+_FIELD_RE = re.compile(r'^(?P<name>[A-Z][A-Za-z -]{1,30}): (?P<value>.*)$')
 
 
-def _saved_dir_date(directory: Path) -> date | None:
-    """The run date encoded in a `saved_jobs-2026Sep09` directory name."""
+def _saved_dir_date(directory: Path) -> date:
+    """The run date encoded in a `saved_jobs-2026Sep09` directory name; raises ValueError otherwise."""
     try:
         return datetime.strptime(directory.name.removeprefix('saved_jobs-'), '%Y%b%d').date()
-    except ValueError:
-        return None
+    except ValueError as ex:
+        raise ValueError(f'{directory.name!r} is not saved_jobs-<YYYYMonDD>: {ex}') from ex
 
 
 def _parse_saved_job(path: Path) -> tuple[dict, str] | None:
@@ -49,7 +49,7 @@ def _parse_saved_job(path: Path) -> tuple[dict, str] | None:
     last_field_line = -1
     for i, line in enumerate(lines):
         if match := _FIELD_RE.match(line):
-            fields[match.group(1)] = match.group(2).strip()
+            fields[match.group('name')] = match.group('value').strip()
             last_field_line = i
     description = '\n'.join(lines[last_field_line + 1:]).strip()
     return fields, description
@@ -61,8 +61,12 @@ def collect(run_dir: Path, today: date | None = None) -> list[dict]:
     records: list[dict] = []
 
     for directory in sorted(run_dir.glob('saved_jobs-*')):
-        notified = _saved_dir_date(directory)
-        if notified is None or notified < cutoff:
+        try:
+            notified = _saved_dir_date(directory)
+        except ValueError as ex:
+            logger.warning(f'Skipping {directory}: {ex}')
+            continue
+        if notified < cutoff:
             continue
         for path in sorted(directory.glob('job_posting-*.md')):
             match = _JOB_ID_RE.search(path.name)

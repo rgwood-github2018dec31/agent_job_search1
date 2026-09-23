@@ -7,9 +7,11 @@ import os
 import random
 import re
 import socket
+import statistics
 import sys
 import tempfile
 import time
+from contextlib import aclosing
 from datetime import date, datetime
 from urllib.parse import quote_plus
 import requests
@@ -28,7 +30,18 @@ from utils_tools_n_agents_common.models import (
 
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
+    AUDIT_FALSE_NEGATIVE_MIN_RATING,
     AUDIT_OPUS_SAMPLE_SIZE,
+    BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
+    CONSOLE_BANNER_WIDTH,
+    COST_DELTA_DISPLAY_TOLERANCE_USD,
+    EXTRACT_FALLBACK_MAX_TURNS,
+    EXTRACT_PAGE_RENDER_WAIT_SECONDS,
+    EXTRACT_SNAPSHOT_MAX_CHARS,
+    FAILED_QUERIES_NAMED_MAX,
+    LISTING_ESTIMATE_HISTORY_RUNS,
+    LOCATION_GUESS_REASON_MAX_CHARS,
+    REFERENCE_JOB_PROMPT_MAX_CHARS,
     JOB_STALE_AGE_DAYS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
@@ -36,7 +49,10 @@ from agentic_job_search.config import (
     MODEL_NAME_QUERY,
     MODEL_NAME_RATING,
     MODEL_NAME_SCRAPER,
+    PLAYWRIGHT_MAX_RESTARTS_PER_RUN,
     PLAYWRIGHT_MCP_PACKAGE,
+    PLAYWRIGHT_MCP_READY_POLL_ATTEMPTS,
+    PLAYWRIGHT_MCP_READY_POLL_INTERVAL_SECONDS,
     PLAYWRIGHT_MCP_REGISTRY_URL,
     PLAYWRIGHT_MCP_VERSION,
     PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
@@ -53,6 +69,8 @@ from agentic_job_search.config import (
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_MAX_TURNS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
+    SECONDS_PER_MINUTE,
+    YIELD_HISTORY_RUNS_SHOWN,
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
@@ -67,6 +85,7 @@ from agentic_job_search.location import classify_location, is_eu_member, locatio
 from agentic_job_search import scrape_openrouter
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
+from agentic_job_search.text_budget import pages_to_prompt, snippet, truncate_reported
 from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
     PROJECT_DIR,
@@ -135,6 +154,10 @@ async def _send_pipeline_notification(text: str) -> None:
     try:
         await telegram_send_message(text)
     except Exception as ex:
+        logger.warning(
+            f'Telegram pipeline notification failed ({len(text)}-char message {snippet(text)!r}): '
+            f'{type(ex).__name__}: {unwrap_exception(ex)}'
+        )
         console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
 
 
@@ -735,7 +758,7 @@ async def _generate_queries_openrouter(prompt: str, stage_stats: dict | None) ->
         stage_stats['cost'] += cost_usd
     queries = extract_json_object(content).get('queries') or []
     if not isinstance(queries, list) or not queries:
-        raise ValueError(f'OpenRouter returned no usable queries: {content[:300]!r}')
+        raise ValueError(f'OpenRouter returned no usable queries: {snippet(content)!r}')
     return [str(q).strip() for q in queries if str(q).strip()]
 
 
@@ -813,10 +836,12 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
             cwd=str(PROJECT_DIR),
         )
         try:
-            async for msg in sdk_query(prompt=f'{prompt}\n\nCall the submit_search_queries tool with your list.', options=options):
-                if isinstance(msg, ResultMessage):
-                    cost_delta = accumulate_stage_stats(stage_stats, msg) if stage_stats is not None else None
-                    print_result_stats(msg, cost_delta)
+            full_prompt = f'{prompt}\n\nCall the submit_search_queries tool with your list.'
+            async with aclosing(sdk_query(prompt=full_prompt, options=options)) as stream:
+                async for msg in stream:
+                    if isinstance(msg, ResultMessage):
+                        cost_delta = accumulate_stage_stats(stage_stats, msg) if stage_stats is not None else None
+                        print_result_stats(msg, cost_delta)
             provider = 'anthropic'
         except Exception as ex:
             raise RuntimeError(f'Stage 1a (query generation) failed: {ex}') from ex
@@ -855,13 +880,21 @@ def build_evaluator_prompt(reference_block: str = '') -> str:
     return "\n\n".join(parts).replace('\x00', '')
 
 
+def _reference_job_texts() -> list[str]:
+    """The newest MAX_REFERENCE_JOBS applied jobs, each serialized within REFERENCE_JOB_PROMPT_MAX_CHARS."""
+    return [
+        pages_to_prompt(pages, f'reference job {i}', REFERENCE_JOB_PROMPT_MAX_CHARS)
+        for i, pages in enumerate(tools_module._reference_job_pages[:MAX_REFERENCE_JOBS], 1)
+    ]
+
+
 def build_reference_block() -> str:
-    texts = tools_module._reference_job_texts
+    texts = _reference_job_texts()
     if not texts:
         return ''
     parts = ['--- REFERENCE JOBS (jobs I have applied to — treat as 5/5 calibration examples) ---']
-    for i, text in enumerate(texts[:MAX_REFERENCE_JOBS], 1):
-        parts.append(f'[Reference Job {i}]\n{text[:3000]}')
+    for i, text in enumerate(texts, 1):
+        parts.append(f'[Reference Job {i}]\n{text}')
     parts.append('--- END REFERENCE JOBS ---')
     return '\n\n'.join(parts)
 
@@ -884,12 +917,13 @@ async def _summarize_references_anthropic(prompt: str, stage_stats: dict | None)
         },
         cwd=str(PROJECT_DIR),
     )
-    async for msg in sdk_query(prompt=prompt, options=options):
-        if isinstance(msg, ResultMessage):
-            if stage_stats is not None:
-                accumulate_stage_stats(stage_stats, msg)
-            if msg.structured_output:
-                return msg.structured_output['summary']
+    async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
+        async for msg in stream:
+            if isinstance(msg, ResultMessage):
+                if stage_stats is not None:
+                    accumulate_stage_stats(stage_stats, msg)
+                if msg.structured_output:
+                    return msg.structured_output['summary']
     raise RuntimeError('Anthropic reference summarization returned no structured output')
 
 
@@ -899,10 +933,10 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
     Provider chain: OpenRouter MCP -> local Ollama MCP -> Anthropic Haiku; each failure
     logs and falls through. Falls back to the full reference block if all three fail.
     """
-    texts = tools_module._reference_job_texts
+    texts = _reference_job_texts()
     if not texts:
         return ''
-    combined = '\n\n'.join(f'[Reference Job {i}]\n{t[:3000]}' for i, t in enumerate(texts[:MAX_REFERENCE_JOBS], 1))
+    combined = '\n\n'.join(f'[Reference Job {i}]\n{t}' for i, t in enumerate(texts, 1))
     corpus_hash_md5 = hashlib.md5(combined.encode('utf-8')).hexdigest()
 
     cache: dict = {}
@@ -942,7 +976,7 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
                 logger.error(f'Reference summary failed on all providers, using full reference block: {ex3}')
                 return build_reference_block()
 
-    summary = summary.strip()[:REFERENCE_SUMMARY_MAX_CHARS]
+    summary = truncate_reported(summary.strip(), REFERENCE_SUMMARY_MAX_CHARS, f'reference summary from {provider}')
     logger.info(f'Reference summary: {len(combined)} chars → {len(summary)} chars via {provider}')
     REFERENCE_SUMMARY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     REFERENCE_SUMMARY_CACHE_PATH.write_text(
@@ -992,7 +1026,7 @@ def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> N
             parts.append(f"cache_read={cache_read} cache_write={cache_write}")
     if msg.total_cost_usd is not None:
         parts.append(f"cost=${msg.total_cost_usd:.4f}")
-        if cost_delta is not None and abs(cost_delta - msg.total_cost_usd) > 1e-9:
+        if cost_delta is not None and abs(cost_delta - msg.total_cost_usd) > COST_DELTA_DISPLAY_TOLERANCE_USD:
             parts.append(f"delta=${cost_delta:.4f}")
     if parts:
         console.print(f"[dim]{' · '.join(parts)}[/dim]")
@@ -1093,7 +1127,7 @@ def cost_delta_for(stats: dict, msg: ResultMessage) -> float:
 
 async def run_interactive(client: ClaudeSDKClient) -> None:
     console.print("[bold cyan]Job Search Agent — Interactive Mode[/bold cyan]")
-    console.print("[cyan]" + "=" * 40 + "[/cyan]")
+    console.print("[cyan]" + "=" * CONSOLE_BANNER_WIDTH + "[/cyan]")
     console.print("[dim]Note: On first run, you may need to log in to LinkedIn in the browser window.[/dim]")
     console.print("[dim]Type 'quit' to exit.[/dim]\n")
     console.print("[yellow]Reading your resume and job requirements - please wait ...[/yellow]")
@@ -1236,6 +1270,10 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'BROWSER TOOLCHAIN OUTDATED: {alert.get("detail")}')
         elif kind == 'location_recommendations':
             alerts.append(f'COUNTRY LISTS: {alert.get("detail")}')
+        elif kind == 'browser_restarted':
+            alerts.append(f'BROWSER RESTARTED: {alert.get("detail")}')
+        elif kind == 'browser_dead':
+            alerts.append(f'BROWSER DIED, STAGE 2 STOPPED: {alert.get("detail")}')
 
     # 1b. Queries that failed outright. Deliberately ahead of saturation: saturation is measured
     #     against DISTINCT listings and is skipped entirely when there are none (`if distinct:`
@@ -1246,7 +1284,7 @@ def assess_run_health(funnel: dict) -> list[str]:
     failed = funnel.get('queries_failed') or {}
     if failed:
         total = funnel.get('queries_generated') or len(failed)
-        first_reason = str(next(iter(failed.values()), ''))[:300]
+        first_reason = snippet(next(iter(failed.values()), ''))
         if len(failed) >= total:
             alerts.append(
                 f'ALL {total} QUERIES FAILED — no search completed, so 0 listings is not "nothing '
@@ -1257,7 +1295,8 @@ def assess_run_health(funnel: dict) -> list[str]:
             # its second region while the other five ran normally (156 distinct listings), and the
             # all-failed wording above told the reader that no search had completed.
             names = list(failed)
-            shown = ', '.join(names[:3]) + (f' +{len(names) - 3} more' if len(names) > 3 else '')
+            overflow = len(names) - FAILED_QUERIES_NAMED_MAX
+            shown = ', '.join(names[:FAILED_QUERIES_NAMED_MAX]) + (f' +{overflow} more' if overflow > 0 else '')
             alerts.append(
                 f'{len(failed)} of {total} QUERIES FAILED ({shown}) — their unfinished searches '
                 f'did not run; the other {total - len(failed)} completed. First error: {first_reason}'
@@ -1310,7 +1349,15 @@ def health_alert_block(alerts: list[str]) -> str:
     return f'⚠️ NEEDS ATTENTION ({len(alerts)}):\n{alert_lines}'
 
 
-def recent_yield_history(limit: int = 5) -> list[str]:
+def _timestamp_date(timestamp: object) -> str:
+    """The YYYY-MM-DD date of an ISO timestamp from cost_log.jsonl. Raises ValueError if unparseable."""
+    try:
+        return datetime.fromisoformat(str(timestamp)).date().isoformat()
+    except ValueError as ex:
+        raise ValueError(f'cost-log timestamp {timestamp!r} is not ISO 8601: {ex}') from ex
+
+
+def recent_yield_history(limit: int = YIELD_HISTORY_RUNS_SHOWN) -> list[str]:
     """Last few runs' yield, read back from cost_log.jsonl, to give an alert context.
 
     No new state file: every run already writes its funnel there.
@@ -1335,7 +1382,12 @@ def recent_yield_history(limit: int = 5) -> list[str]:
         funnel = row.get('funnel') or {}
         seen = funnel.get('listings_distinct') or funnel.get('listings_seen') or 0
         new_jobs = (funnel.get('check_status') or {}).get('new', 0)
-        out.append(f"{str(row.get('timestamp', ''))[:10]}: {new_jobs} new / {seen}")
+        try:
+            when = _timestamp_date(row.get('timestamp'))
+        except ValueError as ex:
+            logger.warning(f'Yield history row in {path} has a bad timestamp, shown raw: {ex}')
+            when = str(row.get('timestamp'))
+        out.append(f"{when}: {new_jobs} new / {seen}")
     return out
 
 
@@ -1349,12 +1401,10 @@ def _listings_distinct_per_query() -> dict[str, int]:
 
 
 def _median(values: list[int]) -> float:
-    ordered = sorted(values)
-    mid = len(ordered) // 2
-    return float(ordered[mid]) if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+    return float(statistics.median(values))
 
 
-def expected_listings_per_query(query: str, limit: int = 10) -> tuple[float | None, str]:
+def expected_listings_per_query(query: str, limit: int = LISTING_ESTIMATE_HISTORY_RUNS) -> tuple[float | None, str]:
     """How many listings `query` usually yields, read back from cost_log.jsonl, plus a label.
 
     Median, not mean, so one bad day of zeros does not drag the expectation down. Prefers the
@@ -1715,7 +1765,7 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
         permission_mode="bypassPermissions",
         cwd=str(PROJECT_DIR),
         model=ANTHROPIC_MODEL_NAME_LOW,
-        max_turns=16,
+        max_turns=EXTRACT_FALLBACK_MAX_TURNS,
     )
     query = (
         f"Extract this job posting:\n"
@@ -1757,7 +1807,7 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
     return extract
 
 
-_MORE_BUTTON_RE = re.compile(r'button "([^"]*\bmore\b[^"]*)" \[ref=(e\d+)\]', re.IGNORECASE)
+_MORE_BUTTON_RE = re.compile(r'button "(?P<element>[^"]*\bmore\b[^"]*)" \[ref=(?P<ref>e\d+)\]', re.IGNORECASE)
 
 
 async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> dict | None:
@@ -1767,23 +1817,24 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
     agentic path, so bot-detection exposure is unchanged."""
     async with mcp_session(playwright_mcp_url) as call:
         await call('browser_navigate', {'url': candidate['url']})
-        await call('browser_wait_for', {'time': 3})  # let the dynamic description render
+        await call('browser_wait_for', {'time': EXTRACT_PAGE_RENDER_WAIT_SECONDS})  # let the dynamic description render
         snapshot = await call('browser_snapshot', {})
         m = _MORE_BUTTON_RE.search(snapshot)
         if m:
             try:
-                await call('browser_click', {'element': m.group(1), 'target': m.group(2)})
+                await call('browser_click', {'element': m.group('element'), 'target': m.group('ref')})
                 await call('browser_wait_for', {'time': 1})
                 snapshot = await call('browser_snapshot', {})
             except Exception as ex:
                 logger.warning(f'Extract fallback: expand click failed, using collapsed description: {ex}')
 
+    snapshot_label = f"extract-fallback snapshot for {candidate['company']} — {candidate['title']}"
     prompt = (
         'Below is an accessibility snapshot of a job posting page. Condense it into a structured extract. '
         'Keep requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or '
         '"no longer accepting applications" statements. Strip navigation chrome, footers, similar-jobs '
         'lists, and marketing boilerplate.\n\n'
-        f'{snapshot[:80000]}'
+        + truncate_reported(snapshot, EXTRACT_SNAPSHOT_MAX_CHARS, snapshot_label)
     )
     options = ClaudeAgentOptions(
         setting_sources=[],
@@ -1796,12 +1847,13 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
         cwd=str(PROJECT_DIR),
     )
     structured: dict | None = None
-    async for msg in sdk_query(prompt=prompt, options=options):
-        if isinstance(msg, ResultMessage):
-            cost_delta = accumulate_stage_stats(stage_stats, msg)
-            print_result_stats(msg, cost_delta)
-            if msg.structured_output:
-                structured = msg.structured_output
+    async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
+        async for msg in stream:
+            if isinstance(msg, ResultMessage):
+                cost_delta = accumulate_stage_stats(stage_stats, msg)
+                print_result_stats(msg, cost_delta)
+                if msg.structured_output:
+                    structured = msg.structured_output
     if structured is None:
         logger.warning(f"Extract fallback: {candidate['company']} — {candidate['title']}: no structured output")
         return None
@@ -1952,7 +2004,7 @@ def derive_residency_scope(extract: dict) -> str:
 
     haystack = (
         f"{extract.get('location', '')}\n{extract.get('relocation', '')}\n"
-        f"{str(extract.get('description', ''))[:2000]}"
+        f"{extract.get('description', '')}"
     )
     if explicit == 'country_only' or _COUNTRY_ONLY_RE.search(haystack):
         return 'country_only'
@@ -1976,7 +2028,7 @@ def derive_workplace_type(extract: dict) -> str:
     if explicit in {'on-site', 'on site', 'in-office', 'in office'}:
         return 'onsite'
 
-    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')[:2000]}"
+    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')}"
     if _HYBRID_RE.search(haystack):
         return 'hybrid'
     if _ONSITE_RE.search(haystack):
@@ -2036,7 +2088,7 @@ def derive_education_requirement(extract: dict) -> str:
         if _MASTERS_RE.search(explicit) or explicit in {'master', 'ms', 'ma'}:
             return 'master'
 
-    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')[:4000]}"
+    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')}"
     for sentence in _SENTENCE_SPLIT_RE.split(haystack):
         if not _DEGREE_REQUIRED_RE.search(sentence):
             continue
@@ -2115,23 +2167,22 @@ def derive_agency_posting(extract: dict) -> bool:
         return bool(explicit)
     if _AGENCY_COMPANY_RE.search(str(extract.get('company') or '')):
         return True
-    return bool(_AGENCY_PHRASE_RE.search(str(extract.get('description') or '')[:4000]))
+    return bool(_AGENCY_PHRASE_RE.search(str(extract.get('description') or '')))
 
 
 def format_extract_text(candidate: dict, extract: dict) -> str:
+    workplace_type = derive_workplace_type(extract)
+    # Who would actually hire, when a recruiter names them — the poster's name is not the employer.
+    end_client = derive_end_client(extract)
     lines = [
         f"Title: {extract['title']}",
         f"Company: {extract['company']}",
+        *([f"Hiring company: {end_client}"] if end_client else []),
         f"Location: {extract['location']}",
+        *([f"Workplace: {workplace_type}"] if workplace_type else []),
         f"Posted: {extract['date_posted'] or candidate['date_posted']}",
         f"URL: {candidate['url']}",
     ]
-    workplace_type = derive_workplace_type(extract)
-    if workplace_type:
-        lines.insert(3, f"Workplace: {workplace_type}")
-    # Who would actually hire, when a recruiter names them — the poster's name is not the employer.
-    if end_client := derive_end_client(extract):
-        lines.insert(2, f"Hiring company: {end_client}")
     if candidate['snippet']:
         lines.append(f"Search-result snippet: {candidate['snippet']}")
     if extract['salary']:
@@ -2169,7 +2220,10 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
         f"Company: {extract.get('company') or candidate.get('company', '')}",
         f"Location: {extract.get('location') or ''}",
         f"Title: {extract.get('title') or candidate.get('title', '')}",
-        (extract.get('description') or '')[:500],
+        truncate_reported(
+            extract.get('description') or '', BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
+            f"blacklist-confirmation description for job {candidate.get('job_id')}",
+        ),
     ]))
     for name in (extract.get('company') or candidate.get('company', ''), derive_end_client(extract)):
         if name and (reason := await tools_module.company_blacklist_reason(name, context=blacklist_context)):
@@ -2177,7 +2231,14 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
 
     if extract['closed'] or 'no longer accepting applications' in full_text.lower():
         return 'posting closed (no longer accepting applications)'
-    posted = parse_posting_date(extract['date_posted'] or candidate['date_posted'])
+    try:
+        posted = parse_posting_date(extract['date_posted'] or candidate['date_posted'])
+    except ValueError as ex:
+        logger.warning(
+            f"{candidate['company']} — {candidate['title']} (job {candidate.get('job_id')}): {ex} "
+            f"— treating its age as unknown, so the stale-posting rule does not apply"
+        )
+        posted = None
     if posted and (date.today() - posted).days > JOB_STALE_AGE_DAYS:
         return f'posting older than {JOB_STALE_AGE_DAYS} days ({posted.isoformat()})'
     sponsorship_locations = preferences.sponsorship_required_in()
@@ -2348,7 +2409,7 @@ async def resolve_location_guesses(stage_stats: dict | None = None) -> list[tupl
                 raise ValueError(f'guess outside the vocabulary: {guess!r}')
             _location_guesses[country] = (
                 'would live' if guess == 'would_live' else 'would NOT live',
-                _trim(' '.join(str(answer.get('reason') or '').split()), 150),
+                _trim(' '.join(str(answer.get('reason') or '').split()), LOCATION_GUESS_REASON_MAX_CHARS),
             )
             logger.info(f'Location guess: {country} -> {_location_guesses[country][0]} (${cost:.6f})')
         except Exception as ex:
@@ -2614,7 +2675,7 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if extract.get('relocation'):
         warnings.append(f"Relocation required: {extract['relocation']}")
 
-    if _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')[:3000]}"):
+    if _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')}"):
         warnings.append('Contract role — full-time preferred')
 
     if not salary_figure_listed(extract):
@@ -2773,12 +2834,13 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
         cwd=str(PROJECT_DIR),
     )
     structured: dict | None = None
-    async for msg in sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options):
-        if isinstance(msg, ResultMessage):
-            cost_delta = accumulate_stage_stats(stage_stats, msg)
-            print_result_stats(msg, cost_delta)
-            if msg.structured_output:
-                structured = msg.structured_output
+    async with aclosing(sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options)) as stream:
+        async for msg in stream:
+            if isinstance(msg, ResultMessage):
+                cost_delta = accumulate_stage_stats(stage_stats, msg)
+                print_result_stats(msg, cost_delta)
+                if msg.structured_output:
+                    structured = msg.structured_output
     if structured is None:
         raise RuntimeError('Anthropic rating call returned no structured output')
     return structured
@@ -2839,10 +2901,15 @@ def _hard_rule_category(reason: str) -> str:
 async def evaluate_all_candidates(
     candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str,
     profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
-    triage_enabled: bool = True,
+    triage_enabled: bool = True, browser: BrowserServer | None = None,
 ) -> None:
     """Stage 2: per candidate — Haiku extract, deterministic hard rules, local triage,
     then one configurable-model rating call. All sharing one browser.
+
+    ``browser``, when given, is checked before each job and after each failure: a dead one is
+    restarted (up to PLAYWRIGHT_MAX_RESTARTS_PER_RUN) and the job it failed on is retried. Past
+    that budget Stage 2 stops, and every job not yet evaluated is released from processed_jobs/
+    so the next run picks it up instead of deduping it away.
 
     When ``audit`` is set, gate-killed candidates (hard-ruled / triaged-out) are STILL
     sent through the strong rater so we can detect false negatives (gate dropped it but
@@ -2867,8 +2934,8 @@ async def evaluate_all_candidates(
         try:
             result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
             strong = result['rating']
-            verdict = 'FALSE NEGATIVE' if strong >= 3 else 'confirmed drop'
-            if strong >= 3:
+            verdict = 'FALSE NEGATIVE' if strong >= AUDIT_FALSE_NEGATIVE_MIN_RATING else 'confirmed drop'
+            if strong >= AUDIT_FALSE_NEGATIVE_MIN_RATING:
                 bump('audit_false_negatives')
             logger.info(
                 f"AUDIT [{gate_label}] {candidate['company']} — {candidate['title']}: "
@@ -2877,7 +2944,53 @@ async def evaluate_all_candidates(
         except Exception as ex:
             logger.warning(f"AUDIT rating failed for {candidate['company']} — {candidate['title']}: {ex}")
 
-    for candidate in candidates:
+    async def browser_usable(remaining: list[dict]) -> bool:
+        """True when the browser is alive (restarting it if allowed); False once Stage 2 must stop."""
+        if browser is None or not browser.is_dead():
+            return True
+        if browser.restarts < PLAYWRIGHT_MAX_RESTARTS_PER_RUN:
+            try:
+                await browser.restart()
+                tools_module._ui_alerts.append({
+                    'kind': 'browser_restarted', 'query': '(all)', 'region': '(all)',
+                    'detail': f'{PLAYWRIGHT_MCP_PACKAGE} died during Stage 2 and was restarted '
+                              f'({len(remaining)} job(s) still to evaluate)',
+                })
+                return True
+            except Exception as ex:
+                logger.error(f'Restarting {PLAYWRIGHT_MCP_PACKAGE} failed: {type(ex).__name__}: {ex}')
+        release_unevaluated(remaining)
+        return False
+
+    def release_unevaluated(remaining: list[dict]) -> None:
+        not_released = []
+        for candidate in remaining:
+            tools_module.record_job_outcome(
+                candidate['site'], candidate['job_id'], 'browser_dead',
+                summary='not evaluated: browser died; released for the next run',
+            )
+            try:
+                tools_module.forget_processed_job(candidate['site'], candidate['job_id'])
+            except FileNotFoundError as ex:
+                not_released.append(f"{candidate['site']}/{candidate['job_id']} ({ex})")
+        funnel['browser_dead'] = len(remaining)
+        logger.error(
+            f'Stage 2 stopped: {PLAYWRIGHT_MCP_PACKAGE} is dead after {browser.restarts} restart(s); '
+            f'{len(remaining)} job(s) not evaluated and released for the next run'
+            + (f'; {len(not_released)} could not be released: {"; ".join(not_released)}' if not_released else '')
+        )
+        tools_module._ui_alerts.append({
+            'kind': 'browser_dead', 'query': '(all)', 'region': '(all)',
+            'detail': f'{PLAYWRIGHT_MCP_PACKAGE} died and stayed down; {len(remaining)} job(s) not '
+                      f'evaluated, released for the next run',
+        })
+
+    index = 0
+    while index < len(candidates):
+        if not await browser_usable(candidates[index:]):
+            break
+        candidate = candidates[index]
+        index += 1
         console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
         try:
             if route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
@@ -2888,6 +3001,9 @@ async def evaluate_all_candidates(
                 extract = await extract_job_page(candidate, playwright_mcp, stage_stats['extraction'])
             if extract is None:
                 extract = await extract_job_page_direct(candidate, playwright_mcp['url'], stage_stats['extraction'])
+            if extract is None and browser is not None and browser.is_dead():
+                index -= 1   # the browser, not the page, failed: retry this job after the restart
+                continue
             if extract is None:
                 bump('extract_failed')
                 tools_module.record_job_outcome(
@@ -3066,9 +3182,14 @@ async def evaluate_all_candidates(
             if should_notify_based_on_rating(rating) and is_agency and not repost:
                 tools_module.record_recruiter_notification(candidate, extract)
         except Exception as ex:
+            if browser is not None and browser.is_dead():
+                logger.warning(f"Stage 2: browser died while evaluating {candidate['company']} — "
+                               f"{candidate['title']} ({type(ex).__name__}: {ex}); not counted as an eval_error")
+                index -= 1   # retried after the restart, or released if the browser stays down
+                continue
             bump('eval_error')
             tools_module.record_job_outcome(
-                candidate['site'], candidate['job_id'], 'eval_error', summary=str(ex)[:200]
+                candidate['site'], candidate['job_id'], 'eval_error', summary=snippet(ex)
             )
             console.print(f"[red]Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}[/red]")
             logger.warning(f"Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}")
@@ -3104,11 +3225,12 @@ async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats:
         },
         cwd=str(PROJECT_DIR),
     )
-    async for msg in sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options):
-        if isinstance(msg, ResultMessage):
-            accumulate_stage_stats(stage_stats, msg)
-            if msg.structured_output:
-                return msg.structured_output
+    async with aclosing(sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options)) as stream:
+        async for msg in stream:
+            if isinstance(msg, ResultMessage):
+                accumulate_stage_stats(stage_stats, msg)
+                if msg.structured_output:
+                    return msg.structured_output
     raise RuntimeError('Opus audit rating returned no structured output')
 
 
@@ -3287,8 +3409,9 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
     proc = await asyncio.create_subprocess_exec(*cmd)
     try:
         console.print(f'[dim]→ GET http://localhost:{port}/mcp (polling until ready)[/dim]')
-        for _ in range(30):
-            await asyncio.sleep(1)
+        last_error: Exception | None = None
+        for _ in range(PLAYWRIGHT_MCP_READY_POLL_ATTEMPTS):
+            await asyncio.sleep(PLAYWRIGHT_MCP_READY_POLL_INTERVAL_SECONDS)
             # A dead npx polls exactly like a slow one, so without this a bad pin costs 30s of
             # silence and then surfaces as a connection error naming neither npx nor the version.
             if proc.returncode is not None:
@@ -3298,14 +3421,67 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
                     f'was yanked, correct PLAYWRIGHT_MCP_VERSION in config.py.'
                 )
             try:
-                requests.get(f'http://localhost:{port}/mcp', timeout=1)
+                requests.get(f'http://localhost:{port}/mcp', timeout=PLAYWRIGHT_MCP_READY_POLL_INTERVAL_SECONDS)
                 break
-            except Exception:
-                pass
+            except requests.RequestException as ex:
+                last_error = ex   # expected until the server is up; reported only if it never is
+        else:
+            # Returning here used to hand back a server that never answered, surfacing later as a
+            # connection error with no mention of the launch.
+            proc.terminate()
+            raise RuntimeError(
+                f'{PLAYWRIGHT_MCP_PACKAGE} did not answer on http://localhost:{port}/mcp after '
+                f'{PLAYWRIGHT_MCP_READY_POLL_ATTEMPTS} attempts '
+                f'{PLAYWRIGHT_MCP_READY_POLL_INTERVAL_SECONDS}s apart; last error: '
+                f'{type(last_error).__name__}: {last_error}'
+            ) from last_error
     finally:
         if tmp_config:
             Path(tmp_config).unlink(missing_ok=True)
     return proc
+
+
+class BrowserServer:
+    """The shared @playwright/mcp process, restartable when it dies mid-run.
+
+    ``mcp`` is updated in place on restart, so callers holding it (every Stage 2 extract reads
+    ``mcp['url']``) follow the new port without being handed a new object.
+    """
+
+    def __init__(self, browser_mode: str) -> None:
+        self.browser_mode = browser_mode
+        self.port = 0
+        self.proc: asyncio.subprocess.Process | None = None
+        self.restarts = 0
+        self.mcp: dict = {'type': 'http', 'url': ''}
+
+    async def start(self) -> None:
+        self.port = find_free_port()
+        console.print(f"[dim]Starting shared browser ({self.browser_mode}, port {self.port}) ...[/dim]")
+        self.proc = await start_playwright_server(self.port, browser_mode=self.browser_mode)
+        self.mcp['url'] = f'http://localhost:{self.port}/mcp'
+
+    def is_dead(self) -> bool:
+        return self.proc is not None and self.proc.returncode is not None
+
+    async def restart(self) -> None:
+        exit_code = self.proc.returncode if self.proc else None
+        logger.error(
+            f'{PLAYWRIGHT_MCP_PACKAGE} on port {self.port} exited with code {exit_code} mid-run; '
+            f'restarting it ({self.restarts + 1} of {PLAYWRIGHT_MAX_RESTARTS_PER_RUN} allowed). '
+            f'A negative code is the signal; a node crash report is in ~/Library/Logs/DiagnosticReports'
+        )
+        self.restarts += 1
+        await self.start()
+
+    async def stop(self) -> None:
+        # terminate() on an already-exited process raises ProcessLookupError. On 2026-09-21 that
+        # escaped this cleanup and cost the run its summary, audit log and notification.
+        if self.proc is None:
+            return
+        if self.proc.returncode is None:
+            self.proc.terminate()
+        await self.proc.wait()
 
 
 async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scraping_stats: dict) -> bool:
@@ -3373,7 +3549,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         console.print('[bold magenta]AUDIT mode: gate-killed jobs will still be re-rated to detect false negatives.[/bold magenta]')
 
     console.print("[bold cyan]Job Search Agent — Non-interactive Mode[/bold cyan]")
-    console.print("[cyan]" + "=" * 40 + "[/cyan]")
+    console.print("[cyan]" + "=" * CONSOLE_BANNER_WIDTH + "[/cyan]")
 
     start_time = time.time()
     stage_stats = {
@@ -3388,10 +3564,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     }
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 
-    port = find_free_port()
-    console.print(f"[dim]Starting shared browser ({browser_mode}, port {port}) ...[/dim]")
-    playwright_proc = await start_playwright_server(port, browser_mode=browser_mode)
-    playwright_mcp = {'type': 'http', 'url': f'http://localhost:{port}/mcp'}
+    browser = BrowserServer(browser_mode)
+    await browser.start()
+    playwright_mcp = browser.mcp
 
     try:
         # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping
@@ -3406,13 +3581,13 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 "status": "failed_no_queries",
                 "stage_stats": public_stage_stats(stage_stats),
                 "total_cost": sum(s["cost"] for s in stage_stats.values()),
-                "elapsed_minutes": (time.time() - start_time) / 60,
+                "elapsed_minutes": (time.time() - start_time) / SECONDS_PER_MINUTE,
             })
             return
         console.print(f"[dim]Queries: {queries}[/dim]\n")
 
         console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
-        await run_stage_1b(port, playwright_mcp, queries, stage_stats["scraping"])
+        await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats["scraping"])
 
         candidates = tools_module._candidates
         candidates_per_query = tools_module._candidates_per_query
@@ -3427,7 +3602,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
         if not candidates:
             console.print("[red]Error: 0 jobs returned across all searches.[/red]")
-            elapsed_mins = (time.time() - start_time) / 60
+            elapsed_mins = (time.time() - start_time) / SECONDS_PER_MINUTE
             total_cost = sum(s["cost"] for s in stage_stats.values())
             # check_status distinguishes dedup-saturation (all already_processed) from an
             # authwall/empty-page (nothing seen at all) — the two zero-candidate root causes.
@@ -3523,7 +3698,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
         await evaluate_all_candidates(
             candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats,
-            funnel=funnel, audit=audit, triage_enabled=triage_enabled,
+            funnel=funnel, audit=audit, triage_enabled=triage_enabled, browser=browser,
         )
         if audit_opus:
             console.print(f"[bold magenta]Opus audit: sampling up to {audit_opus} un-surfaced job(s) per pool ...[/bold magenta]")
@@ -3534,10 +3709,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 1 for f in audit_findings if f['verdict'] == 'FALSE NEGATIVE'
             )
     finally:
-        playwright_proc.terminate()
-        await playwright_proc.wait()
+        await browser.stop()
 
-    elapsed_mins = (time.time() - start_time) / 60
+    elapsed_mins = (time.time() - start_time) / SECONDS_PER_MINUTE
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
     total_cost = sum(s["cost"] for s in stage_stats.values())
 
@@ -3742,6 +3916,11 @@ async def main() -> None:
                 await run_interactive(client)
         else:
             await run_non_interactive(browser_mode=args.browser, audit=args.audit, audit_opus=args.audit_opus)
+    except BaseException as ex:
+        # Without this the cause of a dead run reached only the terminal. On 2026-09-21 the log just
+        # stopped at "Released run lock", with no hint that cleanup had raised ProcessLookupError.
+        logger.exception(f'Run aborted by {type(ex).__name__}: {ex}')
+        raise
     finally:
         tools_module.release_run_lock()
 

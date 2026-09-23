@@ -18,6 +18,7 @@ from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_EXTRACTOR,
 )
+from agentic_job_search.text_budget import snippet, truncate_reported
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, mcp_session
 
 logger = logging.getLogger(__name__)
@@ -196,7 +197,7 @@ async def extract_job_page_openrouter(
             if not data.get('ok'):
                 logger.warning(
                     f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
-                    f"chat failed: {data.get('error', raw[:300])}"
+                    f"chat failed: {data.get('error') or snippet(raw)}"
                 )
                 return None
             usage = data.get('usage') or {}
@@ -221,6 +222,11 @@ async def extract_job_page_openrouter(
                 try:
                     args = json.loads(tool_call['function'].get('arguments') or '{}')
                 except json.JSONDecodeError as ex:
+                    logger.warning(
+                        f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                        f"{name} called with invalid JSON arguments ({ex}): "
+                        f"{snippet(tool_call['function'].get('arguments'))}"
+                    )
                     messages.append({
                         'role': 'tool', 'tool_call_id': call_id,
                         'content': f'Error: invalid JSON arguments ({ex}). Retry the call with valid JSON.',
@@ -247,14 +253,20 @@ async def extract_job_page_openrouter(
                     try:
                         result_text = await browser_call(name, args)
                     except Exception as ex:
+                        logger.warning(
+                            f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                            f"browser tool {name}({snippet(args)}) failed: {type(ex).__name__}: {ex}"
+                        )
                         result_text = f'Error executing {name}: {ex}'
                     logger.debug(
                         f'Extract (openrouter) iteration {iteration + 1}: {name}({args}) '
-                        f'→ {len(result_text)} chars: {result_text[:200]!r}'
+                        f'→ {len(result_text)} chars: {snippet(result_text)!r}'
                     )
                     messages.append({
                         'role': 'tool', 'tool_call_id': call_id,
-                        'content': result_text[:EXTRACTOR_TOOL_RESULT_MAX_CHARS],
+                        'content': truncate_reported(
+                            result_text, EXTRACTOR_TOOL_RESULT_MAX_CHARS,
+                            f"{name} result extracting job {candidate.get('job_id')}"),
                     })
                 else:
                     messages.append({

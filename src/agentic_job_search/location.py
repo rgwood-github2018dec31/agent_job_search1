@@ -95,7 +95,11 @@ def is_eu_member(country: str) -> bool:
     return ' '.join(str(country or '').split()).casefold() in _EU_LOOKUP
 
 
-@functools.lru_cache(maxsize=512)
+# Distinct place names seen in a run are far fewer than this; it only bounds a pathological run.
+TOKEN_PATTERN_CACHE_SIZE = 512
+
+
+@functools.lru_cache(maxsize=TOKEN_PATTERN_CACHE_SIZE)
 def _token_pattern(token: str) -> re.Pattern[str]:
     r"""Compiled whole-token matcher for one place name. Case-SENSITIVE and accent-exact.
 

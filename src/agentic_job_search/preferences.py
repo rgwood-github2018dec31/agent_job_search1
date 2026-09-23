@@ -258,7 +258,7 @@ def relocation_note() -> str:
 
 
 def _parse_added_date(raw: Any) -> date | None:
-    '''Parse a blacklist entry's `added` field. Returns None if absent or unparseable.'''
+    '''Parse a blacklist entry's `added` field. None if absent; raises ValueError if unparseable.'''
     if isinstance(raw, datetime):
         return raw.date()
     if isinstance(raw, date):
@@ -267,27 +267,34 @@ def _parse_added_date(raw: Any) -> date | None:
         return None
     try:
         return datetime.strptime(str(raw).strip(), '%Y-%m-%d').date()
-    except ValueError:
-        return None
+    except ValueError as ex:
+        raise ValueError(f'`added` value {raw!r} is not a YYYY-MM-DD date: {ex}') from ex
 
 
-def _blacklist_entries() -> list[tuple[str, str, date | None]]:
-    '''Normalize the raw blacklist into (name, reason, added_date) triples.
+def _blacklist_entries() -> list[tuple[str, str, date | None, str]]:
+    '''Normalize the raw blacklist into (name, reason, added_date, date_problem) tuples.
+
+    `date_problem` is empty, or says why `added` could not be read; the caller that owns the
+    once-per-entry warning reports it.
 
     Accepts either a mapping per entry or a bare string (a name with no reason and no date), so a
     hand-edited list of plain names still works. Names are returned **as written** — the match is
     case-sensitive, unlike every other preference accessor here.
     '''
-    entries: list[tuple[str, str, date | None]] = []
+    entries: list[tuple[str, str, date | None, str]] = []
     for raw in load_preferences()['companies']['blacklist']:
+        date_problem = ''
         if isinstance(raw, dict):
             name = str(raw.get('name') or '').strip()
             reason = str(raw.get('reason') or '').strip()
-            added = _parse_added_date(raw.get('added'))
+            try:
+                added = _parse_added_date(raw.get('added'))
+            except ValueError as ex:
+                added, date_problem = None, str(ex)
         else:
             name, reason, added = str(raw or '').strip(), '', None
         if name:
-            entries.append((name, reason, added))
+            entries.append((name, reason, added, date_problem))
     return entries
 
 
@@ -299,13 +306,14 @@ def blacklisted_companies() -> tuple[tuple[str, str], ...]:
     warning is how the typo gets noticed.
     '''
     active: list[tuple[str, str]] = []
-    for name, reason, added in _blacklist_entries():
+    for name, reason, added, date_problem in _blacklist_entries():
         if added is None:
             if name not in _warned_blacklist_entries:
                 _warned_blacklist_entries.add(name)
                 logger.warning(
-                    f'Blacklist entry {name!r} has no valid `added` date (expected YYYY-MM-DD) — '
-                    f'treating it as active. Add a date in {PREFERENCES_PATH} so it can expire.'
+                    f'Blacklist entry {name!r} has no valid `added` date '
+                    f'({date_problem or "none given"}; expected YYYY-MM-DD) — treating it as '
+                    f'active. Add a date in {PREFERENCES_PATH} so it can expire.'
                 )
             active.append((name, reason))
             continue
@@ -327,7 +335,7 @@ def expired_blacklist_entries() -> tuple[tuple[str, str], ...]:
     '''(name, added-date) pairs past COMPANY_BLACKLIST_EXPIRY_DAYS. Reported, never enforced.'''
     return tuple(
         (name, added.isoformat())
-        for name, _reason, added in _blacklist_entries()
+        for name, _reason, added, _date_problem in _blacklist_entries()
         if added is not None and (date.today() - added).days > COMPANY_BLACKLIST_EXPIRY_DAYS
     )
 
@@ -421,8 +429,9 @@ def _bucket_insertion_point(lines: list[str]) -> int | None:
         None,
     )
     if key_at is None:                                   # create the key at the end of the block
-        lines[end_of_block:end_of_block] = [_BUCKET_HEADER, f'  {_BUCKET_KEY}:\n']
-        return end_of_block + 2
+        new_lines = [_BUCKET_HEADER, f'  {_BUCKET_KEY}:\n']
+        lines[end_of_block:end_of_block] = new_lines
+        return end_of_block + len(new_lines)
 
     after = key_at + 1
     while after < end_of_block and lines[after].strip().startswith('- '):
