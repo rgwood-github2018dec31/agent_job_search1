@@ -74,6 +74,8 @@ from agentic_job_search.config import (
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
     REFERENCE_SUMMARY_MAX_CHARS,
+    NOTIFICATION_SALARY_MAX_CHARS,
+    SALARY_FIELD_DESCRIPTION,
     THINKING_MAX_CHARS,
     TRIAGE_ENABLED,
     should_notify_based_on_rating,
@@ -83,9 +85,19 @@ from agentic_job_search import location
 from agentic_job_search import location_review
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search import scrape_openrouter
+from agentic_job_search.salary import (
+    resolve_salary,
+    salary_digits_are_in_the_source,
+    salary_facts_of,
+)
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search.text_budget import pages_to_prompt, snippet, truncate_reported
+from agentic_job_search.text_budget import (
+    pages_to_prompt,
+    snippet,
+    truncate_reported,
+    truncate_reported_middle,
+)
 from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
     PROJECT_DIR,
@@ -539,7 +551,7 @@ Do NOT write a warning about the poster being a recruiting agency or the hiring 
 Three more facts are detected deterministically and added for you. Factor each into the rating, but do not write a warning bullet that only restates it — repeating it just duplicates the bullet in different words:
 - **Workplace:** do not write a bullet stating that the role is hybrid or on-site, or whether its location is one you would commute to. Travel, or occasional on-site customer work, is a different concern: do warn about that.
 - **Contract:** do not write a bullet that only restates that the role is a contract, freelance, temporary or fixed-term position. You may still warn about contractor-style terms the posting does not label as a contract.
-- **Salary:** "No salary listed" is added for you whenever the posting gives no figure. Do not write a bullet that only says the salary is missing or that the target can't be verified. If no figure is given but you judge the pay likely below target, say that in one bullet.
+- **Salary:** the structure of the pay figure is added for you — "No salary listed" when there is none, and a "Partial salary" line when the posting states only a lower bound, only an upper bound, or a single figure. The `Salary structure:` line in the extract tells you which. Do not write a bullet that only says the salary is missing, that the range has one end, or that the target can't be verified. Judging the pay itself is still yours: if the figure (or its absence) makes you think the pay is likely below target, say that in one bullet.
 """
 
 
@@ -641,7 +653,7 @@ EXTRACT_OUTPUT_SCHEMA = {
         'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
         'date_posted': {'type': 'string', 'description': 'As shown on the page, absolute or relative'},
         'closed': {'type': 'boolean', 'description': 'True if the page shows "No longer accepting applications"'},
-        'salary': {'type': 'string'},
+        'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
         'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
         'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
         'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
@@ -1829,12 +1841,17 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
                 logger.warning(f'Extract fallback: expand click failed, using collapsed description: {ex}')
 
     snapshot_label = f"extract-fallback snapshot for {candidate['company']} — {candidate['title']}"
+    # The page's TAIL carries compensation and work-authorization statements, so the budget cuts
+    # the middle here too (2026-09-22). Retained before the cut: what is kept is the page, not
+    # what the model was shown.
+    budgeted_snapshot = truncate_reported_middle(snapshot, EXTRACT_SNAPSHOT_MAX_CHARS, snapshot_label)
+    tools_module.save_raw_posting(candidate, snapshot, 'extract_fallback', len(budgeted_snapshot))
     prompt = (
         'Below is an accessibility snapshot of a job posting page. Condense it into a structured extract. '
         'Keep requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or '
         '"no longer accepting applications" statements. Strip navigation chrome, footers, similar-jobs '
         'lists, and marketing boilerplate.\n\n'
-        + truncate_reported(snapshot, EXTRACT_SNAPSHOT_MAX_CHARS, snapshot_label)
+        + budgeted_snapshot
     )
     options = ClaudeAgentOptions(
         setting_sources=[],
@@ -2170,6 +2187,50 @@ def derive_agency_posting(extract: dict) -> bool:
     return bool(_AGENCY_PHRASE_RE.search(str(extract.get('description') or '')))
 
 
+# The structure line in the extract text the rater reads. `range` is absent on purpose: a complete
+# range needs no note, and a note on every posting is one the rater stops reading.
+_SALARY_STRUCTURE_NOTE_BY_KIND = {
+    'absent': 'no figure stated',
+    'floor_only': 'lower bound stated, no upper bound',
+    'ceiling_only': 'upper bound stated, no lower bound',
+    'single': 'a single figure, not a range',
+    'unclassified': 'could not be read as a pay range',
+}
+
+
+def check_salary_provenance(candidate: dict, extract: dict) -> bool:
+    """Warn when a reported salary figure is not in the page the extract was made from.
+
+    `submit_job_extract` is generative, so a figure it hands back is only as good as the page it
+    read — and until raw postings were retained there was nothing to check one against. This is
+    the first concrete piece of the provenance validation the Anti-fabrication requirement has
+    carried as designed-but-unimplemented. It reports; it never rejects, because a capture that
+    missed the compensation block is at least as likely as a model inventing a number.
+
+    Returns True when the figures check out or there was nothing to check against.
+    """
+    facts = extract.get('salary_facts') or {}
+    if not facts.get('text'):
+        return True
+    path = tools_module.raw_posting_path(candidate)
+    if not path.is_file():
+        return True
+    try:
+        raw_text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError as ex:
+        logger.warning(f'Could not read the raw posting {path} to check the salary: {ex}')
+        return True
+    if salary_digits_are_in_the_source(facts['text'], raw_text):
+        return True
+    logger.warning(
+        f"Salary provenance: {candidate['company']} — {candidate['title']} "
+        f"(job {candidate.get('job_id')}): extracted salary {facts['text']!r} contains figures "
+        f'that do not appear in the retained page {path.name} — treat the figure as unverified.'
+    )
+    facts['source'] = 'unverified'
+    return False
+
+
 def format_extract_text(candidate: dict, extract: dict) -> str:
     workplace_type = derive_workplace_type(extract)
     # Who would actually hire, when a recruiter names them — the poster's name is not the employer.
@@ -2185,8 +2246,15 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     ]
     if candidate['snippet']:
         lines.append(f"Search-result snippet: {candidate['snippet']}")
-    if extract['salary']:
-        lines.append(f"Salary: {extract['salary']}")
+    # Testing the value, not the string: the `Salary:` line's format is pinned by a test and parsed
+    # by scripts/backfill_recruiter_notifications.py, so it keeps its wording; `Salary structure:`
+    # is a separate label, which that parser reads as its own field. The rater sees both, so it no
+    # longer has to infer from prose whether a range has two ends.
+    salary_facts = salary_facts_of(extract)
+    if salary_facts['text']:
+        lines.append(f"Salary: {salary_facts['text']}")
+    if (structure := _SALARY_STRUCTURE_NOTE_BY_KIND.get(salary_facts['kind'])):
+        lines.append(f'Salary structure: {structure}')
     if extract['sponsorship_note']:
         lines.append(f"Sponsorship/authorization note: {extract['sponsorship_note']}")
     if extract.get('language_requirement'):
@@ -2618,6 +2686,41 @@ _CONTRACT_RE = re.compile(
 )
 
 NO_SALARY_WARNING = 'No salary listed'
+# Every code-emitted line about an INCOMPLETE range starts with this, so `merge_salary_warning`
+# and the tests have one place to ask "did code already say something about the salary here?".
+PARTIAL_SALARY_WARNING_PREFIX = 'Partial salary'
+UNREADABLE_SALARY_WARNING_PREFIX = 'Salary not interpretable'
+
+# What each reading is worth telling the user. The table is the policy, and it lives in code: the
+# classifier reports what a string says, this decides what that means (see salary.py's docstring).
+_SALARY_WARNING_BY_KIND = {
+    'absent': NO_SALARY_WARNING,
+    'floor_only': f'{PARTIAL_SALARY_WARNING_PREFIX} — only a lower bound: {{text}}',
+    'ceiling_only': f'{PARTIAL_SALARY_WARNING_PREFIX} — only an upper bound: {{text}}',
+    'single': f'{PARTIAL_SALARY_WARNING_PREFIX} — a single figure, no range: {{text}}',
+    'unclassified': f'{UNREADABLE_SALARY_WARNING_PREFIX}: {{text}}',
+}
+
+
+def salary_warning(extract: dict) -> str | None:
+    """The one salary line code emits for this posting, or None when the range is complete.
+
+    'Salary not interpretable' deliberately does not say "no salary": the string said something,
+    and reporting an unreadable value as an absent one is how a figure disappears quietly.
+    """
+    facts = salary_facts_of(extract)
+    template = _SALARY_WARNING_BY_KIND.get(facts['kind'])
+    return template.format(text=facts['text']) if template else None
+
+
+def is_code_emitted_salary_warning(warning: str) -> bool:
+    """True for any salary line this module produced, whichever reading produced it."""
+    text = str(warning).strip()
+    return (
+        text == NO_SALARY_WARNING
+        or text.startswith(PARTIAL_SALARY_WARNING_PREFIX)
+        or text.startswith(UNREADABLE_SALARY_WARNING_PREFIX)
+    )
 
 
 def salary_figure_listed(extract: dict) -> bool:
@@ -2626,10 +2729,10 @@ def salary_figure_listed(extract: dict) -> bool:
     The extractor fills the field with text that says there is no salary — 'Not specified',
     'Competitive salary', 'Not stated ("competitive compensation")' — so a truthiness check read
     196 saved postings as salaried and warned about none of them, more than the 166 it did warn
-    about (2026-09-15). A figure always has a digit; of 1,031 saved values only
-    '12-month contract' and '90th percentile' carry one without being a salary.
+    about (2026-09-15). That lesson is now the `absent` reading in salary.py, which this defers to;
+    a digit test alone could not tell a complete range from one end of one (2026-09-22).
     """
-    return bool(re.search(r'\d', extract.get('salary') or ''))
+    return salary_facts_of(extract)['kind'] != 'absent'
 
 
 def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
@@ -2678,8 +2781,10 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')}"):
         warnings.append('Contract role — full-time preferred')
 
-    if not salary_figure_listed(extract):
-        warnings.append(NO_SALARY_WARNING)
+    # Absent, one-ended, a lone figure or unreadable — each says something different, and a digit
+    # test said the same thing about all four (2026-09-22). See salary.py.
+    if warning := salary_warning(extract):
+        warnings.append(warning)
 
     # Who is actually hiring changes how you apply, and the rater reports it only by luck: on the
     # 2026-08-11 run it flagged CyberCoders and Jobgether but not Hire Feed or Genius Innovation
@@ -2720,7 +2825,12 @@ _SALARY_ABSENCE_LEAD_RE = re.compile(
     r'|(?:salary|compensation|comp|pay)(?:\s+\w+){0,2}\s+(?:not|un\w+)\b)',
     re.IGNORECASE,
 )
-_PAY_WORD_RE = re.compile(r'\b(?:salary|salaries|compensation|comp|pay)\b', re.IGNORECASE)
+# 'base' and 'remuneration' joined the vocabulary on 2026-09-22: the rater's bullet for job
+# 4470298356 was 'Base range floor ($208.6K) sits just below the $210K target', which names no pay
+# word at all and so was not recognised as a salary bullet — it reached the user unfolded, leading
+# with the floor. `\bbase\b` does not match 'based in Toronto' or 'database'.
+_PAY_WORD_RE = re.compile(
+    r'\b(?:salary|salaries|compensation|comp|pay|base|remuneration)\b', re.IGNORECASE)
 _BELOW_TARGET_RE = re.compile(r'\b(?:below|short|under|lower)\b', re.IGNORECASE)
 # Words that make a salary bullet an estimate worth keeping ('Poland-market pay likely well below
 # CAD $210K target') rather than a tautology ('CAD $210K+ target unverified'). Measured on the saved
@@ -2754,15 +2864,19 @@ def _drop_trailing_salary_absence(warning: str) -> str:
 
 
 def merge_salary_warning(deterministic: list[str], llm_warnings: list[str]) -> tuple[list[str], list[str]]:
-    """Fold the rater's salary bullets into the one deterministic 'No salary listed' line.
+    """Fold the rater's salary bullets into the one salary line code emitted.
 
-    A no-op unless code emitted that line. Then every rater salary bullet is removed, and the first
-    that carries an estimate replaces the code line in place — as written when it already leads with
-    the absence, otherwise prefixed with it — so the absence is always stated first and the fact
-    stays decided in code. Without an estimate the code line stands alone. A salary-absence clause
-    trailing an unrelated bullet after ';' is trimmed off it.
+    A no-op unless code emitted such a line — which, for a COMPLETE range, it does not: a genuine
+    below-target bullet about a full range is the judgement the rater is asked for, and it passes
+    through untouched. Otherwise every rater salary bullet is removed and the first that carries an
+    estimate is appended to the code line in place, so the structure is stated in code first and
+    the rater's judgement second. That ordering is the point: for job 4470298356 the rater's own
+    bullet led with the floor ('Base range floor ($208.6K) sits just below…') and nothing
+    contradicted it (2026-09-22). A salary-absence clause trailing an unrelated bullet after ';'
+    is trimmed off it.
     """
-    if NO_SALARY_WARNING not in deterministic:
+    code_line = next((w for w in deterministic if is_code_emitted_salary_warning(w)), '')
+    if not code_line:
         return deterministic, llm_warnings
     llm_warnings = [_drop_trailing_salary_absence(str(w)) for w in llm_warnings]
     salary_bullets = [w for w in llm_warnings if _is_salary_bullet(str(w))]
@@ -2770,9 +2884,13 @@ def merge_salary_warning(deterministic: list[str], llm_warnings: list[str]) -> t
     estimate = next((str(w).strip() for w in salary_bullets if _SALARY_JUDGEMENT_RE.search(str(w))), '')
     if not estimate:
         return deterministic, others
-    if not _SALARY_ABSENCE_LEAD_RE.search(estimate):
-        estimate = f'{NO_SALARY_WARNING} — {estimate}'
-    return [estimate if w == NO_SALARY_WARNING else w for w in deterministic], others
+    # An estimate that already leads with the absence replaces the line outright; anything else is
+    # appended, so the code-decided fact keeps the front of the bullet.
+    merged_line = (
+        estimate if code_line == NO_SALARY_WARNING and _SALARY_ABSENCE_LEAD_RE.search(estimate)
+        else f'{code_line} — {estimate}'
+    )
+    return [merged_line if w == code_line else w for w in deterministic], others
 
 
 def merge_warnings(deterministic: list[str], llm_warnings: list[str]) -> list[str]:
@@ -2801,6 +2919,31 @@ def _bullet_block(heading: str, items: list[str]) -> str:
     return f'{heading}\n{bullets}'
 
 
+# What each reading adds after the figure on the 💰 line. A complete range needs no gloss; a
+# partial one needs the user to see WHY it is partial without reading the warnings block.
+_SALARY_LINE_SUFFIX_BY_KIND = {
+    'floor_only': ' (lower bound only)',
+    'ceiling_only': ' (upper bound only)',
+    'single': ' (single figure, no range)',
+    'unclassified': ' (could not be read as a pay range)',
+}
+
+
+def format_salary_line(extract: dict) -> str:
+    """The 💰 line of a job-match message: the salary text as extracted, never a paraphrase.
+
+    The message used to carry no salary field at all, so the only figure reaching the user was
+    whatever the rater wrote into a bullet — for job 4470298356 that was '$208K–$274K' in one
+    bullet (rounded up from 273,770) and the floor alone in another, with nothing to check either
+    against (2026-09-22). Omitted when there is no figure: the ⚠️ bullet already says so.
+    """
+    facts = salary_facts_of(extract)
+    if facts['kind'] == 'absent' or not facts['text']:
+        return ''
+    text = snippet(facts['text'], NOTIFICATION_SALARY_MAX_CHARS)
+    return f"💰 {text}{_SALARY_LINE_SUFFIX_BY_KIND.get(facts['kind'], '')}"
+
+
 def format_job_notification(
     candidate: dict, extract: dict, rating: int, pros: list[str], warnings: list[str]
 ) -> str:
@@ -2811,7 +2954,12 @@ def format_job_notification(
     workplace_type = derive_workplace_type(extract)
     if location and workplace_type and workplace_type not in location.lower():
         location = f'{location} — {workplace_type}'
-    sections = [f'{header}\n📍 {location}' if location else header]
+    lines = [header]
+    if location:
+        lines.append(f'📍 {location}')
+    if salary_line := format_salary_line(extract):
+        lines.append(salary_line)
+    sections = ['\n'.join(lines)]
     for block in (_bullet_block('✅ Good:', pros), _bullet_block('⚠️ Warnings:', warnings)):
         if block:
             sections.append(block)
@@ -3028,6 +3176,12 @@ async def evaluate_all_candidates(
             extract['place_names'] = (
                 await classify_location(extract.get('location', ''))
             ).get('place_names') or []
+            # And the salary reading, same pattern: resolved once here (the rules answer almost
+            # every string for free; only one they cannot read reaches a model, and then only
+            # once ever, cached) so the sync consumers -- the warning, the notification line, the
+            # extract text -- all read ONE reading instead of each deriving its own.
+            extract['salary_facts'] = await resolve_salary(extract, stage_stats['salary'])
+            check_salary_provenance(candidate, extract)
             extract_text = format_extract_text(candidate, extract)
             logger.info(
                 f"Extract signal: {candidate['company']} — {candidate['title']}: "
@@ -3039,7 +3193,11 @@ async def evaluate_all_candidates(
                 f"residency_scope={raw_residency_scope!r}->{extract.get('residency_scope')!r} "
                 f"place_names={extract.get('place_names')} "
                 f"education_requirement={extract.get('education_requirement')!r} "
-                f"is_agency={derive_agency_posting(extract)} end_client={extract.get('end_client')!r}"
+                f"is_agency={derive_agency_posting(extract)} end_client={extract.get('end_client')!r} "
+                f"salary={extract.get('salary')!r}->kind={extract['salary_facts']['kind']} "
+                f"currency={extract['salary_facts']['currency']!r} "
+                f"period={extract['salary_facts']['period']!r} "
+                f"salary_source={extract['salary_facts']['source']}"
             )
 
             # Already-applied, checked against the END CLIENT only.
@@ -3543,6 +3701,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._ui_alerts = list(_startup_ui_alerts)
     location.reset_countries_seen()
     reset_location_guesses()
+    tools_module.prune_raw_postings()
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -3561,6 +3720,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         "location_review": new_stage_stats(),
         # $0.0000 on a run where no agency posted twice, which is most of them.
         "recruiter_repost": new_stage_stats(),
+        # $0.0000 on a run whose salary strings all parse deterministically — which is itself the
+        # evidence the rules are doing the work, rather than a model quietly doing it for them.
+        "salary": new_stage_stats(),
     }
     jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
 

@@ -12,6 +12,7 @@ import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools
 from agentic_job_search import agent
 from agentic_job_search import location
+from agentic_job_search import salary
 from agentic_job_search import location_review
 from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
 from agentic_job_search.agent import load_env
@@ -281,6 +282,41 @@ def _isolated_location_cache(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {})
+
+
+@pytest.fixture(autouse=True)
+def _isolated_salary_cache(monkeypatch, tmp_path):
+    """No test may read or write the developer's real run_dir/salary_cache.yaml.
+
+    Same reasoning as the location cache: a leaked real cache makes a unit test assert on whatever
+    salary strings this machine happened to see.
+    """
+    monkeypatch.setattr(salary, 'SALARY_CACHE_PATH', tmp_path / 'salary_cache.yaml')
+    monkeypatch.setattr(salary, '_cache', {})
+
+
+@pytest.fixture(autouse=True)
+def stub_salary_classifier(monkeypatch):
+    """Autouse: no unit test may escalate a salary string to the real model.
+
+    The classifier FAILS OPEN toward `unclassified`, so without this an unstubbed test would pass
+    while making a live, paid call and nothing would look wrong — the same shape as the location
+    stub below it. Tests exercising the escalation path patch `chat_openrouter` themselves, which
+    wins over this.
+    """
+    async def _no_network(*args, **kwargs):
+        raise AssertionError('a unit test tried to reach the OpenRouter MCP server')
+
+    monkeypatch.setattr('agentic_job_search.salary.chat_openrouter', _no_network)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_raw_postings(monkeypatch, tmp_path):
+    """No test may write into — or prune — the developer's real run_dir/raw_postings/.
+
+    prune_raw_postings() deletes directories, so a test that forgot would delete real captures.
+    """
+    monkeypatch.setattr(tools, 'RAW_POSTINGS_DIR', tmp_path / 'raw_postings')
 
 
 @pytest.fixture(autouse=True)

@@ -303,6 +303,10 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
 MODEL_NAME_QUERY = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 MODEL_NAME_COMPANY_MATCH = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 MODEL_NAME_RATING = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+# Reading amounts out of a compensation phrase is a PARSE, not a judgement — the deterministic
+# tiers in salary.py answer all but a few strings, and this only sees what they could not read.
+# Flash tier for that reason, and cached per string so a phrase is parsed once, ever.
+MODEL_NAME_SALARY = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
 # The extraction loop is a many-iteration tool-calling conversation, so it runs on the
 # shared agentic (flash-tier) default rather than the intelligence default — glm-5.2
 # measured agentic 45.7 vs 58.2 for glm-5.3-flash, at ~1/19th the per-token price.
@@ -329,6 +333,28 @@ AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
 # Stage 2 (evaluation) configuration
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10
 EXTRACTOR_TOOL_RESULT_MAX_CHARS = 40_000
+# The a11y snapshot specifically, split out from the cap above (2026-09-22). One LinkedIn page
+# measured 74,797 chars against the shared 40,000 cap and lost 34,797 from the END — where a JD
+# keeps compensation, benefits and work-authorization statements. The extract-fallback path has
+# always been allowed to read these same pages whole, so this matches it; the remaining overflow
+# is cut from the MIDDLE by truncate_reported_middle rather than from the tail.
+EXTRACTOR_SNAPSHOT_MAX_CHARS = 80_000
+# Share of a middle-truncated text kept as the head; the rest is the tail. Above half because a
+# page's own structure is front-loaded and only the trailing facts need rescuing.
+SNAPSHOT_HEAD_SHARE = 0.6
+# The `salary` field's contract, defined ONCE and imported by all three extract schemas
+# (agent.EXTRACT_OUTPUT_SCHEMA, tools_generic.submit_job_extract, extract_openrouter's tool spec).
+# Two of those carried a "must stay in sync" comment and no test; the field itself carried no
+# description at all, and a model handed back a rounded, one-ended range that reached the user
+# (2026-09-22). Asking for the text verbatim is the courier-argument exception the Anti-fabrication
+# NFR allows for submit_job_extract — which is why raw postings are now retained, so it is
+# checkable rather than merely requested.
+SALARY_FIELD_DESCRIPTION = (
+    'Compensation exactly as the posting states it. Copy BOTH ends of a range, the currency and '
+    'the period, e.g. "CA$208,580 - CA$273,770 per year" or "€700-€900/day". Never round a figure, '
+    'never give only one end of a range the posting states in full, and never convert a currency. '
+    'Put bonus/equity wording after the amounts. Leave empty ONLY when the page states no pay at all.'
+)
 TRIAGE_ENABLED = True
 TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (clear low fits)
 REFERENCE_SUMMARY_MAX_CHARS = 2500
@@ -391,6 +417,26 @@ OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS = 1024
 SCRAPER_WHAT_HAPPENED_MAX_CHARS = 500
 # Diagnostic excerpts of a response, error or command in log lines and exception messages.
 LOG_SNIPPET_MAX_CHARS = 300
+# The salary text shown on the 💰 line of a Telegram job-match message.
+NOTIFICATION_SALARY_MAX_CHARS = 200
+# Compensation sentences of the description handed to the salary classifier, and ONLY when the
+# deterministic tiers found no figure in the salary field itself.
+SALARY_CONTEXT_MAX_CHARS = 1500
+# A retained raw posting. Generous: the whole point is to be able to check an extracted figure
+# against what the page said, and a capture that drops the compensation block answers nothing.
+RAW_POSTING_MAX_CHARS = 200_000
+
+# Multipliers for the amount suffixes a posting writes instead of zeros ('60-75K', '€1.2M').
+SALARY_THOUSAND_MULTIPLIER = 1_000
+SALARY_MILLION_MULTIPLIER = 1_000_000
+# A run of exactly this many digits after a '.' or ',' is a thousands separator, not a decimal:
+# '208,580' and '392.000' are both whole amounts, '46.50' is not.
+THOUSANDS_GROUP_DIGITS = 3
+
+# run_dir/raw_postings/ retention. Long enough to investigate the current run and the one before
+# it, short enough that a daily run does not accumulate. Read by nothing in the pipeline — the
+# directory exists so an extracted figure can be checked against the page it came from.
+RAW_POSTINGS_RETENTION_DAYS = 7
 
 SECONDS_PER_MINUTE = 60
 # Waiting for a freshly launched @playwright/mcp to answer: this many polls, this far apart. A

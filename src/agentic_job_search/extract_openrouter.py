@@ -13,17 +13,52 @@ import logging
 
 from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
+    EXTRACTOR_SNAPSHOT_MAX_CHARS,
     EXTRACTOR_TOOL_RESULT_MAX_CHARS,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_EXTRACTOR,
+    SALARY_FIELD_DESCRIPTION,
 )
-from agentic_job_search.text_budget import snippet, truncate_reported
+from agentic_job_search.text_budget import (
+    normalize_whitespace,
+    snippet,
+    truncate_reported,
+    truncate_reported_middle,
+)
+from agentic_job_search.tools_generic import save_raw_posting
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, mcp_session
 
 logger = logging.getLogger(__name__)
 
 _BROWSER_TOOL_NAMES = {'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_wait_for'}
+_SNAPSHOT_TOOL_NAME = 'browser_snapshot'
+
+
+def _budget_tool_result(name: str, result_text: str, candidate: dict) -> str:
+    """Fit one tool result into the model's context, cutting where the least is lost.
+
+    An a11y snapshot is the one result whose TAIL matters — a job description keeps compensation,
+    benefits and work-authorization statements at the bottom — so it gets its own, larger cap
+    (matching what the extract-fallback path has always been allowed to read), is collapsed to
+    remove the tree's indentation before anything is dropped, and loses its MIDDLE rather than its
+    end. One LinkedIn page measured 74,797 chars against the shared 40,000 cap and lost 34,797
+    from the end, which is where its salary range lived (job 4470298356, 2026-09-22).
+    """
+    what = f"{name} result extracting job {candidate.get('job_id')}"
+    if name != _SNAPSHOT_TOOL_NAME:
+        return truncate_reported(result_text, EXTRACTOR_TOOL_RESULT_MAX_CHARS, what)
+    collapsed = normalize_whitespace(result_text)
+    budgeted = truncate_reported_middle(collapsed, EXTRACTOR_SNAPSHOT_MAX_CHARS, what)
+    logger.info(
+        f'Snapshot extracting job {candidate.get("job_id")}: {len(result_text)} chars captured, '
+        f'{len(collapsed)} after collapsing whitespace, {len(budgeted)} sent to the model '
+        f'({EXTRACTOR_SNAPSHOT_MAX_CHARS}-char cap)'
+    )
+    # Retained BEFORE the budget bites, so what is kept is the page, not what the model was shown.
+    save_raw_posting(candidate, collapsed, 'openrouter_loop', len(budgeted))
+    return budgeted
+
 
 OPENROUTER_EXTRACT_TOOLS = [
     {
@@ -118,7 +153,7 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
                     'date_posted': {'type': 'string'},
                     'closed': {'type': 'boolean'},
-                    'salary': {'type': 'string'},
+                    'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
                     'sponsorship_note': {'type': 'string'},
                     'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase"},
                     'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output"},
@@ -264,9 +299,7 @@ async def extract_job_page_openrouter(
                     )
                     messages.append({
                         'role': 'tool', 'tool_call_id': call_id,
-                        'content': truncate_reported(
-                            result_text, EXTRACTOR_TOOL_RESULT_MAX_CHARS,
-                            f"{name} result extracting job {candidate.get('job_id')}"),
+                        'content': _budget_tool_result(name, result_text, candidate),
                     })
                 else:
                     messages.append({

@@ -26,6 +26,7 @@ from agentic_job_search import location
 from agentic_job_search import location_review
 from agentic_job_search import config
 from agentic_job_search import extract_openrouter
+from agentic_job_search import salary
 from agentic_job_search import preferences
 from agentic_job_search import scrape_openrouter
 from agentic_job_search import text_budget
@@ -1803,12 +1804,57 @@ async def test_openrouter_loop_returns_none_on_chat_error(monkeypatch):
     assert extract is None
 
 
-async def test_openrouter_loop_truncates_tool_results(monkeypatch, caplog):
+async def test_openrouter_loop_keeps_the_tail_of_an_oversized_snapshot(monkeypatch, caplog):
+    """A snapshot is cut in the MIDDLE, so the end of the page survives.
+
+    Compensation, benefits and work-authorization statements live at the bottom of a job
+    description. End-truncation dropped 34,797 chars from one LinkedIn page and took its salary
+    range with them (job 4470298356, 2026-09-22), so what this pins is that the tail comes back.
+    """
+    from contextlib import asynccontextmanager
+    from agentic_job_search.config import EXTRACTOR_SNAPSHOT_MAX_CHARS
+    chat_requests = []
+    responses = [
+        _chat_response(tool_calls=[_tool_call('c1', 'browser_snapshot', {})]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
+    ]
+    head, tail = 'SALARY AT THE TOP', 'SALARY AT THE BOTTOM'
+    oversized = head + ('x' * (EXTRACTOR_SNAPSHOT_MAX_CHARS * 2)) + tail
+
+    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
+        chat_requests.append(json.loads(json.dumps(args)))
+        return responses.pop(0)
+
+    @asynccontextmanager
+    async def fake_mcp_session(url):
+        async def call(tool_name, args):
+            return oversized
+
+        yield call
+
+    monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    monkeypatch.setattr(extract_openrouter, 'mcp_session', fake_mcp_session)
+
+    await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
+    )
+    content = chat_requests[1]['messages'][-1]['content']
+    assert len(content) <= EXTRACTOR_SNAPSHOT_MAX_CHARS
+    assert content.startswith(head)
+    assert content.endswith(tail), 'the end of the page is where the pay figure lives'
+    assert 'dropped' in content and 'MIDDLE' in content, \
+        'the model must be told its tool result was cut, and where'
+    assert any('Truncating browser_snapshot result' in r.message and r.levelname == 'WARNING'
+               for r in caplog.records), 'a cut must be logged, never silent'
+
+
+async def test_openrouter_loop_truncates_a_non_snapshot_tool_result(monkeypatch, caplog):
+    """Every other tool result still loses its end: only a snapshot has facts at the bottom."""
     from contextlib import asynccontextmanager
     from agentic_job_search.config import EXTRACTOR_TOOL_RESULT_MAX_CHARS
     chat_requests = []
     responses = [
-        _chat_response(tool_calls=[_tool_call('c1', 'browser_snapshot', {})]),
+        _chat_response(tool_calls=[_tool_call('c1', 'browser_navigate', {'url': 'http://x'})]),
         _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
     ]
 
@@ -1829,12 +1875,10 @@ async def test_openrouter_loop_truncates_tool_results(monkeypatch, caplog):
     await extract_openrouter.extract_job_page_openrouter(
         _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
     )
-    tool_msg = chat_requests[1]['messages'][-1]
-    kept, _, marker = tool_msg['content'].rpartition('\n')
+    kept, _, marker = chat_requests[1]['messages'][-1]['content'].rpartition('\n')
     assert len(kept) == EXTRACTOR_TOOL_RESULT_MAX_CHARS
-    assert marker.startswith(f'[truncated: kept {EXTRACTOR_TOOL_RESULT_MAX_CHARS} of '), \
-        'the model must be told its tool result was cut'
-    assert any('Truncating browser_snapshot result' in r.message and r.levelname == 'WARNING'
+    assert marker.startswith(f'[truncated: kept {EXTRACTOR_TOOL_RESULT_MAX_CHARS} of ')
+    assert any('Truncating browser_navigate result' in r.message and r.levelname == 'WARNING'
                for r in caplog.records), 'a cut must be logged, never silent'
 
 
@@ -3783,7 +3827,7 @@ def test_build_deterministic_warnings_flags_hybrid_contract_and_missing_salary()
 
 
 def test_build_deterministic_warnings_quiet_for_clean_remote_job():
-    extract = _make_extract(salary='CAD 220,000')
+    extract = _make_extract(salary='CAD 200,000 - 240,000 per year')
     assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
 
 
@@ -3813,6 +3857,343 @@ def test_build_deterministic_warnings_flags_salary_text_with_no_figure():
     assert 'No salary listed' in agent.build_deterministic_warnings(_make_candidate(), extract)
 
 
+# ---------------------------------------------------------------------------
+# Salary classification (salary.py)
+#
+# Every string below is taken verbatim from the saved-posting corpus. A digit test called all of
+# them "salary listed" alike, which is how a one-ended range reached a notification (2026-09-22).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('text, kind, minimum, maximum', [
+    # Complete ranges, in the shapes postings actually write them.
+    ('CA$208,580–$273,770 annually (typical hiring range; plus bonus and equity eligibility)',
+     'range', 208580, 273770),
+    ('$190K/yr - $300K/yr', 'range', 190000, 300000),
+    ('90K EUR/yr - 110K EUR/yr', 'range', 90000, 110000),
+    ('zł392,000 – zł588,000 (annualized base salary)', 'range', 392000, 588000),
+    ('60-75K', 'range', 60000, 75000),
+    ('€700-€900/day (DOE)', 'range', 700, 900),
+    ('513,000 kr—684,000 kr SEK (Remote Sweden)', 'range', 513000, 684000),
+    # One-ended: the whole point. Each states a real figure and no second bound.
+    ('Up to €50k (dependent on experience)', 'ceiling_only', None, 50000),
+    ('Under $40/hr', 'ceiling_only', None, 40),
+    ('Daily rate up to 600€', 'ceiling_only', None, 600),
+    ('Up to CA$70/hr', 'ceiling_only', None, 70),
+    # The ceiling is the amount the marker introduces, not the largest number in the string.
+    ('Up to €135,000 Base + Bonus (c.€150,000 OTE)', 'ceiling_only', None, 135000),
+    ('Minimum €65,000/year (overpayment possible depending on qualifications)', 'floor_only', 65000, None),
+    ('Competitive salary starting from €70K gross annually, depending on skills and experience',
+     'floor_only', 70000, None),
+    ('$30+ USD per hour, with bonus rates available on some projects', 'floor_only', 30, None),
+    ('Min. 32,640 PLN gross per month + performance-based variable pay', 'floor_only', 32640, None),
+    # A lone figure is not a range either.
+    ('€110,000', 'single', 110000, 110000),
+    ('$100/hr', 'single', 100, 100),
+    ('$46.50/hour', 'single', 46.5, 46.5),
+    ('CAD 220,000', 'single', 220000, 220000),
+    # No figure stated. These are the 2026-09-15 lesson and must keep reading as absent.
+    ('', 'absent', None, None),
+    ('Not specified', 'absent', None, None),
+    ('Competitive salary', 'absent', None, None),
+    ('Not stated ("competitive compensation", performance bonus, stock options)', 'absent', None, None),
+    # Not pay at all, though every one of them carries a digit.
+    ('12-month contract / Outside IR35', 'unclassified', None, None),
+    ('90th percentile', 'unclassified', None, None),
+    ('€1,200/year training budget; flexible compensation package; private medical insurance',
+     'unclassified', None, None),
+])
+def test_classify_salary_reads_the_structure_of_a_pay_string(text, kind, minimum, maximum):
+    facts = salary.classify_salary(text)
+    assert facts['kind'] == kind
+    assert facts['minimum'] == minimum
+    assert facts['maximum'] == maximum
+    assert facts['text'] == text.strip(), 'the string is carried through as written'
+    assert facts['source'] == 'deterministic', 'no rule-answerable string may cost a model call'
+
+
+@pytest.mark.parametrize('text, currency, period', [
+    ('CA$208,580–$273,770 annually', 'CAD', 'year'),
+    ('90K EUR/yr - 110K EUR/yr', 'EUR', 'year'),
+    ('zł392,000 – zł588,000', 'PLN', ''),
+    ('Up to CA$70/hr', 'CAD', 'hour'),
+    ('€650/day', 'EUR', 'day'),
+    ('EUR 5,014.30 gross/month', 'EUR', 'month'),
+    # A bare '$' is genuinely ambiguous — USD, CAD, AUD, SGD. Guessing is not this module's job.
+    ('$190K/yr - $300K/yr', '', 'year'),
+])
+def test_classify_salary_reads_currency_and_period(text, currency, period):
+    facts = salary.classify_salary(text)
+    assert facts['currency'] == currency
+    assert facts['period'] == period
+
+
+async def test_resolve_salary_does_not_call_the_model_for_a_readable_string(monkeypatch):
+    """The rules answer 862 of 911 figured postings in the corpus; none may cost a call."""
+    async def _boom(*args, **kwargs):
+        raise AssertionError('a readable salary string was escalated to the model')
+
+    monkeypatch.setattr(salary, 'chat_openrouter', _boom)
+    facts = await salary.resolve_salary({'salary': 'CA$208,580–$273,770 annually', 'description': ''})
+    assert facts['kind'] == 'range'
+
+
+async def test_resolve_salary_escalates_only_what_the_rules_cannot_read(monkeypatch):
+    calls = []
+
+    async def _fake(prompt, model=None):
+        calls.append(prompt)
+        return ('{"kind": "single", "minimum": 5014.3, "maximum": null, '
+                '"currency": "EUR", "period": "month"}', 0.000123)
+
+    monkeypatch.setattr(salary, 'chat_openrouter', _fake)
+    extract = {'salary': 'EUR 5,014.30 gross/month (full-time 40h/week, 14 times per year)',
+               'description': ''}
+    stats = agent.new_stage_stats()
+
+    facts = await salary.resolve_salary(extract, stats)
+    assert facts['kind'] == 'single'
+    assert facts['source'] == 'llm'
+    assert stats['cost'] == pytest.approx(0.000123)
+    assert len(calls) == 1
+
+    # The cache is what makes this deterministic: the same string cannot be answered twice, and
+    # differing whitespace or case is not compensation.
+    again = await salary.resolve_salary(dict(extract, salary=extract['salary'].upper()), stats)
+    assert again['source'] == 'cache'
+    assert again['kind'] == 'single'
+    assert len(calls) == 1, 'a string already parsed must not be parsed again'
+
+
+async def test_resolve_salary_fails_toward_saying_less_when_the_server_is_down(monkeypatch, caplog):
+    """A provider outage must never turn an unreadable string into a complete range."""
+    async def _down(*args, **kwargs):
+        raise RuntimeError('tools_llm_remote_openrouter is not running')
+
+    monkeypatch.setattr(salary, 'chat_openrouter', _down)
+    facts = await salary.resolve_salary({'salary': 'six figures, depending', 'description': ''})
+    assert facts['kind'] == 'unclassified'
+    assert facts['source'] == 'error'
+    assert any('Salary classification failed' in r.message and r.levelname == 'WARNING'
+               for r in caplog.records), 'a silent classifier is a silent gate'
+
+
+async def test_resolve_salary_never_upgrades_a_partial_to_a_range(monkeypatch):
+    """A model that labels something `range` without two numbers is downgraded, not trusted."""
+    async def _fake(prompt, model=None):
+        return ('{"kind": "range", "minimum": 70000, "maximum": null, "currency": "EUR"}', 0.0)
+
+    monkeypatch.setattr(salary, 'chat_openrouter', _fake)
+    facts = await salary.resolve_salary({'salary': 'attractive package, six figures', 'description': ''})
+    assert facts['kind'] == 'unclassified'
+
+
+async def test_resolve_salary_shows_the_model_the_compensation_lines_when_the_field_has_no_figure(monkeypatch):
+    """The excerpt is selected in code, so the model is handed evidence rather than sent looking."""
+    prompts = []
+
+    async def _fake(prompt, model=None):
+        prompts.append(prompt)
+        return ('{"kind": "range", "minimum": 180000, "maximum": 220000, "currency": "CAD"}', 0.0)
+
+    monkeypatch.setattr(salary, 'chat_openrouter', _fake)
+    extract = {
+        'salary': 'salary information withheld',
+        'description': 'We build things. The base salary range is CAD 180,000 - 220,000. '
+                       'We use Python and Kubernetes.',
+    }
+    facts = await salary.resolve_salary(extract)
+    assert facts['kind'] == 'range'
+    assert 'CAD 180,000 - 220,000' in prompts[0]
+    assert 'Python and Kubernetes' not in prompts[0], 'only the money sentences are sent'
+
+
+@pytest.mark.parametrize('salary_text, expected', [
+    ('Competitive salary', 'No salary listed'),
+    ('Up to CA$70/hr', 'Partial salary — only an upper bound: Up to CA$70/hr'),
+    ('Minimum €65,000', 'Partial salary — only a lower bound: Minimum €65,000'),
+    ('€110,000', 'Partial salary — a single figure, no range: €110,000'),
+    ('12-month contract / Outside IR35', 'Salary not interpretable: 12-month contract / Outside IR35'),
+])
+def test_build_deterministic_warnings_names_what_is_wrong_with_the_salary(salary_text, expected):
+    extract = _make_extract(salary=salary_text)
+    assert expected in agent.build_deterministic_warnings(_make_candidate(), extract)
+
+
+def test_build_deterministic_warnings_says_nothing_about_a_complete_range():
+    extract = _make_extract(salary='CA$208,580–$273,770 annually')
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert not any('salary' in w.lower() for w in warnings)
+
+
+def test_merge_salary_warning_puts_the_code_line_before_the_raters_floor_first_bullet():
+    """The incident, in one assertion.
+
+    The rater's own bullet led with the floor and nothing contradicted it, because the fold was a
+    no-op whenever a figure was listed (job 4470298356, 2026-09-22).
+    """
+    deterministic = ['Partial salary — only a lower bound: From CA$208,580']
+    llm = ['Base range floor ($208.6K) sits just below the $210K target; upper half well above']
+    merged = agent.merge_warnings(deterministic, llm)
+    assert len(merged) == 1, 'one salary line, not two saying the same thing differently'
+    assert merged[0].startswith('Partial salary — only a lower bound:'), \
+        'the structure is stated in code first, the rater\'s judgement second'
+    assert '$210K target' in merged[0], "the rater's estimate is kept, not discarded"
+
+
+def test_merge_salary_warning_leaves_a_complete_range_to_the_rater():
+    """Below-target on a full range is the judgement the rater is asked for (requirements.md)."""
+    llm = ['Pay is below the CAD $210K target across the whole band']
+    assert agent.merge_warnings([], llm) == llm
+
+
+def test_format_job_notification_carries_the_extracted_salary():
+    """The message used to contain no salary field at all — only the rater's paraphrase of one."""
+    extract = _make_extract(salary='CA$208,580–$273,770 annually (typical hiring range)')
+    message = agent.format_job_notification(
+        _make_candidate(), extract, 4, ['Strong comp: CA$208K–$274K base'], [])
+    assert '💰 CA$208,580–$273,770 annually (typical hiring range)' in message
+
+
+@pytest.mark.parametrize('salary_text, gloss', [
+    ('Up to CA$70/hr', '(upper bound only)'),
+    ('Minimum €65,000', '(lower bound only)'),
+    ('€110,000', '(single figure, no range)'),
+])
+def test_format_job_notification_says_why_a_salary_line_is_partial(salary_text, gloss):
+    message = agent.format_job_notification(
+        _make_candidate(), _make_extract(salary=salary_text), 4, [], [])
+    assert f'💰 {salary_text} {gloss}' in message
+
+
+def test_format_job_notification_omits_the_salary_line_when_there_is_no_figure():
+    message = agent.format_job_notification(
+        _make_candidate(), _make_extract(salary='Competitive salary'), 4, [], ['No salary listed'])
+    assert '💰' not in message, 'the warning already says there is no figure'
+
+
+def test_format_extract_text_tells_the_rater_the_salary_structure():
+    text = agent.format_extract_text(_make_candidate(), _make_extract(salary='Up to €50k'))
+    assert 'Salary: Up to €50k' in text, 'the existing label keeps its format'
+    assert 'Salary structure: upper bound stated, no lower bound' in text
+
+
+def test_format_extract_text_adds_no_structure_line_for_a_complete_range():
+    text = agent.format_extract_text(
+        _make_candidate(), _make_extract(salary='CA$208,580–$273,770 annually'))
+    assert 'Salary structure:' not in text, 'a note on every posting is one the rater stops reading'
+
+
+# ---------------------------------------------------------------------------
+# Raw posting retention (run_dir/raw_postings/)
+# ---------------------------------------------------------------------------
+
+def test_save_raw_posting_writes_the_page_with_its_provenance_header(tmp_path):
+    candidate = dict(_make_candidate(), job_id='4470298356', site='linkedin')
+    path = tools.save_raw_posting(candidate, 'CA$208,580 to CA$273,770 per year', 'openrouter_loop', 900)
+    assert path is not None and path.is_file()
+    content = path.read_text(encoding='utf-8')
+    assert 'CA$208,580 to CA$273,770 per year' in content
+    assert 'job_id:' in content and 'chars_sent_to_model: 900' in content
+    assert path.name == 'linkedin-4470298356.txt'
+
+
+def test_save_raw_posting_survives_an_unwritable_directory(monkeypatch, caplog):
+    """A retention failure is not a run failure: this directory feeds nothing."""
+    def _boom(*args, **kwargs):
+        raise OSError('read-only file system')
+
+    monkeypatch.setattr(Path, 'mkdir', _boom)
+    assert tools.save_raw_posting(_make_candidate(), 'text', 'openrouter_loop', 4) is None
+    assert any('Could not retain the raw posting' in r.message for r in caplog.records)
+
+
+def test_prune_raw_postings_removes_only_directories_past_the_window():
+    from agentic_job_search.config import RAW_POSTINGS_RETENTION_DAYS
+    today = date(2026, 9, 22)
+    fresh = today - timedelta(days=RAW_POSTINGS_RETENTION_DAYS - 1)
+    stale = today - timedelta(days=RAW_POSTINGS_RETENTION_DAYS + 1)
+    for day in (fresh, stale):
+        directory = tools.RAW_POSTINGS_DIR / day.isoformat()
+        directory.mkdir(parents=True)
+        (directory / 'linkedin-1.txt').write_text('x', encoding='utf-8')
+
+    assert tools.prune_raw_postings(today=today) == 1
+    assert (tools.RAW_POSTINGS_DIR / fresh.isoformat()).is_dir()
+    assert not (tools.RAW_POSTINGS_DIR / stale.isoformat()).exists()
+
+
+def test_prune_raw_postings_leaves_anything_that_is_not_a_capture_directory(caplog):
+    """The only code in this repo that deletes user data deletes exactly one shape of thing."""
+    keep = tools.RAW_POSTINGS_DIR / 'notes-i-put-here-by-hand'
+    keep.mkdir(parents=True)
+    (keep / 'important.txt').write_text('mine', encoding='utf-8')
+
+    assert tools.prune_raw_postings(today=date(2099, 1, 1)) == 0
+    assert (keep / 'important.txt').is_file()
+    assert any('Not a capture directory' in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize('salary_text, raw_text, verified', [
+    ('CA$208,580–$273,770 annually', 'base pay range CA$208,580.00/yr - CA$273,770.00/yr', True),
+    # Separators differ between the page and the extract; the number is the same number.
+    ('CA$208580 - CA$273770', 'CA$208,580 - CA$273,770', True),
+    ('CA$208,600–$273,800 annually', 'base pay range CA$208,580 - CA$273,770', False),
+    ('Competitive salary', 'no figures anywhere on this page', True),
+])
+def test_salary_digits_are_in_the_source(salary_text, raw_text, verified):
+    assert salary.salary_digits_are_in_the_source(salary_text, raw_text) is verified
+
+
+def test_check_salary_provenance_flags_a_figure_the_page_does_not_contain(caplog):
+    candidate = dict(_make_candidate(), job_id='4470298356', site='linkedin')
+    tools.save_raw_posting(candidate, 'base pay range CA$208,580 - CA$273,770', 'openrouter_loop', 40)
+    extract = _make_extract(salary='CA$208,600 - CA$273,800 annually')
+    extract['salary_facts'] = salary.classify_salary(extract['salary'])
+
+    assert agent.check_salary_provenance(candidate, extract) is False
+    assert extract['salary_facts']['source'] == 'unverified'
+    assert any('Salary provenance' in r.message and r.levelname == 'WARNING'
+               for r in caplog.records)
+
+
+def test_check_salary_provenance_passes_when_the_page_backs_the_figure():
+    candidate = dict(_make_candidate(), job_id='4470298356', site='linkedin')
+    tools.save_raw_posting(candidate, 'base pay range CA$208,580 - CA$273,770', 'openrouter_loop', 40)
+    extract = _make_extract(salary='CA$208,580–$273,770 annually')
+    extract['salary_facts'] = salary.classify_salary(extract['salary'])
+    assert agent.check_salary_provenance(candidate, extract) is True
+
+
+@pytest.mark.live
+async def test_resolve_salary_live(monkeypatch, tmp_path):
+    """The real classifier against the real server, on a string the rules deliberately refuse."""
+    _require_llm_server(8006)
+    monkeypatch.setattr(salary, 'SALARY_CACHE_PATH', tmp_path / 'salary_cache.yaml')
+    monkeypatch.setattr(salary, '_cache', {})
+    monkeypatch.setattr(salary, 'chat_openrouter', triage.chat_openrouter)
+    facts = await salary.resolve_salary(
+        {'salary': 'somewhere in the region of eighty thousand euros a year', 'description': ''})
+    assert facts['kind'] in salary.SALARY_KINDS
+    assert facts['source'] in ('llm', 'error')
+
+
+def test_the_three_extract_schemas_share_one_salary_description():
+    """Two of them carried a 'must stay in sync' comment and no test to enforce it."""
+    from agentic_job_search.config import SALARY_FIELD_DESCRIPTION
+    from agentic_job_search import extract_openrouter as extract_or
+    from agentic_job_search import tools_generic
+
+    openrouter_schema = next(
+        t['function']['parameters'] for t in extract_or.OPENROUTER_EXTRACT_TOOLS
+        if t['function']['name'] == 'submit_job_extract'
+    )
+    sdk_schema = tools_generic.submit_job_extract.input_schema['properties']
+    for properties in (agent.EXTRACT_OUTPUT_SCHEMA['properties'],
+                       openrouter_schema['properties'], sdk_schema):
+        assert properties['salary'].get('description') == SALARY_FIELD_DESCRIPTION
+    assert 'BOTH ends' in SALARY_FIELD_DESCRIPTION
+
+
 @pytest.mark.parametrize('description', [
     'Temporary position up to 12 months, based in Toronto.',
     'Work Type: Temporary Full Time.',
@@ -3822,7 +4203,7 @@ def test_build_deterministic_warnings_flags_salary_text_with_no_figure():
     'Temporary workforce expansion for the holiday season.',
 ])
 def test_build_deterministic_warnings_flags_temporary_roles_as_contract(description):
-    extract = _make_extract(description=description, salary='CAD 220,000')
+    extract = _make_extract(description=description, salary='CAD 200,000 - 240,000 per year')
     assert 'Contract role — full-time preferred' in agent.build_deterministic_warnings(_make_candidate(), extract)
 
 
@@ -3834,7 +4215,7 @@ def test_build_deterministic_warnings_flags_temporary_roles_as_contract(descript
     'We are unable to hire temporary foreign workers.',
 ])
 def test_build_deterministic_warnings_ignores_temporary_visa_boilerplate(description):
-    extract = _make_extract(description=description, salary='CAD 220,000')
+    extract = _make_extract(description=description, salary='CAD 200,000 - 240,000 per year')
     assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
 
 
@@ -3897,7 +4278,7 @@ def test_apply_rating_caps_applies_lowest_cap_and_reports_every_reason(monkeypat
 
 
 def test_build_deterministic_warnings_flags_foreign_posting_language():
-    extract = _make_extract(posting_language='french', salary='CAD 200,000')
+    extract = _make_extract(posting_language='french', salary='CAD 200,000 - 240,000 per year')
     warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
     assert any('Posting written in French' in w for w in warnings)
 
@@ -3905,7 +4286,7 @@ def test_build_deterministic_warnings_flags_foreign_posting_language():
 def test_build_deterministic_warnings_flags_non_english_implied_local_language():
     """Reads the RESOLVED field; `derive_implied_local_language` is what puts it there."""
     extract = _make_extract(
-        implied_local_language='french', location='Montreal, Canada', salary='CAD 200,000',
+        implied_local_language='french', location='Montreal, Canada', salary='CAD 200,000 - 240,000 per year',
     )
     warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
     assert any('Implied local language: French' in w and 'Montreal, Canada' in w for w in warnings)
@@ -3916,7 +4297,7 @@ def test_build_deterministic_warnings_flags_non_english_implied_local_language()
     {'posting_language': '', 'implied_local_language': ''},
 ])
 def test_build_deterministic_warnings_quiet_for_english_language_fields(overrides):
-    extract = _make_extract(salary='CAD 220,000', **overrides)
+    extract = _make_extract(salary='CAD 200,000 - 240,000 per year', **overrides)
     assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
 
 
@@ -4009,7 +4390,7 @@ def test_agency_warning_says_so_when_the_client_is_anonymous():
 
 
 def test_no_agency_warning_for_a_direct_employer():
-    extract = _make_extract(salary='CAD 220,000')
+    extract = _make_extract(salary='CAD 200,000 - 240,000 per year')
     assert not any('agency' in w.lower() for w in agent.build_deterministic_warnings(_make_candidate(), extract))
 
 
@@ -4270,7 +4651,7 @@ async def test_recruiter_repost_judgement_live():
 # --- the same thing end to end, through Stage 2 -----------------------------
 
 def _stage2_stats() -> dict:
-    return {k: agent.new_stage_stats() for k in ('extraction', 'rating', 'recruiter_repost')}
+    return {k: agent.new_stage_stats() for k in ('extraction', 'rating', 'recruiter_repost', 'salary')}
 
 
 def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, list]:
@@ -4669,7 +5050,7 @@ async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences
 def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences):
     """With no languages configured there is nothing to be foreign to — no cap, no warning."""
     extract = _make_extract(
-        posting_language='french', implied_local_language='french', salary='CAD 200,000',
+        posting_language='french', implied_local_language='french', salary='CAD 200,000 - 240,000 per year',
     )
     assert agent.foreign_posting_language(extract) == ''
     assert agent.foreign_implied_local_language(extract) == ''
@@ -7617,7 +7998,7 @@ def test_agency_gate_reads_past_the_old_cap():
 
 
 def test_contract_warning_reads_past_the_old_cap():
-    extract = _make_extract(description=_GATE_FILLER + 'This is a 6-month contract.', salary='CAD 200,000')
+    extract = _make_extract(description=_GATE_FILLER + 'This is a 6-month contract.', salary='CAD 200,000 - 240,000 per year')
     assert 'Contract role — full-time preferred' in agent.build_deterministic_warnings(_make_candidate(), extract)
 
 

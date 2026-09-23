@@ -22,8 +22,11 @@ from agentic_job_search.config import (
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
     PDF_PROMPT_MAX_CHARS,
+    RAW_POSTINGS_RETENTION_DAYS,
+    RAW_POSTING_MAX_CHARS,
     RECRUITER_REPOST_MAX_PRIORS,
     RECRUITER_REPOST_WINDOW_DAYS,
+    SALARY_FIELD_DESCRIPTION,
     SCRAPER_DATE_POSTED_LABEL,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_DATE_POSTED_SECONDS,
@@ -55,6 +58,11 @@ PROJECT_DIR = Path(__file__).parent.parent.parent  # src/agentic_job_search/ -> 
 RUN_DIR = PROJECT_DIR / "run_dir"
 JOB_REQUIREMENTS_PATH = RUN_DIR / "JOB_REQUIREMENTS.md"
 PROCESSED_JOBS_DIR = RUN_DIR / "processed_jobs"
+# The page an extract was made from, kept so a figure it reports can be checked against its source.
+# READ BY NOTHING IN THE PIPELINE — no gate, no rating, no dedup. It exists because 'CA$208,580 -
+# $273,770' reached a notification with no way, anywhere, to tell whether the page said that
+# (2026-09-22). Date-partitioned so pruning is a whole-directory operation.
+RAW_POSTINGS_DIR = RUN_DIR / "raw_postings"
 # Applied-job PDFs travel between TWO DISTINCT DIRECTORIES, and nothing conflates them:
 #
 #   save_dir       — SOURCE. Outside the project, user-controlled, configurable via the
@@ -517,6 +525,86 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
 # LLM call that picks a prior job_id out of a list it was shown. It withholds a NOTIFICATION only —
 # the job is still rated, saved and audited — and it fails open, because a duplicate ping costs a
 # glance while a missed one costs a real role.
+
+def raw_posting_path(candidate: dict, captured_on: date | None = None) -> Path:
+    """Where this job's captured page text lives. One file per job per day."""
+    captured_on = captured_on or date.today()
+    site = re.sub(r'[^A-Za-z0-9_-]', '_', str(candidate.get('site') or 'unknown'))
+    job_id = re.sub(r'[^A-Za-z0-9_-]', '_', str(candidate.get('job_id') or 'unknown'))
+    return RAW_POSTINGS_DIR / captured_on.isoformat() / f'{site}-{job_id}.txt'
+
+
+def save_raw_posting(candidate: dict, text: str, source: str, chars_sent_to_model: int) -> Path | None:
+    """Keep the page an extract was made from, so its figures can be checked against it later.
+
+    Returns the path written, or None when it could not be. A retention failure is not a run
+    failure: this directory feeds nothing, and losing a capture costs a later audit, not a job.
+    """
+    path = raw_posting_path(candidate)
+    header = yaml.safe_dump({
+        'url': str(candidate.get('url') or ''),
+        'job_id': str(candidate.get('job_id') or ''),
+        'company': str(candidate.get('company') or ''),
+        'captured': datetime.now().isoformat(timespec='seconds'),
+        'source': source,
+        'chars_captured': len(text),
+        'chars_sent_to_model': chars_sent_to_model,
+    }, sort_keys=True, allow_unicode=True)
+    body = truncate_reported(
+        text, RAW_POSTING_MAX_CHARS, f"raw posting capture for job {candidate.get('job_id')}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'---\n{header}---\n{body}', encoding='utf-8')
+    except OSError as ex:
+        logger.warning(
+            f"Could not retain the raw posting for job {candidate.get('job_id')} at {path}: "
+            f'{type(ex).__name__}: {ex} — continuing without it.'
+        )
+        return None
+    return path
+
+
+def prune_raw_postings(today: date | None = None) -> int:
+    """Delete captured pages older than RAW_POSTINGS_RETENTION_DAYS. Returns directories removed.
+
+    This is the only code in the repo that deletes the user's data, so it deletes exactly one
+    shape of thing: a direct child of RAW_POSTINGS_DIR whose name is a date past the window. A
+    child that is not a date is left alone and reported rather than guessed about.
+    """
+    today = today or date.today()
+    if not RAW_POSTINGS_DIR.is_dir():
+        return 0
+    cutoff = today - timedelta(days=RAW_POSTINGS_RETENTION_DAYS)
+    removed, freed = 0, 0
+    for child in sorted(RAW_POSTINGS_DIR.iterdir()):
+        if not child.is_dir():
+            continue
+        try:
+            captured_on = date.fromisoformat(child.name)
+        except ValueError:
+            logger.warning(f'Not a capture directory, leaving it alone: {child}')
+            continue
+        if captured_on >= cutoff:
+            continue
+        # Belt and braces on a delete: resolve and confirm containment before removing anything.
+        resolved = child.resolve()
+        if resolved.parent != RAW_POSTINGS_DIR.resolve():
+            logger.warning(f'Refusing to delete {resolved}: outside {RAW_POSTINGS_DIR}')
+            continue
+        freed += sum(f.stat().st_size for f in resolved.rglob('*') if f.is_file())
+        try:
+            shutil.rmtree(resolved)
+        except OSError as ex:
+            logger.warning(f'Could not prune {resolved}: {type(ex).__name__}: {ex}')
+            continue
+        removed += 1
+    if removed:
+        logger.info(
+            f'Pruned {removed} raw-posting director(ies) older than {cutoff.isoformat()} '
+            f'({RAW_POSTINGS_RETENTION_DAYS}-day window), freeing {freed} bytes'
+        )
+    return removed
+
 
 RECRUITER_NOTIFICATIONS_PATH = RUN_DIR / 'recruiter_notifications.yaml'
 RECRUITER_DESCRIPTION_MAX_CHARS = 1500
@@ -1979,7 +2067,7 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
             'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
             'date_posted': {'type': 'string'},
             'closed': {'type': 'boolean'},
-            'salary': {'type': 'string'},
+            'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
             'sponsorship_note': {'type': 'string'},
             'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
             'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
