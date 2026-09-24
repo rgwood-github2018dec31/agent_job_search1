@@ -27,8 +27,10 @@ COMPANY_BLACKLIST_EXPIRY_DAYS = 180
 # role between 2026-09-02 and 09-10 — and each new id defeats (site, job_id) deduplication.
 RECRUITER_REPOST_WINDOW_DAYS = 14
 # ...and how many of those postings the judgement call is shown, newest first. An agency that posts
-# daily would otherwise grow the prompt without bound: measured at 7 priors the prompt is ~9.7K
-# chars, and every prior carries a description capped at RECRUITER_DESCRIPTION_MAX_CHARS. A repost
+# daily would otherwise grow the prompt without bound: every prior carries a description capped at
+# RECRUITER_DESCRIPTION_MAX_CHARS (~9.7K chars at 7 priors was measured before that cap was raised
+# on 2026-09-24; the ceiling is now this many priors times that cap, still far inside any model's
+# context). A repost
 # is re-advertised within days of the original, so the newest few are the ones that can match.
 RECRUITER_REPOST_MAX_PRIORS = 8
 
@@ -326,6 +328,10 @@ SCRAPER_OPENROUTER_MAX_ITERATIONS = 90
 # Per tool result. A LinkedIn a11y snapshot is far larger than anything the scraper needs to reason
 # about, and uncached every byte is re-billed on every later iteration.
 SCRAPER_TOOL_RESULT_MAX_CHARS = 30_000
+# browser_find, split out from the cap above (2026-09-24). Unlike a full snapshot it returns only
+# the matches the model asked for, so what it cut was signal: it went over the shared cap 13 times
+# across all logged runs, by a few hundred chars up to ~26K. Sized above the largest one measured.
+SCRAPER_FIND_RESULT_MAX_CHARS = 60_000
 
 # Audit configuration
 AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
@@ -409,8 +415,11 @@ PDF_PROMPT_MAX_CHARS = int(ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS * CHARS_PER_TOKEN_
 REFERENCE_JOB_PROMPT_MAX_CHARS = 3000
 # The accessibility snapshot handed to the extract-fallback condensation call.
 EXTRACT_SNAPSHOT_MAX_CHARS = 80_000
-# The description excerpt shown to the blacklist confirmation call alongside company/location/title.
-BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS = 500
+# The description shown to the blacklist confirmation call alongside company/location/title. Sized
+# above the longest description measured across 2,345 saved jobs (2026-09-24), so in practice it is
+# whole: the call runs only on an exact name hit, and more of the posting is what tells "Cohere" the
+# AI lab from Cohere Health.
+BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS = 8_000
 # OpenAI-compatible function-calling APIs reject a tool description longer than this.
 OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS = 1024
 # The scraper's report_blocked `what_happened` argument, echoed into logs and the audit.

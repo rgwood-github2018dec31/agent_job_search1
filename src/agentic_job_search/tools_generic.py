@@ -19,6 +19,7 @@ from rich.console import Console
 
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
+    BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
     PDF_PROMPT_MAX_CHARS,
@@ -416,7 +417,7 @@ async def _blacklist_confirms_openrouter(prompt: str) -> dict:
     return extract_json_object(content)
 
 
-async def company_blacklist_reason(company: str, context: str = '') -> str | None:
+async def company_blacklist_reason(company: str, context: str = '', description: str = '') -> str | None:
     """Return the blacklist reason if this posting is from a blacklisted company, else None.
 
     Deliberately does NOT reuse ``company_matches_applied``: that one matches on a normalized,
@@ -429,6 +430,10 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
     Ambiguity resolves toward rejecting: if the confirmation call fails for any reason, the exact
     name match stands and the job is rejected. A blacklist is an explicit user decision, and an
     unrelated tool-server outage must not quietly let a blacklisted company back through.
+
+    `description` is budgeted only after a name hit, because only then does anything read it.
+    Budgeting it up front logged a truncation for every job on every run (20 on 2026-09-24) for
+    text that was then thrown away unread.
     """
     entries = preferences.blacklisted_companies()
     if not entries or not company or not company.strip():
@@ -441,6 +446,11 @@ async def company_blacklist_reason(company: str, context: str = '') -> str | Non
     entry_name, reason = matched
     label = reason or 'blacklisted'
 
+    if description:
+        context = '\n'.join(filter(None, [context, truncate_reported(
+            description, BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
+            f'blacklist-confirmation description for {candidate!r}',
+        )]))
     prompt = _blacklist_confirm_prompt(candidate, entry_name, reason, context)
     structured: dict | None = None
 
@@ -607,7 +617,9 @@ def prune_raw_postings(today: date | None = None) -> int:
 
 
 RECRUITER_NOTIFICATIONS_PATH = RUN_DIR / 'recruiter_notifications.yaml'
-RECRUITER_DESCRIPTION_MAX_CHARS = 1500
+# Above the longest description measured across 2,345 saved jobs (2026-09-24), so a repost check
+# compares whole postings; at 1500 it cut 3 of this run's descriptions short.
+RECRUITER_DESCRIPTION_MAX_CHARS = 8_000
 
 _RECRUITER_NOTIFICATIONS_HEADER = (
     '# Agency postings the user has been notified about, pruned to the last\n'

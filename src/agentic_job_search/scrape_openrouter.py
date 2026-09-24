@@ -26,6 +26,7 @@ from agentic_job_search.config import (
     MODEL_NAME_SCRAPER,
     OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
+    SCRAPER_FIND_RESULT_MAX_CHARS,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     SCRAPER_WHAT_HAPPENED_MAX_CHARS,
@@ -36,6 +37,13 @@ from agentic_job_search.triage import http_status_of, provider_error
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 logger = logging.getLogger(__name__)
+
+_FIND_TOOL_NAME = 'browser_find'
+
+
+def _result_cap(tool_name: str) -> int:
+    """The char budget for one tool result: browser_find returns only matches, so it gets more room."""
+    return SCRAPER_FIND_RESULT_MAX_CHARS if tool_name == _FIND_TOOL_NAME else SCRAPER_TOOL_RESULT_MAX_CHARS
 
 # Gateway/server errors worth one retry of the same chat call. Deliberately disjoint from
 # PROVIDER_UNAVAILABLE_STATUSES (401/402/403/429): those break every query and must abort at once.
@@ -336,7 +344,7 @@ class ScrapeSession:
                         )
                         out = f'ERROR calling {name}: {ex}'
                 messages.append({'role': 'tool', 'tool_call_id': call.get('id', ''),
-                                 'content': truncate_reported(out, SCRAPER_TOOL_RESULT_MAX_CHARS,
+                                 'content': truncate_reported(out, _result_cap(name),
                                                               f'{name} result for query {self.query!r}')})
 
             if self.blocked:

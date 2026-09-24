@@ -32,7 +32,6 @@ from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
     AUDIT_OPUS_SAMPLE_SIZE,
-    BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_FALLBACK_MAX_TURNS,
@@ -2297,13 +2296,11 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
         f"Company: {extract.get('company') or candidate.get('company', '')}",
         f"Location: {extract.get('location') or ''}",
         f"Title: {extract.get('title') or candidate.get('title', '')}",
-        truncate_reported(
-            extract.get('description') or '', BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
-            f"blacklist-confirmation description for job {candidate.get('job_id')}",
-        ),
     ]))
+    description = extract.get('description') or ''
     for name in (extract.get('company') or candidate.get('company', ''), derive_end_client(extract)):
-        if name and (reason := await tools_module.company_blacklist_reason(name, context=blacklist_context)):
+        if name and (reason := await tools_module.company_blacklist_reason(
+                name, context=blacklist_context, description=description)):
             return f'blacklisted company: {name} ({reason})'
 
     if extract['closed'] or 'no longer accepting applications' in full_text.lower():

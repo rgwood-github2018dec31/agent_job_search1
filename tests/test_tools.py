@@ -2511,6 +2511,13 @@ class _FakeScraperClient:
         yield
 
 
+def test_scraper_browser_find_gets_its_own_larger_cap():
+    """browser_find returns only matches, so cutting it at the snapshot cap cut signal (2026-09-24)."""
+    assert scrape_openrouter._result_cap('browser_find') == config.SCRAPER_FIND_RESULT_MAX_CHARS
+    assert scrape_openrouter._result_cap('browser_snapshot') == config.SCRAPER_TOOL_RESULT_MAX_CHARS
+    assert config.SCRAPER_FIND_RESULT_MAX_CHARS > config.SCRAPER_TOOL_RESULT_MAX_CHARS
+
+
 async def test_run_scraper_sends_one_request_per_query(monkeypatch):
     """Each query needs its own turn budget; a shared request starves the later ones."""
     monkeypatch.setattr(tools, '_check_status_counts', {})
@@ -6468,6 +6475,38 @@ async def test_blacklist_no_structured_output_still_rejects(monkeypatch):
     monkeypatch.setattr(tools, '_blacklist_confirms_openrouter', fail_openrouter)
     monkeypatch.setattr(tools, 'sdk_query', empty_sdk)
     assert await tools.company_blacklist_reason('Blocked Corp') == 'test entry'
+
+
+async def test_blacklist_description_not_budgeted_without_a_name_hit(monkeypatch, caplog):
+    """Budgeting it up front logged a truncation for every job (20 on 2026-09-24), all unread."""
+    _no_llm(monkeypatch)
+    long_description = 'x' * (config.BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS * 2)
+    with caplog.at_level(logging.WARNING):
+        reason = await agent.apply_hard_rules(
+            _make_candidate(), _make_extract(company='Acme', description=long_description))
+    assert reason is None
+    assert 'blacklist-confirmation' not in caplog.text
+
+
+async def test_blacklist_name_hit_sends_budgeted_description(monkeypatch, caplog):
+    prompts = []
+
+    async def capture_openrouter(prompt):
+        prompts.append(prompt)
+        return {'same_organization': True}
+
+    monkeypatch.setattr(tools, '_blacklist_confirms_openrouter', capture_openrouter)
+    head, tail = 'POSTING HEAD', 'POSTING TAIL'
+    description = head + 'x' * (config.BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS * 2) + tail
+    with caplog.at_level(logging.WARNING):
+        reason = await tools.company_blacklist_reason(
+            'Blocked Corp', context='Company: Blocked Corp', description=description)
+    assert reason == 'test entry'
+    assert len(prompts) == 1
+    assert 'Company: Blocked Corp' in prompts[0]
+    assert head in prompts[0]
+    assert tail not in prompts[0]
+    assert 'blacklist-confirmation' in caplog.text
 
 
 async def test_blacklist_entry_without_reason_still_rejects(monkeypatch):
