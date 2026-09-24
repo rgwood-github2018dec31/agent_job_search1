@@ -16,8 +16,9 @@ Two design rules hold this file together, both learned the hard way (see CLAUDE.
 import asyncio
 import json
 import logging
-from typing import Any
 from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
@@ -25,9 +26,12 @@ from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_SCRAPER,
     OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS,
+    SCRAPER_CACHED_PROMPT_SHARE,
+    SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_FIND_RESULT_MAX_CHARS,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
+    SCRAPER_PROVIDER_MAX_SWITCHES,
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     SCRAPER_WHAT_HAPPENED_MAX_CHARS,
     UI_BLOCK_SIGNATURES,
@@ -49,6 +53,122 @@ def _result_cap(tool_name: str) -> int:
 # PROVIDER_UNAVAILABLE_STATUSES (401/402/403/429): those break every query and must abort at once.
 TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 TRANSIENT_RETRY_DELAY_SECONDS = 5
+# Failures that belong to the ACCOUNT (auth, credits), not to the endpoint serving the call: moving
+# to another provider cannot help, so these still abort the OpenRouter scraper at once. A 429 is
+# not among them once an endpoint is pinned with fallbacks off — it is that provider's rate limit.
+ACCOUNT_LEVEL_HTTP_STATUSES = frozenset({401, 402, 403})
+PER_MILLION = 1_000_000
+
+
+def effective_price_per_million(endpoint: dict) -> float | None:
+    """What this endpoint charges per million PROMPT tokens of the scraper's token mix.
+
+    None when a price the estimate needs is missing — never guessed. A missing cache-read price
+    counts as no cache discount (the full prompt price), which can only rank it lower.
+    """
+    prompt, completion = endpoint.get('prompt_price'), endpoint.get('completion_price')
+    if prompt is None or completion is None:
+        return None
+    cache_read = endpoint.get('cache_read_price')
+    cache_read = prompt if cache_read is None else cache_read
+    per_token = ((1 - SCRAPER_CACHED_PROMPT_SHARE) * prompt + SCRAPER_CACHED_PROMPT_SHARE * cache_read
+                 + SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN * completion)
+    return per_token * PER_MILLION
+
+
+def rank_endpoints(listing: dict, exclude: list[str]) -> list[tuple[float, dict]]:
+    """Usable endpoints, cheapest effective price first.
+
+    Usable: up (status 0), tool-calling, at the precision the server pins by default (a pin at
+    another precision is refused by the server), with a tag to pin, not already failed this run.
+    """
+    default_bits = next((e.get('bits') for e in listing.get('endpoints') or []
+                         if e.get('quantization') == listing.get('default_quantization')), None)
+    ranked = []
+    for endpoint in listing.get('endpoints') or []:
+        tag = endpoint.get('tag')
+        if not tag or tag in exclude or endpoint.get('status') != 0 or endpoint.get('supports_tools') is not True:
+            continue
+        if default_bits is not None and endpoint.get('bits') != default_bits:
+            continue
+        price = effective_price_per_million(endpoint)
+        if price is not None:
+            ranked.append((price, endpoint))
+    return sorted(ranked, key=lambda pair: pair[0])
+
+
+@dataclass
+class ProviderPin:
+    """The one OpenRouter endpoint every scraper call of this run is served on.
+
+    Chosen once per run by effective price, then passed as chat(provider=...) with fallbacks off,
+    so each query's prompt cache stays on one provider and the bill cannot drift to a provider
+    charging 40x more for cache reads. `tag` None means unpinned: the old behaviour.
+    """
+    model: str
+    tag: str | None = None
+    estimate_per_million: float | None = None
+    failed: list[str] = field(default_factory=list)
+    switches: int = 0
+
+    async def choose(self) -> bool:
+        """Pin the cheapest usable endpoint not yet failed. Raises when the listing fails."""
+        raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'list_endpoints', {'model': self.model},
+                                  timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+        listing = json.loads(raw)
+        if not listing.get('ok'):
+            raise RuntimeError(f'list_endpoints failed for {self.model}: {listing.get("error") or snippet(raw)}')
+        ranked = rank_endpoints(listing, self.failed)
+        if not ranked:
+            self.tag, self.estimate_per_million = None, None
+            return False
+        self.estimate_per_million, best = ranked[0]
+        self.tag = best['tag']
+        runners_up = ', '.join(f"{e['tag']} ${price:.4f}/M" for price, e in ranked[1:4])
+        logger.info(
+            f'Stage 1b: pinned {self.model} to {self.tag} — est. ${self.estimate_per_million:.4f} per '
+            f'million prompt tokens at the scraper\'s token mix (next: {runners_up or "none"})'
+        )
+        return True
+
+    async def switch(self, error: str, query: str) -> bool:
+        """After a failure on the pinned endpoint, move to the next-cheapest. False when none is left."""
+        if self.tag is None:
+            return False
+        failed_tag = self.tag
+        self.failed.append(failed_tag)
+        if self.switches >= SCRAPER_PROVIDER_MAX_SWITCHES:
+            logger.warning(f'Stage 1b: {failed_tag} failed and the {SCRAPER_PROVIDER_MAX_SWITCHES}-switch '
+                           f'cap is used up: {snippet(error)}')
+            return False
+        self.switches += 1
+        try:
+            chose = await self.choose()
+        except Exception as ex:
+            logger.warning(f'Stage 1b: could not re-choose a provider after {failed_tag} failed: '
+                           f'{type(ex).__name__}: {ex}')
+            return False
+        if not chose:
+            logger.warning(f'Stage 1b: {failed_tag} failed and no other usable endpoint is left: {snippet(error)}')
+            return False
+        detail = f'{failed_tag} failed ({snippet(error)}); switched to {self.tag} for the rest of the run'
+        logger.warning(f'Stage 1b: {detail}')
+        tools_generic._ui_alerts.append({'kind': 'provider_switch', 'query': query, 'region': '(all)', 'detail': detail})
+        return True
+
+
+async def pin_scraper_provider(model: str) -> ProviderPin:
+    """Choose this run's scraper endpoint. A failure to choose is logged and leaves the run unpinned."""
+    pin = ProviderPin(model)
+    try:
+        if not await pin.choose():
+            logger.warning(f'Stage 1b: no usable endpoint to pin {model} to — running unpinned')
+    except Exception as ex:
+        logger.warning(f'Stage 1b: could not choose a provider for {model} ({type(ex).__name__}: {ex}) — '
+                       f'running unpinned, so the provider and its price are OpenRouter\'s choice')
+        tools_generic._ui_alerts.append({
+            'kind': 'provider_unpinned', 'query': '(all)', 'region': '(all)', 'detail': f'{type(ex).__name__}: {ex}'})
+    return pin
 
 # Substrings that mean a click would land inside the results list. `Dismiss` is the dangerous one:
 # it is the only real <button> in a card and removes the job from the user's feed permanently.
@@ -187,10 +307,13 @@ class ScrapeSession:
     through the model in either direction.
     """
 
-    def __init__(self, browser_call: Callable, query: str, model: str | None = None):
+    def __init__(self, browser_call: Callable, query: str, model: str | None = None,
+                 provider_pin: ProviderPin | None = None):
         self._browser = browser_call
         self.query = query
         self.model = model or MODEL_NAME_SCRAPER
+        self.pin = provider_pin
+        self.served_by: set[str] = set()
         self._harvest: list[dict] | None = None
         self.region = ''
         self.problems: list[str] = []
@@ -275,6 +398,8 @@ class ScrapeSession:
         for i in range(SCRAPER_OPENROUTER_MAX_ITERATIONS):
             self.iterations = i + 1
             chat_args = {'messages': messages, 'model': self.model, 'tools': tools}
+            if self.pin is not None and self.pin.tag:
+                chat_args['provider'] = self.pin.tag
             raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                       timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
             data = json.loads(raw)
@@ -287,6 +412,15 @@ class ScrapeSession:
                 raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                           timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
                 data = json.loads(raw)
+            error = str(data.get('error') or snippet(raw))
+            if (not data.get('ok') and 'provider' in chat_args
+                    and http_status_of(error) not in ACCOUNT_LEVEL_HTTP_STATUSES
+                    and await self.pin.switch(error, self.query)):
+                # The pinned endpoint failed, not the account: carry on on the next-cheapest one.
+                chat_args['provider'] = self.pin.tag
+                raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
+                                          timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+                data = json.loads(raw)
             if not data.get('ok'):
                 # A 402/401/403/429 is the PROVIDER refusing, not this query failing: every
                 # remaining query would fail identically, so this must reach run_scraper as a
@@ -295,6 +429,8 @@ class ScrapeSession:
                                      str(data.get('error') or snippet(raw)))
 
             usage = data.get('usage') or {}
+            if data.get('provider'):
+                self.served_by.add(str(data['provider']))
             self.cost += float(data.get('cost_usd') or 0.0)
             self.usage['prompt'] += usage.get('prompt_tokens', 0)
             self.usage['completion'] += usage.get('completion_tokens', 0)

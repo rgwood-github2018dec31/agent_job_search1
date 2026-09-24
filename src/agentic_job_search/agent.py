@@ -54,6 +54,7 @@ from agentic_job_search.config import (
     PLAYWRIGHT_MCP_VERSION,
     PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
     RATING_AUTO_REJECT,
+    SCRAPER_COST_ALERT_FACTOR,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_INTER_QUERY_DELAY_SECONDS,
     SCRAPER_DATE_POSTED_LABEL,
@@ -1299,6 +1300,12 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'BROWSER RESTARTED: {alert.get("detail")}')
         elif kind == 'browser_dead':
             alerts.append(f'BROWSER DIED, STAGE 2 STOPPED: {alert.get("detail")}')
+        elif kind == 'provider_switch':
+            alerts.append(f'SCRAPER PROVIDER SWITCHED on {alert.get("query", "?")}: {alert.get("detail")}')
+        elif kind == 'provider_unpinned':
+            alerts.append(f'SCRAPER PROVIDER NOT PINNED (cost is OpenRouter\'s choice): {alert.get("detail")}')
+        elif kind == 'scrape_cost':
+            alerts.append(f'SCRAPER COST HIGH on {alert.get("query", "?")}: {alert.get("detail")}')
 
     # 1b. Queries that failed outright. Deliberately ahead of saturation: saturation is measured
     #     against DISTINCT listings and is skipped entirely when there are none (`if distinct:`
@@ -1489,7 +1496,8 @@ def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict):
     return run_pass
 
 
-def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per_query: dict):
+def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per_query: dict,
+                         provider_pin: 'scrape_openrouter.ProviderPin | None' = None):
     """One Stage 1b request through the OpenRouter function-calling loop.
 
     A FRESH conversation per request. On the Anthropic path all six queries share one transcript,
@@ -1499,7 +1507,7 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
     """
     async def run_pass(instruction: str) -> int | None:
         query = tools_module._current_query or ''
-        session = scrape_openrouter.ScrapeSession(browser_call, query)
+        session = scrape_openrouter.ScrapeSession(browser_call, query, provider_pin=provider_pin)
         try:
             await session.run(build_scraper_prompt(), instruction, tools)
         finally:
@@ -1512,10 +1520,19 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
             entry['iterations'] += session.iterations
             entry['prompt'] += session.usage['prompt']
             entry['cached'] += session.usage['cached']
+            per_million = (session.cost / session.usage['prompt'] * scrape_openrouter.PER_MILLION
+                           if session.usage['prompt'] else 0.0)
             logger.info(
                 f'Stage 1b cost: "{query}" ${session.cost:.4f} over {session.iterations} iteration(s) '
                 f'(prompt={session.usage["prompt"]:,} cached={session.usage["cached"]:,} '
-                f'out={session.usage["completion"]:,})')
+                f'out={session.usage["completion"]:,}; ${per_million:.4f}/M prompt; '
+                f'served by {", ".join(sorted(session.served_by)) or "unknown"})')
+            estimate = provider_pin.estimate_per_million if provider_pin is not None else None
+            if estimate and per_million > estimate * SCRAPER_COST_ALERT_FACTOR:
+                detail = (f'${per_million:.4f}/M prompt tokens against an estimate of ${estimate:.4f}/M for '
+                          f'{provider_pin.tag} (served by {", ".join(sorted(session.served_by)) or "unknown"})')
+                logger.warning(f'Stage 1b: query "{query}" cost more than expected — {detail}')
+                tools_module._ui_alerts.append({'kind': 'scrape_cost', 'query': query, 'region': '(all)', 'detail': detail})
         return session.iterations
     return run_pass
 
@@ -3749,9 +3766,11 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
                              + scrape_openrouter.LOCAL_TOOL_DEFS)
                 logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
                             f'{MODEL_NAME_SCRAPER}')
+                # One endpoint for the whole run, chosen by effective price (see ProviderPin).
+                provider_pin = await scrape_openrouter.pin_scraper_provider(MODEL_NAME_SCRAPER)
                 await run_scraper(
                     _openrouter_run_pass(browser_call, tool_defs, scraping_stats,
-                                         tools_module._scrape_per_query),
+                                         tools_module._scrape_per_query, provider_pin),
                     queries, scraping_stats)
             return True
         except Exception as ex:

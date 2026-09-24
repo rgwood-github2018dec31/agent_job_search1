@@ -328,6 +328,20 @@ MODEL_NAME_SCRAPER = OPENROUTER_MODEL_NAME_SCRAPER
 # Replaces max_turns for the OpenRouter loop. A healthy search measured 26 iterations; this is sized
 # for two regions plus recovery, with headroom, because starvation is silent (see Search coverage).
 SCRAPER_OPENROUTER_MAX_ITERATIONS = 90
+# One OpenRouter endpoint serves every scraper call of a run (2026-09-24). Within the server's bpw
+# pin, OpenRouter otherwise spreads a conversation across ~16 fp8 providers weighted by price, and
+# their CACHE-READ prices for this model spanned 0.0017-0.07 $/M: identical runs cost $0.05 or
+# $1.59 on the luck of the draw. Endpoints are ranked by the effective price of the scraper's own
+# token mix, measured over the runs of 2026-09-11..24: this share of prompt tokens were cache
+# reads, and this many completion tokens were generated per prompt token.
+SCRAPER_CACHED_PROMPT_SHARE = 0.94
+SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN = 0.002
+# Moves to the next-cheapest endpoint after a provider-side failure, per run, before the scraper
+# gives up on OpenRouter and falls back to the Anthropic scraper.
+SCRAPER_PROVIDER_MAX_SWITCHES = 2
+# A query whose effective $/M prompt tokens exceeds the chosen endpoint's estimate by this factor
+# raises a run alert: the week this pin fixes cost ~$5-7 extra with nothing flagging it.
+SCRAPER_COST_ALERT_FACTOR = 3
 # Per tool result. A LinkedIn a11y snapshot is far larger than anything the scraper needs to reason
 # about, and uncached every byte is re-billed on every later iteration.
 SCRAPER_TOOL_RESULT_MAX_CHARS = 30_000

@@ -15,6 +15,7 @@ from agentic_job_search import location
 from agentic_job_search import salary
 from agentic_job_search import location_review
 from agentic_job_search import linkedin_page
+from agentic_job_search import scrape_openrouter
 from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
 from agentic_job_search.agent import load_env
 load_env()
@@ -318,6 +319,16 @@ def _isolated_raw_postings(monkeypatch, tmp_path):
     prune_raw_postings() deletes directories, so a test that forgot would delete real captures.
     """
     monkeypatch.setattr(tools, 'RAW_POSTINGS_DIR', tmp_path / 'raw_postings')
+
+
+@pytest.fixture(autouse=True)
+def _unpinned_scraper_provider(monkeypatch):
+    """No test may reach the OpenRouter MCP server to choose a scraper endpoint: Stage 1b runs
+    unpinned. Tests of the pin itself build a ProviderPin and patch call_mcp_tool."""
+    async def _unpinned(model):
+        return scrape_openrouter.ProviderPin(model)
+
+    monkeypatch.setattr(scrape_openrouter, 'pin_scraper_provider', _unpinned)
 
 
 @pytest.fixture(autouse=True)
