@@ -8368,6 +8368,50 @@ def test_parse_posting_date_raises_on_an_unknown_format():
         tools.parse_posting_date('last Tuesday')
 
 
+@pytest.mark.parametrize(('raw', 'days_ago'), [
+    # Every form below was logged as unparseable on a real run (tallied 2026-09-24).
+    ('Reposted 4 days ago', 4),
+    ('Reposted 1 day ago', 1),
+    ('Reposted 2 days ago (LinkedIn)', 2),
+    ('Reposted 3 days ago (Requisition ID: 12345)', 3),
+    ('Reposted 3 days ago (no exact date shown)', 3),
+    ('Reposted 3 days ago (as of page visit)', 3),
+    ('Reposted 2 weeks ago', 14),
+    ('Posted 2 months ago', 2 * tools.DAYS_PER_MONTH_APPROX),
+])
+def test_parse_posting_date_accepts_relative_dates_with_surrounding_text(raw, days_ago):
+    assert tools.parse_posting_date(raw) == date.today() - timedelta(days=days_ago)
+
+
+@pytest.mark.parametrize('raw', [
+    '5 minutes ago',
+    'Reposted 7 hours ago',
+    'Reposted 1 hours ago (2020-01-01)',
+    'Reposted 1 hours ago (as of 2020-01-01)',
+    'Posted 1 hours ago (viewed 2020-01-01, so ~2020-01-01)',
+])
+def test_parse_posting_date_relative_beats_a_trailing_viewed_date(raw):
+    """A date AFTER the relative phrase is when the page was viewed, not when the job was posted."""
+    parsed = tools.parse_posting_date(raw)
+    assert date.today() - timedelta(days=1) <= parsed <= date.today()
+
+
+@pytest.mark.parametrize('raw', [
+    '2026-09-20 (4 days ago)',
+    '2026-09-20 (posted 4 days ago)',
+    '2026-09-20 (reposted 3 hours ago)',
+    '2026-09-20 (1 day ago)',
+])
+def test_parse_posting_date_leading_iso_date_wins(raw):
+    assert tools.parse_posting_date(raw) == date(2026, 9, 20)
+
+
+@pytest.mark.parametrize('raw', ['last Tuesday', 'Reposted recently', '12345 (Requisition ID)'])
+def test_parse_posting_date_still_raises_without_a_date(raw):
+    with pytest.raises(ValueError):
+        tools.parse_posting_date(raw)
+
+
 async def test_hard_rules_log_an_unparseable_posting_date_once(caplog):
     extract = _make_extract(date_posted='last Tuesday')
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None

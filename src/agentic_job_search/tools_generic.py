@@ -1721,8 +1721,13 @@ def _requires_current_us_auth(text: str) -> bool:
     return any(p.search(text) for p in _AUTH_REQUIRED_PATTERNS)
 
 
-_ISO_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
-_RELATIVE_DATE_RE = re.compile(r"(?P<count>\d+)\s+(?P<unit>hour|day|week|month)s?\s+ago")
+# Both are SEARCHED within the string, not matched against all of it. LinkedIn and the extract
+# model write "Reposted 4 days ago", "2026-09-22 (3 days ago)" and "Posted 19 hours ago (viewed
+# 2026-09-24)"; anchoring on the bare forms produced 98 unparsed-date warnings across logged runs, and a
+# rejected date silently skips the stale-posting rule (2026-09-24).
+# A LEADING date is the posting date; a date later in the string is often when the page was viewed.
+_LEADING_ISO_DATE_RE = re.compile(r'^(?P<iso>\d{4}-\d{2}-\d{2})\b')
+_RELATIVE_DATE_RE = re.compile(r"\b(?P<count>\d+)\s+(?P<unit>minute|hour|day|week|month)s?\s+ago\b")
 _JUST_POSTED_PHRASES = ("just now", "today", "moments ago")
 # "N months ago" is approximate by nature; a calendar-exact month would imply false precision.
 DAYS_PER_MONTH_APPROX = 30
@@ -1731,27 +1736,30 @@ DAYS_PER_MONTH_APPROX = 30
 def parse_posting_date(date_posted: str | None) -> date | None:
     """Parse an absolute (YYYY-MM-DD) or relative ('4 days ago') posting date.
 
+    A leading YYYY-MM-DD wins; otherwise the first "N units ago" anywhere in the string, so
+    prefixes ("Reposted") and trailing notes ("(viewed 2026-09-24)") are tolerated.
+
     None when no date was given. Raises ValueError for a non-empty string in no known format, so
     the caller, which knows the job, decides how to report it.
     """
     if not date_posted:
         return None
     s = date_posted.strip().lower()
-    if _ISO_DATE_RE.match(s):
+    if iso := _LEADING_ISO_DATE_RE.match(s):
         try:
-            return date.fromisoformat(s)
+            return date.fromisoformat(iso.group('iso'))
         except ValueError as ex:
             raise ValueError(f'posting date {date_posted!r} looks ISO but is not a real date: {ex}') from ex
-    m = _RELATIVE_DATE_RE.match(s)
+    m = _RELATIVE_DATE_RE.search(s)
     if m:
         n, unit = int(m.group('count')), m.group('unit')
-        deltas = {"hour": timedelta(hours=n), "day": timedelta(days=n),
+        deltas = {"minute": timedelta(minutes=n), "hour": timedelta(hours=n), "day": timedelta(days=n),
                   "week": timedelta(weeks=n), "month": timedelta(days=n * DAYS_PER_MONTH_APPROX)}
         return (datetime.now() - deltas[unit]).date()
     if s in _JUST_POSTED_PHRASES:
         return date.today()
     raise ValueError(
-        f'posting date {date_posted!r} is neither YYYY-MM-DD, "N hours/days/weeks/months ago", '
+        f'posting date {date_posted!r} is neither YYYY-MM-DD, "N minutes/hours/days/weeks/months ago", '
         f'nor one of {_JUST_POSTED_PHRASES}'
     )
 
