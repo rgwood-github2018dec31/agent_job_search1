@@ -137,7 +137,7 @@ def browser_tool_defs(mcp_tools: list[dict]) -> list[dict]:
     ]
 
 
-def _extract_json(raw: str) -> dict | None:
+def parse_evaluate_result(raw: str) -> dict | None:
     """Pull the object out of a browser_evaluate response.
 
     playwright-mcp answers with a `### Result` section followed by `### Ran Playwright code`, and
@@ -200,7 +200,7 @@ class ScrapeSession:
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
 
     async def _evaluate(self, js: str) -> dict | None:
-        return _extract_json(await self._browser('browser_evaluate', {'function': js}))
+        return parse_evaluate_result(await self._browser('browser_evaluate', {'function': js}))
 
     async def dispatch_local(self, name: str, args: dict) -> str:
         """Run one of our tools. Every branch obtains its own data."""

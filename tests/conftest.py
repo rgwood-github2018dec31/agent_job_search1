@@ -14,6 +14,7 @@ from agentic_job_search import agent
 from agentic_job_search import location
 from agentic_job_search import salary
 from agentic_job_search import location_review
+from agentic_job_search import linkedin_page
 from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
 from agentic_job_search.agent import load_env
 load_env()
@@ -317,6 +318,23 @@ def _isolated_raw_postings(monkeypatch, tmp_path):
     prune_raw_postings() deletes directories, so a test that forgot would delete real captures.
     """
     monkeypatch.setattr(tools, 'RAW_POSTINGS_DIR', tmp_path / 'raw_postings')
+
+
+@pytest.fixture(autouse=True)
+def _isolated_linkedin_page(monkeypatch, tmp_path):
+    """No test may write the real company_assets/ or linkedin_page_sections.yaml, or fetch an asset
+    or classify a page section over the network. Tests exercising those patch them themselves."""
+    monkeypatch.setattr(linkedin_page, 'COMPANY_ASSETS_DIR', tmp_path / 'company_assets')
+    monkeypatch.setattr(linkedin_page, 'PAGE_SECTIONS_PATH', tmp_path / 'linkedin_page_sections.yaml')
+
+    def _no_fetch(*args, **kwargs):
+        raise AssertionError('a unit test tried to fetch a page asset over the network')
+
+    async def _no_classifier(*args, **kwargs):
+        raise AssertionError('a unit test tried to reach the page-section classifier')
+
+    monkeypatch.setattr(linkedin_page, '_http_get', _no_fetch)
+    monkeypatch.setattr(linkedin_page, 'chat_openrouter', _no_classifier)
 
 
 @pytest.fixture(autouse=True)

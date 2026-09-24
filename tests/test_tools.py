@@ -22,6 +22,7 @@ from utils_tools_n_agents_common.models import (
 )
 
 from agentic_job_search import agent
+from agentic_job_search import linkedin_page
 from agentic_job_search import location
 from agentic_job_search import location_review
 from agentic_job_search import config
@@ -1600,10 +1601,12 @@ async def test_rate_job_dispatches_to_anthropic_by_default(monkeypatch):
 # extract_job_page_direct (deterministic fallback)
 # ---------------------------------------------------------------------------
 
-def _make_agent_sdk_mock(monkeypatch, structured_output: dict):
+def _make_agent_sdk_mock(monkeypatch, structured_output: dict, prompts: list | None = None):
     from claude_agent_sdk import ResultMessage
 
     async def fake_sdk_query(**kwargs):
+        if prompts is not None:
+            prompts.append(kwargs['prompt'])
         yield ResultMessage(
             subtype='success', duration_ms=100, duration_api_ms=100, is_error=False,
             num_turns=1, session_id='fake-session', structured_output=structured_output,
@@ -1612,62 +1615,81 @@ def _make_agent_sdk_mock(monkeypatch, structured_output: dict):
     monkeypatch.setattr(agent, 'sdk_query', fake_sdk_query)
 
 
-def _make_mcp_session_mock(monkeypatch, snapshot_text: str, mcp_calls: list):
-    from contextlib import asynccontextmanager
+def _stub_read_page(monkeypatch, page=None, calls: list | None = None):
+    """Replace the code-side page read; records (job_id, url) per read."""
+    page = page if page is not None else linkedin_page.JobPage(text='Staff Engineer\nAbout the job\nBuild agents.', source='dom')
 
-    @asynccontextmanager
-    async def fake_mcp_session(url):
-        async def call(tool_name, args):
-            mcp_calls.append((tool_name, args.get('target')))
-            return snapshot_text
+    async def fake_read_page(candidate, url, stats):
+        if calls is not None:
+            calls.append((candidate['job_id'], url))
+        return page
 
-        yield call
-
-    monkeypatch.setattr(agent, 'mcp_session', fake_mcp_session)
+    monkeypatch.setattr(agent, 'read_page', fake_read_page)
 
 
-async def test_extract_job_page_direct_condenses_snapshot(monkeypatch):
-    mcp_calls = []
-    _make_mcp_session_mock(monkeypatch, 'heading "Staff Engineer" text "Build agents." (no expand button)', mcp_calls)
-    _make_agent_sdk_mock(monkeypatch, {'title': 'Staff Engineer', 'company': 'Acme', 'description': 'Build agents.'})
+async def test_extract_job_page_direct_condenses_the_page_it_is_given(monkeypatch):
+    prompts = []
+    _make_agent_sdk_mock(monkeypatch, {'title': 'Staff Engineer', 'company': 'Acme', 'description': 'Build agents.'}, prompts)
 
-    extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats())
+    async def no_read(*args):
+        raise AssertionError('a page the caller already read must not be read again')
 
-    assert [c[0] for c in mcp_calls] == ['browser_navigate', 'browser_wait_for', 'browser_snapshot']
+    monkeypatch.setattr(agent, 'read_page', no_read)
+    page = linkedin_page.JobPage(text='PAGE TEXT FROM CODE', source='dom')
+    extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), page=page)
+
     assert extract['title'] == 'Staff Engineer'
     assert extract['closed'] is False  # default filled
-    assert extract['location'] == ''
+    assert 'PAGE TEXT FROM CODE' in prompts[0]
+    assert 'de-cluttered by code' in prompts[0]
 
 
-async def test_extract_job_page_direct_clicks_more_button(monkeypatch):
-    mcp_calls = []
-    _make_mcp_session_mock(monkeypatch, 'text "intro" button "… more" [ref=e611] text "rest"', mcp_calls)
+async def test_extract_job_page_direct_reads_the_page_when_not_given_one(monkeypatch):
+    calls = []
+    _stub_read_page(monkeypatch, calls=calls)
     _make_agent_sdk_mock(monkeypatch, {'title': 'T', 'company': 'C', 'description': 'D'})
 
-    await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats())
+    extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats())
+    assert extract is not None
+    assert calls == [('123', 'http://localhost:1/mcp')]
 
-    assert mcp_calls == [
-        ('browser_navigate', None), ('browser_wait_for', None), ('browser_snapshot', None),
-        ('browser_click', 'e611'), ('browser_wait_for', None), ('browser_snapshot', None),
-    ]
+
+async def test_extract_job_page_direct_returns_none_when_the_page_cannot_be_read(monkeypatch):
+    async def failed_read(candidate, url, stats):
+        return None
+
+    monkeypatch.setattr(agent, 'read_page', failed_read)
+    assert await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats()) is None
 
 
 async def test_extract_job_page_direct_returns_none_without_output(monkeypatch):
-    mcp_calls = []
-    _make_mcp_session_mock(monkeypatch, 'snapshot text', mcp_calls)
-
     async def fake_sdk_query(**kwargs):
         return
         yield
 
     monkeypatch.setattr(agent, 'sdk_query', fake_sdk_query)
-
-    extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats())
+    page = linkedin_page.JobPage(text='page', source='dom')
+    extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), page=page)
     assert extract is None
 
 
+async def test_read_page_logs_and_returns_none_when_the_browser_fails(monkeypatch, caplog):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def dead_session(url):
+        raise ConnectionError('All connection attempts failed')
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent, 'mcp_session', dead_session)
+    with caplog.at_level(logging.WARNING):
+        page = await agent.read_page(_make_candidate(job_id='77'), 'http://localhost:1/mcp', agent.new_stage_stats())
+    assert page is None
+    assert any('Reading the page failed' in r.message and 'job 77' in r.message for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
-# extract_job_page_openrouter (function-calling agent loop)
+# extract_job_page_openrouter (page text in, one submit_job_extract out)
 # ---------------------------------------------------------------------------
 
 def _chat_response(tool_calls=None, content=None, ok=True, cost=0.001, error=None):
@@ -1685,217 +1707,120 @@ def _tool_call(call_id, name, args) -> dict:
 _SUBMIT_ARGS = {'title': 'Staff Engineer', 'company': 'Acme', 'description': 'Build agents in Python.'}
 
 
-def _wire_openrouter_loop(monkeypatch, chat_responses: list, browser_calls: list, chat_requests: list):
-    """Wire fake chat responses and a browser-call recorder into the loop."""
-    from contextlib import asynccontextmanager
-
+def _wire_openrouter_loop(monkeypatch, chat_responses: list, chat_requests: list):
     async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
         # Deep-copy: the loop mutates its messages list in place between calls
         chat_requests.append(json.loads(json.dumps(args)))
         return chat_responses.pop(0)
 
-    @asynccontextmanager
-    async def fake_mcp_session(url):
-        async def call(tool_name, args):
-            browser_calls.append((tool_name, args))
-            return f'snapshot of page after {tool_name}'
-
-        yield call
-
     monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
-    monkeypatch.setattr(extract_openrouter, 'mcp_session', fake_mcp_session)
+
+
+async def _run_loop(page_text='About the job\nBuild agents.'):
+    return await extract_openrouter.extract_job_page_openrouter(
+        _make_candidate(), page_text, agent.new_stage_stats(), 'sys')
+
+
+def test_extractor_model_has_no_browser_tools():
+    """Code reads the page; a model that can click could hit a Dismiss button (2026-09-24)."""
+    assert [t['function']['name'] for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS] == ['submit_job_extract']
 
 
 async def test_openrouter_loop_happy_path(monkeypatch):
-    browser_calls, chat_requests = [], []
-    responses = [
-        _chat_response(tool_calls=[
-            _tool_call('c1', 'browser_navigate', {'url': 'https://example.com/job/123'}),
-            _tool_call('c2', 'browser_snapshot', {}),
-        ]),
-        _chat_response(tool_calls=[_tool_call('c3', 'submit_job_extract', _SUBMIT_ARGS)]),
-    ]
-    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [_chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', _SUBMIT_ARGS)])], chat_requests)
 
     stats = agent.new_stage_stats()
     extract = await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', stats, 'system prompt'
-    )
+        _make_candidate(), 'PAGE TEXT FROM CODE', stats, 'system prompt')
 
     assert extract['title'] == 'Staff Engineer'
     assert extract['closed'] is False  # default filled
-    assert [c[0] for c in browser_calls] == ['browser_navigate', 'browser_snapshot']
-    assert stats['cost'] == pytest.approx(0.002)
-    assert stats['input_tokens'] == 200
-    # second request carries the assistant tool_calls turn and both tool results
-    roles = [m['role'] for m in chat_requests[1]['messages']]
-    assert roles == ['system', 'user', 'assistant', 'tool', 'tool']
+    assert stats['cost'] == pytest.approx(0.001)
+    assert stats['input_tokens'] == 100
+    user = chat_requests[0]['messages'][1]
+    assert user['role'] == 'user' and 'PAGE TEXT FROM CODE' in user['content']
+    assert [t['function']['name'] for t in chat_requests[0]['tools']] == ['submit_job_extract']
+
+
+async def test_openrouter_loop_rejects_an_unknown_tool(monkeypatch):
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'browser_click', {'target': 'e1'})]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
+    ], chat_requests)
+
+    assert await _run_loop() is not None
+    reply = chat_requests[1]['messages'][-1]
+    assert reply['role'] == 'tool' and "unknown tool 'browser_click'" in reply['content']
 
 
 async def test_openrouter_loop_invalid_json_args_retries(monkeypatch):
-    browser_calls, chat_requests = [], []
-    responses = [
-        _chat_response(tool_calls=[_tool_call('c1', 'browser_navigate', '{not json')]),
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', '{not json')]),
         _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
-    ]
-    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+    ], chat_requests)
 
-    extract = await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
-    )
-
-    assert extract is not None
-    assert browser_calls == []  # bad call never executed
+    assert await _run_loop() is not None
     error_msg = chat_requests[1]['messages'][-1]
     assert error_msg['role'] == 'tool'
     assert 'invalid JSON' in error_msg['content']
 
 
 async def test_openrouter_loop_missing_submit_fields_retries(monkeypatch):
-    browser_calls, chat_requests = [], []
-    responses = [
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
         _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', {'title': 'T'})]),
         _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
-    ]
-    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+    ], chat_requests)
 
-    extract = await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
-    )
-    assert extract is not None
+    assert await _run_loop() is not None
     assert 'missing required field' in chat_requests[1]['messages'][-1]['content']
 
 
 async def test_openrouter_loop_stops_at_iteration_cap(monkeypatch):
     from agentic_job_search.config import EXTRACTOR_OPENROUTER_MAX_ITERATIONS
-    browser_calls, chat_requests = [], []
-    responses = [
-        _chat_response(tool_calls=[_tool_call(f'c{i}', 'browser_snapshot', {})])
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call(f'c{i}', 'submit_job_extract', {'title': 'T'})])
         for i in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS + 5)
-    ]
-    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
+    ], chat_requests)
 
-    extract = await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
-    )
-    assert extract is None
+    assert await _run_loop() is None
     assert len(chat_requests) == EXTRACTOR_OPENROUTER_MAX_ITERATIONS
 
 
 async def test_openrouter_loop_returns_none_when_model_stops_without_submit(monkeypatch):
-    browser_calls, chat_requests = [], []
-    responses = [_chat_response(content='I could not find the job posting.')]
-    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
-
-    extract = await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
-    )
-    assert extract is None
+    _wire_openrouter_loop(monkeypatch, [_chat_response(content='I could not find the job posting.')], [])
+    assert await _run_loop() is None
 
 
 async def test_openrouter_loop_returns_none_on_chat_error(monkeypatch):
-    browser_calls, chat_requests = [], []
-    responses = [_chat_response(ok=False, error='server down')]
-    _wire_openrouter_loop(monkeypatch, responses, browser_calls, chat_requests)
-
-    extract = await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
-    )
-    assert extract is None
-
-
-async def test_openrouter_loop_keeps_the_tail_of_an_oversized_snapshot(monkeypatch, caplog):
-    """A snapshot is cut in the MIDDLE, so the end of the page survives.
-
-    Compensation, benefits and work-authorization statements live at the bottom of a job
-    description. End-truncation dropped 34,797 chars from one LinkedIn page and took its salary
-    range with them (job 4470298356, 2026-09-22), so what this pins is that the tail comes back.
-    """
-    from contextlib import asynccontextmanager
-    from agentic_job_search.config import EXTRACTOR_SNAPSHOT_MAX_CHARS
-    chat_requests = []
-    responses = [
-        _chat_response(tool_calls=[_tool_call('c1', 'browser_snapshot', {})]),
-        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
-    ]
-    head, tail = 'SALARY AT THE TOP', 'SALARY AT THE BOTTOM'
-    oversized = head + ('x' * (EXTRACTOR_SNAPSHOT_MAX_CHARS * 2)) + tail
-
-    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
-        chat_requests.append(json.loads(json.dumps(args)))
-        return responses.pop(0)
-
-    @asynccontextmanager
-    async def fake_mcp_session(url):
-        async def call(tool_name, args):
-            return oversized
-
-        yield call
-
-    monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
-    monkeypatch.setattr(extract_openrouter, 'mcp_session', fake_mcp_session)
-
-    await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
-    )
-    content = chat_requests[1]['messages'][-1]['content']
-    assert len(content) <= EXTRACTOR_SNAPSHOT_MAX_CHARS
-    assert content.startswith(head)
-    assert content.endswith(tail), 'the end of the page is where the pay figure lives'
-    assert 'dropped' in content and 'MIDDLE' in content, \
-        'the model must be told its tool result was cut, and where'
-    assert any('Truncating browser_snapshot result' in r.message and r.levelname == 'WARNING'
-               for r in caplog.records), 'a cut must be logged, never silent'
-
-
-async def test_openrouter_loop_truncates_a_non_snapshot_tool_result(monkeypatch, caplog):
-    """Every other tool result still loses its end: only a snapshot has facts at the bottom."""
-    from contextlib import asynccontextmanager
-    from agentic_job_search.config import EXTRACTOR_TOOL_RESULT_MAX_CHARS
-    chat_requests = []
-    responses = [
-        _chat_response(tool_calls=[_tool_call('c1', 'browser_navigate', {'url': 'http://x'})]),
-        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', _SUBMIT_ARGS)]),
-    ]
-
-    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
-        chat_requests.append(json.loads(json.dumps(args)))
-        return responses.pop(0)
-
-    @asynccontextmanager
-    async def fake_mcp_session(url):
-        async def call(tool_name, args):
-            return 'x' * (EXTRACTOR_TOOL_RESULT_MAX_CHARS * 3)
-
-        yield call
-
-    monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
-    monkeypatch.setattr(extract_openrouter, 'mcp_session', fake_mcp_session)
-
-    await extract_openrouter.extract_job_page_openrouter(
-        _make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), 'sys'
-    )
-    kept, _, marker = chat_requests[1]['messages'][-1]['content'].rpartition('\n')
-    assert len(kept) == EXTRACTOR_TOOL_RESULT_MAX_CHARS
-    assert marker.startswith(f'[truncated: kept {EXTRACTOR_TOOL_RESULT_MAX_CHARS} of ')
-    assert any('Truncating browser_navigate result' in r.message and r.levelname == 'WARNING'
-               for r in caplog.records), 'a cut must be logged, never silent'
+    _wire_openrouter_loop(monkeypatch, [_chat_response(ok=False, error='server down')], [])
+    assert await _run_loop() is None
 
 
 async def test_extractor_provider_dispatch_openrouter(monkeypatch):
     monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
     called = {'openrouter': 0, 'anthropic': 0, 'direct': 0}
+    reads = []
+    page = linkedin_page.JobPage(text='the page', source='dom')
+    _stub_read_page(monkeypatch, page=page, calls=reads)
 
-    async def fake_openrouter(candidate, url, stats, system_prompt):
+    async def fake_openrouter(candidate, page_text, stats, system_prompt):
         called['openrouter'] += 1
+        assert page_text == 'the page'
+        assert system_prompt is agent.PAGE_EXTRACTOR_INSTRUCTIONS
         return None
 
     async def fake_anthropic(candidate, mcp, stats):
         called['anthropic'] += 1
         return None
 
-    async def fake_direct(candidate, url, stats):
+    async def fake_direct(candidate, url, stats, page=None):
         called['direct'] += 1
+        assert page is not None and page.text == 'the page', 'the fallback reuses the page already read'
         return None
 
     monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_openrouter)
@@ -1908,6 +1833,7 @@ async def test_extractor_provider_dispatch_openrouter(monkeypatch):
     )
 
     assert called == {'openrouter': 1, 'anthropic': 0, 'direct': 1}  # fallback still fires
+    assert len(reads) == 1, 'the page is read once per job'
 
 
 # ---------------------------------------------------------------------------
@@ -4755,7 +4681,7 @@ def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, li
 
     monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
 
-    async def fake_extract(candidate, url, stats, system_prompt):
+    async def fake_extract(candidate, page_text, stats, system_prompt):
         return dict(extract)
 
     async def fake_triage(extract_text, profile_block):
@@ -4774,6 +4700,7 @@ def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, li
     async def fake_notify(text):
         notifications.append(text)
 
+    _stub_read_page(monkeypatch)
     monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_extract)
     monkeypatch.setattr(agent, 'triage_job_fit', fake_triage)
     monkeypatch.setattr(agent, 'rate_job', fake_rate)
@@ -7310,14 +7237,14 @@ def _two_jobs():
 def test_evaluate_parser_ignores_the_echoed_script_block():
     """Regression: scanning to the LAST '}' runs past the JSON into the echoed source, so every
     real harvest parsed as None while hand-written fixtures passed."""
-    obj = scrape_openrouter._extract_json('### Result\n' + _two_jobs() + _CODE_ECHO)
+    obj = scrape_openrouter.parse_evaluate_result('### Result\n' + _two_jobs() + _CODE_ECHO)
     assert obj is not None and obj['count'] == 2
     assert [j['id'] for j in obj['jobs']] == ['111', '222']
 
 
 def test_evaluate_parser_handles_braces_inside_strings():
     payload = json.dumps({'count': 1, 'jobs': [{'id': '1', 'title': 'Eng {x} "q"'}]})
-    obj = scrape_openrouter._extract_json('### Result\n' + payload + _CODE_ECHO)
+    obj = scrape_openrouter.parse_evaluate_result('### Result\n' + payload + _CODE_ECHO)
     assert obj['jobs'][0]['title'] == 'Eng {x} "q"'
 
 
@@ -8224,17 +8151,22 @@ def _stage2_with_dying_browser(monkeypatch, browser, dies_on: list[str]):
     monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
     calls = []
 
-    async def fake_extract(candidate, url, stats, system_prompt):
+    async def fake_read_page(candidate, url, stats):
+        # The real read_page logs a dead browser and returns None; the loop then sees is_dead().
         calls.append((candidate['job_id'], url))
         if candidate['job_id'] in dies_on:
             dies_on.remove(candidate['job_id'])
             browser.dead = True
-            raise ConnectionError('All connection attempts failed')
+            return None
+        return linkedin_page.JobPage(text='page', source='dom')
+
+    async def fake_extract(candidate, page_text, stats, system_prompt):
         return None
 
-    async def fake_direct(candidate, url, stats):
+    async def fake_direct(candidate, url, stats, page=None):
         return None
 
+    monkeypatch.setattr(agent, 'read_page', fake_read_page)
     monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_extract)
     monkeypatch.setattr(agent, 'extract_job_page_direct', fake_direct)
     monkeypatch.setattr(agent.tools_module, '_ui_alerts', [])

@@ -35,8 +35,6 @@ from agentic_job_search.config import (
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_FALLBACK_MAX_TURNS,
-    EXTRACT_PAGE_RENDER_WAIT_SECONDS,
-    EXTRACT_SNAPSHOT_MAX_CHARS,
     FAILED_QUERIES_NAMED_MAX,
     LISTING_ESTIMATE_HISTORY_RUNS,
     LOCATION_GUESS_REASON_MAX_CHARS,
@@ -80,6 +78,7 @@ from agentic_job_search.config import (
     should_notify_based_on_rating,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
+from agentic_job_search.linkedin_page import JobPage, read_job_page
 from agentic_job_search import location
 from agentic_job_search import location_review
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
@@ -96,7 +95,6 @@ from agentic_job_search.text_budget import (
     pages_to_prompt,
     snippet,
     truncate_reported,
-    truncate_reported_middle,
 )
 from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
@@ -498,6 +496,18 @@ Only pass information directly visible on the card. Do not infer or fabricate mi
 Stage 2 will fill in the details from the job page.
 """
 
+# What to capture and how, shared by both extractor prompts below.
+EXTRACT_FIELD_GUIDANCE = """Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or "no longer accepting applications" statements. In the location field, always include the workplace type shown on the page (Remote / Hybrid / On-site), e.g. "Bucharest, Romania (Remote within country)". Strip navigation chrome, footers, "similar jobs" lists, and marketing boilerplate.
+
+Also capture:
+- workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
+- language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
+- posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely undeterminable.
+- residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany", "open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere", "any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is advertised: "Romania (Remote)" on its own says nothing here.
+- relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
+- education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required."""
+
+# The Anthropic agentic path (the non-default route) still browses for itself.
 EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. Navigate to the job URL provided and capture a condensed extract of the posting.
 
 Follow EXACTLY this sequence — you have a hard turn budget, and calling submit_job_extract is the only thing that counts as success:
@@ -508,17 +518,20 @@ Follow EXACTLY this sequence — you have a hard turn budget, and calling submit
 
 If you have a title, company, and any description text, calling submit_job_extract is ALWAYS your next action. Never end a turn without having either taken your one snapshot or submitted the extract.
 
-Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or "no longer accepting applications" statements. In the location field, always include the workplace type shown on the page (Remote / Hybrid / On-site), e.g. "Bucharest, Romania (Remote within country)". Strip navigation chrome, footers, "similar jobs" lists, and marketing boilerplate.
-
-Also capture:
-- workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
-- language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
-- posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely undeterminable.
-- residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany", "open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere", "any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is advertised: "Romania (Remote)" on its own says nothing here.
-- relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
-- education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required.
+""" + EXTRACT_FIELD_GUIDANCE + """
 
 Do not rate the job. Do not browse other pages. Extract this one posting, submit it, then stop.
+"""
+
+# The default path: code has already read the page (linkedin_page.read_job_page), so the model
+# has the text and one tool, and no browser.
+PAGE_EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code — you have no browser and need none.
+
+Call submit_job_extract exactly once, with what the page text says. Never invent a field the text does not support; leave it empty instead.
+
+""" + EXTRACT_FIELD_GUIDANCE + """
+
+Do not rate the job. Extract this one posting, submit it, then stop.
 """
 
 EVALUATOR_INSTRUCTIONS_TEMPLATE = """You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not need to browse anywhere.
@@ -1819,39 +1832,36 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
     return extract
 
 
-_MORE_BUTTON_RE = re.compile(r'button "(?P<element>[^"]*\bmore\b[^"]*)" \[ref=(?P<ref>e\d+)\]', re.IGNORECASE)
+async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> JobPage | None:
+    """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
+    try:
+        async with mcp_session(playwright_mcp_url) as call:
+            return await read_job_page(candidate, call, stage_stats)
+    except Exception as ex:
+        logger.warning(
+            f"Reading the page failed for {candidate['company']} — {candidate['title']} "
+            f"(job {candidate.get('job_id')}, {candidate.get('url')}): {unwrap_exception(ex)}"
+        )
+        return None
 
 
-async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> dict | None:
-    """Fallback for a failed agentic extract: fetch the page snapshot directly via the
-    Playwright MCP server (full text, no turn budget) and condense it with one
-    non-agentic Haiku call. The browser and logged-in profile are identical to the
-    agentic path, so bot-detection exposure is unchanged."""
-    async with mcp_session(playwright_mcp_url) as call:
-        await call('browser_navigate', {'url': candidate['url']})
-        await call('browser_wait_for', {'time': EXTRACT_PAGE_RENDER_WAIT_SECONDS})  # let the dynamic description render
-        snapshot = await call('browser_snapshot', {})
-        m = _MORE_BUTTON_RE.search(snapshot)
-        if m:
-            try:
-                await call('browser_click', {'element': m.group('element'), 'target': m.group('ref')})
-                await call('browser_wait_for', {'time': 1})
-                snapshot = await call('browser_snapshot', {})
-            except Exception as ex:
-                logger.warning(f'Extract fallback: expand click failed, using collapsed description: {ex}')
-
-    snapshot_label = f"extract-fallback snapshot for {candidate['company']} — {candidate['title']}"
-    # The page's TAIL carries compensation and work-authorization statements, so the budget cuts
-    # the middle here too (2026-09-22). Retained before the cut: what is kept is the page, not
-    # what the model was shown.
-    budgeted_snapshot = truncate_reported_middle(snapshot, EXTRACT_SNAPSHOT_MAX_CHARS, snapshot_label)
-    tools_module.save_raw_posting(candidate, snapshot, 'extract_fallback', len(budgeted_snapshot))
+async def extract_job_page_direct(
+    candidate: dict, playwright_mcp_url: str, stage_stats: dict, page: JobPage | None = None
+) -> dict | None:
+    """Fallback for a failed extract, and the audit path: condense the page text with one
+    non-agentic Haiku call. Reads the page itself when the caller has not already."""
+    if page is None:
+        page = await read_page(candidate, playwright_mcp_url, stage_stats)
+        if page is None:
+            return None
+    what = ('the text of a job posting page, read and de-cluttered by code' if page.source == 'dom'
+            else 'an accessibility snapshot of a job posting page')
     prompt = (
-        'Below is an accessibility snapshot of a job posting page. Condense it into a structured extract. '
+        f'Below is {what}. Condense it into a structured extract. '
         'Keep requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or '
         '"no longer accepting applications" statements. Strip navigation chrome, footers, similar-jobs '
         'lists, and marketing boilerplate.\n\n'
-        + budgeted_snapshot
+        + page.text
     )
     options = ClaudeAgentOptions(
         setting_sources=[],
@@ -1889,7 +1899,7 @@ async def extract_job_page_direct(candidate: dict, playwright_mcp_url: str, stag
     }
     logger.info(
         f"Extract fallback: {candidate['company']} — {candidate['title']}: "
-        f"{len(snapshot)} snapshot chars → {len(extract['description'])} chars condensed"
+        f"{len(page.text)} page chars ({page.source}) → {len(extract['description'])} chars condensed"
     )
     return extract
 
@@ -3210,14 +3220,18 @@ async def evaluate_all_candidates(
         index += 1
         console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
         try:
+            page: JobPage | None = None
             if route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
-                extract = await extract_job_page_openrouter(
-                    candidate, playwright_mcp['url'], stage_stats['extraction'], EXTRACTOR_INSTRUCTIONS
-                )
+                # Read once, in code; both extractors below work from the same text.
+                page = await read_page(candidate, playwright_mcp['url'], stage_stats['extraction'])
+                extract = (await extract_job_page_openrouter(
+                    candidate, page.text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS
+                ) if page is not None else None)
             else:
                 extract = await extract_job_page(candidate, playwright_mcp, stage_stats['extraction'])
             if extract is None:
-                extract = await extract_job_page_direct(candidate, playwright_mcp['url'], stage_stats['extraction'])
+                extract = await extract_job_page_direct(
+                    candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)
             if extract is None and browser is not None and browser.is_dead():
                 index -= 1   # the browser, not the page, failed: retry this job after the restart
                 continue

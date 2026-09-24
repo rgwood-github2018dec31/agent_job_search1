@@ -1,11 +1,11 @@
-"""OpenRouter-driven agentic job-page extractor.
+"""OpenRouter job-page extractor: one posting's text in, one submit_job_extract call out.
 
-Runs a function-calling agent loop: an OpenRouter model (via the tools_llm_remote_openrouter
-MCP server's `chat` tool) decides which browser tools to call, this module executes them
-against the shared Playwright MCP session, and the loop ends when the model calls
-submit_job_extract or the iteration cap is hit. Used when MODEL_NAME_EXTRACTOR routes
-via OpenRouter;
-the deterministic Haiku fallback in agent.py still covers loop failures.
+Code reads the page (`linkedin_page.read_job_page`) and hands this loop the text; the model has
+exactly one tool, `submit_job_extract`, and no browser. It used to navigate, snapshot and click
+for itself (2026-09-24), which let a model decide what to read and gave it a click it did not need:
+the description arrives complete without expanding "… more". The loop remains so a submit with
+missing fields or invalid JSON can be retried, capped at `EXTRACTOR_OPENROUTER_MAX_ITERATIONS`.
+The deterministic Haiku fallback in agent.py covers loop failures.
 """
 
 import json
@@ -13,101 +13,20 @@ import logging
 
 from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
-    EXTRACTOR_SNAPSHOT_MAX_CHARS,
-    EXTRACTOR_TOOL_RESULT_MAX_CHARS,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_EXTRACTOR,
     SALARY_FIELD_DESCRIPTION,
 )
-from agentic_job_search.text_budget import (
-    normalize_whitespace,
-    snippet,
-    truncate_reported,
-    truncate_reported_middle,
-)
-from agentic_job_search.tools_generic import save_raw_posting
-from utils_tools_n_agents_common.mcp_client import call_mcp_tool, mcp_session
+from agentic_job_search.text_budget import snippet
+from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 logger = logging.getLogger(__name__)
 
-_BROWSER_TOOL_NAMES = {'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_wait_for'}
-_SNAPSHOT_TOOL_NAME = 'browser_snapshot'
-
-
-def _budget_tool_result(name: str, result_text: str, candidate: dict) -> str:
-    """Fit one tool result into the model's context, cutting where the least is lost.
-
-    An a11y snapshot is the one result whose TAIL matters — a job description keeps compensation,
-    benefits and work-authorization statements at the bottom — so it gets its own, larger cap
-    (matching what the extract-fallback path has always been allowed to read), is collapsed to
-    remove the tree's indentation before anything is dropped, and loses its MIDDLE rather than its
-    end. One LinkedIn page measured 74,797 chars against the shared 40,000 cap and lost 34,797
-    from the end, which is where its salary range lived (job 4470298356, 2026-09-22).
-    """
-    what = f"{name} result extracting job {candidate.get('job_id')}"
-    if name != _SNAPSHOT_TOOL_NAME:
-        return truncate_reported(result_text, EXTRACTOR_TOOL_RESULT_MAX_CHARS, what)
-    collapsed = normalize_whitespace(result_text)
-    budgeted = truncate_reported_middle(collapsed, EXTRACTOR_SNAPSHOT_MAX_CHARS, what)
-    logger.info(
-        f'Snapshot extracting job {candidate.get("job_id")}: {len(result_text)} chars captured, '
-        f'{len(collapsed)} after collapsing whitespace, {len(budgeted)} sent to the model '
-        f'({EXTRACTOR_SNAPSHOT_MAX_CHARS}-char cap)'
-    )
-    # Retained BEFORE the budget bites, so what is kept is the page, not what the model was shown.
-    save_raw_posting(candidate, collapsed, 'openrouter_loop', len(budgeted))
-    return budgeted
+_SUBMIT_TOOL_NAME = 'submit_job_extract'
 
 
 OPENROUTER_EXTRACT_TOOLS = [
-    {
-        'type': 'function',
-        'function': {
-            'name': 'browser_navigate',
-            'description': 'Navigate the browser to a URL.',
-            'parameters': {
-                'type': 'object',
-                'properties': {'url': {'type': 'string'}},
-                'required': ['url'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'browser_snapshot',
-            'description': 'Capture an accessibility snapshot of the current page as text.',
-            'parameters': {'type': 'object', 'properties': {}},
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'browser_click',
-            'description': 'Click an element on the page.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'element': {'type': 'string', 'description': 'Human-readable element description'},
-                    'target': {'type': 'string', 'description': 'Exact element reference from the page snapshot, e.g. "e611"'},
-                },
-                'required': ['element', 'target'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'browser_wait_for',
-            'description': 'Wait for the given number of seconds (e.g. for dynamic content to render).',
-            'parameters': {
-                'type': 'object',
-                'properties': {'time': {'type': 'number', 'description': 'Seconds to wait'}},
-                'required': ['time'],
-            },
-        },
-    },
     {
         'type': 'function',
         'function': {
@@ -205,10 +124,10 @@ def _extract_from_submit_args(args: dict) -> dict:
 
 
 async def extract_job_page_openrouter(
-    candidate: dict, playwright_mcp_url: str, stage_stats: dict, system_prompt: str
+    candidate: dict, page_text: str, stage_stats: dict, system_prompt: str
 ) -> dict | None:
-    """Extract a job page via an OpenRouter function-calling loop. Returns the extract
-    dict, or None on failure (caller falls back to the deterministic Haiku path)."""
+    """Condense one posting's page text via submit_job_extract. Returns the extract dict, or None
+    on failure (the caller falls back to the deterministic Haiku path)."""
     messages = [
         {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': (
@@ -217,96 +136,78 @@ async def extract_job_page_openrouter(
             f"Title: {candidate['title']}\n"
             f"URL: {candidate['url']}\n"
             f"Posted: {candidate['date_posted']}\n"
-            f"Snippet: {candidate['snippet']}"
+            f"Snippet: {candidate['snippet']}\n\n"
+            f"--- PAGE TEXT ---\n{page_text}\n--- END PAGE TEXT ---"
         )},
     ]
     total_cost = 0.0
-    async with mcp_session(playwright_mcp_url) as browser_call:
-        for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
-            raw = await call_mcp_tool(
-                LLM_OPENROUTER_MCP_URL, 'chat',
-                {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS},
-                timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS,
+    for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
+        raw = await call_mcp_tool(
+            LLM_OPENROUTER_MCP_URL, 'chat',
+            {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS},
+            timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS,
+        )
+        data = json.loads(raw)
+        if not data.get('ok'):
+            logger.warning(
+                f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                f"chat failed: {data.get('error') or snippet(raw)}"
             )
-            data = json.loads(raw)
-            if not data.get('ok'):
+            return None
+        usage = data.get('usage') or {}
+        stage_stats['cost'] += float(data.get('cost_usd') or 0.0)
+        stage_stats['input_tokens'] += usage.get('prompt_tokens', 0)
+        stage_stats['output_tokens'] += usage.get('completion_tokens', 0)
+        total_cost += float(data.get('cost_usd') or 0.0)
+
+        tool_calls = data.get('tool_calls')
+        if not tool_calls:
+            logger.warning(
+                f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                f"model stopped without submitting (iteration {iteration + 1}, "
+                f"finish_reason={data.get('finish_reason')})"
+            )
+            return None
+
+        messages.append({'role': 'assistant', 'content': data.get('content'), 'tool_calls': tool_calls})
+        for tool_call in tool_calls:
+            name = tool_call['function']['name']
+            call_id = tool_call.get('id', '')
+            try:
+                args = json.loads(tool_call['function'].get('arguments') or '{}')
+            except json.JSONDecodeError as ex:
                 logger.warning(
                     f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
-                    f"chat failed: {data.get('error') or snippet(raw)}"
+                    f"{name} called with invalid JSON arguments ({ex}): "
+                    f"{snippet(tool_call['function'].get('arguments'))}"
                 )
-                return None
-            usage = data.get('usage') or {}
-            stage_stats['cost'] += float(data.get('cost_usd') or 0.0)
-            stage_stats['input_tokens'] += usage.get('prompt_tokens', 0)
-            stage_stats['output_tokens'] += usage.get('completion_tokens', 0)
-            total_cost += float(data.get('cost_usd') or 0.0)
+                messages.append({
+                    'role': 'tool', 'tool_call_id': call_id,
+                    'content': f'Error: invalid JSON arguments ({ex}). Retry the call with valid JSON.',
+                })
+                continue
 
-            tool_calls = data.get('tool_calls')
-            if not tool_calls:
-                logger.warning(
-                    f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
-                    f"model stopped without submitting (iteration {iteration + 1}, "
-                    f"finish_reason={data.get('finish_reason')})"
-                )
-                return None
-
-            messages.append({'role': 'assistant', 'content': data.get('content'), 'tool_calls': tool_calls})
-            for tool_call in tool_calls:
-                name = tool_call['function']['name']
-                call_id = tool_call.get('id', '')
-                try:
-                    args = json.loads(tool_call['function'].get('arguments') or '{}')
-                except json.JSONDecodeError as ex:
-                    logger.warning(
-                        f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
-                        f"{name} called with invalid JSON arguments ({ex}): "
-                        f"{snippet(tool_call['function'].get('arguments'))}"
-                    )
-                    messages.append({
-                        'role': 'tool', 'tool_call_id': call_id,
-                        'content': f'Error: invalid JSON arguments ({ex}). Retry the call with valid JSON.',
-                    })
-                    continue
-
-                if name == 'submit_job_extract':
-                    missing = [f for f in _SUBMIT_REQUIRED_FIELDS if not args.get(f)]
-                    if missing:
-                        messages.append({
-                            'role': 'tool', 'tool_call_id': call_id,
-                            'content': f'Error: missing required field(s) {missing}. Call submit_job_extract again with them.',
-                        })
-                        continue
-                    extract = _extract_from_submit_args(args)
-                    logger.info(
-                        f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
-                        f"{len(extract['description'])} chars condensed in {iteration + 1} iteration(s), "
-                        f"${total_cost:.4f}"
-                    )
-                    return extract
-
-                if name in _BROWSER_TOOL_NAMES:
-                    try:
-                        result_text = await browser_call(name, args)
-                    except Exception as ex:
-                        logger.warning(
-                            f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
-                            f"browser tool {name}({snippet(args)}) failed: {type(ex).__name__}: {ex}"
-                        )
-                        result_text = f'Error executing {name}: {ex}'
-                    logger.debug(
-                        f'Extract (openrouter) iteration {iteration + 1}: {name}({args}) '
-                        f'→ {len(result_text)} chars: {snippet(result_text)!r}'
-                    )
-                    messages.append({
-                        'role': 'tool', 'tool_call_id': call_id,
-                        'content': _budget_tool_result(name, result_text, candidate),
-                    })
-                else:
-                    messages.append({
-                        'role': 'tool', 'tool_call_id': call_id,
-                        'content': f'Error: unknown tool {name!r}. Available: '
-                                   f'{sorted(_BROWSER_TOOL_NAMES)} and submit_job_extract.',
-                    })
+            if name != _SUBMIT_TOOL_NAME:
+                messages.append({
+                    'role': 'tool', 'tool_call_id': call_id,
+                    'content': f'Error: unknown tool {name!r}. The page text is in the user message; '
+                               f'the only tool is {_SUBMIT_TOOL_NAME}.',
+                })
+                continue
+            missing = [f for f in _SUBMIT_REQUIRED_FIELDS if not args.get(f)]
+            if missing:
+                messages.append({
+                    'role': 'tool', 'tool_call_id': call_id,
+                    'content': f'Error: missing required field(s) {missing}. Call submit_job_extract again with them.',
+                })
+                continue
+            extract = _extract_from_submit_args(args)
+            logger.info(
+                f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                f"{len(page_text)} page chars → {len(extract['description'])} chars condensed in "
+                f"{iteration + 1} iteration(s), ${total_cost:.4f}"
+            )
+            return extract
 
     logger.warning(
         f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "

@@ -37,6 +37,10 @@ anything a rule covers.
   is Dismiss, and clicking it has already destroyed real jobs. JavaScript may read the page and
   never drive it. Never apply, save, follow, or dismiss anything. See Account safety in
   [docs/requirements.md](docs/requirements.md#non-functional-requirements).
+- **No Stage 2 model gets a browser tool.** Code navigates and reads each job page with one
+  read-only `browser_evaluate`; the extractor gets the page text and `submit_job_extract` only.
+  Page clutter is matched on text and aria-labels, never on LinkedIn's hashed class names. See
+  Read Job Page in [docs/requirements.md](docs/requirements.md#use-cases).
 - **Stop on a CAPTCHA, verification page, or "unusual activity" notice, and never retry into
   one.** The profile is a real logged-in account. See Account safety.
 - **The model chooses actions and code moves data.** A tool argument must be a decision, never
@@ -125,7 +129,8 @@ src/agentic_job_search/
   tools_generic.py                # Tool implementations and MCP server factories
   triage.py                       # Local triage and non-Anthropic rating calls (MCP client lives in utils_tools_n_agents_common)
   scrape_openrouter.py            # Stage 1b: OpenRouter function-calling scraper loop (default path)
-  extract_openrouter.py           # OpenRouter function-calling agent loop for page extraction
+  extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
+  linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
   location.py                     # Cached geographic classifier for a job's location
@@ -137,6 +142,7 @@ scripts/
   backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
 tests/
   test_tools.py                   # Unit tests for all tools
+  test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
   requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)
@@ -149,7 +155,9 @@ run_dir/
   reference_summary_cache.yaml    # Cached distilled ideal-role profile (md5-keyed)
   location_cache.yaml             # Cached geography per location string (country/region/language)
   salary_cache.yaml               # Cached salary reading per salary string (kind/bounds/currency/period)
-  raw_postings/                   # Pages extracts were made from, pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
+  raw_postings/                   # Per job: .html page archive (JS-free) + .txt text the extractor read; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
+  company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
+  linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
   recruiter_notifications.yaml    # Agency postings already notified (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
@@ -167,6 +175,7 @@ measurements) are in git history: `git show dd14c73:docs/diagnoses/README.md`.
 | If you are touching… | Read first in [docs/requirements.md](docs/requirements.md) unless noted |
 |---|---|
 | Model constants, provider routing, pipeline stages, MCP tools, dedup, applied-job corpus | [docs/architecture.md](docs/architecture.md) |
+| Stage 2 page reading, `linkedin_page.py`, the `LINKEDIN_REMOVE_*` lists, `linkedin_page_sections.yaml` | Read Job Page, Classify Unknown Page Section, Retain Raw Posting Text; NFRs Account safety, Anti-fabrication |
 | Stage 1b scraping, `scrape_openrouter.py`, Playwright, anything that drives LinkedIn | Scrape Job Postings, Verify Search UI Contract, Harvest Job Listings; NFRs Account safety, Search coverage, Anti-fabrication |
 | Location gate, `location.py`, `location_review.py`, the `locations.*` preferences | Reject Excluded Location, Classify Job Location, Detect Residency Scope, Review Country Lists; NFRs A matching rule fails silently permissive, Names stay proper |
 | Hard rules, rating caps, warnings, notifications | Apply Hard Rules, Rate Job Fit, Build Deterministic Warnings; NFRs A structural fact is decided in code, Rating hard rules, Rating caps |

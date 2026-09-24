@@ -313,6 +313,9 @@ MODEL_NAME_SALARY = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
 # shared agentic (flash-tier) default rather than the intelligence default — glm-5.2
 # measured agentic 45.7 vs 58.2 for glm-5.3-flash, at ~1/19th the per-token price.
 MODEL_NAME_EXTRACTOR = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
+# Judges a LinkedIn job-page section nobody has classified yet: keep or remove. A judgement, so the
+# intelligence tier; called only for a section signature never seen before, then cached for good.
+MODEL_NAME_PAGE_SECTIONS = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 # Stage 1b scraping is the one place DeepSeek wins (implicit caching, no cache-write fee;
 # measured 9.3x cheaper than Haiku on one live search — $0.0283 vs $0.4330 — because
 # OPENROUTER_MODEL_NAME_SCRAPER caches implicitly at ~88% and cache writes were 42% of
@@ -338,12 +341,11 @@ AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
 
 # Stage 2 (evaluation) configuration
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10
-EXTRACTOR_TOOL_RESULT_MAX_CHARS = 40_000
-# The a11y snapshot specifically, split out from the cap above (2026-09-22). One LinkedIn page
-# measured 74,797 chars against the shared 40,000 cap and lost 34,797 from the END — where a JD
-# keeps compensation, benefits and work-authorization statements. The extract-fallback path has
-# always been allowed to read these same pages whole, so this matches it; the remaining overflow
-# is cut from the MIDDLE by truncate_reported_middle rather than from the tail.
+# Budget for the a11y snapshot on the FALLBACK path only (linkedin_page._read_snapshot, used when
+# the DOM capture fails or the description is missing). The normal path sends de-cluttered text,
+# measured 3-9K chars, and never needs a cut. One LinkedIn snapshot once lost 34,797 chars from
+# its END, where a JD keeps compensation and work-authorization statements (2026-09-22), so the
+# overflow is cut from the MIDDLE by truncate_reported_middle rather than from the tail.
 EXTRACTOR_SNAPSHOT_MAX_CHARS = 80_000
 # Share of a middle-truncated text kept as the head; the rest is the tail. Above half because a
 # page's own structure is front-loaded and only the trailing facts need rescuing.
@@ -413,8 +415,6 @@ PDF_PROMPT_MAX_CHARS = int(ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS * CHARS_PER_TOKEN_
 # Per reference job, in the full reference block and the summarization prompt. Up to
 # MAX_REFERENCE_JOBS of these are concatenated, so this budget is per job, not per prompt.
 REFERENCE_JOB_PROMPT_MAX_CHARS = 3000
-# The accessibility snapshot handed to the extract-fallback condensation call.
-EXTRACT_SNAPSHOT_MAX_CHARS = 80_000
 # The description shown to the blacklist confirmation call alongside company/location/title. Sized
 # above the longest description measured across 2,345 saved jobs (2026-09-24), so in practice it is
 # whole: the call runs only on an exact name hit, and more of the posting is what tells "Cohere" the
@@ -472,6 +472,51 @@ LOCATION_GUESS_REASON_MAX_CHARS = 150
 # Stage 2 extract fallback (Anthropic, deterministic Playwright)
 EXTRACT_FALLBACK_MAX_TURNS = 16
 EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after navigation
+
+# LinkedIn job pages are read by CODE, not by the extractor model (2026-09-24). One read-only
+# browser_evaluate serializes the DOM after LinkedIn's own scripts have run; code then removes the
+# clutter and hands the model the text. Measured on three pages, the a11y snapshot the model used
+# to read was 58K-171K chars, of which the description was ~15%; the rest was nav, upsells, the
+# company's social posts and "More jobs" — other companies' listings WITH their salaries.
+#
+# Read-only: no DOM writes, no .click(), no dispatchEvent. Built without string or regex literals
+# that could be escaped in transit (a `'<!'` literal came back as a SyntaxError in the POC), and
+# with U+2028/U+2029/U+0085 written as character references: JSON.stringify leaves them raw and
+# the MCP client's SSE parser splits lines on them. `chars` is the JS length, in UTF-16 units.
+LINKEDIN_PAGE_CAPTURE_JS = r'''() => {
+  const lt = String.fromCharCode(60), nl = String.fromCharCode(10);
+  const doctype = document.doctype ? lt + '!DOCTYPE ' + document.doctype.name + '>' + nl : '';
+  let html = doctype + document.documentElement.outerHTML;
+  for (const code of [0x2028, 0x2029, 0x85]) html = html.split(String.fromCharCode(code)).join('&#' + code + ';');
+  return {url: location.href, title: document.title, chars: html.length, html};
+}'''
+# Sections removed wherever they appear, matched against an element's OWN text from its start.
+# Never by class name: LinkedIn's classes are hashed build output and change between deploys.
+LINKEDIN_REMOVE_SECTION_PHRASES = (
+    'Job search smarter with Premium',
+    'Take the next step in your job search',
+    'Looking for talent?',
+    'People you can reach out to',
+    'Set alert for similar jobs',
+    'Unlock hiring insights',
+    'More jobs',
+    'Use AI to assess how you fit',
+    'Interested in working with us in the future?',
+    'Trending employee content',
+)
+# Single elements removed by their exact aria-label.
+LINKEDIN_REMOVE_ARIA_LABELS = ('Show more about the company',)
+# Page chrome removed whole.
+LINKEDIN_REMOVE_TAGS = ('header', 'footer', 'nav')
+# Retries of the capture when the description has not rendered yet, each after the render wait.
+LINKEDIN_PAGE_CAPTURE_RETRIES = 1
+# Timeout for fetching the posting company's logo and the page stylesheet. Fetched with plain
+# requests — no cookies — from LinkedIn's public CDN, never through the logged-in browser.
+JOB_PAGE_ASSET_FETCH_TIMEOUT_SECONDS = 15
+# An unknown page section is shown to MODEL_NAME_PAGE_SECTIONS as its text, up to this many chars
+# each (a cut is reported), and is cached under a signature of up to this many words of its first line.
+PAGE_SECTION_SAMPLE_MAX_CHARS = 1500
+PAGE_SECTION_SIGNATURE_MAX_WORDS = 8
 
 # Local LLM sampling: low for the 1-5 triage score and JSON answers, which should be repeatable.
 LOCAL_LLM_TEMPERATURE = 0.2
