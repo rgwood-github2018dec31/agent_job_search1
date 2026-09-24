@@ -480,14 +480,12 @@ EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after naviga
 # company's social posts and "More jobs" — other companies' listings WITH their salaries.
 #
 # Read-only: no DOM writes, no .click(), no dispatchEvent. Built without string or regex literals
-# that could be escaped in transit (a `'<!'` literal came back as a SyntaxError in the POC), and
-# with U+2028/U+2029/U+0085 written as character references: JSON.stringify leaves them raw and
-# the MCP client's SSE parser splits lines on them. `chars` is the JS length, in UTF-16 units.
+# that could be escaped in transit (a `'<!'` literal came back as a SyntaxError in the POC).
+# `chars` is the JS length, in UTF-16 units, so read_job_page can tell a capture cut in transit.
 LINKEDIN_PAGE_CAPTURE_JS = r'''() => {
   const lt = String.fromCharCode(60), nl = String.fromCharCode(10);
   const doctype = document.doctype ? lt + '!DOCTYPE ' + document.doctype.name + '>' + nl : '';
-  let html = doctype + document.documentElement.outerHTML;
-  for (const code of [0x2028, 0x2029, 0x85]) html = html.split(String.fromCharCode(code)).join('&#' + code + ';');
+  const html = doctype + document.documentElement.outerHTML;
   return {url: location.href, title: document.title, chars: html.length, html};
 }'''
 # Sections removed wherever they appear, matched against an element's OWN text from its start.
