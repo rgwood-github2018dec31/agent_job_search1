@@ -54,6 +54,5 @@ markers = [
     "network: marks tests that reach a third-party network service (no local servers required)",
 ]
 
-[tool.ruff]
-# 99% of existing lines already fit; ruff's default of 88 flagged hundreds of lines as noise.
-line-length = 120
+# Ruff config comes from the workspace ruff.toml one level up (lines are only reported
+# above 160, so the old default-88 line-length noise is gone).
