@@ -4091,6 +4091,53 @@ def test_format_job_notification_omits_the_salary_line_when_there_is_no_figure()
     assert '💰' not in message, 'the warning already says there is no figure'
 
 
+def test_format_job_notification_shows_the_posting_date():
+    extract = _make_extract(date_posted=f'{date.today().year}-09-28')
+    message = agent.format_job_notification(_make_candidate(), extract, 4, [], [])
+    assert '🗓 Posted Sep 28th' in message
+
+
+@pytest.mark.parametrize('day, expected', [
+    (1, '1st'), (2, '2nd'), (3, '3rd'), (4, '4th'), (11, '11th'), (12, '12th'), (13, '13th'),
+    (21, '21st'), (22, '22nd'), (23, '23rd'), (31, '31st'),
+])
+def test_format_posted_line_ordinal_suffix(day, expected):
+    extract = _make_extract(date_posted=f'{date.today().year}-01-{day:02d}')
+    assert agent.format_posted_line(_make_candidate(), extract) == f'🗓 Posted Jan {expected}'
+
+
+def test_format_posted_line_shows_the_year_only_when_not_this_one():
+    extract = _make_extract(date_posted=f'{date.today().year - 1}-12-30')
+    assert agent.format_posted_line(_make_candidate(), extract) == f'🗓 Posted Dec 30th {date.today().year - 1}'
+
+
+def test_format_posted_line_keeps_reposted():
+    """LinkedIn writes reposts as 'Reposted N days ago'; a repost must not read as a new posting."""
+    line = agent.format_posted_line(_make_candidate(), _make_extract(date_posted='Reposted 2 days ago'))
+    assert line.startswith('🗓 Reposted ')
+
+
+def test_format_posted_line_resolves_a_relative_date():
+    today = date.today()
+    line = agent.format_posted_line(_make_candidate(), _make_extract(date_posted='just now'))
+    assert line == f"🗓 Posted {today.strftime('%b')} {today.day}{agent._ordinal_suffix(today.day)}"
+
+
+def test_format_posted_line_falls_back_to_the_candidate_date():
+    candidate = _make_candidate(date_posted=f'{date.today().year}-03-02')
+    assert agent.format_posted_line(candidate, _make_extract(date_posted='')) == '🗓 Posted Mar 2nd'
+
+
+def test_format_posted_line_shows_an_unparseable_date_as_extracted():
+    line = agent.format_posted_line(_make_candidate(), _make_extract(date_posted='Recently'))
+    assert line == '🗓 Posted: Recently'
+
+
+def test_format_posted_line_reports_a_missing_date():
+    line = agent.format_posted_line(_make_candidate(date_posted=''), _make_extract(date_posted=''))
+    assert line == '🗓 Posting date not shown'
+
+
 def test_format_extract_text_tells_the_rater_the_salary_structure():
     text = agent.format_extract_text(_make_candidate(), _make_extract(salary='Up to €50k'))
     assert 'Salary: Up to €50k' in text, 'the existing label keeps its format'

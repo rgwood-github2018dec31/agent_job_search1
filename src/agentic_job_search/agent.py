@@ -66,6 +66,7 @@ from agentic_job_search.config import (
     MODEL_NAME_QUERY,
     MODEL_NAME_RATING,
     MODEL_NAME_SCRAPER,
+    NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_SALARY_MAX_CHARS,
     PLAYWRIGHT_MAX_RESTARTS_PER_RUN,
     PLAYWRIGHT_MCP_PACKAGE,
@@ -3039,6 +3040,44 @@ def format_salary_line(extract: dict) -> str:
     return f"💰 {text}{_SALARY_LINE_SUFFIX_BY_KIND.get(facts['kind'], '')}"
 
 
+_ORDINAL_SUFFIX_BY_LAST_DIGIT = {1: 'st', 2: 'nd', 3: 'rd'}
+# 11th, 12th, 13th: the teens take "th" whatever their last digit.
+_ORDINAL_TEENS = range(11, 14)
+_DECIMAL_BASE = 10
+_CENTURY = 100
+
+
+def _ordinal_suffix(day: int) -> str:
+    if day % _CENTURY in _ORDINAL_TEENS:
+        return 'th'
+    return _ORDINAL_SUFFIX_BY_LAST_DIGIT.get(day % _DECIMAL_BASE, 'th')
+
+
+def format_posted_line(candidate: dict, extract: dict) -> str:
+    """The 🗓 line of a job-match message: the posting date, e.g. 'Posted Sep 28th'.
+
+    Same source precedence as the stale-posting rule (extract, then candidate). A relative date
+    ('3 days ago') is resolved to the calendar date; the year is shown only when it is not this
+    one. A date that cannot be parsed is shown as extracted, and an absent one is reported as absent, never dropped.
+    """
+    raw = (extract.get('date_posted') or candidate.get('date_posted') or '').strip()
+    if not raw:
+        return '🗓 Posting date not shown'
+    try:
+        posted = parse_posting_date(raw)
+    except ValueError as ex:
+        logger.warning(
+            f"{candidate.get('company')} — {candidate.get('title')} (job {candidate.get('job_id')}): "
+            f'{type(ex).__name__}: {ex} — showing the posting date as extracted in the notification'
+        )
+        return f'🗓 Posted: {snippet(raw, NOTIFICATION_POSTED_MAX_CHARS)}'
+    verb = 'Reposted' if 'reposted' in raw.casefold() else 'Posted'
+    shown = f"{posted.strftime('%b')} {posted.day}{_ordinal_suffix(posted.day)}"
+    if posted.year != date.today().year:
+        shown = f'{shown} {posted.year}'
+    return f'🗓 {verb} {shown}'
+
+
 def format_job_notification(
     candidate: dict, extract: dict, rating: int, pros: list[str], warnings: list[str]
 ) -> str:
@@ -3054,6 +3093,7 @@ def format_job_notification(
         lines.append(f'📍 {location}')
     if salary_line := format_salary_line(extract):
         lines.append(salary_line)
+    lines.append(format_posted_line(candidate, extract))
     sections = ['\n'.join(lines)]
     for block in (_bullet_block('✅ Good:', pros), _bullet_block('⚠️ Warnings:', warnings)):
         if block:

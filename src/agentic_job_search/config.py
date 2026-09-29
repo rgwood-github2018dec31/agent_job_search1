@@ -442,6 +442,8 @@ SCRAPER_WHAT_HAPPENED_MAX_CHARS = 500
 LOG_SNIPPET_MAX_CHARS = 300
 # The salary text shown on the 💰 line of a Telegram job-match message.
 NOTIFICATION_SALARY_MAX_CHARS = 200
+# An unparseable posting date shown verbatim on the 🗓 line of a Telegram job-match message.
+NOTIFICATION_POSTED_MAX_CHARS = 80
 # Compensation sentences of the description handed to the salary classifier, and ONLY when the
 # deterministic tiers found no figure in the salary field itself.
 SALARY_CONTEXT_MAX_CHARS = 1500
