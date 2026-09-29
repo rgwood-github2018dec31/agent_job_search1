@@ -329,7 +329,7 @@ async def test_read_job_page_waits_again_then_falls_back_when_the_description_ne
 
 
 async def test_read_job_page_falls_back_when_the_capture_was_altered_in_transit(caplog):
-    call, calls = _browser(PAGE, chars_delta=7)
+    call, _calls = _browser(PAGE, chars_delta=7)
     with caplog.at_level(logging.WARNING):
         page = await lp.read_job_page(_candidate(), call)
     assert page.source == 'snapshot'

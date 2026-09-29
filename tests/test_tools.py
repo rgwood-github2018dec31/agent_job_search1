@@ -2517,7 +2517,7 @@ async def test_no_scraper_prompt_ever_instructs_clicking_the_results_list(monkey
     client = _FakeScraperClient({'Healthy': agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20, 'Starved': 1})
     await _scrape(client, ['Empty', 'Starved', 'Healthy'])
 
-    prompts = client.requests + [agent.build_scraper_instructions()]
+    prompts = [*client.requests, agent.build_scraper_instructions()]
     assert len(client.requests) == 5, 'two retries plus three initial passes'
     for prompt in prompts:
         assert 'currentJobId' not in prompt, f'click-to-reveal leaked into a prompt: {prompt[:120]}'
@@ -4718,7 +4718,7 @@ async def _run_stage2(candidate: dict, funnel: dict) -> None:
 
 async def test_stage_2_notifies_and_records_a_first_agency_posting(monkeypatch):
     calls = _repost_llm(monkeypatch, '')
-    notifications, saved = _stage2_stubs(monkeypatch, _agency_extract())
+    notifications, _saved = _stage2_stubs(monkeypatch, _agency_extract())
     funnel: dict = {}
 
     await _run_stage2(_make_candidate(job_id='4464637425', company='Archer Recruitment'), funnel)
@@ -6704,8 +6704,8 @@ def test_fingerprint_ignores_linkedins_per_query_topical_chips(tmp_path, monkeyp
     """
     monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
     structural = ['Jobs', 'Past week', 'Senior', 'Employment type', 'Company']
-    tools.check_fingerprint_drift(_sound_report(chips=structural + ['Gen AI', 'AWS']))
-    drift = tools.check_fingerprint_drift(_sound_report(chips=structural + ['AI/ML', 'Analytics']))
+    tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'Gen AI', 'AWS']))
+    drift = tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'AI/ML', 'Analytics']))
     assert drift == '', 'topical suggestion chips must not count as a UI change'
 
 
@@ -6890,7 +6890,7 @@ def _npx_launch_sites(tree):
                 isinstance(e, ast.Constant) and e.value == 'npx' for e in node.elts):
             yield node.lineno, node.elts
         elif isinstance(node, ast.Dict):
-            pairs = {k.value: v for k, v in zip(node.keys, node.values)
+            pairs = {k.value: v for k, v in zip(node.keys, node.values, strict=True)
                      if isinstance(k, ast.Constant)}
             command, args = pairs.get('command'), pairs.get('args')
             if (isinstance(command, ast.Constant) and command.value == 'npx'
@@ -7732,7 +7732,7 @@ async def test_a_newly_applied_job_changes_the_reference_set(tmp_path, monkeypat
     before = _reference_texts()[:MAX_REFERENCE_JOBS]
 
     # Apply to one more job today, on top of an already-full corpus.
-    index_path = _corpus(applied, records + [
+    index_path = _corpus(applied, [*records,
         (date.today(), 'brand new job text', f'{date.today().isoformat()}-cat-saved_jd-newest.pdf'),
     ])
     await tools.load_applied_jobs(applied_to_dir=applied, index_path=index_path)

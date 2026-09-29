@@ -2364,9 +2364,9 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     # live anywhere in the EU — so the two are judged apart, on different fields.
     if region := await location_rejection_reason(extract):
         return f'located in an excluded region: {region}'
-    if relocation := str(extract.get('relocation') or '').strip():
-        if region := await rejected_location(relocation):
-            return f'relocation required to an excluded region: {region}'
+    if (relocation := str(extract.get('relocation') or '').strip()) and (
+            region := await rejected_location(relocation)):
+        return f'relocation required to an excluded region: {region}'
     degree = derive_education_requirement(extract)
     if degree and degree in preferences.rejected_degrees():
         return f'requires advanced degree: {degree}'
@@ -2629,7 +2629,7 @@ async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
         return denials[0]
 
     undecided = [
-        country for country, denial in zip(countries_named, denials)
+        country for country, denial in zip(countries_named, denials, strict=True)
         if not denial
         and not any(location_token_matches(t, country) for t in preferences.would_live_here())
         and not any(location_token_matches(t, country) for t in preferences.not_yet_bucketed())
@@ -3312,7 +3312,9 @@ async def evaluate_all_candidates(
             # never changes the rating and never rejects on its own; the one thing it now gates is a
             # REPEAT notification for a role already sent (see recruiter_repost_of below).
             end_client = derive_end_client(extract)
-            if end_client:
+            # nested (not combined) deliberately: a 20-line gate body reads better
+            # one level deeper than folded into a single 100-char condition
+            if end_client:  # noqa: SIM102
                 if matched_pdf := await tools_module.company_matches_applied(end_client):
                     bump('end_client_already_applied')
                     logger.info(
