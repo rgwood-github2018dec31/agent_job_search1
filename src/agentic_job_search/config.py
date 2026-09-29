@@ -496,12 +496,12 @@ EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after naviga
 # Read-only: no DOM writes, no .click(), no dispatchEvent. Built without string or regex literals
 # that could be escaped in transit (a `'<!'` literal came back as a SyntaxError in the POC).
 # `chars` is the JS length, in UTF-16 units, so read_job_page can tell a capture cut in transit.
-LINKEDIN_PAGE_CAPTURE_JS = r'''() => {
+LINKEDIN_PAGE_CAPTURE_JS = r"""() => {
   const lt = String.fromCharCode(60), nl = String.fromCharCode(10);
   const doctype = document.doctype ? lt + '!DOCTYPE ' + document.doctype.name + '>' + nl : '';
   const html = doctype + document.documentElement.outerHTML;
   return {url: location.href, title: document.title, chars: html.length, html};
-}'''
+}"""
 # Sections removed wherever they appear, matched against an element's OWN text from its start.
 # Never by class name: LinkedIn's classes are hashed build output and change between deploys.
 LINKEDIN_REMOVE_SECTION_PHRASES = (

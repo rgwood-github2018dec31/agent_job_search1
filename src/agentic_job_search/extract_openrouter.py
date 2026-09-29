@@ -56,7 +56,7 @@ OPENROUTER_EXTRACT_TOOLS = [
                 'residing in a specific place; omit for work-from-anywhere roles. '
                 "Pass education_requirement as 'master' or 'phd' ONLY if an advanced degree is a hard "
                 "requirement (e.g. 'MSc required', 'PhD is a must'); omit it when the degree is merely "
-                'preferred, when equivalent experience is accepted, or when only a Bachelor\'s is required. '
+                "preferred, when equivalent experience is accepted, or when only a Bachelor's is required. "
                 'Pass is_agency=true if the poster is a staffing firm, recruiting agency, or job '
                 'aggregator reposting on behalf of another company rather than the employer that would '
                 "actually hire, and pass end_client with that hiring company's name if the posting "
@@ -75,7 +75,7 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'closed': {'type': 'boolean'},
                     'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
                     'sponsorship_note': {'type': 'string'},
-                    'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase"},
+                    'language_requirement': {'type': 'string', 'description': 'Explicitly required languages, comma-separated lowercase'},
                     'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output"},
                     'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
                                         'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},

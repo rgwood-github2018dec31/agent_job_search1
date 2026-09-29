@@ -140,13 +140,13 @@ from agentic_job_search.triage import (
 
 
 def load_env() -> None:
-    env_path = PROJECT_DIR / ".env"
+    env_path = PROJECT_DIR / '.env'
     if not env_path.exists():
         return
     for line in env_path.read_text().splitlines():
         line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
+        if line and not line.startswith('#') and '=' in line:
+            key, _, value = line.partition('=')
             os.environ.setdefault(key.strip(), value.strip())
 
 
@@ -154,7 +154,7 @@ load_env()
 
 logger = logging.getLogger(__name__)
 
-BROWSER_PROFILE_DIR = Path.home() / ".linkedin-agent-profile"
+BROWSER_PROFILE_DIR = Path.home() / '.linkedin-agent-profile'
 # Playwright MCP snapshot/screenshot output — kept out of the repo tree
 PLAYWRIGHT_OUTPUT_DIR = Path(tempfile.gettempdir()) / 'linkedin-agent-playwright-output'
 REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
@@ -723,27 +723,27 @@ def build_system_prompt(interactive: bool) -> str:
         # Resume only needed in interactive mode; non-interactive uses JOB_REQUIREMENTS.md criteria.
         resume = load_resume()
         if resume:
-            parts.append(f"--- RESUME ---\n{resume}\n--- END RESUME ---")
+            parts.append(f'--- RESUME ---\n{resume}\n--- END RESUME ---')
         else:
-            console.print("[yellow]Warning: no resume file found matching *-resume-*.md[/yellow]")
+            console.print('[yellow]Warning: no resume file found matching *-resume-*.md[/yellow]')
 
     if JOB_REQUIREMENTS_PATH.exists():
-        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
-        parts.append(f"--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---")
+        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding='utf-8')
+        parts.append(f'--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---')
 
     parts.append(build_interactive_instructions())
 
-    return "\n\n".join(parts)
+    return '\n\n'.join(parts)
 
 
 def build_scraper_prompt() -> str:
     # No date needed — check_and_record_job enforces age filtering via tool.
     parts = []
     if JOB_REQUIREMENTS_PATH.exists():
-        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
-        parts.append(f"--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---")
+        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding='utf-8')
+        parts.append(f'--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---')
     parts.append(build_scraper_instructions())
-    return "\n\n".join(parts)
+    return '\n\n'.join(parts)
 
 
 def build_query_generation_instructions() -> str:
@@ -885,11 +885,11 @@ def build_profile_block(reference_block: str = '') -> str:
     """Requirements + reference profile, without rating instructions (shared by triage and rating)."""
     parts = []
     if JOB_REQUIREMENTS_PATH.exists():
-        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding="utf-8")
-        parts.append(f"--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---")
+        requirements = JOB_REQUIREMENTS_PATH.read_text(encoding='utf-8')
+        parts.append(f'--- JOB_REQUIREMENTS.md ---\n{requirements}\n--- END JOB_REQUIREMENTS.md ---')
     if reference_block:
         parts.append(reference_block)
-    return "\n\n".join(parts)
+    return '\n\n'.join(parts)
 
 
 def build_evaluator_prompt(reference_block: str = '') -> str:
@@ -902,7 +902,7 @@ def build_evaluator_prompt(reference_block: str = '') -> str:
     parts.append(build_evaluator_instructions())
     # The system prompt is passed to the CLI as a subprocess argument; a stray
     # null byte anywhere in it makes every session fail to spawn.
-    return "\n\n".join(parts).replace('\x00', '')
+    return '\n\n'.join(parts).replace('\x00', '')
 
 
 def _reference_job_texts() -> list[str]:
@@ -1023,7 +1023,7 @@ def _wrap_reference_summary(summary: str, num_jobs: int) -> str:
 
 def print_thinking(text: str) -> None:
     display = text if len(text) <= THINKING_MAX_CHARS else text[:THINKING_MAX_CHARS] + f'\n… ({len(text) - THINKING_MAX_CHARS} more chars)'
-    console.print(f"\n[dim italic]Thinking: {display}[/dim italic]\n")
+    console.print(f'\n[dim italic]Thinking: {display}[/dim italic]\n')
 
 
 def log_agent_text(stage: str, text: str) -> None:
@@ -1045,14 +1045,14 @@ def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> N
     parts = []
     if msg.usage:
         parts.append(f"in={msg.usage.get('input_tokens', 0)} out={msg.usage.get('output_tokens', 0)}")
-        cache_read = msg.usage.get("cache_read_input_tokens", 0)
-        cache_write = msg.usage.get("cache_creation_input_tokens", 0)
+        cache_read = msg.usage.get('cache_read_input_tokens', 0)
+        cache_write = msg.usage.get('cache_creation_input_tokens', 0)
         if cache_read or cache_write:
-            parts.append(f"cache_read={cache_read} cache_write={cache_write}")
+            parts.append(f'cache_read={cache_read} cache_write={cache_write}')
     if msg.total_cost_usd is not None:
-        parts.append(f"cost=${msg.total_cost_usd:.4f}")
+        parts.append(f'cost=${msg.total_cost_usd:.4f}')
         if cost_delta is not None and abs(cost_delta - msg.total_cost_usd) > COST_DELTA_DISPLAY_TOLERANCE_USD:
-            parts.append(f"delta=${cost_delta:.4f}")
+            parts.append(f'delta=${cost_delta:.4f}')
     if parts:
         console.print(f"[dim]{' · '.join(parts)}[/dim]")
     # The console output above is rich-only and never reaches run_dir/logs/run-*.log, which is
@@ -1089,13 +1089,13 @@ _PRIVATE_STAGE_STAT_KEYS = ('session_costs',)
 
 def new_stage_stats() -> dict:
     return {
-        "cost": 0.0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
+        'cost': 0.0,
+        'input_tokens': 0,
+        'output_tokens': 0,
+        'cache_read_input_tokens': 0,
+        'cache_creation_input_tokens': 0,
         # session_id -> highest total_cost_usd seen for that session (see accumulate_stage_stats)
-        "session_costs": {},
+        'session_costs': {},
     }
 
 
@@ -1110,12 +1110,12 @@ def public_stage_stats(stage_stats: dict) -> dict:
 def accumulate_stage_stats(stats: dict, msg: ResultMessage) -> float:
     """Fold a ResultMessage into a stage's totals. Returns the cost actually charged."""
     if msg.usage:
-        stats["input_tokens"] += msg.usage.get("input_tokens", 0)
-        stats["output_tokens"] += msg.usage.get("output_tokens", 0)
-        stats["cache_read_input_tokens"] += msg.usage.get("cache_read_input_tokens", 0)
-        stats["cache_creation_input_tokens"] += msg.usage.get("cache_creation_input_tokens", 0)
+        stats['input_tokens'] += msg.usage.get('input_tokens', 0)
+        stats['output_tokens'] += msg.usage.get('output_tokens', 0)
+        stats['cache_read_input_tokens'] += msg.usage.get('cache_read_input_tokens', 0)
+        stats['cache_creation_input_tokens'] += msg.usage.get('cache_creation_input_tokens', 0)
     delta = cost_delta_for(stats, msg)
-    stats["cost"] += delta
+    stats['cost'] += delta
     return delta
 
 
@@ -1136,7 +1136,7 @@ def cost_delta_for(stats: dict, msg: ResultMessage) -> float:
     # No session id => nothing to correlate against, so treat the value as already per-request.
     if not msg.session_id:
         return msg.total_cost_usd
-    session_costs = stats.setdefault("session_costs", {})
+    session_costs = stats.setdefault('session_costs', {})
     previous = session_costs.get(msg.session_id, 0.0)
     delta = msg.total_cost_usd - previous
     if delta < 0:
@@ -1151,17 +1151,17 @@ def cost_delta_for(stats: dict, msg: ResultMessage) -> float:
 
 
 async def run_interactive(client: ClaudeSDKClient) -> None:
-    console.print("[bold cyan]Job Search Agent — Interactive Mode[/bold cyan]")
-    console.print("[cyan]" + "=" * CONSOLE_BANNER_WIDTH + "[/cyan]")
-    console.print("[dim]Note: On first run, you may need to log in to LinkedIn in the browser window.[/dim]")
+    console.print('[bold cyan]Job Search Agent — Interactive Mode[/bold cyan]')
+    console.print('[cyan]' + '=' * CONSOLE_BANNER_WIDTH + '[/cyan]')
+    console.print('[dim]Note: On first run, you may need to log in to LinkedIn in the browser window.[/dim]')
     console.print("[dim]Type 'quit' to exit.[/dim]\n")
-    console.print("[yellow]Reading your resume and job requirements - please wait ...[/yellow]")
+    console.print('[yellow]Reading your resume and job requirements - please wait ...[/yellow]')
 
     initial = "You have the resume and JOB_REQUIREMENTS.md in your context. Review them, then ask the user: 'Should I start the search on LinkedIn?'"
     await client.query(initial)
 
     while True:
-        console.print("\n[bold green]Agent:[/bold green] ", end="")
+        console.print('\n[bold green]Agent:[/bold green] ', end='')
         async for msg in client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
@@ -1173,8 +1173,8 @@ async def run_interactive(client: ClaudeSDKClient) -> None:
             elif isinstance(msg, ResultMessage):
                 print_result_stats(msg)
 
-        user_input = input("\n\033[1;34mYou:\033[0m ").strip()
-        if user_input.lower() in ("quit", "exit", "q"):
+        user_input = input('\n\033[1;34mYou:\033[0m ').strip()
+        if user_input.lower() in ('quit', 'exit', 'q'):
             break
         if not user_input:
             continue
@@ -1182,12 +1182,12 @@ async def run_interactive(client: ClaudeSDKClient) -> None:
         await client.query(user_input)
 
 
-_RATING_RE = re.compile(r"-rating_(\d+)-")
+_RATING_RE = re.compile(r'-rating_(\d+)-')
 
 
 def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
     """Return (num_evaluated, num_high_rated) for job files created since snapshot."""
-    jobs_after = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
+    jobs_after = set(RUN_DIR.glob('saved_jobs-*/job_posting-*.md'))
     new_jobs = jobs_after - jobs_before
     num_evaluated = len(new_jobs)
     num_high_rated = sum(
@@ -1418,7 +1418,7 @@ def recent_yield_history(limit: int = YIELD_HISTORY_RUNS_SHOWN) -> list[str]:
         except ValueError as ex:
             logger.warning(f'Yield history row in {path} has a bad timestamp, shown raw: {ex}')
             when = str(row.get('timestamp'))
-        out.append(f"{when}: {new_jobs} new / {seen}")
+        out.append(f'{when}: {new_jobs} new / {seen}')
     return out
 
 
@@ -1549,10 +1549,10 @@ async def _run_anthropic_scraper(playwright_mcp: dict, queries: list[str], stage
         tools=[],
         system_prompt=build_scraper_prompt(),
         mcp_servers={
-            "playwright": playwright_mcp,
-            "job_scraper": make_scraper_server(),
+            'playwright': playwright_mcp,
+            'job_scraper': make_scraper_server(),
         },
-        permission_mode="bypassPermissions",
+        permission_mode='bypassPermissions',
         # Removes these from the model's context entirely. allowed_tools would NOT — it only
         # auto-grants permission, which bypassPermissions already does. See the constant.
         disallowed_tools=SCRAPER_DISALLOWED_BROWSER_TOOLS,
@@ -1600,7 +1600,7 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
     differ only in how one request is executed.
     """
     for i, query in enumerate(queries, 1):
-        console.print(f"[cyan]Stage 1b: query {i}/{len(queries)} — \"{query}\"[/cyan]")
+        console.print(f'[cyan]Stage 1b: query {i}/{len(queries)} — "{query}"[/cyan]')
         if i > 1:
             await _human_pause(SCRAPER_INTER_QUERY_DELAY_SECONDS, f'query {i}/{len(queries)}')
         tools_module._current_query = query
@@ -1609,16 +1609,16 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
         try:
             turns = await run_pass(
                 f'Search LinkedIn for this ONE query only: "{query}"\n\n'
-                "Run every search listed in your instructions (one per region). Search on the "
-                "query text alone, then set the location, date-posted and experience-level "
-                "filters by CLICKING their chips — never by putting geoId/f_TPR in the URL. Then "
-                "call run_ui_contract with the region name and do what it tells you, then "
-                "harvest_listings, then record_listings. Clicking filter chips is fine; never "
-                "click anything in the results LIST — the card and its Dismiss button are "
-                "indistinguishable to you, and a stray click destroys a real job. If anything is "
-                "missing or unreadable, call report_problem and stop rather than guessing. Do not "
-                "ask for permission — call the tools directly. Do not navigate to individual job "
-                "pages. Stop when you have worked through the searches for this query."
+                'Run every search listed in your instructions (one per region). Search on the '
+                'query text alone, then set the location, date-posted and experience-level '
+                'filters by CLICKING their chips — never by putting geoId/f_TPR in the URL. Then '
+                'call run_ui_contract with the region name and do what it tells you, then '
+                'harvest_listings, then record_listings. Clicking filter chips is fine; never '
+                'click anything in the results LIST — the card and its Dismiss button are '
+                'indistinguishable to you, and a stray click destroys a real job. If anything is '
+                'missing or unreadable, call report_problem and stop rather than guessing. Do not '
+                'ask for permission — call the tools directly. Do not navigate to individual job '
+                'pages. Stop when you have worked through the searches for this query.'
             )
         except ProviderUnavailableError as ex:
             # Systemic, not per-query: the provider is refusing every call, so the remaining
@@ -1794,16 +1794,16 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
         tools=[],
         system_prompt=EXTRACTOR_INSTRUCTIONS,
         mcp_servers={
-            "playwright": playwright_mcp,
-            "job_evaluator": make_evaluator_server(),
+            'playwright': playwright_mcp,
+            'job_evaluator': make_evaluator_server(),
         },
         allowed_tools=[
-            "mcp__playwright__browser_navigate",
-            "mcp__playwright__browser_snapshot",
-            "mcp__playwright__browser_click",
-            "mcp__job_evaluator__submit_job_extract",
+            'mcp__playwright__browser_navigate',
+            'mcp__playwright__browser_snapshot',
+            'mcp__playwright__browser_click',
+            'mcp__job_evaluator__submit_job_extract',
         ],
-        permission_mode="bypassPermissions",
+        permission_mode='bypassPermissions',
         cwd=str(PROJECT_DIR),
         model=ANTHROPIC_MODEL_NAME_LOW,
         max_turns=EXTRACT_FALLBACK_MAX_TURNS,
@@ -2081,15 +2081,15 @@ def derive_workplace_type(extract: dict) -> str:
     return ''
 
 
-_PHD_RE = re.compile(r"\bph\.?\s?d\.?\b|\bdoctorates?\b|\bdoctoral\s+degree\b", re.IGNORECASE)
+_PHD_RE = re.compile(r'\bph\.?\s?d\.?\b|\bdoctorates?\b|\bdoctoral\s+degree\b', re.IGNORECASE)
 _MASTERS_RE = re.compile(
     r"\bmasters?'?s?\s+degree\b|\bmaster's\b|\bmasters\b|\bm\.?sc\.?\b"
     r"|\bmaster\s+of\s+(?:science|engineering|arts)\b|\bm\.?s\.?\s+in\b|\bm\.?a\.?\s+in\b",
     re.IGNORECASE,
 )
 _DEGREE_REQUIRED_RE = re.compile(
-    r"\brequired\b|\brequirements?\b|\brequires?\b|\bmust\s+(?:have|hold|possess)\b"
-    r"|\bis\s+a\s+must\b|\bmandatory\b|\bminimum\b",
+    r'\brequired\b|\brequirements?\b|\brequires?\b|\bmust\s+(?:have|hold|possess)\b'
+    r'|\bis\s+a\s+must\b|\bmandatory\b|\bminimum\b',
     re.IGNORECASE,
 )
 # Any of these in the same sentence means the degree is not a hard gate: it is preferred, one of
@@ -2270,9 +2270,9 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     lines = [
         f"Title: {extract['title']}",
         f"Company: {extract['company']}",
-        *([f"Hiring company: {end_client}"] if end_client else []),
+        *([f'Hiring company: {end_client}'] if end_client else []),
         f"Location: {extract['location']}",
-        *([f"Workplace: {workplace_type}"] if workplace_type else []),
+        *([f'Workplace: {workplace_type}'] if workplace_type else []),
         f"Posted: {extract['date_posted'] or candidate['date_posted']}",
         f"URL: {candidate['url']}",
     ]
@@ -2302,7 +2302,7 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     if extract.get('education_requirement'):
         lines.append(f"Education requirement: {extract['education_requirement']}")
     if extract['closed']:
-        lines.append("Status: no longer accepting applications")
+        lines.append('Status: no longer accepting applications')
     lines.append(f"\n{extract['description']}")
     return '\n'.join(lines)
 
@@ -3321,7 +3321,7 @@ async def evaluate_all_candidates(
                     )
                     await _save_and_notify(
                         candidate, rating=RATING_AUTO_REJECT,
-                        summary=f"already applied to end client {end_client}",
+                        summary=f'already applied to end client {end_client}',
                         content=(
                             f"# Already applied — posted by {candidate['company']} on behalf of "
                             f"{end_client}\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"
@@ -3339,8 +3339,8 @@ async def evaluate_all_candidates(
                 bump(_hard_rule_category(hard_rule_reason))
                 logger.info(f"Hard rule: {candidate['company']} — {candidate['title']}: rated 1 ({hard_rule_reason})")
                 await _save_and_notify(
-                    candidate, rating=RATING_AUTO_REJECT, summary=f"auto rejected {hard_rule_reason}",
-                    content=f"# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}", notify=False,
+                    candidate, rating=RATING_AUTO_REJECT, summary=f'auto rejected {hard_rule_reason}',
+                    content=f'# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}', notify=False,
                 )
                 tools_module.record_job_outcome(
                     candidate['site'], candidate['job_id'], 'hard_ruled', rating=RATING_AUTO_REJECT, summary=hard_rule_reason
@@ -3425,7 +3425,7 @@ async def evaluate_all_candidates(
                 + (_bullet_block('## Warnings', warnings) + '\n\n' if warnings else '')
                 + f"Reasoning: {result['reasoning']}\n"
                 + (f"Triage score (local): {triage_result['score']}\n" if triage_result else '')
-                + f"\n{extract_text}"
+                + f'\n{extract_text}'
             )
             tools_module.record_job_outcome(
                 candidate['site'], candidate['job_id'], 'recruiter_repost' if repost else 'rated',
@@ -3715,7 +3715,7 @@ class BrowserServer:
 
     async def start(self) -> None:
         self.port = find_free_port()
-        console.print(f"[dim]Starting shared browser ({self.browser_mode}, port {self.port}) ...[/dim]")
+        console.print(f'[dim]Starting shared browser ({self.browser_mode}, port {self.port}) ...[/dim]')
         self.proc = await start_playwright_server(self.port, browser_mode=self.browser_mode)
         self.mcp['url'] = f'http://localhost:{self.port}/mcp'
 
@@ -3809,24 +3809,24 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     if audit:
         console.print('[bold magenta]AUDIT mode: gate-killed jobs will still be re-rated to detect false negatives.[/bold magenta]')
 
-    console.print("[bold cyan]Job Search Agent — Non-interactive Mode[/bold cyan]")
-    console.print("[cyan]" + "=" * CONSOLE_BANNER_WIDTH + "[/cyan]")
+    console.print('[bold cyan]Job Search Agent — Non-interactive Mode[/bold cyan]')
+    console.print('[cyan]' + '=' * CONSOLE_BANNER_WIDTH + '[/cyan]')
 
     start_time = time.time()
     stage_stats = {
-        "query_generation": new_stage_stats(),
-        "scraping": new_stage_stats(),
-        "reference_summary": new_stage_stats(),
-        "extraction": new_stage_stats(),
-        "rating": new_stage_stats(),
-        "location_review": new_stage_stats(),
+        'query_generation': new_stage_stats(),
+        'scraping': new_stage_stats(),
+        'reference_summary': new_stage_stats(),
+        'extraction': new_stage_stats(),
+        'rating': new_stage_stats(),
+        'location_review': new_stage_stats(),
         # $0.0000 on a run where no agency posted twice, which is most of them.
-        "recruiter_repost": new_stage_stats(),
+        'recruiter_repost': new_stage_stats(),
         # $0.0000 on a run whose salary strings all parse deterministically — which is itself the
         # evidence the rules are doing the work, rather than a model quietly doing it for them.
-        "salary": new_stage_stats(),
+        'salary': new_stage_stats(),
     }
-    jobs_before = set(RUN_DIR.glob("saved_jobs-*/job_posting-*.md"))
+    jobs_before = set(RUN_DIR.glob('saved_jobs-*/job_posting-*.md'))
 
     browser = BrowserServer(browser_mode)
     await browser.start()
@@ -3834,24 +3834,24 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
     try:
         # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping
-        console.print("[yellow]Stage 1a: Generating search queries ...[/yellow]")
-        queries = await generate_search_queries(stage_stats["query_generation"])
+        console.print('[yellow]Stage 1a: Generating search queries ...[/yellow]')
+        queries = await generate_search_queries(stage_stats['query_generation'])
         if not queries:
-            console.print("[red]Error: no search queries generated.[/red]")
-            await _send_pipeline_notification("Job search run FAILED\n• Error: no search queries generated")
+            console.print('[red]Error: no search queries generated.[/red]')
+            await _send_pipeline_notification('Job search run FAILED\n• Error: no search queries generated')
             log_run_cost({
-                "timestamp": datetime.now().isoformat(),
-                "mode": "non-interactive",
-                "status": "failed_no_queries",
-                "stage_stats": public_stage_stats(stage_stats),
-                "total_cost": sum(s["cost"] for s in stage_stats.values()),
-                "elapsed_minutes": (time.time() - start_time) / SECONDS_PER_MINUTE,
+                'timestamp': datetime.now().isoformat(),
+                'mode': 'non-interactive',
+                'status': 'failed_no_queries',
+                'stage_stats': public_stage_stats(stage_stats),
+                'total_cost': sum(s['cost'] for s in stage_stats.values()),
+                'elapsed_minutes': (time.time() - start_time) / SECONDS_PER_MINUTE,
             })
             return
-        console.print(f"[dim]Queries: {queries}[/dim]\n")
+        console.print(f'[dim]Queries: {queries}[/dim]\n')
 
-        console.print("[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n")
-        await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats["scraping"])
+        console.print('[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n')
+        await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats['scraping'])
 
         candidates = tools_module._candidates
         candidates_per_query = tools_module._candidates_per_query
@@ -3859,23 +3859,23 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
             f'  "{q}": {candidates_per_query.get(q, 0)} job(s)' + (' ⚠' if candidates_per_query.get(q, 0) == 0 else '')
             for q in queries
         ]
-        console.print(f"\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]")
+        console.print(f'\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]')
         for line in query_summary_lines:
-            console.print(f"[dim]{line}[/dim]")
+            console.print(f'[dim]{line}[/dim]')
         console.print()
 
         if not candidates:
-            console.print("[red]Error: 0 jobs returned across all searches.[/red]")
+            console.print('[red]Error: 0 jobs returned across all searches.[/red]')
             elapsed_mins = (time.time() - start_time) / SECONDS_PER_MINUTE
-            total_cost = sum(s["cost"] for s in stage_stats.values())
+            total_cost = sum(s['cost'] for s in stage_stats.values())
             # check_status distinguishes dedup-saturation (all already_processed) from an
             # authwall/empty-page (nothing seen at all) — the two zero-candidate root causes.
             check_status_counts = dict(tools_module._check_status_counts)
             logger.warning(
-                f"Run funnel (0 candidates): listings_seen={sum(check_status_counts.values())} "
-                f"check_status={json.dumps(check_status_counts)}"
+                f'Run funnel (0 candidates): listings_seen={sum(check_status_counts.values())} '
+                f'check_status={json.dumps(check_status_counts)}'
             )
-            query_lines = "\n".join(f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' for q in queries)
+            query_lines = '\n'.join(f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' for q in queries)
             # Health is assessed HERE too, not only on the main path below: this branch returns
             # before that code, so without this a run whose every query failed reported itself as
             # healthy in both the audit log and Telegram.
@@ -3896,40 +3896,40 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                     {'kind': 'location_recommendations', 'query': '', 'region': '', 'detail': detail}
                 )
             zero_funnel = {
-                "queries_generated": len(queries),
-                "listings_seen": sum(check_status_counts.values()),
-                "listings_distinct": _listings_distinct(),
-                "region_overlap": tools_module.region_overlap_report(),
-                "ui_alerts": list(tools_module._ui_alerts),
-                "check_status": check_status_counts,
-                "check_status_per_query": dict(tools_module._check_status_per_query),
-                "listings_distinct_per_query": _listings_distinct_per_query(),
-                "queries_failed": dict(tools_module._query_errors),
-                "queue_skipped": dict(tools_module._queue_skipped_counts),
-                "candidates_queued": 0,
+                'queries_generated': len(queries),
+                'listings_seen': sum(check_status_counts.values()),
+                'listings_distinct': _listings_distinct(),
+                'region_overlap': tools_module.region_overlap_report(),
+                'ui_alerts': list(tools_module._ui_alerts),
+                'check_status': check_status_counts,
+                'check_status_per_query': dict(tools_module._check_status_per_query),
+                'listings_distinct_per_query': _listings_distinct_per_query(),
+                'queries_failed': dict(tools_module._query_errors),
+                'queue_skipped': dict(tools_module._queue_skipped_counts),
+                'candidates_queued': 0,
             }
             health_alerts = attach_run_health(zero_funnel)
             fail_lines = [
-                "Job search run FAILED",
-                "• Error: 0 candidates found",
-                f"• Queries ({len(queries)}):\n{query_lines}",
-                f"• Listings seen: {sum(check_status_counts.values())} {check_status_counts}",
-                f"• Elapsed: {elapsed_mins:.1f} min",
-                f"• Total cost: ${total_cost:.4f}",
+                'Job search run FAILED',
+                '• Error: 0 candidates found',
+                f'• Queries ({len(queries)}):\n{query_lines}',
+                f'• Listings seen: {sum(check_status_counts.values())} {check_status_counts}',
+                f'• Elapsed: {elapsed_mins:.1f} min',
+                f'• Total cost: ${total_cost:.4f}',
             ]
             if block := health_alert_block(health_alerts):
                 fail_lines.insert(1, block)
                 if history := recent_yield_history():
-                    fail_lines.append("• Recent yield:\n" + "\n".join(f"  - {h}" for h in history))
-            await _send_pipeline_notification("\n".join(fail_lines))
+                    fail_lines.append('• Recent yield:\n' + '\n'.join(f'  - {h}' for h in history))
+            await _send_pipeline_notification('\n'.join(fail_lines))
             log_run_cost({
-                "timestamp": datetime.now().isoformat(),
-                "mode": "non-interactive",
-                "status": "failed_no_candidates",
-                "stage_stats": public_stage_stats(stage_stats),
-                "total_cost": total_cost,
-                "check_status": check_status_counts,
-                "elapsed_minutes": elapsed_mins,
+                'timestamp': datetime.now().isoformat(),
+                'mode': 'non-interactive',
+                'status': 'failed_no_candidates',
+                'stage_stats': public_stage_stats(stage_stats),
+                'total_cost': total_cost,
+                'check_status': check_status_counts,
+                'elapsed_minutes': elapsed_mins,
             })
             # A zero-candidate run is exactly when the trace matters most — it distinguishes
             # "no query was ever searched" from "searched, everything deduped".
@@ -3939,12 +3939,12 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 applied_jobs_total=len(list(tools_module.APPLIED_JOBS_DIR.glob('*.pdf'))),
                 funnel=zero_funnel,
             )
-            console.print(f"[dim]Run audit log: {audit_log_path}[/dim]")
+            console.print(f'[dim]Run audit log: {audit_log_path}[/dim]')
             return
 
         # Stage 2: all evaluations share the same browser via the SSE server
-        console.print("[yellow]Stage 2: Evaluating candidates ...[/yellow]\n")
-        reference_block = await build_reference_summary(stage_stats["reference_summary"])
+        console.print('[yellow]Stage 2: Evaluating candidates ...[/yellow]\n')
+        reference_block = await build_reference_summary(stage_stats['reference_summary'])
         evaluator_prompt = build_evaluator_prompt(reference_block)
         profile_block = build_profile_block(reference_block)
 
@@ -3965,7 +3965,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
             funnel=funnel, audit=audit, triage_enabled=triage_enabled, browser=browser,
         )
         if audit_opus:
-            console.print(f"[bold magenta]Opus audit: sampling up to {audit_opus} un-surfaced job(s) per pool ...[/bold magenta]")
+            console.print(f'[bold magenta]Opus audit: sampling up to {audit_opus} un-surfaced job(s) per pool ...[/bold magenta]')
             audit_findings = await audit_unsurfaced_with_opus(
                 playwright_mcp, evaluator_prompt, stage_stats, audit_opus
             )
@@ -3977,7 +3977,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
     elapsed_mins = (time.time() - start_time) / SECONDS_PER_MINUTE
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
-    total_cost = sum(s["cost"] for s in stage_stats.values())
+    total_cost = sum(s['cost'] for s in stage_stats.values())
 
     check_status_counts = dict(tools_module._check_status_counts)
     if guess_rows := await resolve_location_guesses(stage_stats.get('location_review')):
@@ -3995,21 +3995,21 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         )
 
     funnel_summary = {
-        "queries_generated": len(queries),
-        "listings_seen": sum(check_status_counts.values()),
-        "listings_distinct": _listings_distinct(),
-        "region_overlap": tools_module.region_overlap_report(),
-        "ui_alerts": list(tools_module._ui_alerts),
-        "check_status": check_status_counts,
-        "check_status_per_query": dict(tools_module._check_status_per_query),
-        "listings_distinct_per_query": _listings_distinct_per_query(),
-        "queries_failed": dict(tools_module._query_errors),
-        "queue_skipped": dict(tools_module._queue_skipped_counts),
-        "candidates_queued": len(candidates),
-        "scrape_per_query": dict(tools_module._scrape_per_query),
+        'queries_generated': len(queries),
+        'listings_seen': sum(check_status_counts.values()),
+        'listings_distinct': _listings_distinct(),
+        'region_overlap': tools_module.region_overlap_report(),
+        'ui_alerts': list(tools_module._ui_alerts),
+        'check_status': check_status_counts,
+        'check_status_per_query': dict(tools_module._check_status_per_query),
+        'listings_distinct_per_query': _listings_distinct_per_query(),
+        'queries_failed': dict(tools_module._query_errors),
+        'queue_skipped': dict(tools_module._queue_skipped_counts),
+        'candidates_queued': len(candidates),
+        'scrape_per_query': dict(tools_module._scrape_per_query),
         **funnel,
     }
-    logger.info(f"Run funnel: {json.dumps(funnel_summary)}")
+    logger.info(f'Run funnel: {json.dumps(funnel_summary)}')
 
     # Discovery-health alerts. A run that finds nothing because the page changed, because a region
     # collapsed, or because the pool is exhausted must not look the same as a healthy quiet run.
@@ -4022,46 +4022,46 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         funnel=funnel_summary,
         audit_findings=audit_findings,
     )
-    console.print(f"[dim]Run audit log: {audit_log_path}[/dim]")
+    console.print(f'[dim]Run audit log: {audit_log_path}[/dim]')
     if audit:
         logger.info(f"AUDIT summary: {funnel.get('audit_false_negatives', 0)} false negative(s) "
                     "(gate-dropped but strong rater >=3)")
 
-    query_lines = "\n".join(
+    query_lines = '\n'.join(
         f'  - "{q}": {candidates_per_query.get(q, 0)} jobs' + (' ⚠' if candidates_per_query.get(q, 0) == 0 else '')
         for q in queries
     )
-    stage_cost_lines = "\n".join(
+    stage_cost_lines = '\n'.join(
         f'  - {name}: ${stats["cost"]:.4f}' for name, stats in stage_stats.items()
     )
     stats_lines = [
-        "Job search run complete",
-        f"• Queries ({len(queries)}):\n{query_lines}",
-        f"• Candidates found: {len(candidates)}",
-        f"• Jobs saved: {num_evaluated}",
-        f"• Jobs rated ≥4: {num_high_rated}",
-        f"• Elapsed: {elapsed_mins:.1f} min",
-        f"• Cost by stage:\n{stage_cost_lines}",
-        f"• Total cost: ${total_cost:.4f}",
+        'Job search run complete',
+        f'• Queries ({len(queries)}):\n{query_lines}',
+        f'• Candidates found: {len(candidates)}',
+        f'• Jobs saved: {num_evaluated}',
+        f'• Jobs rated ≥4: {num_high_rated}',
+        f'• Elapsed: {elapsed_mins:.1f} min',
+        f'• Cost by stage:\n{stage_cost_lines}',
+        f'• Total cost: ${total_cost:.4f}',
     ]
     if block := health_alert_block(health_alerts):
         stats_lines.insert(1, block)
         if history := recent_yield_history():
-            stats_lines.append("• Recent yield:\n" + "\n".join(f"  - {h}" for h in history))
-    stats_msg = "\n".join(stats_lines)
-    console.print(f"\n[dim]{stats_msg}[/dim]")
+            stats_lines.append('• Recent yield:\n' + '\n'.join(f'  - {h}' for h in history))
+    stats_msg = '\n'.join(stats_lines)
+    console.print(f'\n[dim]{stats_msg}[/dim]')
     await _send_pipeline_notification(stats_msg)
     log_run_cost({
-        "timestamp": datetime.now().isoformat(),
-        "mode": "non-interactive",
-        "status": "complete",
-        "stage_stats": public_stage_stats(stage_stats),
-        "total_cost": total_cost,
-        "candidates_found": len(candidates),
-        "jobs_saved": num_evaluated,
-        "jobs_rated_high": num_high_rated,
-        "funnel": funnel_summary,
-        "elapsed_minutes": elapsed_mins,
+        'timestamp': datetime.now().isoformat(),
+        'mode': 'non-interactive',
+        'status': 'complete',
+        'stage_stats': public_stage_stats(stage_stats),
+        'total_cost': total_cost,
+        'candidates_found': len(candidates),
+        'jobs_saved': num_evaluated,
+        'jobs_rated_high': num_high_rated,
+        'funnel': funnel_summary,
+        'elapsed_minutes': elapsed_mins,
     })
 
 
@@ -4070,49 +4070,49 @@ async def main() -> None:
     # ratings — everything logged via the logging module lands in both). Written to
     # run_dir/logs/run-<YYYY-MM-DD>_<HHMMSS>.log via the shared logging setup.
     setup_logging('run', RUN_DIR, level=os.environ.get('LOG_LEVEL', 'INFO'))
-    parser = argparse.ArgumentParser(description="Job Search Agent")
+    parser = argparse.ArgumentParser(description='Job Search Agent')
     parser.add_argument(
-        "--non-interactive", "-n",
-        action="store_true",
-        help="Run autonomously: search LinkedIn, rate jobs, notify on 4+, no user interaction",
+        '--non-interactive', '-n',
+        action='store_true',
+        help='Run autonomously: search LinkedIn, rate jobs, notify on 4+, no user interaction',
     )
     parser.add_argument(
-        "--browser",
-        choices=["headless", "minimized", "visible"],
-        default="headless",
-        help="Browser display mode for non-interactive runs (default: headless)",
+        '--browser',
+        choices=['headless', 'minimized', 'visible'],
+        default='headless',
+        help='Browser display mode for non-interactive runs (default: headless)',
     )
     parser.add_argument(
-        "--status",
-        action="store_true",
-        help="Report whether a job search run is currently active, then exit",
+        '--status',
+        action='store_true',
+        help='Report whether a job search run is currently active, then exit',
     )
     parser.add_argument(
-        "--force",
-        action="store_true",
+        '--force',
+        action='store_true',
         help="Start even if another run holds the run lock (concurrent runs steal each other's jobs)",
     )
     parser.add_argument(
-        "--no-version-check",
-        action="store_true",
-        help="Skip the startup check for a newer @playwright/mcp than the pinned version",
+        '--no-version-check',
+        action='store_true',
+        help='Skip the startup check for a newer @playwright/mcp than the pinned version',
     )
     parser.add_argument(
-        "--audit-opus",
-        nargs="?",
+        '--audit-opus',
+        nargs='?',
         type=int,
         const=AUDIT_OPUS_SAMPLE_SIZE,
         default=0,
-        metavar="N",
-        help=f"Diagnostic: sample N jobs (default {AUDIT_OPUS_SAMPLE_SIZE}) from each un-surfaced pool "
-             "(filtered at Stage 1 / seen but never queued / rated 2-3) and re-rate them with Opus "
-             "to find jobs the funnel should have delivered",
+        metavar='N',
+        help=f'Diagnostic: sample N jobs (default {AUDIT_OPUS_SAMPLE_SIZE}) from each un-surfaced pool '
+             '(filtered at Stage 1 / seen but never queued / rated 2-3) and re-rate them with Opus '
+             'to find jobs the funnel should have delivered',
     )
     parser.add_argument(
-        "--audit",
-        action="store_true",
-        help="Diagnostic: re-rate gate-killed jobs with the strong rater to detect false negatives "
-             "(non-interactive mode only; saving/notification behaviour unchanged)",
+        '--audit',
+        action='store_true',
+        help='Diagnostic: re-rate gate-killed jobs with the strong rater to detect false negatives '
+             '(non-interactive mode only; saving/notification behaviour unchanged)',
     )
     args = parser.parse_args()
     interactive = not args.non_interactive
@@ -4143,7 +4143,7 @@ async def main() -> None:
         sys.exit(1)
 
     if not interactive and not JOB_REQUIREMENTS_PATH.exists():
-        console.print("[red]Error: JOB_REQUIREMENTS.md not found. Non-interactive mode requires it.[/red]")
+        console.print('[red]Error: JOB_REQUIREMENTS.md not found. Non-interactive mode requires it.[/red]')
         sys.exit(1)
 
     # Release on every exit path — a lock left behind by a crash would block the next run
@@ -4161,19 +4161,19 @@ async def main() -> None:
                 skills=[],
                 system_prompt=build_system_prompt(interactive=True),
                 mcp_servers={
-                    "playwright": {
-                        "type": "stdio",
-                        "command": "npx",
-                        "args": [
-                            "--yes",
+                    'playwright': {
+                        'type': 'stdio',
+                        'command': 'npx',
+                        'args': [
+                            '--yes',
                             PLAYWRIGHT_MCP_PACKAGE,
-                            "--user-data-dir", str(BROWSER_PROFILE_DIR),
-                            "--output-dir", str(PLAYWRIGHT_OUTPUT_DIR),
+                            '--user-data-dir', str(BROWSER_PROFILE_DIR),
+                            '--output-dir', str(PLAYWRIGHT_OUTPUT_DIR),
                         ],
                     },
-                    "job_search": make_job_search_server(interactive=True),
+                    'job_search': make_job_search_server(interactive=True),
                 },
-                permission_mode="acceptEdits",
+                permission_mode='acceptEdits',
                 cwd=str(PROJECT_DIR),
             )
             async with ClaudeSDKClient(options) as client:

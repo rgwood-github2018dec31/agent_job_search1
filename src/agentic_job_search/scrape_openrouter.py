@@ -166,7 +166,7 @@ async def pin_scraper_provider(model: str) -> ProviderPin:
             logger.warning(f'Stage 1b: no usable endpoint to pin {model} to — running unpinned')
     except Exception as ex:
         logger.warning(f'Stage 1b: could not choose a provider for {model} ({type(ex).__name__}: {ex}) — '
-                       f'running unpinned, so the provider and its price are OpenRouter\'s choice')
+                       f"running unpinned, so the provider and its price are OpenRouter's choice")
         tools_generic._ui_alerts.append({
             'kind': 'provider_unpinned', 'query': '(all)', 'region': '(all)', 'detail': f'{type(ex).__name__}: {ex}'})
     return pin

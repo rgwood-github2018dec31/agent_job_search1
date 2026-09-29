@@ -1,4 +1,4 @@
-'''Personal job-search preferences, loaded from a gitignored file in ``run_dir/``.
+"""Personal job-search preferences, loaded from a gitignored file in ``run_dir/``.
 
 Everything in this module is about *the person running the agent* — where they live, which
 regions they can work in, what languages they speak, which titles they want. None of that
@@ -9,7 +9,7 @@ live in ``run_dir/preferences.yaml`` alongside the resume and JOB_REQUIREMENTS.m
 deliberately neutral — an unconfigured checkout searches without a location filter and applies no
 work-authorization, language, or education gate, rather than silently inheriting someone else's
 situation.
-'''
+"""
 
 import logging
 import re
@@ -108,11 +108,11 @@ _warned_blacklist_entries: set[str] = set()
 
 
 def load_preferences(force_reload: bool = False) -> dict[str, Any]:
-    '''Read run_dir/preferences.yaml over the neutral defaults, cached for the process.
+    """Read run_dir/preferences.yaml over the neutral defaults, cached for the process.
 
     A missing file is not an error — the agent still runs, just without any personal gate. It is
     logged at WARNING because an unconfigured run silently rates very differently.
-    '''
+    """
     global _cache
     if _cache is not None and not force_reload:
         return _cache
@@ -146,7 +146,7 @@ def load_preferences(force_reload: bool = False) -> dict[str, Any]:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    '''Recursive dict merge; override wins. Nested dicts merge, scalars and lists replace.'''
+    """Recursive dict merge; override wins. Nested dicts merge, scalars and lists replace."""
     merged = dict(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -157,17 +157,17 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def save_dir() -> Path:
-    '''Directory where saved job-posting PDFs land, before categorization and ingest.
+    """Directory where saved job-posting PDFs land, before categorization and ingest.
 
     This is the SOURCE only — an external, user-controlled folder the agent moves files out of.
     It is never the applied-jobs corpus, which lives at tools_generic.APPLIED_JOBS_DIR
     (run_dir/applied_jobs/) and is deliberately not configurable.
-    '''
+    """
     return Path(str(load_preferences()['save_dir'])).expanduser()
 
 
 def search_regions() -> list[dict[str, str]]:
-    '''Regions to search. Empty means one unfiltered search.
+    """Regions to search. Empty means one unfiltered search.
 
     Each entry is {'name', 'linkedin_location', 'geo_id'}:
       - `linkedin_location` is the text TYPED INTO the location chip's autocomplete, which is how
@@ -177,7 +177,7 @@ def search_regions() -> list[dict[str, str]]:
         LinkedIn puts in the URL once the suggestion is picked (e.g. European Union = 91000000).
         Before 2026-08-18 the region was typed into `keywords`, which LinkedIn silently ignored,
         so every EU search returned the account's home metro for days without anything noticing.
-    '''
+    """
     return list(load_preferences()['search_regions'])
 
 
@@ -189,63 +189,63 @@ def _places(key: str) -> tuple[str, ...]:
 
 
 def sponsorship_required_in() -> tuple[str, ...]:
-    '''Place names where the user would need visa sponsorship, as written.
+    """Place names where the user would need visa sponsorship, as written.
 
     Returned unfolded like the other place-name lists. This rule still compares by SUBSTRING and
     case-insensitively at its call site, unlike the two geographic lists -- but the folding happens
     there, where it is a comparison, rather than here, where it would be a lossy store.
-    '''
+    """
     return tuple(
         str(loc).strip() for loc in load_preferences()['sponsorship_required_in'] if str(loc).strip()
     )
 
 
 def would_live_here() -> tuple[str, ...]:
-    '''Places the user has said they would live. Exempts a posting from the geographic gate.
+    """Places the user has said they would live. Exempts a posting from the geographic gate.
 
     Returned **as written**, like the company blacklist and unlike the vocabulary lists: these are
     proper names, matched case-sensitively and accent-exactly. Lowercasing them is what made
     `malaga` an entry that could never match `Málaga`.
-    '''
+    """
     return _places('would_live_here')
 
 
 def would_not_live_here() -> tuple[str, ...]:
-    '''Places the user has said they would NOT live. Rejects outright, ahead of any guess.'''
+    """Places the user has said they would NOT live. Rejects outright, ahead of any guess."""
     return _places('would_not_live_here')
 
 
 def not_yet_bucketed() -> tuple[str, ...]:
-    '''Places the agent has guessed about, awaiting the user's decision.
+    """Places the agent has guessed about, awaiting the user's decision.
 
     **Gates nothing.** A posting here is rated and shown normally, carrying a warning that says the
     location was guessed. That is the whole reason the agent is allowed to write this one list and
     no other: it cannot reject a job by appending to it.
-    '''
+    """
     return _places('not_yet_bucketed')
 
 
 def would_commute_here() -> tuple[str, ...]:
-    '''Places the user would travel to an OFFICE. A different question from would_live_here.
+    """Places the user would travel to an OFFICE. A different question from would_live_here.
 
     Drives the hybrid/on-site rating cap only. Living somewhere does not imply commuting across it
     -- `Spain` on the live list once meant an on-site role in any Spanish town was uncapped.
-    '''
+    """
     return _places('would_commute_here')
 
 
 def languages() -> tuple[str, ...]:
-    '''Lowercase languages the user works in; a posting requiring any other language is rejected.'''
+    """Lowercase languages the user works in; a posting requiring any other language is rejected."""
     return tuple(str(lang).lower() for lang in load_preferences()['languages'])
 
 
 def foreign_language_rating_cap() -> int:
-    '''Highest rating a posting written in a language outside `languages` can receive.'''
+    """Highest rating a posting written in a language outside `languages` can receive."""
     return int(load_preferences()['foreign_language_rating_cap'])
 
 
 def rejected_degrees() -> tuple[str, ...]:
-    '''Lowercase degree levels ('master', 'phd') that hard-reject when a posting requires them.'''
+    """Lowercase degree levels ('master', 'phd') that hard-reject when a posting requires them."""
     return tuple(str(degree).lower() for degree in load_preferences()['reject_required_degrees'])
 
 
@@ -266,11 +266,11 @@ def relocation_note() -> str:
 
 
 def salary_target() -> tuple[float, str] | None:
-    '''(annual base target, ISO currency) — or None when either is unset.
+    """(annual base target, ISO currency) — or None when either is unset.
 
     A malformed value raises rather than reading as unset: an ignored target silently switches the
     below-target comparison off and hands it back to the rater.
-    '''
+    """
     compensation = load_preferences()['compensation']
     raw_target, raw_currency = compensation.get('base_target'), compensation.get('currency')
     if raw_target in (None, '') or not raw_currency:
@@ -292,7 +292,7 @@ def salary_target() -> tuple[float, str] | None:
 
 
 def _parse_added_date(raw: Any) -> date | None:
-    '''Parse a blacklist entry's `added` field. None if absent; raises ValueError if unparseable.'''
+    """Parse a blacklist entry's `added` field. None if absent; raises ValueError if unparseable."""
     if isinstance(raw, datetime):
         return raw.date()
     if isinstance(raw, date):
@@ -306,7 +306,7 @@ def _parse_added_date(raw: Any) -> date | None:
 
 
 def _blacklist_entries() -> list[tuple[str, str, date | None, str]]:
-    '''Normalize the raw blacklist into (name, reason, added_date, date_problem) tuples.
+    """Normalize the raw blacklist into (name, reason, added_date, date_problem) tuples.
 
     `date_problem` is empty, or says why `added` could not be read; the caller that owns the
     once-per-entry warning reports it.
@@ -314,7 +314,7 @@ def _blacklist_entries() -> list[tuple[str, str, date | None, str]]:
     Accepts either a mapping per entry or a bare string (a name with no reason and no date), so a
     hand-edited list of plain names still works. Names are returned **as written** — the match is
     case-sensitive, unlike every other preference accessor here.
-    '''
+    """
     entries: list[tuple[str, str, date | None, str]] = []
     for raw in load_preferences()['companies']['blacklist']:
         date_problem = ''
@@ -333,12 +333,12 @@ def _blacklist_entries() -> list[tuple[str, str, date | None, str]]:
 
 
 def blacklisted_companies() -> tuple[tuple[str, str], ...]:
-    '''(name, reason) pairs for unexpired blacklist entries. Empty means no blacklist gate.
+    """(name, reason) pairs for unexpired blacklist entries. Empty means no blacklist gate.
 
     An entry with a missing or unparseable `added` date stays **active** and is warned about. An
     auto-reject is unappealable, so a typo in a date must not silently switch the rule off; the
     warning is how the typo gets noticed.
-    '''
+    """
     active: list[tuple[str, str]] = []
     for name, reason, added, date_problem in _blacklist_entries():
         if added is None:
@@ -366,7 +366,7 @@ def blacklisted_companies() -> tuple[tuple[str, str], ...]:
 
 
 def expired_blacklist_entries() -> tuple[tuple[str, str], ...]:
-    '''(name, added-date) pairs past COMPANY_BLACKLIST_EXPIRY_DAYS. Reported, never enforced.'''
+    """(name, added-date) pairs past COMPANY_BLACKLIST_EXPIRY_DAYS. Reported, never enforced."""
     return tuple(
         (name, added.isoformat())
         for name, _reason, added, _date_problem in _blacklist_entries()

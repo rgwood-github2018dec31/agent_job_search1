@@ -40,23 +40,23 @@ from utils_tools_n_agents_common.models import (
 # ---------------------------------------------------------------------------
 
 def test_underscorify_basic():
-    assert tools.underscorify("Hello World") == "hello_world"
+    assert tools.underscorify('Hello World') == 'hello_world'
 
 
 def test_underscorify_special_chars():
-    assert tools.underscorify("Shopify Inc.") == "shopify_inc"
+    assert tools.underscorify('Shopify Inc.') == 'shopify_inc'
 
 
 def test_underscorify_consecutive_separators():
-    assert tools.underscorify("Senior  Software---Engineer") == "senior_software_engineer"
+    assert tools.underscorify('Senior  Software---Engineer') == 'senior_software_engineer'
 
 
 def test_underscorify_leading_trailing():
-    assert tools.underscorify("  leading and trailing  ") == "leading_and_trailing"
+    assert tools.underscorify('  leading and trailing  ') == 'leading_and_trailing'
 
 
 def test_underscorify_numbers():
-    assert tools.underscorify("GPT-4 Engineer") == "gpt_4_engineer"
+    assert tools.underscorify('GPT-4 Engineer') == 'gpt_4_engineer'
 
 
 # ---------------------------------------------------------------------------
@@ -64,69 +64,69 @@ def test_underscorify_numbers():
 # ---------------------------------------------------------------------------
 
 async def test_save_job_posting_creates_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
 
     result = await tools.do_save_job_posting(
-        company="Shopify",
-        description="Senior Software Engineer",
+        company='Shopify',
+        description='Senior Software Engineer',
         rating=4,
-        content="# Senior Software Engineer at Shopify\n\nGreat remote role.",
+        content='# Senior Software Engineer at Shopify\n\nGreat remote role.',
     )
 
-    assert not result.get("isError")
-    saved_dirs = list(tmp_path.glob("saved_jobs-*"))
+    assert not result.get('isError')
+    saved_dirs = list(tmp_path.glob('saved_jobs-*'))
     assert len(saved_dirs) == 1
 
-    files = list(saved_dirs[0].glob("job_posting-noid-rating_4-shopify-senior_software_engineer-*.md"))
+    files = list(saved_dirs[0].glob('job_posting-noid-rating_4-shopify-senior_software_engineer-*.md'))
     assert len(files) == 1
-    assert files[0].read_text() == "# Senior Software Engineer at Shopify\n\nGreat remote role."
+    assert files[0].read_text() == '# Senior Software Engineer at Shopify\n\nGreat remote role.'
 
 
 async def test_save_job_posting_result_contains_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
 
     result = await tools.do_save_job_posting(
-        company="Acme",
-        description="Engineer",
+        company='Acme',
+        description='Engineer',
         rating=2,
-        content="content",
+        content='content',
     )
 
-    text = result["content"][0]["text"]
-    assert "saved_jobs-" in text
-    assert "job_posting-noid-rating_2-acme-engineer-" in text
+    text = result['content'][0]['text']
+    assert 'saved_jobs-' in text
+    assert 'job_posting-noid-rating_2-acme-engineer-' in text
 
 
 async def test_save_job_posting_creates_daily_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
 
     for rating in (3, 5):
         await tools.do_save_job_posting(
-            company="Corp",
-            description="Role",
+            company='Corp',
+            description='Role',
             rating=rating,
-            content=f"content {rating}",
+            content=f'content {rating}',
         )
 
-    saved_dirs = list(tmp_path.glob("saved_jobs-*"))
+    saved_dirs = list(tmp_path.glob('saved_jobs-*'))
     assert len(saved_dirs) == 1  # same day → same dir
-    assert len(list(saved_dirs[0].glob("*.md"))) == 2
+    assert len(list(saved_dirs[0].glob('*.md'))) == 2
 
 
 async def test_save_job_posting_caps_long_filename(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
 
-    long_description = "triaged out " + "this is an extremely long triage reason sentence " * 10
+    long_description = 'triaged out ' + 'this is an extremely long triage reason sentence ' * 10
     result = await tools.do_save_job_posting(
-        company="A Very Long Company Name That Goes On And On Incorporated",
+        company='A Very Long Company Name That Goes On And On Incorporated',
         description=long_description,
         rating=1,
-        content="content",
-        job_id="4442638114",
+        content='content',
+        job_id='4442638114',
     )
 
-    assert not result.get("isError")
-    files = list(tmp_path.glob("saved_jobs-*/job_posting-4442638114-rating_1-*.md"))
+    assert not result.get('isError')
+    files = list(tmp_path.glob('saved_jobs-*/job_posting-4442638114-rating_1-*.md'))
     assert len(files) == 1
     assert len(files[0].name.encode()) < 255
 
@@ -136,33 +136,33 @@ async def test_save_job_posting_caps_long_filename(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_update_job_requirements_writes_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(tools, 'JOB_REQUIREMENTS_PATH', tmp_path / 'JOB_REQUIREMENTS.md')
 
-    content = "# Requirements\n\n- Remote only\n- Canada or EU\n"
+    content = '# Requirements\n\n- Remote only\n- Canada or EU\n'
     result = await tools.do_update_job_requirements(content)
 
-    assert not result.get("isError")
-    assert (tmp_path / "JOB_REQUIREMENTS.md").read_text() == content
+    assert not result.get('isError')
+    assert (tmp_path / 'JOB_REQUIREMENTS.md').read_text() == content
 
 
 async def test_update_job_requirements_returns_content(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(tools, 'JOB_REQUIREMENTS_PATH', tmp_path / 'JOB_REQUIREMENTS.md')
 
-    content = "# Requirements\n\n- Senior only\n"
+    content = '# Requirements\n\n- Senior only\n'
     result = await tools.do_update_job_requirements(content)
 
     # New contents must be in the tool result so the agent has them in context
-    assert content in result["content"][0]["text"]
+    assert content in result['content'][0]['text']
 
 
 async def test_update_job_requirements_overwrites(tmp_path, monkeypatch):
-    path = tmp_path / "JOB_REQUIREMENTS.md"
-    monkeypatch.setattr(tools, "JOB_REQUIREMENTS_PATH", path)
+    path = tmp_path / 'JOB_REQUIREMENTS.md'
+    monkeypatch.setattr(tools, 'JOB_REQUIREMENTS_PATH', path)
 
-    await tools.do_update_job_requirements("first version")
-    await tools.do_update_job_requirements("second version")
+    await tools.do_update_job_requirements('first version')
+    await tools.do_update_job_requirements('second version')
 
-    assert path.read_text() == "second version"
+    assert path.read_text() == 'second version'
 
 
 # ---------------------------------------------------------------------------
@@ -171,30 +171,30 @@ async def test_update_job_requirements_overwrites(tmp_path, monkeypatch):
 
 
 def test_log_run_cost_writes_jsonl_line(tmp_path):
-    log_path = tmp_path / "cost_log.jsonl"
-    record = {"mode": "non-interactive", "total_cost": 1.2345}
+    log_path = tmp_path / 'cost_log.jsonl'
+    record = {'mode': 'non-interactive', 'total_cost': 1.2345}
 
     tools.log_run_cost(record, log_path=log_path)
 
-    lines = log_path.read_text(encoding="utf-8").splitlines()
+    lines = log_path.read_text(encoding='utf-8').splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0]) == record
 
 
 def test_log_run_cost_appends_multiple_runs(tmp_path):
-    log_path = tmp_path / "cost_log.jsonl"
+    log_path = tmp_path / 'cost_log.jsonl'
 
-    tools.log_run_cost({"run": 1}, log_path=log_path)
-    tools.log_run_cost({"run": 2}, log_path=log_path)
+    tools.log_run_cost({'run': 1}, log_path=log_path)
+    tools.log_run_cost({'run': 2}, log_path=log_path)
 
-    lines = log_path.read_text(encoding="utf-8").splitlines()
-    assert [json.loads(line) for line in lines] == [{"run": 1}, {"run": 2}]
+    lines = log_path.read_text(encoding='utf-8').splitlines()
+    assert [json.loads(line) for line in lines] == [{'run': 1}, {'run': 2}]
 
 
 def test_log_run_cost_creates_parent_dirs(tmp_path):
-    log_path = tmp_path / "nested" / "cost_log.jsonl"
+    log_path = tmp_path / 'nested' / 'cost_log.jsonl'
 
-    tools.log_run_cost({"run": 1}, log_path=log_path)
+    tools.log_run_cost({'run': 1}, log_path=log_path)
 
     assert log_path.exists()
 
@@ -202,33 +202,33 @@ def test_log_run_cost_creates_parent_dirs(tmp_path):
 def test_new_stage_stats_zeroed():
     stats = agent.new_stage_stats()
     assert stats == {
-        "cost": 0.0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "session_costs": {},
+        'cost': 0.0,
+        'input_tokens': 0,
+        'output_tokens': 0,
+        'cache_read_input_tokens': 0,
+        'cache_creation_input_tokens': 0,
+        'session_costs': {},
     }
 
 
 def test_accumulate_stage_stats_sums_usage_and_cost():
     """Two independent requests (separate sessions) sum in both usage and cost."""
     usage = {
-        "input_tokens": 100,
-        "output_tokens": 50,
-        "cache_read_input_tokens": 10,
-        "cache_creation_input_tokens": 5,
+        'input_tokens': 100,
+        'output_tokens': 50,
+        'cache_read_input_tokens': 10,
+        'cache_creation_input_tokens': 5,
     }
     stats = agent.new_stage_stats()
-    agent.accumulate_stage_stats(stats, _result_msg("req-1", 0.01, **usage))
-    agent.accumulate_stage_stats(stats, _result_msg("req-2", 0.01, **usage))
+    agent.accumulate_stage_stats(stats, _result_msg('req-1', 0.01, **usage))
+    agent.accumulate_stage_stats(stats, _result_msg('req-2', 0.01, **usage))
 
-    assert agent.public_stage_stats({"s": stats})["s"] == {
-        "cost": pytest.approx(0.02),
-        "input_tokens": 200,
-        "output_tokens": 100,
-        "cache_read_input_tokens": 20,
-        "cache_creation_input_tokens": 10,
+    assert agent.public_stage_stats({'s': stats})['s'] == {
+        'cost': pytest.approx(0.02),
+        'input_tokens': 200,
+        'output_tokens': 100,
+        'cache_read_input_tokens': 20,
+        'cache_creation_input_tokens': 10,
     }
 
 
@@ -246,83 +246,83 @@ def _old_date() -> str:
 
 
 async def test_check_and_record_job_new(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
     result = await tools.do_check_and_record_job(
-        "linkedin", "1234567890", "Shopify", "Senior Engineer", date_posted=_recent_date()
+        'linkedin', '1234567890', 'Shopify', 'Senior Engineer', date_posted=_recent_date()
     )
 
-    assert result["content"][0]["text"] == "new"
-    files = list((tmp_path / "processed_jobs").glob("job_posting-linkedin-1234567890-*.yaml"))
+    assert result['content'][0]['text'] == 'new'
+    files = list((tmp_path / 'processed_jobs').glob('job_posting-linkedin-1234567890-*.yaml'))
     assert len(files) == 1
 
 
 async def test_check_and_record_job_duplicate(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
     await tools.do_check_and_record_job(
-        "linkedin", "1234567890", "Shopify", "Senior Engineer", date_posted=_recent_date()
+        'linkedin', '1234567890', 'Shopify', 'Senior Engineer', date_posted=_recent_date()
     )
     result = await tools.do_check_and_record_job(
-        "linkedin", "1234567890", "Shopify", "Senior Engineer", date_posted=_recent_date()
+        'linkedin', '1234567890', 'Shopify', 'Senior Engineer', date_posted=_recent_date()
     )
 
-    assert result["content"][0]["text"] == "already_processed"
+    assert result['content'][0]['text'] == 'already_processed'
 
 
 async def test_check_and_record_job_too_old(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
     result = await tools.do_check_and_record_job(
-        "linkedin", "9999999999", "OldCo", "Stale Role", date_posted=_old_date()
+        'linkedin', '9999999999', 'OldCo', 'Stale Role', date_posted=_old_date()
     )
 
-    assert result["content"][0]["text"] == "too_old"
-    assert not list((tmp_path / "processed_jobs").glob("*.yaml"))
+    assert result['content'][0]['text'] == 'too_old'
+    assert not list((tmp_path / 'processed_jobs').glob('*.yaml'))
 
 
 async def test_check_and_record_job_different_sites(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
     r1 = await tools.do_check_and_record_job(
-        "linkedin", "111", "Corp", "Engineer", date_posted=_recent_date()
+        'linkedin', '111', 'Corp', 'Engineer', date_posted=_recent_date()
     )
     r2 = await tools.do_check_and_record_job(
-        "indeed", "111", "Corp", "Engineer", date_posted=_recent_date()
+        'indeed', '111', 'Corp', 'Engineer', date_posted=_recent_date()
     )
 
-    assert r1["content"][0]["text"] == "new"
-    assert r2["content"][0]["text"] == "new"
+    assert r1['content'][0]['text'] == 'new'
+    assert r2['content'][0]['text'] == 'new'
 
 
 async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
     import yaml
 
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
     posted = _recent_date()
     await tools.do_check_and_record_job(
-        "linkedin", "5555555555", "Stripe", "Staff Engineer", date_posted=posted
+        'linkedin', '5555555555', 'Stripe', 'Staff Engineer', date_posted=posted
     )
 
-    files = list((tmp_path / "processed_jobs").glob("*.yaml"))
+    files = list((tmp_path / 'processed_jobs').glob('*.yaml'))
     data = yaml.safe_load(files[0].read_text())
-    assert data["site"] == "linkedin"
-    assert data["job_id"] == "5555555555"
-    assert data["date_posted"] == posted
-    assert data["date_recorded"] == date.today().isoformat()
-    assert data["company"] == "Stripe"
-    assert data["description"] == "Staff Engineer"
+    assert data['site'] == 'linkedin'
+    assert data['job_id'] == '5555555555'
+    assert data['date_posted'] == posted
+    assert data['date_recorded'] == date.today().isoformat()
+    assert data['company'] == 'Stripe'
+    assert data['description'] == 'Staff Engineer'
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +338,7 @@ async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
     'Will not sponsor applicants for work visas',
     'US citizens and permanent residents only',
     'Currently authorized to work in the United States',
-    "This position does not provide visa sponsorship",
+    'This position does not provide visa sponsorship',
     'Employment authorization without sponsorship required',
     'must be legally authorized to work in the united states',
     'Must be authorized to work in the U.S.',
@@ -394,53 +394,53 @@ async def test_check_and_record_job_auth_not_triggered_for_canada(tmp_path, monk
 # ---------------------------------------------------------------------------
 
 async def test_load_processed_jobs_from_md_files(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
-    await tools.do_save_job_posting("Shopify", "Engineer", 4, "content", job_id="3859234876")
-    await tools.do_save_job_posting("Acme", "Designer", 2, "content", job_id="1122334455")
+    await tools.do_save_job_posting('Shopify', 'Engineer', 4, 'content', job_id='3859234876')
+    await tools.do_save_job_posting('Acme', 'Designer', 2, 'content', job_id='1122334455')
 
     tools.load_processed_jobs()
-    assert ("linkedin", "3859234876") in tools._processed_jobs
-    assert ("linkedin", "1122334455") in tools._processed_jobs
+    assert ('linkedin', '3859234876') in tools._processed_jobs
+    assert ('linkedin', '1122334455') in tools._processed_jobs
 
 
 async def test_load_processed_jobs_from_yaml_files(tmp_path, monkeypatch):
     import yaml
 
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
-    (tmp_path / "processed_jobs").mkdir()
-    (tmp_path / "processed_jobs" / "job_posting-indeed-42-2026Apr10-000-co-role.yaml").write_text(
-        yaml.dump({"site": "indeed", "job_id": "42", "date_posted": "2026-04-05",
-                   "date_recorded": "2026-04-10", "company": "co", "description": "role"})
+    (tmp_path / 'processed_jobs').mkdir()
+    (tmp_path / 'processed_jobs' / 'job_posting-indeed-42-2026Apr10-000-co-role.yaml').write_text(
+        yaml.dump({'site': 'indeed', 'job_id': '42', 'date_posted': '2026-04-05',
+                   'date_recorded': '2026-04-10', 'company': 'co', 'description': 'role'})
     )
 
     tools.load_processed_jobs()
-    assert ("indeed", "42") in tools._processed_jobs
+    assert ('indeed', '42') in tools._processed_jobs
 
 
 async def test_load_processed_jobs_combines_both(tmp_path, monkeypatch):
     import yaml
 
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(tools, "PROCESSED_JOBS_DIR", tmp_path / "processed_jobs")
-    monkeypatch.setattr(tools, "_processed_jobs", set())
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
 
-    await tools.do_save_job_posting("Corp", "Role", 3, "content", job_id="111")
+    await tools.do_save_job_posting('Corp', 'Role', 3, 'content', job_id='111')
 
-    (tmp_path / "processed_jobs").mkdir()
-    (tmp_path / "processed_jobs" / "job_posting-indeed-999-2026Apr10-000-co-role.yaml").write_text(
-        yaml.dump({"site": "indeed", "job_id": "999", "date_posted": "2026-04-05",
-                   "date_recorded": "2026-04-10", "company": "co", "description": "role"})
+    (tmp_path / 'processed_jobs').mkdir()
+    (tmp_path / 'processed_jobs' / 'job_posting-indeed-999-2026Apr10-000-co-role.yaml').write_text(
+        yaml.dump({'site': 'indeed', 'job_id': '999', 'date_posted': '2026-04-05',
+                   'date_recorded': '2026-04-10', 'company': 'co', 'description': 'role'})
     )
 
     tools.load_processed_jobs()
-    assert ("linkedin", "111") in tools._processed_jobs
-    assert ("indeed", "999") in tools._processed_jobs
+    assert ('linkedin', '111') in tools._processed_jobs
+    assert ('indeed', '999') in tools._processed_jobs
 
 
 # ---------------------------------------------------------------------------
@@ -448,35 +448,35 @@ async def test_load_processed_jobs_combines_both(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_build_system_prompt_includes_resume(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(agent, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'JOB_REQUIREMENTS.md')
 
-    (tmp_path / "R_Garth_Wood-resume-2026Apr08v1.md").write_text("# Garth Wood\n\nExperienced engineer.")
+    (tmp_path / 'R_Garth_Wood-resume-2026Apr08v1.md').write_text('# Garth Wood\n\nExperienced engineer.')
 
     prompt = agent.build_system_prompt(interactive=True)
-    assert "Garth Wood" in prompt
-    assert "RESUME" in prompt
+    assert 'Garth Wood' in prompt
+    assert 'RESUME' in prompt
 
 
 def test_build_system_prompt_includes_job_requirements(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
-    req_path = tmp_path / "JOB_REQUIREMENTS.md"
-    monkeypatch.setattr(agent, "JOB_REQUIREMENTS_PATH", req_path)
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    req_path = tmp_path / 'JOB_REQUIREMENTS.md'
+    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', req_path)
 
-    req_path.write_text("# Requirements\n\n- Remote only")
+    req_path.write_text('# Requirements\n\n- Remote only')
 
     prompt = agent.build_system_prompt(interactive=True)
-    assert "Remote only" in prompt
-    assert "JOB_REQUIREMENTS.md" in prompt
+    assert 'Remote only' in prompt
+    assert 'JOB_REQUIREMENTS.md' in prompt
 
 
 def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(agent, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(agent, "JOB_REQUIREMENTS_PATH", tmp_path / "JOB_REQUIREMENTS.md")
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'JOB_REQUIREMENTS.md')
 
     agent.build_system_prompt(interactive=True)
 
-    assert "Warning" in capsys.readouterr().out
+    assert 'Warning' in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -486,20 +486,20 @@ def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys)
 @pytest.mark.live_agent_claude
 async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
     """Agent uses the save_job_posting tool when instructed to save a job."""
-    monkeypatch.setattr(tools, "RUN_DIR", tmp_path)
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
     options = ClaudeAgentOptions(
         system_prompt=(
-            "You are a job search assistant. "
-            "When asked to save a job, use the save_job_posting tool exactly once."
+            'You are a job search assistant. '
+            'When asked to save a job, use the save_job_posting tool exactly once.'
         ),
-        mcp_servers={"job_search": tools.make_job_search_server(interactive=False)},
+        mcp_servers={'job_search': tools.make_job_search_server(interactive=False)},
         # bypassPermissions, as every non-interactive site in agent.py uses: acceptEdits
         # auto-approves file edits only, so an in-process MCP tool call is DENIED under it
         # (verified: the call arrives, then shows up in ResultMessage.permission_denials).
-        permission_mode="bypassPermissions",
+        permission_mode='bypassPermissions',
         # Without these the run also loads every global MCP server, burying save_job_posting
         # among dozens of unrelated tools, plus the repo CLAUDE.md. Same leak as the src sites.
         setting_sources=[],
@@ -517,12 +517,12 @@ async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
     ):
         pass
 
-    saved_dirs = list(tmp_path.glob("saved_jobs-*"))
-    assert len(saved_dirs) == 1, "Expected a saved_jobs-* directory to be created"
+    saved_dirs = list(tmp_path.glob('saved_jobs-*'))
+    assert len(saved_dirs) == 1, 'Expected a saved_jobs-* directory to be created'
     # Filename order is job_posting-{id}-rating_{n}-{company}-...; the old glob here had company
     # before rating and so could never have matched even once the tool was called.
-    files = list(saved_dirs[0].glob("job_posting-*-rating_4-testcorp-*.md"))
-    assert len(files) == 1, f"Expected one saved job file, found: {list(saved_dirs[0].iterdir())}"
+    files = list(saved_dirs[0].glob('job_posting-*-rating_4-testcorp-*.md'))
+    assert len(files) == 1, f'Expected one saved job file, found: {list(saved_dirs[0].iterdir())}'
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1127,7 @@ def test_min_turns_floor_is_absolute_not_a_budget_fraction():
     click-to-reveal, and a warning that fires on success gets ignored."""
     assert config.SCRAPER_MIN_TURNS_PER_QUERY >= 1
     assert config.SCRAPER_MIN_TURNS_PER_QUERY < config.SCRAPER_MAX_TURNS_PER_QUERY // 3, \
-        'must sit below a healthy query\'s turn count, not scale with the budget'
+        "must sit below a healthy query's turn count, not scale with the budget"
 
 
 async def test_queue_candidate_without_query_does_not_track(monkeypatch):
@@ -2048,13 +2048,13 @@ async def test_extract_applied_job_metadata_live():
     `_extract_applied_job_metadata(text, filename) -> dict` in commit 96bd708, but the old test
     stayed behind calling the deleted name. It never failed, because the live gate skipped it.
     """
-    text = '''
+    text = """
     Software Engineer — Remote
     Shopify
     We are looking for an experienced software engineer to join our team.
     You will work on our e-commerce platform serving millions of merchants.
     Requirements: 5+ years Python, strong distributed systems knowledge.
-    '''
+    """
     metadata = await tools._extract_applied_job_metadata(text, 'shopify_swe.pdf')
 
     assert 'shopify' in metadata['company'].lower(), metadata
@@ -2066,13 +2066,13 @@ async def test_extract_applied_job_metadata_live():
 @pytest.mark.live_agent_claude
 async def test_extract_applied_job_metadata_live_flags_agency():
     """The agency/end-client split is the field that keeps a staffing firm off the blocklist."""
-    text = '''
+    text = """
     Staff Machine Learning Engineer
     Posted by TalentBridge Recruiting — a specialist technology staffing agency.
     Our client, a global payments company called Northwind Payments, is looking for a
     Staff Machine Learning Engineer to join their fraud detection team.
     Requirements: 8+ years Python, production ML systems.
-    '''
+    """
     metadata = await tools._extract_applied_job_metadata(text, 'talentbridge_mle.pdf')
 
     assert metadata['is_agency'] is True, metadata
@@ -2081,7 +2081,7 @@ async def test_extract_applied_job_metadata_live_flags_agency():
 
 @pytest.mark.live_agent_claude
 async def test_categorize_pdf_text_live_saved_jd():
-    text = '''
+    text = """
     Principal AI Engineer — Remote Canada
     Dayforce
     We are hiring a Principal AI Engineer to lead our machine learning platform.
@@ -2089,7 +2089,7 @@ async def test_categorize_pdf_text_live_saved_jd():
     build RAG pipelines and LLM evaluation frameworks.
     Requirements: 10+ years experience, Python, deep learning expertise.
     Salary: CAD $220,000 base + equity.
-    '''
+    """
     category = await tools._categorize_pdf_text(text, 'Principal AI Engineer _ Dayforce Jobs.pdf')
     assert category is not None, 'tool was not called'
     assert category == 'saved_jd', f'expected saved_jd, got {category!r}'
@@ -2097,13 +2097,13 @@ async def test_categorize_pdf_text_live_saved_jd():
 
 @pytest.mark.live_agent_claude
 async def test_categorize_pdf_text_live_other():
-    text = '''
+    text = """
     Your Airbnb booking confirmation
     Check-in: June 12, 2026
     Check-out: June 15, 2026
     Property: Cozy cabin in Whistler
     Total: $450 CAD
-    '''
+    """
     category = await tools._categorize_pdf_text(text, 'Your trip overview – Airbnb.pdf')
     assert category is not None, 'tool was not called'
     assert category != 'saved_jd', f'expected non-jd category, got {category!r}'
@@ -3185,7 +3185,7 @@ def test_release_run_lock_does_not_delete_another_runs_lock(tmp_path, monkeypatc
 
     tools.release_run_lock(lock)
 
-    assert lock.exists(), "must never release a lock we do not hold"
+    assert lock.exists(), 'must never release a lock we do not hold'
 
 
 def test_force_overrides_active_lock(tmp_path, monkeypatch):
@@ -3969,7 +3969,7 @@ def test_merge_salary_warning_puts_the_code_line_before_the_raters_floor_first_b
     merged = agent.merge_warnings(deterministic, llm)
     assert len(merged) == 1, 'one salary line, not two saying the same thing differently'
     assert merged[0].startswith('Partial salary — only a lower bound:'), \
-        'the structure is stated in code first, the rater\'s judgement second'
+        "the structure is stated in code first, the rater's judgement second"
     assert '$210K target' in merged[0], "the rater's estimate is kept, not discarded"
 
 
@@ -8189,7 +8189,7 @@ async def test_stage2_restarts_a_dead_browser_and_retries_the_same_job(monkeypat
     assert [job for job, _ in calls] == ['1', '1', '2'], 'the job the browser died on must be retried'
     assert calls[1][1] == 'http://localhost:2/mcp', 'the retry must use the restarted server'
     assert browser.restarts == 1
-    assert 'eval_error' not in funnel, 'a dead browser is not the job\'s fault'
+    assert 'eval_error' not in funnel, "a dead browser is not the job's fault"
     assert funnel.get('extract_failed') == 2
     assert released == []
     assert [a['kind'] for a in agent.tools_module._ui_alerts] == ['browser_restarted']

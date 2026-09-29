@@ -58,14 +58,14 @@ from agentic_job_search.triage import chat_openrouter, extract_json_object
 console = Console()
 
 PROJECT_DIR = Path(__file__).parent.parent.parent  # src/agentic_job_search/ -> src/ -> project root
-RUN_DIR = PROJECT_DIR / "run_dir"
-JOB_REQUIREMENTS_PATH = RUN_DIR / "JOB_REQUIREMENTS.md"
-PROCESSED_JOBS_DIR = RUN_DIR / "processed_jobs"
+RUN_DIR = PROJECT_DIR / 'run_dir'
+JOB_REQUIREMENTS_PATH = RUN_DIR / 'JOB_REQUIREMENTS.md'
+PROCESSED_JOBS_DIR = RUN_DIR / 'processed_jobs'
 # The page an extract was made from, kept so a figure it reports can be checked against its source.
 # READ BY NOTHING IN THE PIPELINE — no gate, no rating, no dedup. It exists because 'CA$208,580 -
 # $273,770' reached a notification with no way, anywhere, to tell whether the page said that
 # (2026-09-22). Date-partitioned so pruning is a whole-directory operation.
-RAW_POSTINGS_DIR = RUN_DIR / "raw_postings"
+RAW_POSTINGS_DIR = RUN_DIR / 'raw_postings'
 # Applied-job PDFs travel between TWO DISTINCT DIRECTORIES, and nothing conflates them:
 #
 #   save_dir       — SOURCE. Outside the project, user-controlled, configurable via the
@@ -77,11 +77,11 @@ RAW_POSTINGS_DIR = RUN_DIR / "raw_postings"
 #
 # Functions that touch both take them as separate parameters named `save_dir` and
 # `applied_to_dir`; a function that names only one directory operates only on that one.
-APPLIED_JOBS_DIR = RUN_DIR / "applied_jobs"
-APPLIED_JOBS_INDEX_PATH = APPLIED_JOBS_DIR / "index.yaml"
+APPLIED_JOBS_DIR = RUN_DIR / 'applied_jobs'
+APPLIED_JOBS_INDEX_PATH = APPLIED_JOBS_DIR / 'index.yaml'
 # Legacy per-path cache from when the corpus lived in ~/Downloads; still read during ingest
 # as a fallback source of applied dates if a file's mtime has drifted.
-LEGACY_DOWNLOADS_CACHE_PATH = RUN_DIR / "downloads_pdf_cache.yaml"
+LEGACY_DOWNLOADS_CACHE_PATH = RUN_DIR / 'downloads_pdf_cache.yaml'
 
 # Leading wildcard so an already-date-prefixed PDF landing back in the save directory is ingested
 # (with its original date) rather than silently ignored.
@@ -1601,11 +1601,11 @@ def unsurfaced_pools(saved_ratings: dict[tuple[str, str], int] | None = None) ->
 
 
 def underscorify(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+    return re.sub(r'[^a-z0-9]+', '_', s.lower()).strip('_')
 
 
 # Old MD filename pattern: job_posting-{linkedin_id}[-rating_{N}]-{company}-{desc}-{timestamp}.md
-_SAVED_JOB_MD_RE = re.compile(r"^job_posting-(\d+|noid)(?:-rating_\d+)?-.+-\d+\.md$")
+_SAVED_JOB_MD_RE = re.compile(r'^job_posting-(\d+|noid)(?:-rating_\d+)?-.+-\d+\.md$')
 
 
 def load_processed_jobs() -> None:
@@ -1614,19 +1614,19 @@ def load_processed_jobs() -> None:
     ids: set[tuple[str, str]] = set()
 
     # Old format: extract (linkedin, job_id) from saved MD filenames
-    for f in RUN_DIR.glob("saved_jobs-*/job_posting-*.md"):
+    for f in RUN_DIR.glob('saved_jobs-*/job_posting-*.md'):
         m = _SAVED_JOB_MD_RE.match(f.name)
         if m:
             job_id = m.group(1)
-            if job_id != "noid":
-                ids.add(("linkedin", job_id))
+            if job_id != 'noid':
+                ids.add(('linkedin', job_id))
 
     # New format: load (site, job_id) from per-job YAML files
-    for f in PROCESSED_JOBS_DIR.glob("*.yaml"):
+    for f in PROCESSED_JOBS_DIR.glob('*.yaml'):
         try:
-            data = yaml.safe_load(f.read_text(encoding="utf-8"))
-            if data and "site" in data and "job_id" in data:
-                ids.add((data["site"], str(data["job_id"])))
+            data = yaml.safe_load(f.read_text(encoding='utf-8'))
+            if data and 'site' in data and 'job_id' in data:
+                ids.add((data['site'], str(data['job_id'])))
         except Exception as ex:
             logger.warning(
                 f'Could not read processed-job record {f}; that job may be re-evaluated: {type(ex).__name__}: {ex}'
@@ -1634,7 +1634,7 @@ def load_processed_jobs() -> None:
             console.print(f'[yellow]Warning: could not read {f}: {ex}[/yellow]')
 
     _processed_jobs = ids
-    console.print(f"[dim]Loaded {len(_processed_jobs)} previously processed job(s).[/dim]")
+    console.print(f'[dim]Loaded {len(_processed_jobs)} previously processed job(s).[/dim]')
 
 
 def forget_processed_job(site: str, job_id: str) -> int:
@@ -1661,40 +1661,40 @@ def forget_processed_job(site: str, job_id: str) -> int:
 async def do_save_job_posting(
     company: str, description: str, rating: int, content: str, job_id: str | None = None
 ) -> dict:
-    date_str = datetime.now().strftime("%Y%b%d")
-    dir_path = RUN_DIR / f"saved_jobs-{date_str}"
+    date_str = datetime.now().strftime('%Y%b%d')
+    dir_path = RUN_DIR / f'saved_jobs-{date_str}'
     dir_path.mkdir(parents=True, exist_ok=True)
 
     ts = int(time.time())
-    id_part = job_id if job_id else "noid"
-    rating_part = f"-rating_{rating}" if rating is not None else ""
+    id_part = job_id if job_id else 'noid'
+    rating_part = f'-rating_{rating}' if rating is not None else ''
     # Cap name components (SAVED_JOB_FILENAME_*); the full text is in the file itself.
     company_part = underscorify(company)[:SAVED_JOB_FILENAME_COMPANY_MAX_CHARS].rstrip('_')
     description_part = underscorify(description)[:SAVED_JOB_FILENAME_DESCRIPTION_MAX_CHARS].rstrip('_')
-    filename = f"job_posting-{id_part}{rating_part}-{company_part}-{description_part}-{ts}.md"
-    (dir_path / filename).write_text(content, encoding="utf-8")
+    filename = f'job_posting-{id_part}{rating_part}-{company_part}-{description_part}-{ts}.md'
+    (dir_path / filename).write_text(content, encoding='utf-8')
 
-    return {"content": [{"type": "text", "text": f"Saved: saved_jobs-{date_str}/{filename}"}]}
+    return {'content': [{'type': 'text', 'text': f'Saved: saved_jobs-{date_str}/{filename}'}]}
 
 
 async def do_update_job_requirements(content: str) -> dict:
-    JOB_REQUIREMENTS_PATH.write_text(content, encoding="utf-8")
+    JOB_REQUIREMENTS_PATH.write_text(content, encoding='utf-8')
     return {
-        "content": [
-            {"type": "text", "text": f"JOB_REQUIREMENTS.md updated. New contents:\n\n{content}"}
+        'content': [
+            {'type': 'text', 'text': f'JOB_REQUIREMENTS.md updated. New contents:\n\n{content}'}
         ]
     }
 
 
-COST_LOG_PATH = RUN_DIR / "cost_log.jsonl"
+COST_LOG_PATH = RUN_DIR / 'cost_log.jsonl'
 
 
 def log_run_cost(record: dict, log_path: Path | None = None) -> None:
     """Append a per-run cost record as one JSON line to cost_log.jsonl."""
     path = log_path if log_path is not None else COST_LOG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    with path.open('a', encoding='utf-8') as f:
+        f.write(json.dumps(record) + '\n')
 
 
 # Written as the name is written, like every other place name (see docs/requirements.md, Names
@@ -1729,8 +1729,8 @@ def _requires_current_us_auth(text: str) -> bool:
 # rejected date silently skips the stale-posting rule (2026-09-24).
 # A LEADING date is the posting date; a date later in the string is often when the page was viewed.
 _LEADING_ISO_DATE_RE = re.compile(r'^(?P<iso>\d{4}-\d{2}-\d{2})\b')
-_RELATIVE_DATE_RE = re.compile(r"\b(?P<count>\d+)\s+(?P<unit>minute|hour|day|week|month)s?\s+ago\b")
-_JUST_POSTED_PHRASES = ("just now", "today", "moments ago")
+_RELATIVE_DATE_RE = re.compile(r'\b(?P<count>\d+)\s+(?P<unit>minute|hour|day|week|month)s?\s+ago\b')
+_JUST_POSTED_PHRASES = ('just now', 'today', 'moments ago')
 # "N months ago" is approximate by nature; a calendar-exact month would imply false precision.
 DAYS_PER_MONTH_APPROX = 30
 
@@ -1755,8 +1755,8 @@ def parse_posting_date(date_posted: str | None) -> date | None:
     m = _RELATIVE_DATE_RE.search(s)
     if m:
         n, unit = int(m.group('count')), m.group('unit')
-        deltas = {"minute": timedelta(minutes=n), "hour": timedelta(hours=n), "day": timedelta(days=n),
-                  "week": timedelta(weeks=n), "month": timedelta(days=n * DAYS_PER_MONTH_APPROX)}
+        deltas = {'minute': timedelta(minutes=n), 'hour': timedelta(hours=n), 'day': timedelta(days=n),
+                  'week': timedelta(weeks=n), 'month': timedelta(days=n * DAYS_PER_MONTH_APPROX)}
         return (datetime.now() - deltas[unit]).date()
     if s in _JUST_POSTED_PHRASES:
         return date.today()
@@ -1786,16 +1786,16 @@ async def do_check_and_record_job(
         }
         logger.info(f'check_and_record_job: {status} — {company} — {description} '
                     f'[{site}/{job_id}, date_posted={date_posted!r}]')
-        return {"content": [{"type": "text", "text": status}]}
+        return {'content': [{'type': 'text', 'text': status}]}
 
     key = (site, job_id)
     if key in _processed_jobs:
-        return _result("already_processed")
+        return _result('already_processed')
 
     matched_pdf = await company_matches_applied(company)
     if matched_pdf is not None:
-        console.print(f"[dim]Skipping {company} — already applied ({matched_pdf}).[/dim]")
-        return _result("already_applied")
+        console.print(f'[dim]Skipping {company} — already applied ({matched_pdf}).[/dim]')
+        return _result('already_applied')
 
     try:
         posted = parse_posting_date(date_posted)
@@ -1804,32 +1804,32 @@ async def do_check_and_record_job(
         logger.warning(f'{site} job {job_id} ({company}): {ex} — treating its age as unknown')
         posted = None
     if posted and (date.today() - posted).days > JOB_MAX_AGE_DAYS:
-        return _result("too_old")
+        return _result('too_old')
 
     combined_text = ' '.join(filter(None, [description, content]))
     if _requires_current_us_auth(combined_text):
         console.print(f'[dim]Skipping {company} — requires current US work authorization.[/dim]')
-        return _result("auth_required")
+        return _result('auth_required')
 
     PROCESSED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.now().strftime("%Y%b%d")
+    date_str = datetime.now().strftime('%Y%b%d')
     ts = int(time.time())
-    filename = f"job_posting-{site}-{job_id}-{date_str}-{ts}-{underscorify(company)}-{underscorify(description)}.yaml"
+    filename = f'job_posting-{site}-{job_id}-{date_str}-{ts}-{underscorify(company)}-{underscorify(description)}.yaml'
     data = {
-        "site": site,
-        "job_id": job_id,
-        "date_posted": date_posted,
-        "date_recorded": date.today().isoformat(),
-        "company": company,
-        "description": description,
+        'site': site,
+        'job_id': job_id,
+        'date_posted': date_posted,
+        'date_recorded': date.today().isoformat(),
+        'company': company,
+        'description': description,
     }
     if url:
-        data["url"] = url
+        data['url'] = url
     if content:
-        data["content"] = content
-    (PROCESSED_JOBS_DIR / filename).write_text(yaml.dump(data, default_flow_style=False), encoding="utf-8")
+        data['content'] = content
+    (PROCESSED_JOBS_DIR / filename).write_text(yaml.dump(data, default_flow_style=False), encoding='utf-8')
     _processed_jobs.add(key)
-    return _result("new")
+    return _result('new')
 
 
 async def do_submit_job_extract(
@@ -1856,7 +1856,7 @@ async def do_submit_job_extract(
         'is_agency': is_agency,
         'end_client': (end_client or '').strip(),
     })
-    return {"content": [{"type": "text", "text": "Extract submitted."}]}
+    return {'content': [{'type': 'text', 'text': 'Extract submitted.'}]}
 
 
 async def do_queue_candidate(
@@ -1871,11 +1871,11 @@ async def do_queue_candidate(
             record['url'] = url or record['url']
             record['summary'] = reason
         logger.info(f'queue_candidate: SKIPPED {company} — {title} [{site}/{job_id}]: {reason}')
-        return {"content": [{"type": "text", "text": f"Skipped (not queued): {reason}. Continue with the next listing."}]}
+        return {'content': [{'type': 'text', 'text': f'Skipped (not queued): {reason}. Continue with the next listing.'}]}
     _candidates.append({
-        "site": site, "job_id": job_id, "url": url,
-        "title": title, "company": company,
-        "date_posted": date_posted or "", "snippet": snippet,
+        'site': site, 'job_id': job_id, 'url': url,
+        'title': title, 'company': company,
+        'date_posted': date_posted or '', 'snippet': snippet,
     })
     # Attribute to the query run_scraper is actually on, not the string the model echoed back.
     # Since the region and filter words moved into the search text, the model passes the full
@@ -1897,7 +1897,7 @@ async def do_queue_candidate(
         record['snippet'] = snippet
         record['outcome'] = 'queued'
     logger.info(f'queue_candidate: {company} — {title} [{site}/{job_id}, query={query!r}]')
-    return {"content": [{"type": "text", "text": f"Queued: {company} — {title}"}]}
+    return {'content': [{'type': 'text', 'text': f'Queued: {company} — {title}'}]}
 
 
 async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
@@ -1952,70 +1952,70 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
 # --- Tool wrappers (SDK @tool decorators delegate to the implementations above) ---
 
 @tool(
-    "save_job_posting",
-    "Save a job posting to the daily saved_jobs directory. Call this for every job evaluated. "
-    "Extract the LinkedIn job ID from the URL (e.g. linkedin.com/jobs/view/1234567890/) and pass it as job_id.",
+    'save_job_posting',
+    'Save a job posting to the daily saved_jobs directory. Call this for every job evaluated. '
+    'Extract the LinkedIn job ID from the URL (e.g. linkedin.com/jobs/view/1234567890/) and pass it as job_id.',
     # Explicit JSON Schema, not the {"name": str} shorthand: that shorthand marks EVERY key
     # required (claude_agent_sdk/__init__.py:422), and a required job_id makes this tool
     # uncallable for a posting whose id is not visible — the model either refuses or invents one.
     {
-        "type": "object",
-        "properties": {
-            "company": {"type": "string"},
-            "description": {"type": "string"},
-            "rating": {"type": "integer"},
-            "content": {"type": "string"},
-            "job_id": {"type": "string", "description": "LinkedIn job id if visible; omit if not"},
+        'type': 'object',
+        'properties': {
+            'company': {'type': 'string'},
+            'description': {'type': 'string'},
+            'rating': {'type': 'integer'},
+            'content': {'type': 'string'},
+            'job_id': {'type': 'string', 'description': 'LinkedIn job id if visible; omit if not'},
         },
-        "required": ["company", "description", "rating", "content"],
+        'required': ['company', 'description', 'rating', 'content'],
     },
 )
 async def save_job_posting(args: dict[str, Any]) -> dict:
     return await do_save_job_posting(
-        args["company"], args["description"], args["rating"], args["content"],
-        job_id=args.get("job_id"),
+        args['company'], args['description'], args['rating'], args['content'],
+        job_id=args.get('job_id'),
     )
 
 
 @tool(
-    "update_job_requirements",
+    'update_job_requirements',
     "Rewrite JOB_REQUIREMENTS.md with a complete, updated summary of the user's job preferences. "
     "Always rewrite the full file — never append. Returns the new contents so they are in context.",
-    {"content": str},
+    {'content': str},
 )
 async def update_job_requirements(args: dict[str, Any]) -> dict:
-    return await do_update_job_requirements(args["content"])
+    return await do_update_job_requirements(args['content'])
 
 
 @tool(
-    "check_and_record_job",
+    'check_and_record_job',
     "Before evaluating any job, call this with the site name, job ID, company name, and job title/description. "
     "Returns 'already_processed' (skip it), 'too_old' (skip it), 'already_applied' (skip it), 'auth_required' (skip it — requires current US work authorization), or 'new' (proceed to evaluate). "
     "date_posted is optional — pass whatever is visible (YYYY-MM-DD or relative like '4 days ago'); omit if not shown. "
     "Optionally pass url (the job posting URL) and content (full text of the posting) to persist them in the record.",
     {
-        "type": "object",
-        "properties": {
-            "site": {"type": "string"},
-            "job_id": {"type": "string"},
-            "company": {"type": "string"},
-            "description": {"type": "string"},
-            "date_posted": {"type": "string", "description": "YYYY-MM-DD or relative; omit if not shown"},
-            "url": {"type": "string"},
-            "content": {"type": "string"},
+        'type': 'object',
+        'properties': {
+            'site': {'type': 'string'},
+            'job_id': {'type': 'string'},
+            'company': {'type': 'string'},
+            'description': {'type': 'string'},
+            'date_posted': {'type': 'string', 'description': 'YYYY-MM-DD or relative; omit if not shown'},
+            'url': {'type': 'string'},
+            'content': {'type': 'string'},
         },
-        "required": ["site", "job_id", "company", "description"],
+        'required': ['site', 'job_id', 'company', 'description'],
     },
 )
 async def check_and_record_job(args: dict[str, Any]) -> dict:
     return await do_check_and_record_job(
-        args["site"], args["job_id"], args["company"], args["description"],
-        date_posted=args.get("date_posted"), url=args.get("url"), content=args.get("content"),
+        args['site'], args['job_id'], args['company'], args['description'],
+        date_posted=args.get('date_posted'), url=args.get('url'), content=args.get('content'),
     )
 
 
 @tool(
-    "queue_candidate",
+    'queue_candidate',
     "Add a job candidate to the internal evaluation queue. "
     "Call this after check_and_record_job returns 'new'. "
     "Pass what is visible in the search results: URL, title, company, snippet. "
@@ -2023,30 +2023,30 @@ async def check_and_record_job(args: dict[str, Any]) -> dict:
     "query is optional — pass the search query string that returned this result (e.g. 'Staff ML Engineer'). "
     "Do NOT navigate to the individual job page — a separate agent handles that in stage 2.",
     {
-        "type": "object",
-        "properties": {
-            "site": {"type": "string"},
-            "job_id": {"type": "string"},
-            "url": {"type": "string"},
-            "title": {"type": "string"},
-            "company": {"type": "string"},
-            "snippet": {"type": "string"},
-            "date_posted": {"type": "string", "description": "exact or relative; omit if not shown"},
-            "query": {"type": "string", "description": "search query that returned this result"},
+        'type': 'object',
+        'properties': {
+            'site': {'type': 'string'},
+            'job_id': {'type': 'string'},
+            'url': {'type': 'string'},
+            'title': {'type': 'string'},
+            'company': {'type': 'string'},
+            'snippet': {'type': 'string'},
+            'date_posted': {'type': 'string', 'description': 'exact or relative; omit if not shown'},
+            'query': {'type': 'string', 'description': 'search query that returned this result'},
         },
-        "required": ["site", "job_id", "url", "title", "company", "snippet"],
+        'required': ['site', 'job_id', 'url', 'title', 'company', 'snippet'],
     },
 )
 async def queue_candidate(args: dict[str, Any]) -> dict:
     return await do_queue_candidate(
-        args["site"], args["job_id"], args["url"], args["title"],
-        args["company"], args["snippet"], date_posted=args.get("date_posted"),
-        query=args.get("query"),
+        args['site'], args['job_id'], args['url'], args['title'],
+        args['company'], args['snippet'], date_posted=args.get('date_posted'),
+        query=args.get('query'),
     )
 
 
 @tool(
-    "submit_job_extract",
+    'submit_job_extract',
     "Submit the condensed extract of the job posting page you navigated to. "
     "Include only information-dense content: requirements, responsibilities, stack, seniority — "
     "strip navigation chrome, boilerplate, and similar-jobs lists. "
@@ -2117,17 +2117,17 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
 )
 async def submit_job_extract(args: dict[str, Any]) -> dict:
     return await do_submit_job_extract(
-        args["title"], args["company"], args["description"],
-        location=args.get("location"), date_posted=args.get("date_posted"),
-        closed=args.get("closed", False), salary=args.get("salary"),
-        sponsorship_note=args.get("sponsorship_note"),
-        language_requirement=args.get("language_requirement"), relocation=args.get("relocation"),
-        residency_scope=args.get("residency_scope"),
-        workplace_type=args.get("workplace_type"),
-        education_requirement=args.get("education_requirement"),
-        is_agency=args.get("is_agency"),
-        end_client=args.get("end_client"),
-        posting_language=args.get("posting_language"),
+        args['title'], args['company'], args['description'],
+        location=args.get('location'), date_posted=args.get('date_posted'),
+        closed=args.get('closed', False), salary=args.get('salary'),
+        sponsorship_note=args.get('sponsorship_note'),
+        language_requirement=args.get('language_requirement'), relocation=args.get('relocation'),
+        residency_scope=args.get('residency_scope'),
+        workplace_type=args.get('workplace_type'),
+        education_requirement=args.get('education_requirement'),
+        is_agency=args.get('is_agency'),
+        end_client=args.get('end_client'),
+        posting_language=args.get('posting_language'),
     )
 
 
@@ -2138,7 +2138,7 @@ def make_job_search_server(interactive: bool):
     tools = [check_and_record_job, save_job_posting]
     if interactive:
         tools.append(update_job_requirements)
-    return create_sdk_mcp_server(name="job_search", version="1.0.0", tools=tools)
+    return create_sdk_mcp_server(name='job_search', version='1.0.0', tools=tools)
 
 
 # --- UI contract -------------------------------------------------------------------------------
@@ -2258,21 +2258,21 @@ def check_fingerprint_drift(report: dict) -> str:
 
 
 @tool(
-    "report_search",
-    "Report the structural state of one search results page (from the UI-contract evaluate call).",
+    'report_search',
+    'Report the structural state of one search results page (from the UI-contract evaluate call).',
     {
-        "query": str,
-        "region": str,
-        "report": dict,
+        'query': str,
+        'region': str,
+        'report': dict,
     },
 )
 async def report_search(args: dict) -> dict:
     """Record one search and judge whether the page is usable. Judgement lives here, not in the prompt."""
-    query = str(args.get("query") or _current_query or "")
-    region_name = str(args.get("region") or "")
-    report = args.get("report") or {}
+    query = str(args.get('query') or _current_query or '')
+    region_name = str(args.get('region') or '')
+    report = args.get('report') or {}
     if not isinstance(report, dict):
-        return {"content": [{"type": "text", "text": "report must be the object returned by the contract evaluate call"}]}
+        return {'content': [{'type': 'text', 'text': 'report must be the object returned by the contract evaluate call'}]}
 
     global _current_region
     _current_region = region_name
@@ -2307,7 +2307,7 @@ async def report_search(args: dict) -> dict:
     if blocked:
         _ui_alerts.append({'kind': 'blocked', 'query': query, 'region': region_name, 'detail': blocked})
         logger.warning(f'Stage 1b BLOCKED on "{query}" / {region_name}: page matched "{blocked}"')
-        return {"content": [{"type": "text", "text":
+        return {'content': [{'type': 'text', 'text':
             f'BLOCKED: the page matched "{blocked}". Stop this query now. Do NOT retry it, do not '
             'reload, and do not try to work around it. Say what you saw and move on.'}]}
 
@@ -2315,7 +2315,7 @@ async def report_search(args: dict) -> dict:
         _ui_alerts.append({'kind': 'contract', 'query': query, 'region': region_name,
                            'detail': '; '.join(violations)})
         logger.warning(f'Stage 1b UI CONTRACT broken on "{query}" / {region_name}: {"; ".join(violations)}')
-        return {"content": [{"type": "text", "text":
+        return {'content': [{'type': 'text', 'text':
             'UI CONTRACT FAILED: ' + '; '.join(violations) + '. LinkedIn has changed this page. '
             'Stop this query and say exactly what you saw. Do not fall back to clicking the '
             'results list.'}]}
@@ -2328,7 +2328,7 @@ async def report_search(args: dict) -> dict:
         _ui_alerts.append({'kind': 'filters', 'query': query, 'region': region_name,
                            'detail': '; '.join(filter_problems)})
         logger.warning(f'Stage 1b filters not applied on "{query}" / {region_name}: {"; ".join(filter_problems)}')
-        return {"content": [{"type": "text", "text":
+        return {'content': [{'type': 'text', 'text':
             'FILTERS NOT APPLIED: ' + '; '.join(filter_problems) + '. Re-apply the missing filter '
             'by clicking its chip, then call report_search again. If a chip is genuinely absent, '
             'say so and stop this search.'}]}
@@ -2339,7 +2339,7 @@ async def report_search(args: dict) -> dict:
         if alert.get('kind') == 'filters' and alert.get('query') == query and alert.get('region') == region_name:
             alert['resolved'] = True
 
-    return {"content": [{"type": "text", "text": "ok — page looks sound, filters applied; harvest it"}]}
+    return {'content': [{'type': 'text', 'text': 'ok — page looks sound, filters applied; harvest it'}]}
 
 
 def region_overlap_report() -> dict[str, float]:
@@ -2370,7 +2370,7 @@ def region_overlap_report() -> dict[str, float]:
 def make_scraper_server():
     """MCP server for stage 1: collects candidates from search results."""
     return create_sdk_mcp_server(
-        name="job_scraper", version="1.0.0",
+        name='job_scraper', version='1.0.0',
         tools=[check_and_record_job, queue_candidate, report_search],
     )
 
@@ -2378,6 +2378,6 @@ def make_scraper_server():
 def make_evaluator_server():
     """MCP server for stage 2: captures the condensed page extract from the Haiku extractor."""
     return create_sdk_mcp_server(
-        name="job_evaluator", version="1.0.0",
+        name='job_evaluator', version='1.0.0',
         tools=[submit_job_extract],
     )

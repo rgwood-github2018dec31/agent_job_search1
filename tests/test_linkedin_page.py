@@ -24,7 +24,7 @@ JOB_ID = '4415518989'
 LOGO_URL = 'https://media.licdn.com/dms/image/logo-acme.png'
 CSS_URL = 'https://static.licdn.com/aero-v1/sc/h/site.css'
 
-PAGE = f'''<!DOCTYPE html><html><head>
+PAGE = f"""<!DOCTYPE html><html><head>
 <link rel="stylesheet" href="{CSS_URL}"><link rel="modulepreload" href="https://static.licdn.com/m.js">
 <script>window.track()</script></head>
 <body><header><a href="/feed">Home</a> My Network</header>
@@ -55,7 +55,7 @@ PAGE = f'''<!DOCTYPE html><html><head>
   </div></div></div>
   <div class="d71e55ac"><h2>More jobs</h2><p>Other Co — Principal Engineer — $300K/yr</p><img src="https://media.licdn.com/other.png" alt=""></div>
 </div></main>
-<footer><p>Looking for talent?</p><p>Nederlands (Dutch)</p></footer></body></html>'''
+<footer><p>Looking for talent?</p><p>Nederlands (Dutch)</p></footer></body></html>"""
 
 HARMLESS_TEXT = 'New from LinkedIn: see who else viewed this job'
 PAY_SECTION = 'Salary insights for this role'
@@ -233,7 +233,7 @@ async def test_new_sections_are_judged_once_then_cached(monkeypatch, caplog):
 
     text = lp.page_text(soup)
     assert HARMLESS_TEXT not in text
-    assert PAY_SECTION in text, 'a section holding pay wording is never removed on the model\'s say-so'
+    assert PAY_SECTION in text, "a section holding pay wording is never removed on the model's say-so"
     assert 'Commitments' in text
     assert [r['what'] for r in removed] == [f'section {HARMLESS!r}']
     assert stats['cost'] == pytest.approx(0.001)
@@ -312,7 +312,7 @@ async def test_read_job_page_archives_the_page_then_returns_clean_text(monkeypat
     assert 'Build agentic systems in Python.' in page.text and 'More jobs' not in page.text
     html = lp.raw_html_path(_candidate()).read_text()
     assert html.startswith('<!--') and '<script' not in html
-    assert 'More jobs' in html, 'the archive is the whole page; only the model\'s copy is cleaned'
+    assert 'More jobs' in html, "the archive is the whole page; only the model's copy is cleaned"
     retained = tools.raw_posting_path(_candidate()).read_text()
     assert 'source: dom' in retained and 'Salary: $150,000 - $180,000' in retained, \
         'salary provenance checks the text the model read'

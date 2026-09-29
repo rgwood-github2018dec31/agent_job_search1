@@ -386,13 +386,13 @@ def _claude_available() -> bool:
     calls — and gating on the env var silently skipped every live test there. Probe the CLI the
     SDK would actually spawn instead, and fall back to the env var for API-key setups (CI).
     """
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    if os.environ.get('ANTHROPIC_API_KEY'):
         return True
     try:
         import claude_agent_sdk
 
-        bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
-        cli = str(bundled) if bundled.exists() else shutil.which("claude")
+        bundled = Path(claude_agent_sdk.__file__).parent / '_bundled' / 'claude'
+        cli = str(bundled) if bundled.exists() else shutil.which('claude')
     except Exception:
         return False
     if not cli:
@@ -401,7 +401,7 @@ def _claude_available() -> bool:
     # prompt. Cached, so this costs one short call per pytest session at most.
     try:
         completed = subprocess.run(
-            [str(cli), "-p", "hi", "--max-turns", "1"],
+            [str(cli), '-p', 'hi', '--max-turns', '1'],
             capture_output=True,
             text=True,
             timeout=120,
@@ -412,5 +412,5 @@ def _claude_available() -> bool:
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
-    if item.get_closest_marker("live_agent_claude") and not _claude_available():
-        pytest.skip("Skipping: Claude not available (no API key and CLI cannot reach the API)")
+    if item.get_closest_marker('live_agent_claude') and not _claude_available():
+        pytest.skip('Skipping: Claude not available (no API key and CLI cannot reach the API)')

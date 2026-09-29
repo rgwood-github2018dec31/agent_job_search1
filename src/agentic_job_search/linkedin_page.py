@@ -421,7 +421,7 @@ def _classify_prompt(candidate: dict, samples: list[tuple[str, str]]) -> str:
         f'Below are blocks of text from a LinkedIn job posting page ("{candidate.get("title", "")}" at '
         f'"{candidate.get("company", "")}"). They sit OUTSIDE the parts already known to matter (the '
         f'header card, "About the job", the company card), and nobody has classified them yet.\n\n'
-        f'For each block decide whether it can be removed before a model extracts the job\'s facts.\n'
+        f"For each block decide whether it can be removed before a model extracts the job's facts.\n"
         f'remove=true ONLY when you are certain the block says nothing about THIS job or its '
         f'employer: advertising, Premium upsells, social posts, recommendations of other jobs, '
         f'people to contact, navigation, generic LinkedIn UI.\n'
