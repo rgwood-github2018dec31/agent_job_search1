@@ -15,23 +15,36 @@ from typing import Any
 
 import pypdf
 import yaml
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ResultMessage,
+    create_sdk_mcp_server,
+    tool,
+)
+from claude_agent_sdk import (
+    query as sdk_query,
+)
 from rich.console import Console
+from utils_tools_n_agents_common.mcp_client import unwrap_exception
+from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 
+import agentic_job_search.preferences as preferences
+from agentic_job_search import location_review
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
     PDF_PROMPT_MAX_CHARS,
-    RAW_POSTINGS_RETENTION_DAYS,
     RAW_POSTING_MAX_CHARS,
+    RAW_POSTINGS_RETENTION_DAYS,
     RECRUITER_REPOST_MAX_PRIORS,
     RECRUITER_REPOST_WINDOW_DAYS,
     SALARY_FIELD_DESCRIPTION,
     SCRAPER_DATE_POSTED_LABEL,
-    SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_DATE_POSTED_SECONDS,
     SCRAPER_EXPERIENCE_LABEL,
+    SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SECONDS_PER_MINUTE,
     UI_BLOCK_SIGNATURES,
     UI_CONTRACT_ELEMENTS,
@@ -39,19 +52,8 @@ from agentic_job_search.config import (
     UI_STRUCTURAL_CHIPS,
     is_mid_rated,
 )
-from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
-from agentic_job_search import location_review
 from agentic_job_search.text_budget import pages_to_prompt, snippet, truncate_reported
-import agentic_job_search.preferences as preferences
 from agentic_job_search.triage import chat_openrouter, extract_json_object
-from utils_tools_n_agents_common.mcp_client import unwrap_exception
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ResultMessage,
-    create_sdk_mcp_server,
-    query as sdk_query,
-    tool,
-)
 
 console = Console()
 

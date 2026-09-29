@@ -20,6 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from utils_tools_n_agents_common.mcp_client import call_mcp_tool
+
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
     LLM_MCP_CALL_TIMEOUT_SECONDS,
@@ -38,7 +40,6 @@ from agentic_job_search.config import (
 )
 from agentic_job_search.text_budget import snippet, truncate_reported
 from agentic_job_search.triage import http_status_of, provider_error
-from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 logger = logging.getLogger(__name__)
 

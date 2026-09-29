@@ -11,23 +11,44 @@ import statistics
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from contextlib import aclosing
 from datetime import date, datetime
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote_plus
+
 import requests
 import yaml
-from pathlib import Path
-from collections.abc import Sequence
-from typing import Any
-
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+    ThinkingBlock,
+    create_sdk_mcp_server,
+    tool,
+)
+from claude_agent_sdk import (
+    query as sdk_query,
+)
 from utils_tools_n_agents_common.logging_setup import setup_logging
+from utils_tools_n_agents_common.mcp_client import (
+    mcp_session,
+    unwrap_exception,
+)
 from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_HIGH,
     ANTHROPIC_MODEL_NAME_LOW,
     ANTHROPIC_MODEL_NAME_MEDIUM,
     route_for,
 )
+from utils_tools_n_agents_common.telegram_client import send_message as telegram_send_message
 
+import agentic_job_search.preferences as preferences
+import agentic_job_search.tools_generic as tools_module
+from agentic_job_search import location, location_review, scrape_openrouter
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
@@ -36,16 +57,16 @@ from agentic_job_search.config import (
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_FALLBACK_MAX_TURNS,
     FAILED_QUERIES_NAMED_MAX,
+    JOB_STALE_AGE_DAYS,
     LISTING_ESTIMATE_HISTORY_RUNS,
     LOCATION_GUESS_REASON_MAX_CHARS,
-    REFERENCE_JOB_PROMPT_MAX_CHARS,
-    JOB_STALE_AGE_DAYS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
     MODEL_NAME_EXTRACTOR,
     MODEL_NAME_QUERY,
     MODEL_NAME_RATING,
     MODEL_NAME_SCRAPER,
+    NOTIFICATION_SALARY_MAX_CHARS,
     PLAYWRIGHT_MAX_RESTARTS_PER_RUN,
     PLAYWRIGHT_MCP_PACKAGE,
     PLAYWRIGHT_MCP_READY_POLL_ATTEMPTS,
@@ -54,44 +75,39 @@ from agentic_job_search.config import (
     PLAYWRIGHT_MCP_VERSION,
     PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
     RATING_AUTO_REJECT,
-    SCRAPER_COST_ALERT_FACTOR,
-    SCRAPER_DISALLOWED_BROWSER_TOOLS,
-    SCRAPER_INTER_QUERY_DELAY_SECONDS,
-    SCRAPER_DATE_POSTED_LABEL,
-    SCRAPER_EXPERIENCE_LABEL,
-    SCRAPER_INTER_ACTION_DELAY_SECONDS,
-    SCRAPER_INTER_SEARCH_DELAY_SECONDS,
+    REFERENCE_JOB_PROMPT_MAX_CHARS,
+    REFERENCE_SUMMARY_MAX_CHARS,
     REGION_OVERLAP_ALERT_THRESHOLD,
+    SALARY_FIELD_DESCRIPTION,
     SATURATION_MIN_NEW_JOBS,
     SATURATION_MIN_NEW_RATIO,
+    SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
+    SCRAPER_COST_ALERT_FACTOR,
+    SCRAPER_DATE_POSTED_LABEL,
+    SCRAPER_DISALLOWED_BROWSER_TOOLS,
+    SCRAPER_EXPERIENCE_LABEL,
+    SCRAPER_INTER_ACTION_DELAY_SECONDS,
+    SCRAPER_INTER_QUERY_DELAY_SECONDS,
+    SCRAPER_INTER_SEARCH_DELAY_SECONDS,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SCRAPER_MAX_TURNS_PER_QUERY,
+    SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SECONDS_PER_MINUTE,
-    YIELD_HISTORY_RUNS_SHOWN,
-    SCRAPER_MIN_LISTINGS_PER_QUERY,
-    SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
-    REFERENCE_SUMMARY_MAX_CHARS,
-    NOTIFICATION_SALARY_MAX_CHARS,
-    SALARY_FIELD_DESCRIPTION,
     THINKING_MAX_CHARS,
     TRIAGE_ENABLED,
+    YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
 from agentic_job_search.linkedin_page import JobPage, read_job_page
-from agentic_job_search import location
-from agentic_job_search import location_review
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
-from agentic_job_search import scrape_openrouter
 from agentic_job_search.salary import (
     count_ranges,
     resolve_salary,
     salary_digits_are_in_the_source,
     salary_facts_of,
 )
-import agentic_job_search.preferences as preferences
-import agentic_job_search.tools_generic as tools_module
 from agentic_job_search.text_budget import (
     pages_to_prompt,
     snippet,
@@ -120,23 +136,6 @@ from agentic_job_search.triage import (
     rate_with_openrouter,
     triage_job_fit,
     triage_rejects,
-)
-from utils_tools_n_agents_common.mcp_client import (
-    mcp_session,
-    unwrap_exception,
-)
-from utils_tools_n_agents_common.telegram_client import send_message as telegram_send_message
-
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    create_sdk_mcp_server,
-    query as sdk_query,
-    tool,
 )
 
 

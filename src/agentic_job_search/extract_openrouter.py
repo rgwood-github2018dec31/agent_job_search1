@@ -11,6 +11,8 @@ The deterministic Haiku fallback in agent.py covers loop failures.
 import json
 import logging
 
+from utils_tools_n_agents_common.mcp_client import call_mcp_tool
+
 from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
@@ -19,7 +21,6 @@ from agentic_job_search.config import (
     SALARY_FIELD_DESCRIPTION,
 )
 from agentic_job_search.text_budget import snippet
-from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 logger = logging.getLogger(__name__)
 

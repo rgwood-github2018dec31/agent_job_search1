@@ -10,8 +10,6 @@ import logging
 
 import pytest
 import yaml
-from bs4 import BeautifulSoup
-
 from agentic_job_search import linkedin_page as lp
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.config import (
@@ -20,6 +18,7 @@ from agentic_job_search.config import (
     PAGE_SECTION_SIGNATURE_MAX_WORDS,
 )
 from agentic_job_search.scrape_openrouter import _guard_call
+from bs4 import BeautifulSoup
 
 JOB_ID = '4415518989'
 LOGO_URL = 'https://media.licdn.com/dms/image/logo-acme.png'

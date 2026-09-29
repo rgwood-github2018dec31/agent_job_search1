@@ -1,23 +1,18 @@
 import functools
-import re
 import os
+import re
 import shutil
 import subprocess
 from datetime import date, timedelta
 from pathlib import Path
 
-import pytest
-
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools
-from agentic_job_search import agent
-from agentic_job_search import location
-from agentic_job_search import salary
-from agentic_job_search import location_review
-from agentic_job_search import linkedin_page
-from agentic_job_search import scrape_openrouter
-from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
+import pytest
+from agentic_job_search import agent, linkedin_page, location, location_review, salary, scrape_openrouter
 from agentic_job_search.agent import load_env
+from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
+
 load_env()
 
 # Fixed preferences for the whole suite. Tests must never read the real run_dir/preferences.yaml —

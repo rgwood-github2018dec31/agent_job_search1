@@ -15,6 +15,7 @@ import logging
 import re
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
+from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
@@ -26,7 +27,6 @@ from agentic_job_search.config import (
     TRIAGE_THRESHOLD,
 )
 from agentic_job_search.text_budget import snippet
-from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 logger = logging.getLogger(__name__)
 

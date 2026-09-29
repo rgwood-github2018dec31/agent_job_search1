@@ -43,6 +43,7 @@ from datetime import date
 from typing import Any
 
 import yaml
+from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
 from agentic_job_search.config import (
     MODEL_NAME_SALARY,
@@ -54,7 +55,6 @@ from agentic_job_search.config import (
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.text_budget import truncate_reported
 from agentic_job_search.triage import chat_openrouter, extract_json_object
-from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +239,7 @@ def cache_key(text: str, context: str = '') -> str:
     normalized = ' '.join(str(text or '').split()).lower()
     if not context:
         return normalized
-    digest = hashlib.md5(f'{normalized}\n{context}'.encode('utf-8')).hexdigest()
+    digest = hashlib.md5(f'{normalized}\n{context}'.encode()).hexdigest()
     return f'{normalized}#{digest}'
 
 

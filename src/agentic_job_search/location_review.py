@@ -27,13 +27,15 @@ from datetime import date
 from typing import Any
 
 import yaml
+from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
+from agentic_job_search import preferences
 from agentic_job_search.location import (
-    countries_seen_this_run, location_token_matches, place_names_seen_this_run,
+    countries_seen_this_run,
+    location_token_matches,
+    place_names_seen_this_run,
 )
 from agentic_job_search.preferences import RUN_DIR
-from agentic_job_search import preferences
-from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
 logger = logging.getLogger(__name__)
 

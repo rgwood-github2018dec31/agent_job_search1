@@ -1,17 +1,31 @@
 """Tests for the job search agent."""
 
-from pathlib import Path
-from typing import ClassVar
 import asyncio
 import json
 import logging
 import os
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import requests
 import yaml
+from agentic_job_search import (
+    agent,
+    config,
+    extract_openrouter,
+    linkedin_page,
+    location,
+    location_review,
+    preferences,
+    salary,
+    scrape_openrouter,
+    text_budget,
+    triage,
+)
+from agentic_job_search import tools_generic as tools
 from claude_agent_sdk import ResultMessage
 from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_LOW,
@@ -20,20 +34,6 @@ from utils_tools_n_agents_common.models import (
     OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
     OPENROUTER_MODEL_NAME_SCRAPER,
 )
-
-from agentic_job_search import agent
-from agentic_job_search import linkedin_page
-from agentic_job_search import location
-from agentic_job_search import location_review
-from agentic_job_search import config
-from agentic_job_search import extract_openrouter
-from agentic_job_search import salary
-from agentic_job_search import preferences
-from agentic_job_search import scrape_openrouter
-from agentic_job_search import text_budget
-from agentic_job_search import tools_generic as tools
-from agentic_job_search import triage
-
 
 # ---------------------------------------------------------------------------
 # underscorify
@@ -1116,7 +1116,7 @@ async def test_run_scraper_sets_the_current_query(monkeypatch):
 
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
     queries = ['Alpha', 'Beta']
-    await _scrape(_RecordingClient({q: healthy for q in queries}), queries,
+    await _scrape(_RecordingClient(dict.fromkeys(queries, healthy)), queries,
                             {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0})
 
     assert seen == ['Alpha', 'Beta'], 'each request runs with its own base query set'
@@ -2227,10 +2227,10 @@ def test_is_mid_rated_boundary():
 def test_ratings_mid_rated_derived_from_thresholds():
     # The band must be exactly the ratings between the two threshold constants: if either
     # threshold moves and the derivation was replaced by a literal, this fails loudly.
-    assert config.RATINGS_MID_RATED == frozenset(
+    assert frozenset(
         range(config.RATING_AUTO_REJECT + 1, config.RATING_NOTIFICATION_THRESHOLD)
-    )
-    assert config.RATINGS_MID_RATED == frozenset({2, 3})
+    ) == config.RATINGS_MID_RATED
+    assert frozenset({2, 3}) == config.RATINGS_MID_RATED
 
 
 def test_write_run_audit_log_covers_all_four_sections(tmp_path, monkeypatch):
@@ -2458,7 +2458,7 @@ async def test_run_scraper_sends_one_request_per_query(monkeypatch):
 
     queries = ['Principal AI Engineer', 'Staff AI Engineer', 'Lead AI Engineer']
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
-    client = _FakeScraperClient({q: healthy for q in queries})
+    client = _FakeScraperClient(dict.fromkeys(queries, healthy))
 
     await _scrape(client, queries)
 
@@ -3576,7 +3576,7 @@ async def test_run_scraper_pauses_between_queries(monkeypatch):
 
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
     queries = ['One', 'Two', 'Three']
-    client = _FakeScraperClient({q: healthy for q in queries})
+    client = _FakeScraperClient(dict.fromkeys(queries, healthy))
     await _scrape(client, queries)
 
     # A pause before every query except the first -- no point waiting before any work is done.
@@ -4199,9 +4199,9 @@ async def test_resolve_salary_live(monkeypatch, tmp_path):
 
 def test_the_three_extract_schemas_share_one_salary_description():
     """Two of them carried a 'must stay in sync' comment and no test to enforce it."""
-    from agentic_job_search.config import SALARY_FIELD_DESCRIPTION
     from agentic_job_search import extract_openrouter as extract_or
     from agentic_job_search import tools_generic
+    from agentic_job_search.config import SALARY_FIELD_DESCRIPTION
 
     openrouter_schema = next(
         t['function']['parameters'] for t in extract_or.OPENROUTER_EXTRACT_TOOLS
@@ -5881,9 +5881,9 @@ def test_eu_constants_are_written_as_proper_names():
     """
     for name in location.EU_MEMBER_STATES | location._EU_ALIASES:
         assert name != name.casefold(), name
-    assert location._EU_LOOKUP == frozenset(
+    assert frozenset(
         name.casefold() for name in location.EU_MEMBER_STATES | location._EU_ALIASES
-    )
+    ) == location._EU_LOOKUP
 
 
 # ---------------------------------------------------------------------------
@@ -6850,7 +6850,7 @@ def test_playwright_mcp_version_is_concrete():
         f'PLAYWRIGHT_MCP_VERSION must be a concrete version, got '
         f'{config.PLAYWRIGHT_MCP_VERSION!r}'
     )
-    assert config.PLAYWRIGHT_MCP_PACKAGE == f'@playwright/mcp@{config.PLAYWRIGHT_MCP_VERSION}'
+    assert f'@playwright/mcp@{config.PLAYWRIGHT_MCP_VERSION}' == config.PLAYWRIGHT_MCP_PACKAGE
 
 
 def test_playwright_mcp_is_pinned_at_every_launch_site():
@@ -8006,9 +8006,9 @@ def test_pages_to_prompt_truncates_after_normalizing_and_says_so(caplog):
 
 
 def test_pdf_prompt_cap_is_derived_from_the_model_context():
-    assert config.PDF_PROMPT_MAX_CHARS == int(
+    assert int(
         config.ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS * config.CHARS_PER_TOKEN_ESTIMATE
-        * config.PDF_PROMPT_CONTEXT_SHARE)
+        * config.PDF_PROMPT_CONTEXT_SHARE) == config.PDF_PROMPT_MAX_CHARS
     assert config.PDF_PROMPT_MAX_CHARS > config.REFERENCE_JOB_PROMPT_MAX_CHARS
 
 

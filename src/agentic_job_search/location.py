@@ -37,11 +37,11 @@ from datetime import date
 from typing import Any
 
 import yaml
+from utils_tools_n_agents_common.mcp_client import unwrap_exception
+from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.triage import chat_openrouter, extract_json_object
-from utils_tools_n_agents_common.mcp_client import unwrap_exception
-from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 logger = logging.getLogger(__name__)
 
