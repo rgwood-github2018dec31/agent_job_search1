@@ -4,7 +4,7 @@ Why this exists: Stage 1b reached 86.9% of total run cost ($48.24 of $55.52 over
 at $10.06). Cost is `sum over turns of context_size`, and ~90% of it was cache traffic. A flash-tier
 model with implicit caching prices the same traffic ~9x cheaper -- measured, not projected.
 
-Two design rules hold this file together, both learned the hard way (see CLAUDE.md):
+Two design rules hold this file together, both learned the hard way (see AGENTS.md):
 
 1. **The model chooses ACTIONS; code moves DATA.** No tool here accepts a page or job payload. A
    model relaying data cannot distinguish copying from producing, so when it has none it emits a
@@ -221,7 +221,7 @@ def _guard_call(name: str, args: dict) -> str | None:
     """Refuse anything that would touch the job results list. Returns a refusal, or None to allow.
 
     Code-enforced rather than prompted: to the model a card and its Dismiss button are the same
-    node, so wording cannot prevent this (CLAUDE.md, Account safety).
+    node, so wording cannot prevent this (AGENTS.md, Account safety).
     """
     if name in ('browser_click', 'browser_hover'):
         blob = ' '.join(str(args.get(k, '')) for k in ('target', 'element', 'ref', 'selector'))

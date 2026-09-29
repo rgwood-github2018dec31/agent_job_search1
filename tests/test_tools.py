@@ -5306,7 +5306,7 @@ def _seen(countries: dict[str, str]):
 def test_substring_collisions_flags_roma_against_romania(monkeypatch):
     """The deterministic half. This — not the prompt — is what catches the entry that broke the gate.
 
-    'roma' inside 'romania' is arithmetic, and CLAUDE.md's rule that a structural fact must never
+    'roma' inside 'romania' is arithmetic, and AGENTS.md's rule that a structural fact must never
     be left to a model's discretion applies to the reviewer as much as to the rater. It also means
     the warning still appears with the tool server down.
     """

@@ -2,7 +2,7 @@
 
 Everything in this module is about *the person running the agent* — where they live, which
 regions they can work in, what languages they speak, which titles they want. None of that
-belongs in tracked source (see the Knowledge locality requirement in CLAUDE.md), so the values
+belongs in tracked source (see the Knowledge locality requirement in AGENTS.md), so the values
 live in ``run_dir/preferences.yaml`` alongside the resume and JOB_REQUIREMENTS.md.
 
 ``preferences.example.yaml`` in the project root documents every field. The defaults below are

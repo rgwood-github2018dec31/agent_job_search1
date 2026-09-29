@@ -41,7 +41,7 @@ RATING_MIN = 1
 RATING_MAX = 5
 # Jobs at/above this rating reach the user (Telegram notification, high-rated count, recruiter-
 # repost checks, Opus-audit FALSE NEGATIVE verdicts). If this ever moves off 4, update the
-# "rated 4 or 5" prose in CLAUDE.md and docs/requirements.md to match.
+# "rated 4 or 5" prose in AGENTS.md and docs/requirements.md to match.
 RATING_NOTIFICATION_THRESHOLD = 4
 # The rating recorded for every deterministic rejection (hard rules, already-applied): the job
 # is saved and audited, never notified.

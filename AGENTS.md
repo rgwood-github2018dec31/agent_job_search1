@@ -1,11 +1,11 @@
-# CLAUDE.md
+# AGENTS.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Where things get stored
 
 Knowledge about this project — decisions, conventions, diagnoses, preferences about how to work
-on it — goes in a **tracked file in this repo**, normally this `CLAUDE.md`. Configuration and log
+on it — goes in a **tracked file in this repo**, normally this `AGENTS.md`. Configuration and log
 files go in **`run_dir/`**.
 
 **Strongly prefer not to store any of that under `~/.claude/**`**, including the per-project

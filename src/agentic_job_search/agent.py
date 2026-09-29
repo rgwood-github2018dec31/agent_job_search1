@@ -2344,7 +2344,7 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     sponsorship_locations = preferences.sponsorship_required_in()
     # Folded HERE rather than in the accessor: the preference holds place names, and a name folded
     # on the way in cannot be unfolded on the way out. This rule is still a substring match, unlike
-    # the two geographic lists -- see CLAUDE.md.
+    # the two geographic lists -- see AGENTS.md.
     location = extract['location'].casefold()
     needs_sponsorship = any(loc.casefold() in location for loc in sponsorship_locations)
     if sponsorship_locations and (

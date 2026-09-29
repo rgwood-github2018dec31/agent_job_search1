@@ -165,7 +165,7 @@ _queue_skipped_counts: dict[str, int] = {}
 # Deliberately conservative — an auto-skip is unappealable, and the search card gives only a
 # title. 'associate' and bare 'graduate' are NOT here: "Associate Director" and "Graduate
 # Research Scientist" are senior in many orgs. Work arrangement is not filtered here at all;
-# CLAUDE.md records that workplace type must be resolved from the job page, not the card.
+# AGENTS.md records that workplace type must be resolved from the job page, not the card.
 _JUNIOR_TITLE_RE = re.compile(
     r'\b(intern|interns|internship|junior|jr|entry[ -]level|new grad(uate)?|'
     r'apprentice|trainee|co[ -]op|working student)\b',
@@ -1907,7 +1907,7 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
     relay a payload cannot tell copying from producing, so when it has no data it emits a plausible
     object instead of failing (measured 2026-08-21: an evaluate result was diverted to a file and
     the model invented a whole page report). Removing the argument removes the opportunity, which
-    is not something a prompt can do. See the Anti-fabrication requirement in CLAUDE.md.
+    is not something a prompt can do. See the Anti-fabrication requirement in AGENTS.md.
 
     Also collapses ~25 per-listing tool calls into one, and enforces
     SCRAPER_MAX_LISTINGS_PER_SEARCH in code rather than as a prompt suggestion.

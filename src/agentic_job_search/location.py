@@ -6,7 +6,7 @@ the facts returned here (see `agent.rejected_location`).
 
 Why an LLM call sits behind a hard rule at all
 ----------------------------------------------
-CLAUDE.md's rule that "a structural fact must never be left to a model's discretion" exists
+AGENTS.md's rule that "a structural fact must never be left to a model's discretion" exists
 because the *rater* scored Berlin 5/5 one day and Munich 3/5 the next on identical facts. This is
 categorically different, on three counts:
 
@@ -183,7 +183,7 @@ _cache: dict[str, Any] | None = None
 
 # Countries this run actually encountered, country -> region. Run-scoped, NOT the disk cache: the
 # cache accumulates forever and says nothing about what today's postings named. Reset explicitly
-# at the top of a run (an un-reset module global is the most-repeated bug in CLAUDE.md).
+# at the top of a run (an un-reset module global is the most-repeated bug in AGENTS.md).
 # country -> Counter(region -> times seen). A COUNTER, not a single value: the classifier is a
 # model, and a rare wrong region gets frozen by the cache forever. Taking the first answer made the
 # region reported for such a country a coin flip -- Austria came back `eastern_europe` off one
