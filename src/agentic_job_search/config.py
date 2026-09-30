@@ -221,9 +221,13 @@ UI_BLOCK_SIGNATURES = (
 #
 # A chip is also matched by its CHOSEN value, since choosing one relabels it ("Date posted" ->
 # "Past week", "Experience level" -> "Senior").
+#
+# 'In my network' is deliberately absent: LinkedIn shows it on some searches and not others, even
+# within one run (gone on one query, back on the next, 2026-09-28), and it flapped in 5 of the 12
+# logged runs 2026-09-21..28. Each flap raised a drift alert about nothing.
 UI_STRUCTURAL_CHIPS = (
     'Jobs', 'Date posted', 'Experience level', 'Employment type', 'Company',
-    'Under 10 applicants', 'In my network', 'Easy Apply',
+    'Under 10 applicants', 'Easy Apply',
     'Past month', 'Past week', 'Past 24 hours',
     'Entry-level', 'Senior', 'Manager', 'Director', 'Executive',
 )
@@ -337,8 +341,23 @@ SCRAPER_OPENROUTER_MAX_ITERATIONS = 90
 SCRAPER_CACHED_PROMPT_SHARE = 0.94
 SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN = 0.002
 # Moves to the next-cheapest endpoint after a provider-side failure, per run, before the scraper
-# gives up on OpenRouter and falls back to the Anthropic scraper.
-SCRAPER_PROVIDER_MAX_SWITCHES = 2
+# gives up on OpenRouter and falls back to the Anthropic scraper. Raised from 2 (2026-09-29) once
+# the candidate list stopped being one endpoint long: a 429 now walks down the ranked list.
+SCRAPER_PROVIDER_MAX_SWITCHES = 4
+# Spend ceiling for the Anthropic scraper fallback, per run. The fallback bills Haiku prices on the
+# same ~13M-token scrape the OpenRouter path runs for cents: on 2026-09-28 it cost ~$4.96 of a $5.30
+# run. Past this, the remaining queries are skipped and reported (a `scrape_budget` alert) — a thinner
+# run is preferable to a silent multi-dollar one. Roughly two queries' worth at the 09-28 rate.
+SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD = 1.50
+# Lowest bits-per-weight an endpoint may serve the scraper model at. The scraper used to accept only
+# the tool server's DEFAULT precision; when that default became bf16 (~2026-09-27) exactly one
+# endpoint (morph/bf16) qualified, so one 429 on 2026-09-27 and 2026-09-28 left nowhere to switch and
+# dropped Stage 1b to the Anthropic scraper, while 10+ fp8 endpoints were up. Deliberately no
+# default: a scraper model without an entry here fails fast, before any LinkedIn traffic, rather
+# than silently accepting 4-bit quality.
+SCRAPER_MIN_BITS_PER_WEIGHT: dict[str, int] = {
+    'deepseek/deepseek-v4-flash-0731': 8,
+}
 # A query whose effective $/M prompt tokens exceeds the chosen endpoint's estimate by this factor
 # raises a run alert: the week this pin fixes cost ~$5-7 extra with nothing flagging it.
 SCRAPER_COST_ALERT_FACTOR = 3
@@ -349,6 +368,21 @@ SCRAPER_TOOL_RESULT_MAX_CHARS = 30_000
 # the matches the model asked for, so what it cut was signal: it went over the shared cap 13 times
 # across all logged runs, by a few hundred chars up to ~26K. Sized above the largest one measured.
 SCRAPER_FIND_RESULT_MAX_CHARS = 60_000
+# browser_snapshot, split out from the shared cap (2026-09-30). A search-page snapshot is sent with
+# the job detail pane removed (snapshot_prune.drop_job_detail_pane); what is left is the chip row
+# and the full result-card list. Across 351 saved snapshots that measured ~51K median and ~56K max,
+# so every card fits; exceeding this means the page's shape changed, which the WARNING should say.
+SCRAPER_SNAPSHOT_RESULT_MAX_CHARS = 60_000
+# The heading that anchors the job detail pane (the right-hand side of the search page: "About the
+# job", "About the company", the company's posts feed) in an a11y snapshot. Stage 1b never reads a
+# posting -- Stage 2 opens each job itself -- yet this pane was 184K of one 238K snapshot, and
+# every one of 662 logged snapshot truncations (2026-09-21..30) came from snapshots it inflated.
+SNAPSHOT_DETAIL_PANE_HEADING = 'heading "About the job"'
+# A result card's top line in a snapshot: its accessible name concatenates the row text around the
+# Dismiss control (see the scraper prompt). The pane removal must never take one of these with it.
+SNAPSHOT_RESULT_CARD_RE = r'^- button ".* Dismiss .* job\b.*\[cursor=pointer\]'
+# The results count ("99+ results") above the card list; also never inside the detail pane.
+SNAPSHOT_RESULT_COUNT_RE = r'\b\d+\+? results?\b'
 
 # Audit configuration
 AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
@@ -376,6 +410,13 @@ SALARY_FIELD_DESCRIPTION = (
     'the period, e.g. "CA$208,580 - CA$273,770 per year" or "€700-€900/day". Never round a figure, '
     'never give only one end of a range the posting states in full, and never convert a currency. '
     'Put bonus/equity wording after the amounts. Leave empty ONLY when the page states no pay at all.'
+)
+# Shared by every extract schema, like SALARY_FIELD_DESCRIPTION. A language the posting SAYS the
+# work is done in beats the one the location implies (Detect Likely Working Language).
+STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION = (
+    'The language(s) the posting SAYS the team or company works in, lowercase, e.g. "english" for '
+    '"our working language is English" or "international English-speaking team". Leave empty '
+    'unless the posting states it; never infer it from the location.'
 )
 TRIAGE_ENABLED = True
 TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (clear low fits)
@@ -428,7 +469,40 @@ PDF_PROMPT_CONTEXT_SHARE = 0.5
 PDF_PROMPT_MAX_CHARS = int(ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS * CHARS_PER_TOKEN_ESTIMATE * PDF_PROMPT_CONTEXT_SHARE)
 # Per reference job, in the full reference block and the summarization prompt. Up to
 # MAX_REFERENCE_JOBS of these are concatenated, so this budget is per job, not per prompt.
-REFERENCE_JOB_PROMPT_MAX_CHARS = 3000
+# Sized to keep a saved posting WHOLE: the largest of 153 applied-job PDFs is 18,858 chars once
+# LinkedIn's furniture lines are stripped (2026-09-29). The old 3,000 kept page 1 (half of it
+# Premium upsells and apply buttons) plus the description's opening, and cut responsibilities and
+# requirements from all 20 references. The summary is cached by md5, so a bigger budget costs one
+# summarization call per change to the reference set, not one per run. Nothing is cut at the
+# sidebar's start: a saved page's text is two-column and interleaved, and in 11 of the newest 107
+# PDFs posting text (one a salary range) sits AFTER the sidebar's first line.
+REFERENCE_JOB_PROMPT_MAX_CHARS = 20_000
+# Whole lines of LinkedIn UI in a saved job page, matched against a stripped line in full. Each
+# recurred across the applied-job PDFs (2026-09-29) and says nothing about the job itself.
+LINKEDIN_PDF_FURNITURE_LINE_PATTERNS = (
+    # Premium upsells and account chrome
+    r'CA\$0', r'for CA\$0', r'Start hiring for', r'Try Premium for', r'Unlock Premium', r'of Premium Page',
+    r'Claim 1 free month', r'Get AI-powered advice on this job and more exclusive features with Premium\..*',
+    r'Activate Premium for CA\$0', r'Job search smarter with Premium', r'.* and millions of other members use Premium',
+    r'1-month free trial with 24/7 support\..*', r'Plus! Get insider access to live talks with industry leaders\.',
+    r'Get personalized cover letter and resume tips', r'Message hiring managers with InMail',
+    r'See jobs where you.d be a top applicant', r'Use AI to assess how you fit', r'Practice an interview',
+    r'Show match details Tailor my resume Help me stand out',
+    # Apply / tracker buttons and states
+    r'(?:Easy )?Apply(?: Save)?', r'Save', r'Message', r'Follow', r'now', r'Application status',
+    r'Application submitted', r'Take the next step in your job search', r'Did you finish applying\?',
+    r'You.ll find this job under.*', r'Job moved toIn progressunderClicked', r'apply\.',
+    r'Your profile was shared with the job poster\.Undo', r'People you can reach out to',
+    r'No response insights available yet', r'Go to company site',
+    r'Show all', r'Show more', r'Show less', r'Set alert for similar jobs', r'See more jobs like this',
+    # Site footer
+    r'Looking for talent\?', r'Post a job', r'About Accessibility Talent ?Solutions',
+    r'Community Guidelines Careers Marketing Solutions', r'Privacy & Terms Ad Choices Advertising',
+    r'Sales Solutions Mobile Small Business', r'Safety Center', r'LinkedIn Corporation © \d{4}',
+    r'Questions\?', r'Visit our Help Center\.', r'Manage your account and privacy', r'Go to your Settings\.',
+    r'Recommendation transparency', r'Learn more about Recommended Content\.', r'Select language',
+    r'English \(English\)',
+)
 # The description shown to the blacklist confirmation call alongside company/location/title. Sized
 # above the longest description measured across 2,345 saved jobs (2026-09-24), so in practice it is
 # whole: the call runs only on an exact name hit, and more of the posting is what tells "Cohere" the
@@ -472,6 +546,13 @@ PLAYWRIGHT_MCP_READY_POLL_INTERVAL_SECONDS = 1
 # unevaluated jobs back to the next run. On 2026-09-21 its node process died of a V8 heap OOM
 # 1h38m in, and the 23 remaining jobs each failed in milliseconds and were lost to dedup.
 PLAYWRIGHT_MAX_RESTARTS_PER_RUN = 1
+# After a failed extract, Stage 2 probes the server's port this long to tell "the browser died"
+# from "this page failed". The process exit alone is not enough: on 2026-09-28 the server dropped
+# and the last 3 jobs all failed within 43 ms, before the exit was reaped, so each was written off
+# as a bad page and lost to dedup.
+PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS = 2
+# How long a server that stopped answering gets to exit on SIGTERM before it is killed.
+PLAYWRIGHT_STOP_TIMEOUT_SECONDS = 10
 
 # Run reporting
 YIELD_HISTORY_RUNS_SHOWN = 5          # recent runs listed in the yield-history section of alerts

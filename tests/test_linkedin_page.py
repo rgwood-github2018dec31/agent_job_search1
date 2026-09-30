@@ -334,3 +334,20 @@ async def test_read_job_page_falls_back_when_the_capture_was_altered_in_transit(
         page = await lp.read_job_page(_candidate(), call)
     assert page.source == 'snapshot'
     assert any('altered in transit' in r.message for r in caplog.records)
+
+
+PREMIUM_UPSELL = ('Job search faster with Premium Access company insights like strategic priorities, '
+                  'headcount trends, and more Activate Premium for CA$0 1-month free trial with 24/7 support.')
+
+
+@pytest.mark.parametrize(('text', 'expected'), [
+    (PREMIUM_UPSELL, False),
+    ('Try it for $0 today.', False),
+    ('Compensation: CA$170,000 - CA$240,000 / year', True),
+    ('The base salary for this role is €90K.', True),
+    ('Pay starts at CA$0.50 per click', True),
+    ('A signing bonus of $10,000.', True),
+])
+def test_a_zero_price_is_not_pay_wording(text, expected):
+    """The Premium upsell kept tripping the pay guard (11 times, 2026-09-24..28) on 'CA$0'."""
+    assert lp.mentions_pay(text) is expected

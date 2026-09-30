@@ -46,6 +46,7 @@ from agentic_job_search.config import (
     SCRAPER_EXPERIENCE_LABEL,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SECONDS_PER_MINUTE,
+    STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
     UI_BLOCK_SIGNATURES,
     UI_CONTRACT_ELEMENTS,
     UI_FINGERPRINT_FILENAME,
@@ -1840,7 +1841,7 @@ async def do_submit_job_extract(
     residency_scope: str | None = None,
     workplace_type: str | None = None, education_requirement: str | None = None,
     is_agency: bool | None = None, end_client: str | None = None,
-    posting_language: str | None = None,
+    posting_language: str | None = None, stated_working_language: str | None = None,
 ) -> dict:
     _job_extracts.append({
         'title': title, 'company': company, 'description': description,
@@ -1849,6 +1850,7 @@ async def do_submit_job_extract(
         'language_requirement': language_requirement or '', 'relocation': relocation or '',
         'residency_scope': (residency_scope or '').strip().lower(),
         'posting_language': (posting_language or '').strip().lower(),
+        'stated_working_language': (stated_working_language or '').strip().lower(),
         'workplace_type': (workplace_type or '').strip().lower(),
         'education_requirement': (education_requirement or '').strip().lower(),
         # None (not False) when the extractor said nothing, so derive_agency_posting() can tell
@@ -2060,6 +2062,8 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
     "writing here — you translate as you condense, so your own output says nothing about the "
     "original. The original job title is usually the clearest tell (a title like 'Scientifique "
     "principal des données en IA' means 'french'). Omit only if genuinely undeterminable. "
+    "Pass stated_working_language with the language the posting SAYS the team works in "
+    "('our working language is English'); omit it unless stated. "
     "Pass relocation with the country/city if the posting requires relocating to or residing in a "
     "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles. "
     "Pass residency_scope as 'country_only' if the posting requires LIVING IN the country it "
@@ -2093,6 +2097,7 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
             'sponsorship_note': {'type': 'string'},
             'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
             'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
+            'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
             'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
                                 'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
             'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
@@ -2128,6 +2133,7 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
         is_agency=args.get('is_agency'),
         end_client=args.get('end_client'),
         posting_language=args.get('posting_language'),
+        stated_working_language=args.get('stated_working_language'),
     )
 
 
@@ -2232,7 +2238,9 @@ def check_fingerprint_drift(report: dict) -> str:
     if path.exists():
         try:
             stored = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
-            previous = sorted(str(c) for c in (stored.get('chips') or []))
+            # Filtered like `observed`, so a chip later dropped from UI_STRUCTURAL_CHIPS does not
+            # read as "gone" against a fingerprint written before it was dropped.
+            previous = sorted(str(c) for c in (stored.get('chips') or []) if str(c) in UI_STRUCTURAL_CHIPS)
         except Exception as ex:
             logger.warning(f'UI fingerprint at {path} unreadable, treating as absent: {ex}')
 
@@ -2365,14 +2373,6 @@ def region_overlap_report() -> dict[str, float]:
                 worst = max(worst, len(id_sets[i] & id_sets[j]) / len(union))
         overlaps[query] = round(worst, REGION_OVERLAP_DECIMALS)
     return overlaps
-
-
-def make_scraper_server():
-    """MCP server for stage 1: collects candidates from search results."""
-    return create_sdk_mcp_server(
-        name='job_scraper', version='1.0.0',
-        tools=[check_and_record_job, queue_candidate, report_search],
-    )
 
 
 def make_evaluator_server():

@@ -68,6 +68,7 @@ from agentic_job_search.config import (
     MODEL_NAME_SCRAPER,
     NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_SALARY_MAX_CHARS,
+    PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS,
     PLAYWRIGHT_MAX_RESTARTS_PER_RUN,
     PLAYWRIGHT_MCP_PACKAGE,
     PLAYWRIGHT_MCP_READY_POLL_ATTEMPTS,
@@ -75,6 +76,7 @@ from agentic_job_search.config import (
     PLAYWRIGHT_MCP_REGISTRY_URL,
     PLAYWRIGHT_MCP_VERSION,
     PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
+    PLAYWRIGHT_STOP_TIMEOUT_SECONDS,
     RATING_AUTO_REJECT,
     REFERENCE_JOB_PROMPT_MAX_CHARS,
     REFERENCE_SUMMARY_MAX_CHARS,
@@ -83,6 +85,7 @@ from agentic_job_search.config import (
     SATURATION_MIN_NEW_JOBS,
     SATURATION_MIN_NEW_RATIO,
     SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
+    SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD,
     SCRAPER_COST_ALERT_FACTOR,
     SCRAPER_DATE_POSTED_LABEL,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
@@ -95,13 +98,14 @@ from agentic_job_search.config import (
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SECONDS_PER_MINUTE,
+    STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
     THINKING_MAX_CHARS,
     TRIAGE_ENABLED,
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
-from agentic_job_search.linkedin_page import JobPage, read_job_page
+from agentic_job_search.linkedin_page import JobPage, read_job_page, strip_saved_page_furniture
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search.salary import (
     count_ranges,
@@ -124,7 +128,6 @@ from agentic_job_search.tools_generic import (
     log_run_cost,
     make_evaluator_server,
     make_job_search_server,
-    make_scraper_server,
     parse_posting_date,
 )
 from agentic_job_search.triage import (
@@ -504,6 +507,7 @@ Also capture:
 - workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
 - language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
 - posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely undeterminable.
+- stated_working_language: the language(s) the posting SAYS the team or company works in, lowercase, e.g. "english" for "our working language is English" or "international English-speaking team". Leave empty unless the posting states it — never infer it from the location.
 - residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany", "open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere", "any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is advertised: "Romania (Remote)" on its own says nothing here.
 - relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
 - education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required."""
@@ -557,7 +561,7 @@ Also produce:
 - warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — salary below target, stack mismatch. Every conflict you notice MUST appear here, even when you still rate the job highly.
 
 ## Language
-Check the `Posting written in:` and `Implied local language:` lines. A posting written in another language, and a workplace whose implied local working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English. Do not write a warning bullet for either: both are detected deterministically and added for you.
+Check the `Posting written in:`, `Stated working language:` and `Likely working language:` lines. A posting written in another language, and a workplace whose working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English. A `Stated working language:` is what the posting itself says and overrides any guess from the location. A `Likely working language:` marked marginal is a remote role across a multi-country area — a minor friction at most. Do not write a warning bullet for any of these: they are detected deterministically and added for you.
 
 Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
 
@@ -671,6 +675,7 @@ EXTRACT_OUTPUT_SCHEMA = {
         'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
         'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
         'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
+        'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
         'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
                             'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
         'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
@@ -907,9 +912,9 @@ def build_evaluator_prompt(reference_block: str = '') -> str:
 
 
 def _reference_job_texts() -> list[str]:
-    """The newest MAX_REFERENCE_JOBS applied jobs, each serialized within REFERENCE_JOB_PROMPT_MAX_CHARS."""
+    """The newest MAX_REFERENCE_JOBS applied jobs, LinkedIn UI stripped, each within REFERENCE_JOB_PROMPT_MAX_CHARS."""
     return [
-        pages_to_prompt(pages, f'reference job {i}', REFERENCE_JOB_PROMPT_MAX_CHARS)
+        pages_to_prompt(strip_saved_page_furniture(pages), f'reference job {i}', REFERENCE_JOB_PROMPT_MAX_CHARS)
         for i, pages in enumerate(tools_module._reference_job_pages[:MAX_REFERENCE_JOBS], 1)
     ]
 
@@ -978,6 +983,9 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
     prompt = (
         f'{combined}\n\n'
         f'The postings above are jobs the candidate chose to apply to — treat them as 5/5 fit examples. '
+        f'They are saved LinkedIn pages, so some also show a sidebar of OTHER jobs (titles, companies, '
+        f'salaries under "More jobs") and the posting company\'s profile: ignore those listings, and take '
+        f'titles, locations and pay only from each posting itself. '
         f'Distill them into ONE "ideal role profile" of at most {REFERENCE_SUMMARY_MAX_CHARS} characters: '
         f'the recurring titles/seniority, domains, tech stack, responsibilities, locations/remote patterns, '
         f'and compensation ranges. Write it as a dense reference profile for calibrating job-fit ratings, '
@@ -1306,6 +1314,10 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'SCRAPER PROVIDER NOT PINNED (cost is OpenRouter\'s choice): {alert.get("detail")}')
         elif kind == 'scrape_cost':
             alerts.append(f'SCRAPER COST HIGH on {alert.get("query", "?")}: {alert.get("detail")}')
+        elif kind == 'provider_fallback':
+            alerts.append(f'SCRAPER FELL BACK TO ANTHROPIC (billed at Anthropic prices): {alert.get("detail")}')
+        elif kind == 'scrape_budget':
+            alerts.append(f'SCRAPER FALLBACK BUDGET SPENT, QUERIES SKIPPED: {alert.get("detail")}')
 
     # 1b. Queries that failed outright. Deliberately ahead of saturation: saturation is measured
     #     against DISTINCT listings and is skipped entirely when there are none (`if distinct:`
@@ -1475,9 +1487,30 @@ def expected_listings_per_query(query: str, limit: int = LISTING_ESTIMATE_HISTOR
     return None, 'no history yet'
 
 
-def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict):
-    """One Stage 1b request on the shared Claude Agent SDK session (the rollback path)."""
+class ScraperBudgetExceededError(ProviderUnavailableError):
+    """The Anthropic scraper fallback has spent its per-run budget.
+
+    A ProviderUnavailableError so `run_scraper` treats it the same way: abort the query loop and
+    mark every unreached query as an error, rather than letting each remaining query pay for its
+    own attempt.
+    """
+
+
+def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict, max_cost_usd: float | None = None):
+    """One Stage 1b request on the shared Claude Agent SDK session (the rollback path).
+
+    With `max_cost_usd`, a request is refused once this path's own spend has reached it. Checked
+    before each request, from the ResultMessage costs, so it counts only the fallback's spend and
+    not the OpenRouter cost already in `stage_stats`.
+    """
+    spent = {'cost': 0.0}
+
     async def run_pass(instruction: str) -> int | None:
+        if max_cost_usd is not None and spent['cost'] >= max_cost_usd:
+            raise ScraperBudgetExceededError(
+                f'Anthropic scraper fallback spent ${spent["cost"]:.2f}, at or over '
+                f'SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD (${max_cost_usd:.2f}) — the remaining '
+                'queries were not searched')
         num_turns: int | None = None
         await client.query(instruction)
         async for msg in client.receive_response():
@@ -1490,6 +1523,7 @@ def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict):
                         log_agent_text('Stage 1b', block.text)
             elif isinstance(msg, ResultMessage):
                 cost_delta = accumulate_stage_stats(stage_stats, msg)
+                spent['cost'] += cost_delta
                 print_result_stats(msg, cost_delta)
                 num_turns = msg.num_turns
         return num_turns
@@ -1537,12 +1571,45 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
     return run_pass
 
 
-async def _run_anthropic_scraper(playwright_mcp: dict, queries: list[str], stage_stats: dict) -> None:
-    """The original Claude Agent SDK scraper, kept intact as the rollback path.
+def make_anthropic_scraper_server(browser_call):
+    """The OpenRouter scraper's own tools (scrape_openrouter.LOCAL_TOOL_DEFS), served to the SDK.
 
-    Deliberately unchanged: it is what runs if the OpenRouter provider is unavailable, so it should
-    stay the known-good implementation rather than drift alongside the new one.
+    Both scrapers read ONE prompt, so they must expose the same tools. From 2026-08-31 the prompt
+    named run_ui_contract / harvest_listings / record_listings while this path still served the old
+    check_and_record_job / queue_candidate / report_search; on the 2026-09-27 and -28 fallbacks the
+    model improvised, left 5-7 searches unverified and sent report_search a report it made up. Each
+    tool runs the same `ScrapeSession.dispatch_local` code, over Python's own session to the shared
+    browser (--shared-browser-context shares the model's current tab), so the model still never
+    handles page or job data.
     """
+    session = scrape_openrouter.ScrapeSession(browser_call, '')
+
+    def wrap(definition: dict):
+        function = definition['function']
+
+        @tool(function['name'], function['description'], function['parameters'])
+        async def handler(args: dict) -> dict:
+            session.query = tools_module._current_query or ''
+            text = await session.dispatch_local(function['name'], args)
+            return {'content': [{'type': 'text', 'text': text}]}
+        return handler
+
+    return create_sdk_mcp_server(
+        name='job_scraper', version='1.0.0', tools=[wrap(d) for d in scrape_openrouter.LOCAL_TOOL_DEFS])
+
+
+async def _run_anthropic_scraper(playwright_mcp: dict, queries: list[str], stage_stats: dict) -> None:
+    """The Claude Agent SDK scraper: the rollback path when OpenRouter is unavailable.
+
+    It shares the OpenRouter scraper's prompt, so it serves the same tools
+    (make_anthropic_scraper_server); only how one request is executed differs.
+    """
+    async with mcp_session(playwright_mcp['url']) as browser_call:
+        await _run_anthropic_scraper_session(playwright_mcp, browser_call, queries, stage_stats)
+
+
+async def _run_anthropic_scraper_session(playwright_mcp: dict, browser_call, queries: list[str],
+                                         stage_stats: dict) -> None:
     options = ClaudeAgentOptions(
         setting_sources=[],
         strict_mcp_config=True,
@@ -1551,7 +1618,7 @@ async def _run_anthropic_scraper(playwright_mcp: dict, queries: list[str], stage
         system_prompt=build_scraper_prompt(),
         mcp_servers={
             'playwright': playwright_mcp,
-            'job_scraper': make_scraper_server(),
+            'job_scraper': make_anthropic_scraper_server(browser_call),
         },
         permission_mode='bypassPermissions',
         # Removes these from the model's context entirely. allowed_tools would NOT — it only
@@ -1560,9 +1627,19 @@ async def _run_anthropic_scraper(playwright_mcp: dict, queries: list[str], stage
         cwd=str(PROJECT_DIR),
         model=ANTHROPIC_MODEL_NAME_LOW,
         max_turns=SCRAPER_MAX_TURNS_PER_QUERY,
+        # The SDK's own ceiling stops a runaway query mid-flight; the run_pass check stops the
+        # next query from starting. Both read the one constant.
+        max_budget_usd=SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD,
     )
     async with ClaudeSDKClient(options) as scraper:
-        await run_scraper(_anthropic_run_pass(scraper, stage_stats), queries, stage_stats)
+        try:
+            await run_scraper(
+                _anthropic_run_pass(scraper, stage_stats, SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD),
+                queries, stage_stats)
+        except ScraperBudgetExceededError as ex:
+            logger.warning(f'Stage 1b: {ex}')
+            tools_module._ui_alerts.append(
+                {'kind': 'scrape_budget', 'query': '(all)', 'region': '(all)', 'detail': str(ex)})
 
 
 async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
@@ -1605,6 +1682,12 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
         if i > 1:
             await _human_pause(SCRAPER_INTER_QUERY_DELAY_SECONDS, f'query {i}/{len(queries)}')
         tools_module._current_query = query
+        # A query re-run by the Anthropic fallback must not keep the error the aborted OpenRouter
+        # loop stamped on it: on 2026-09-28 four queries that the fallback searched in full were
+        # still reported as "4 of 6 QUERIES FAILED".
+        tools_module._query_errors.pop(query, None)
+        if tools_module._queries_searched.get(query) == 'error':
+            del tools_module._queries_searched[query]
         before = _check_status_snapshot()
         before_distinct = _distinct_snapshot()
         try:
@@ -1716,12 +1799,9 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
                 retry_instruction = (
                     f'The query "{query}" inspected only {seen} job listing(s). A real search returns '
                     'roughly 25 on the first page, so the results list was not actually harvested.\n\n'
-                    'Retry now: scroll the results list to load the cards, then run the single '
-                    'read-only browser_evaluate harvest from your instructions — the one reading '
-                    'div[componentkey^="job-card-component-ref-"] inside '
-                    'div[componentkey="SearchResultsMainContent"], where the job id is the attribute '
-                    'suffix. Report how many jobs it returned, then call check_and_record_job for '
-                    'EVERY one, including those you expect to be already processed.\n\n'
+                    'Retry now: scroll the results list to load the cards, then call '
+                    'harvest_listings and then record_listings. Report the count harvest_listings '
+                    'returned.\n\n'
                     'Do NOT click anything in the results list to work around this. The card and its '
                     'Dismiss button are the same element to you, and clicking destroys a real job. If '
                     'the harvest returns an error or zero jobs while results are visible on screen, '
@@ -1909,6 +1989,7 @@ async def extract_job_page_direct(
         'sponsorship_note': structured.get('sponsorship_note', ''),
         'language_requirement': structured.get('language_requirement', ''),
         'posting_language': (structured.get('posting_language') or '').strip().lower(),
+        'stated_working_language': (structured.get('stated_working_language') or '').strip().lower(),
         'relocation': structured.get('relocation', ''),
         'residency_scope': (structured.get('residency_scope') or '').strip().lower(),
         'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
@@ -2296,8 +2377,12 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Language requirement: {extract['language_requirement']}")
     if extract.get('posting_language'):
         lines.append(f"Posting written in: {extract['posting_language']}")
-    if extract.get('implied_local_language'):
-        lines.append(f"Implied local language: {extract['implied_local_language']}")
+    if extract.get('stated_working_language'):
+        lines.append(f"Stated working language: {extract['stated_working_language']}")
+    # The location's guess is shown only when the posting is silent on language: the JD wins.
+    if extract.get('likely_working_language') and not posting_states_working_language(extract):
+        marginal = ' (marginal: remote across a multilingual area)' if working_language_is_marginal(extract) else ''
+        lines.append(f"Likely working language: {extract['likely_working_language']}{marginal}")
     if extract.get('relocation'):
         lines.append(f"Relocation required: {extract['relocation']}")
     if extract.get('education_requirement'):
@@ -2393,16 +2478,62 @@ def foreign_posting_language(extract: dict) -> str:
     return _unsupported_language(extract.get('posting_language', ''))
 
 
-def foreign_implied_local_language(extract: dict) -> str:
+def foreign_likely_working_language(extract: dict) -> str:
     """The language implied by the job's location, when it is not one the user speaks."""
-    return _unsupported_language(extract.get('implied_local_language', ''))
+    return _unsupported_language(extract.get('likely_working_language', ''))
 
 
-async def derive_implied_local_language(extract: dict) -> str:
-    """The working language IMPLIED by the job's location. Cosmetic: NO gate reads this.
+def posting_states_working_language(extract: dict) -> bool:
+    """True when the JD itself says anything about the working language.
 
-    A place implies a language -- Italy implies Italian -- and that is world knowledge about a
-    location, not a judgement about the posting. So the cached classifier is the only source:
+    What the posting says beats what the location implies, so a stated language (or an explicit
+    language requirement) silences the location-derived line entirely.
+    """
+    return bool(
+        str(extract.get('stated_working_language') or '').strip()
+        or str(extract.get('language_requirement') or '').strip()
+    )
+
+
+def working_language_is_marginal(extract: dict) -> bool:
+    """True for a remote job offered across a multi-country area.
+
+    The location's language then describes one office among many, not where the holder works:
+    "Spain, remote anywhere in the EU" should not warn as if the job were in Madrid.
+    """
+    return derive_workplace_type(extract) == 'remote' and (
+        extract.get('residency_scope') == 'area_wide' or bool(extract.get('location_broad_area'))
+    )
+
+
+def working_language_warnings(extract: dict) -> list[str]:
+    """The working-language bullets, in precedence order (Detect Likely Working Language).
+
+    1. The posting states a working language or a required one -> it wins. A stated language the
+       user does not speak gets its own bullet; the location's guess is never shown.
+    2. Otherwise the location's likely working language, when the user does not speak it --
+       marked marginal for a remote role across a multi-country area.
+    """
+    if posting_states_working_language(extract):
+        if stated := _unsupported_language(extract.get('stated_working_language', '')):
+            return [f'Working language: {stated.title()} (stated in posting)']
+        return []
+    if not (language := foreign_likely_working_language(extract)):
+        return []
+    location = extract.get('location') or 'location not stated'
+    if working_language_is_marginal(extract):
+        return [f'Likely working language (marginal — remote across a multilingual area): '
+                f'{language.title()} — {location}']
+    return [f'Likely working language: {language.title()} — {location}']
+
+
+async def derive_likely_working_language(extract: dict) -> str:
+    """The language a professional team at the job's location most likely works in. NO gate reads this.
+
+    A place implies a working language -- Paris implies French, Montreal French, Toronto English --
+    and that is world knowledge about a location, not a judgement about the posting. It is the
+    language business is actually done in, not the national one: Luxembourg answered
+    `luxembourgish` under the old national-language question (2026-09-29). So the cached classifier is the only source:
     it cannot answer two Berlin jobs differently, within a run or across runs.
 
     The extractor used to supply this too, under a rule where its foreign finding won over the
@@ -2413,7 +2544,7 @@ async def derive_implied_local_language(extract: dict) -> str:
     fact about the page and stays a model judgement for that reason.
     """
     facts = await classify_location(extract.get('location', ''))
-    return str(facts.get('implied_local_language') or '').strip().lower()
+    return str(facts.get('likely_working_language') or '').strip().lower()
 
 
 def commute_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
@@ -2541,7 +2672,7 @@ async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
     "non-English AND not on the acceptable list", which got the right answers for the wrong reason
     and would have excluded a French-language remote role in Canada — the exempt list named
     Vancouver and British Columbia but not Canada itself. What language is spoken somewhere is a
-    separate fact (`implied_local_language`), it warns only, and must never be folded back in here.
+    separate fact (`likely_working_language`), it warns only, and must never be folded back in here.
 
     In order, cheapest first:
       1. unconfigured (`would_live_here` and `would_not_live_here` both empty) -> '', and no
@@ -2844,9 +2975,7 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if language := foreign_posting_language(extract):
         warnings.append(f'Posting written in {language.title()} — not English')
 
-    if implied_local_language := foreign_implied_local_language(extract):
-        location = extract.get('location') or 'location not stated'
-        warnings.append(f'Implied local language: {implied_local_language.title()} — {location}')
+    warnings.extend(working_language_warnings(extract))
 
     location = extract.get('location') or ''
     if guessed := next(
@@ -3288,7 +3417,7 @@ async def evaluate_all_candidates(
             if extract is None:
                 extract = await extract_job_page_direct(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)
-            if extract is None and browser is not None and browser.is_dead():
+            if extract is None and browser is not None and await browser.confirm_dead():
                 index -= 1   # the browser, not the page, failed: retry this job after the restart
                 continue
             if extract is None:
@@ -3299,17 +3428,20 @@ async def evaluate_all_candidates(
                 logger.warning(f"Extract failed (both paths): {candidate['company']} — {candidate['title']}")
                 continue
             bump('extract_ok')
-            # Resolve the implied local language ONCE, here, and write it back — so
+            # Resolve the likely working language ONCE, here, and write it back — so
             # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
-            # field. Cosmetic only: no gate reads it, by design.
-            extract['implied_local_language'] = await derive_implied_local_language(extract)
+            # field. Cosmetic only: no gate reads it, by design. `broad_area` rides along from the
+            # same cached answer, for the marginal-warning rule.
+            extract['likely_working_language'] = await derive_likely_working_language(extract)
+            extract['location_broad_area'] = bool(
+                (await classify_location(extract.get('location', ''))).get('broad_area'))
             # Same treatment for residency_scope, and for the same reason: resolve once here so
             # the sync consumers (the gate, the warnings) read a plain field, and log raw->derived
             # so a fallback that silently overrides the extractor stays countable.
             raw_residency_scope = str(extract.get('residency_scope') or '')
             extract['residency_scope'] = derive_residency_scope(extract)
             # Every other name this place goes by, resolved ONCE (the classifier answer is already
-            # cached from derive_implied_local_language above, which now calls it unconditionally,
+            # cached from derive_likely_working_language above, which now calls it unconditionally,
             # so this is always free) and written back, so the sync consumers below read a plain
             # field instead of each needing to be async.
             extract['place_names'] = (
@@ -3327,7 +3459,8 @@ async def evaluate_all_candidates(
                 f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
                 f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
                 f"posting_language={extract.get('posting_language')!r} "
-                f"implied_local_language={extract.get('implied_local_language')!r} "
+                f"likely_working_language={extract.get('likely_working_language')!r} "
+                f"stated_working_language={extract.get('stated_working_language')!r} "
                 f"relocation={extract.get('relocation')!r} "
                 f"residency_scope={raw_residency_scope!r}->{extract.get('residency_scope')!r} "
                 f"place_names={extract.get('place_names')} "
@@ -3754,24 +3887,51 @@ class BrowserServer:
         self.proc: asyncio.subprocess.Process | None = None
         self.restarts = 0
         self.mcp: dict = {'type': 'http', 'url': ''}
+        # Set by confirm_dead when the port stops answering while the process is not yet reaped.
+        self.unreachable = False
 
     async def start(self) -> None:
         self.port = find_free_port()
         console.print(f'[dim]Starting shared browser ({self.browser_mode}, port {self.port}) ...[/dim]')
         self.proc = await start_playwright_server(self.port, browser_mode=self.browser_mode)
         self.mcp['url'] = f'http://localhost:{self.port}/mcp'
+        self.unreachable = False
 
     def is_dead(self) -> bool:
-        return self.proc is not None and self.proc.returncode is not None
+        return self.proc is not None and (self.proc.returncode is not None or self.unreachable)
+
+    async def confirm_dead(self) -> bool:
+        """After a failed extract: is the server gone, rather than the page bad? Probes the port.
+
+        is_dead() alone missed the 2026-09-28 death: the port closed and three jobs failed within
+        43 ms, before the process exit was reaped, so each was written off as a bad page.
+        """
+        if self.is_dead():
+            return True
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection('localhost', self.port), PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS)
+        except (OSError, TimeoutError) as ex:
+            logger.warning(f'{PLAYWRIGHT_MCP_PACKAGE} on port {self.port} is not accepting connections '
+                           f'({type(ex).__name__}: {ex}); treating the browser as dead')
+            self.unreachable = True
+            return True
+        writer.close()
+        await writer.wait_closed()
+        return False
 
     async def restart(self) -> None:
         exit_code = self.proc.returncode if self.proc else None
+        how = (f'exited with code {exit_code}' if exit_code is not None
+               else 'stopped accepting connections (process not yet exited)')
         logger.error(
-            f'{PLAYWRIGHT_MCP_PACKAGE} on port {self.port} exited with code {exit_code} mid-run; '
+            f'{PLAYWRIGHT_MCP_PACKAGE} on port {self.port} {how} mid-run; '
             f'restarting it ({self.restarts + 1} of {PLAYWRIGHT_MAX_RESTARTS_PER_RUN} allowed). '
             f'A negative code is the signal; a node crash report is in ~/Library/Logs/DiagnosticReports'
         )
         self.restarts += 1
+        # A server that stopped answering may still be running and holding the browser profile.
+        await self.stop()
         await self.start()
 
     async def stop(self) -> None:
@@ -3781,7 +3941,13 @@ class BrowserServer:
             return
         if self.proc.returncode is None:
             self.proc.terminate()
-        await self.proc.wait()
+        try:
+            await asyncio.wait_for(self.proc.wait(), PLAYWRIGHT_STOP_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning(f'{PLAYWRIGHT_MCP_PACKAGE} (pid {self.proc.pid}) ignored SIGTERM for '
+                           f'{PLAYWRIGHT_STOP_TIMEOUT_SECONDS}s; killing it')
+            self.proc.kill()
+            await self.proc.wait()
 
 
 async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scraping_stats: dict) -> bool:
@@ -3828,6 +3994,10 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
 
 
 async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0) -> None:
+    # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
+    # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
+    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
+        scrape_openrouter.min_bits_for(MODEL_NAME_SCRAPER)
     tools_module._candidates = []
     tools_module._candidates_per_query = {}
     tools_module._job_extracts = []

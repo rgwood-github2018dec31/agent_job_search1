@@ -129,6 +129,7 @@ src/agentic_job_search/
   tools_generic.py                # Tool implementations and MCP server factories
   triage.py                       # Local triage and non-Anthropic rating calls (MCP client lives in utils_tools_n_agents_common)
   scrape_openrouter.py            # Stage 1b: OpenRouter function-calling scraper loop (default path)
+  snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)

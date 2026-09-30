@@ -43,6 +43,7 @@ from agentic_job_search.config import (
     JOB_PAGE_ASSET_FETCH_TIMEOUT_SECONDS,
     LINKEDIN_PAGE_CAPTURE_JS,
     LINKEDIN_PAGE_CAPTURE_RETRIES,
+    LINKEDIN_PDF_FURNITURE_LINE_PATTERNS,
     LINKEDIN_REMOVE_ARIA_LABELS,
     LINKEDIN_REMOVE_SECTION_PHRASES,
     LINKEDIN_REMOVE_TAGS,
@@ -50,7 +51,7 @@ from agentic_job_search.config import (
     PAGE_SECTION_SAMPLE_MAX_CHARS,
     PAGE_SECTION_SIGNATURE_MAX_WORDS,
 )
-from agentic_job_search.salary import compensation_context
+from agentic_job_search.salary import mentions_pay
 from agentic_job_search.scrape_openrouter import parse_evaluate_result
 from agentic_job_search.text_budget import normalize_whitespace, snippet, truncate_reported, truncate_reported_middle
 from agentic_job_search.triage import chat_openrouter, extract_json_object
@@ -489,7 +490,7 @@ async def decide_unknown_blocks(soup: BeautifulSoup, candidate: dict, stage_stat
             continue
         for block in group:
             text = norm(block.get_text(' '))
-            if compensation_context(text):
+            if mentions_pay(text):
                 logger.warning(
                     f'Page section {sig!r} is marked remove but holds pay wording — kept '
                     f"(job {candidate.get('job_id')}): {snippet(text, PAGE_SECTION_SAMPLE_MAX_CHARS)!r}")
@@ -577,3 +578,21 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         f'removed {removed_summary}; JS {js_counts}; assets {asset_counts}'
     )
     return JobPage(text=text, source='dom', removed=removed)
+
+
+_PDF_FURNITURE_LINE_RE = re.compile('|'.join(f'(?:{p})' for p in LINKEDIN_PDF_FURNITURE_LINE_PATTERNS))
+
+
+def strip_saved_page_furniture(pages: list[str]) -> list[str]:
+    """Drop whole lines of LinkedIn UI from a SAVED job page's per-page text; keep everything else.
+
+    For the applied-job PDFs (reference jobs), not live pages, which read_job_page cleans at the
+    DOM. Only lines matching LINKEDIN_PDF_FURNITURE_LINE_PATTERNS in full are dropped; nothing is
+    cut by position, because the PDF text is two-column and interleaved (see
+    REFERENCE_JOB_PROMPT_MAX_CHARS). Pages left empty are dropped.
+    """
+    kept = (
+        '\n'.join(line for line in page.split('\n') if not _PDF_FURNITURE_LINE_RE.fullmatch(line.strip()))
+        for page in pages
+    )
+    return [page for page in kept if page.strip()]

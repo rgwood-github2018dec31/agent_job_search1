@@ -165,9 +165,9 @@ def fake_classify(text):
     names = [_GEO_KEYS[match.group(1).casefold()] for match in _GEO_RE.finditer(haystack)]
     countries, regions, language = [], [], ''
     for name in names:
-        country, region, implied_local_language = FAKE_GEOGRAPHY[name]
+        country, region, likely_working_language = FAKE_GEOGRAPHY[name]
         if not language:
-            language = implied_local_language
+            language = likely_working_language
         if country in countries:
             continue
         countries.append(country)
@@ -187,7 +187,7 @@ def fake_classify(text):
         place_names += FAKE_EXONYMS.get(name, [])
     return {
         'countries': countries, 'regions': regions, 'broad_area': broad,
-        'implied_local_language': language, 'place_names': list(dict.fromkeys(place_names)),
+        'likely_working_language': language, 'place_names': list(dict.fromkeys(place_names)),
         'source': 'stub',
     }
 

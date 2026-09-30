@@ -13,6 +13,7 @@ from agentic_job_search import scrape_openrouter as so
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.config import (
     SCRAPER_COST_ALERT_FACTOR,
+    SCRAPER_MIN_BITS_PER_WEIGHT,
     SCRAPER_PROVIDER_MAX_SWITCHES,
 )
 from agentic_job_search.triage import ProviderUnavailableError
@@ -21,6 +22,7 @@ from agentic_job_search.triage import ProviderUnavailableError
 REAL_PIN_SCRAPER_PROVIDER = so.pin_scraper_provider
 
 MODEL = 'deepseek/deepseek-v4-flash-0731'
+MIN_BITS = SCRAPER_MIN_BITS_PER_WEIGHT[MODEL]
 
 
 def _endpoint(tag, prompt, cache, completion, quantization='fp8', bits=8, status=0, tools_ok=True):
@@ -45,7 +47,7 @@ NO_CACHE_PRICE = _endpoint('mancer/fp8', 5e-8, None, 1.6e-7)
 
 def test_ranking_is_by_the_scrapers_token_mix_not_the_prompt_price():
     """NO_CACHE_PRICE has the lowest prompt price, but at 94% cache reads it is the dearest."""
-    ranked = [e['tag'] for _, e in so.rank_endpoints(_listing(COREWEAVE, NO_CACHE_PRICE, DEEPINFRA, STREAMLAKE), [])]
+    ranked = [e['tag'] for _, e in so.rank_endpoints(_listing(COREWEAVE, NO_CACHE_PRICE, DEEPINFRA, STREAMLAKE), [], MIN_BITS)]
     assert ranked == ['streamlake/fp8', 'deepinfra/fp8', 'mancer/fp8', 'coreweave/fp8']
 
 
@@ -66,14 +68,38 @@ def test_a_missing_price_is_never_guessed():
     _endpoint('notools/fp8', 1e-9, 1e-10, 1e-9, tools_ok=None),
     _endpoint('lowbits/fp4', 1e-9, 1e-10, 1e-9, quantization='fp4', bits=4),
     {**_endpoint('x/fp8', 1e-9, 1e-10, 1e-9), 'tag': None},
+    _endpoint('unknown', 1e-9, 1e-10, 1e-9, quantization='unknown', bits=None),
 ])
 def test_unusable_endpoints_are_never_chosen_however_cheap(unusable):
-    ranked = so.rank_endpoints(_listing(unusable, DEEPINFRA), [])
+    ranked = so.rank_endpoints(_listing(unusable, DEEPINFRA), [], MIN_BITS)
     assert [e['tag'] for _, e in ranked] == ['deepinfra/fp8']
 
 
+def test_a_precision_above_the_servers_default_is_still_a_candidate():
+    """2026-09-27: the default became bf16 and every fp8 endpoint vanished from the list."""
+    bf16 = _endpoint('morph/bf16', 1.4e-7, 3.6e-8, 4e-7, quantization='bf16', bits=16)
+    listing = {**_listing(bf16, DEEPINFRA, STREAMLAKE), 'default_quantization': 'bf16'}
+    assert [e['tag'] for _, e in so.rank_endpoints(listing, [], MIN_BITS)] == \
+        ['streamlake/fp8', 'deepinfra/fp8', 'morph/bf16']
+
+
+def test_a_tag_listed_twice_is_one_candidate():
+    assert [e['tag'] for _, e in so.rank_endpoints(_listing(DEEPINFRA, DEEPINFRA), [], MIN_BITS)] == ['deepinfra/fp8']
+
+
+def test_a_model_without_a_precision_floor_fails_fast():
+    with pytest.raises(KeyError, match='SCRAPER_MIN_BITS_PER_WEIGHT'):
+        so.min_bits_for('someone/unlisted-model')
+
+
+async def test_pinning_a_model_without_a_precision_floor_raises_rather_than_running_unpinned(monkeypatch):
+    _wire(monkeypatch, _listing(STREAMLAKE))
+    with pytest.raises(KeyError, match='unlisted-model'):
+        await REAL_PIN_SCRAPER_PROVIDER('someone/unlisted-model')
+
+
 def test_failed_endpoints_are_excluded():
-    assert [e['tag'] for _, e in so.rank_endpoints(_listing(STREAMLAKE, DEEPINFRA), ['streamlake/fp8'])] == ['deepinfra/fp8']
+    assert [e['tag'] for _, e in so.rank_endpoints(_listing(STREAMLAKE, DEEPINFRA), ['streamlake/fp8'], MIN_BITS)] == ['deepinfra/fp8']
 
 
 # --- choosing --------------------------------------------------------------------------------------
@@ -163,9 +189,13 @@ async def test_a_provider_failure_switches_to_the_next_cheapest_for_the_rest_of_
 async def test_a_429_on_a_pinned_endpoint_is_that_providers_rate_limit(monkeypatch):
     pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
     monkeypatch.setattr(tools, '_ui_alerts', [])
-    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE), [_chat(error='429 Client Error: Too Many Requests for url: x'), _chat()])
+    sent = []
+    bf16 = _endpoint('morph/bf16', 1.4e-7, 3.6e-8, 4e-7, quantization='bf16', bits=16)
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE, bf16), [_chat(error='429 Client Error: Too Many Requests for url: x'), _chat()], sent)
     await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
     assert pin.tag == 'deepinfra/fp8'
+    chats = [(args['provider'], args['quantization']) for tool, args in sent if tool == 'chat']
+    assert chats == [('streamlake/fp8', 'fp8'), ('deepinfra/fp8', 'fp8')], 'each call names its endpoint AND its precision'
 
 
 @pytest.mark.parametrize('status', [401, 402, 403])

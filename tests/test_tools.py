@@ -26,7 +26,7 @@ from agentic_job_search import (
     triage,
 )
 from agentic_job_search import tools_generic as tools
-from claude_agent_sdk import ResultMessage
+from claude_agent_sdk import ResultMessage, SdkMcpTool
 from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_LOW,
     ANTHROPIC_MODEL_NAME_MEDIUM,
@@ -1218,6 +1218,12 @@ async def test_submit_job_extract_normalizes_language_fields(monkeypatch):
     assert tools._job_extracts[0]['posting_language'] == 'french'
 
 
+async def test_submit_job_extract_normalizes_stated_working_language(monkeypatch):
+    monkeypatch.setattr(tools, '_job_extracts', [])
+    await tools.do_submit_job_extract('t', 'c', 'desc', stated_working_language=' English ')
+    assert tools._job_extracts[0]['stated_working_language'] == 'english'
+
+
 async def test_submit_job_extract_rejects_a_local_language_argument():
     """The implied local language is a fact about a PLACE, resolved by the cached classifier.
 
@@ -1246,7 +1252,7 @@ def _make_extract(**overrides) -> dict:
         'location': 'Canada (Remote)', 'date_posted': '3 days ago',
         'closed': False, 'salary': '', 'sponsorship_note': '',
         'language_requirement': '', 'relocation': '', 'education_requirement': '',
-        'posting_language': '', 'implied_local_language': '', 'residency_scope': '',
+        'posting_language': '', 'likely_working_language': '', 'residency_scope': '',
     }
     extract.update(overrides)
     return extract
@@ -2013,7 +2019,7 @@ async def test_classify_location_live(monkeypatch, tmp_path):
     # that answers 'germany' fails here rather than being quietly normalised into agreement.
     assert facts['countries'] == ['Germany']
     assert facts['regions'] == ['western_europe']
-    assert facts['implied_local_language'] == 'german'
+    assert facts['likely_working_language'] == 'german'
 
     # The distinction the whole gate rests on: a Mediterranean location is a different region,
     # regardless of the language spoken there.
@@ -2437,11 +2443,14 @@ class _FakeScraperClient:
         yield
 
 
-def test_scraper_browser_find_gets_its_own_larger_cap():
-    """browser_find returns only matches, so cutting it at the snapshot cap cut signal (2026-09-24)."""
+def test_scraper_browser_find_and_snapshot_get_their_own_larger_caps():
+    """browser_find returns only matches, so cutting it at the shared cap cut signal (2026-09-24);
+    a pane-less snapshot must keep every result card (2026-09-30)."""
     assert scrape_openrouter._result_cap('browser_find') == config.SCRAPER_FIND_RESULT_MAX_CHARS
-    assert scrape_openrouter._result_cap('browser_snapshot') == config.SCRAPER_TOOL_RESULT_MAX_CHARS
+    assert scrape_openrouter._result_cap('browser_snapshot') == config.SCRAPER_SNAPSHOT_RESULT_MAX_CHARS
+    assert scrape_openrouter._result_cap('browser_evaluate') == config.SCRAPER_TOOL_RESULT_MAX_CHARS
     assert config.SCRAPER_FIND_RESULT_MAX_CHARS > config.SCRAPER_TOOL_RESULT_MAX_CHARS
+    assert config.SCRAPER_SNAPSHOT_RESULT_MAX_CHARS > config.SCRAPER_TOOL_RESULT_MAX_CHARS
 
 
 async def test_run_scraper_sends_one_request_per_query(monkeypatch):
@@ -3075,6 +3084,36 @@ async def test_provider_abort_keeps_the_in_flight_query_counts(monkeypatch):
     assert 'Q2' not in tools._check_status_per_query, 'a query never reached recorded nothing'
 
 
+async def test_a_query_the_fallback_re_runs_is_not_still_reported_failed(monkeypatch):
+    """2026-09-28: the OpenRouter loop aborted on a 429 and stamped every pending query 'error';
+    the Anthropic fallback then searched all of them, yet run health said "4 of 6 QUERIES FAILED"."""
+    monkeypatch.setattr(tools, '_check_status_counts', {})
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_query_errors', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+
+    async def aborting_pass(instruction):
+        raise triage.ProviderUnavailableError('429 Client Error: Too Many Requests', status=429)
+
+    with pytest.raises(triage.ProviderUnavailableError):
+        await agent.run_scraper(aborting_pass, ['Q1', 'Q2'], {'cost': 0.0})
+    assert set(tools._query_errors) == {'Q1', 'Q2'}
+
+    async def fallback_pass(instruction):
+        return None
+
+    await agent.run_scraper(fallback_pass, ['Q1', 'Q2'], {'cost': 0.0})
+    assert tools._query_errors == {}, 'the re-run succeeded, so no query failed'
+    assert 'error' not in tools._queries_searched.values()
+
+
 def test_audit_log_reports_what_a_failed_query_recorded(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, '_queries_searched', {'Q1': 'error'})
     monkeypatch.setattr(tools, '_query_errors', {'Q1': '502 Server Error: Bad Gateway'})
@@ -3254,6 +3293,65 @@ def _result_msg(session_id: str, cost: float | None, **usage) -> ResultMessage:
         num_turns=1, session_id=session_id, total_cost_usd=cost,
         usage=usage or None,
     )
+
+
+class _BillingScraperClient(_FakeScraperClient):
+    """One shared SDK session whose cumulative total_cost_usd rises by `cost_per_query` per request.
+
+    Each query yields a healthy listing count, so no low-yield retry adds requests of its own.
+    """
+
+    def __init__(self, cost_per_query: float, queries: list[str]):
+        super().__init__(dict.fromkeys(queries, agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20))
+        self.cost_per_query = cost_per_query
+
+    async def receive_response(self):
+        yield _result_msg('fallback-session', self.cost_per_query * len(self.requests))
+
+
+async def test_anthropic_fallback_stops_at_its_budget(monkeypatch):
+    """On 2026-09-28 the fallback billed ~$4.96 of a $5.30 run with nothing to stop it."""
+    _reset_scraper_state(monkeypatch)
+    monkeypatch.setattr(tools, '_query_errors', {})
+    queries = ['Q1', 'Q2', 'Q3', 'Q4']
+    budget = 2.0
+    client = _BillingScraperClient(1.0, queries)
+    stats = {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0,
+             'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+
+    with pytest.raises(agent.ScraperBudgetExceededError, match='SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD'):
+        await agent.run_scraper(agent._anthropic_run_pass(client, stats, budget), queries, stats)
+
+    assert len(client.requests) == 2, 'no query may start once the budget is spent'
+    assert '"Q2"' in client.requests[1], 'the second request must be Q2, not a retry of Q1'
+    assert stats['cost'] == pytest.approx(budget)
+    for skipped in ['Q3', 'Q4']:
+        assert tools._queries_searched[skipped] == 'error', f'{skipped} must not read as searched-and-empty'
+
+
+async def test_anthropic_fallback_budget_counts_only_its_own_spend(monkeypatch):
+    """OpenRouter spend already in the stage totals must not use up the fallback's budget."""
+    _reset_scraper_state(monkeypatch)
+    monkeypatch.setattr(tools, '_query_errors', {})
+    queries = ['Q1', 'Q2']
+    client = _BillingScraperClient(0.1, queries)
+    stats = {'cost': 50.0, 'input_tokens': 0, 'output_tokens': 0,
+             'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+
+    await agent.run_scraper(agent._anthropic_run_pass(client, stats, 1.0), queries, stats)
+
+    assert len(client.requests) == 2
+
+
+def test_fallback_and_budget_alerts_reach_run_health():
+    funnel = {'ui_alerts': [
+        {'kind': 'provider_fallback', 'query': '(all)', 'region': '(all)', 'detail': '429'},
+        {'kind': 'scrape_budget', 'query': '(all)', 'region': '(all)', 'detail': 'spent $1.50'},
+    ], 'queries_generated': 1, 'listings_seen': 25, 'listings_distinct': 25, 'region_overlap': {},
+        'check_status': {}}
+    alerts = agent.assess_run_health(funnel)
+    assert any('FELL BACK TO ANTHROPIC' in a and '429' in a for a in alerts)
+    assert any('BUDGET SPENT' in a and '$1.50' in a for a in alerts)
 
 
 def test_cost_charged_once_for_cumulative_session():
@@ -4261,6 +4359,25 @@ def test_the_three_extract_schemas_share_one_salary_description():
     assert 'BOTH ends' in SALARY_FIELD_DESCRIPTION
 
 
+def test_the_extract_schemas_all_accept_stated_working_language():
+    """A field added to one extractor and not the others silently returns empty for that provider."""
+    from agentic_job_search import extract_openrouter as extract_or
+    from agentic_job_search import tools_generic
+    from agentic_job_search.config import STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION
+
+    openrouter_schema = next(
+        t['function']['parameters'] for t in extract_or.OPENROUTER_EXTRACT_TOOLS
+        if t['function']['name'] == 'submit_job_extract'
+    )
+    sdk_schema = tools_generic.submit_job_extract.input_schema['properties']
+    for properties in (agent.EXTRACT_OUTPUT_SCHEMA['properties'],
+                       openrouter_schema['properties'], sdk_schema):
+        assert properties['stated_working_language']['description'] == STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION
+    parsed = extract_or._extract_from_submit_args(
+        {'title': 't', 'company': 'c', 'description': 'd', 'stated_working_language': 'English'})
+    assert parsed['stated_working_language'] == 'english'
+
+
 @pytest.mark.parametrize('description', [
     'Temporary position up to 12 months, based in Toronto.',
     'Work Type: Temporary Full Time.',
@@ -4308,9 +4425,9 @@ def test_foreign_posting_language(value, expected):
     ('english', ''),
     ('', ''),
 ])
-def test_foreign_implied_local_language(value, expected):
-    assert agent.foreign_implied_local_language(
-        _make_extract(implied_local_language=value)) == expected
+def test_foreign_likely_working_language(value, expected):
+    assert agent.foreign_likely_working_language(
+        _make_extract(likely_working_language=value)) == expected
 
 
 def test_apply_rating_caps_caps_foreign_language_posting():
@@ -4328,9 +4445,9 @@ def test_apply_rating_caps_foreign_language_does_not_raise_a_low_rating():
     assert agent.apply_rating_caps(_make_extract(posting_language='french'), 2) == (2, '')
 
 
-def test_apply_rating_caps_implied_local_language_alone_never_caps():
+def test_apply_rating_caps_likely_working_language_alone_never_caps():
     """A non-English workplace is a warning, not a ceiling — only the JD's own language caps."""
-    assert agent.apply_rating_caps(_make_extract(implied_local_language='french'), 5) == (5, '')
+    assert agent.apply_rating_caps(_make_extract(likely_working_language='french'), 5) == (5, '')
 
 
 def test_apply_rating_caps_applies_lowest_cap_and_reports_every_reason(monkeypatch):
@@ -4350,18 +4467,18 @@ def test_build_deterministic_warnings_flags_foreign_posting_language():
     assert any('Posting written in French' in w for w in warnings)
 
 
-def test_build_deterministic_warnings_flags_non_english_implied_local_language():
-    """Reads the RESOLVED field; `derive_implied_local_language` is what puts it there."""
+def test_build_deterministic_warnings_flags_non_english_likely_working_language():
+    """Reads the RESOLVED field; `derive_likely_working_language` is what puts it there."""
     extract = _make_extract(
-        implied_local_language='french', location='Montreal, Canada', salary='CAD 200,000 - 240,000 per year',
+        likely_working_language='french', location='Montreal, Canada', salary='CAD 200,000 - 240,000 per year',
     )
     warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
-    assert any('Implied local language: French' in w and 'Montreal, Canada' in w for w in warnings)
+    assert any('Likely working language: French' in w and 'Montreal, Canada' in w for w in warnings)
 
 
 @pytest.mark.parametrize('overrides', [
-    {'posting_language': 'english', 'implied_local_language': 'english'},
-    {'posting_language': '', 'implied_local_language': ''},
+    {'posting_language': 'english', 'likely_working_language': 'english'},
+    {'posting_language': '', 'likely_working_language': ''},
 ])
 def test_build_deterministic_warnings_quiet_for_english_language_fields(overrides):
     extract = _make_extract(salary='CAD 200,000 - 240,000 per year', **overrides)
@@ -4370,16 +4487,16 @@ def test_build_deterministic_warnings_quiet_for_english_language_fields(override
 
 def test_format_extract_text_includes_language_fields():
     text = agent.format_extract_text(
-        _make_candidate(), _make_extract(posting_language='french', implied_local_language='french'),
+        _make_candidate(), _make_extract(posting_language='french', likely_working_language='french'),
     )
     assert 'Posting written in: french' in text
-    assert 'Implied local language: french' in text
+    assert 'Likely working language: french' in text
 
 
 def test_format_extract_text_omits_empty_language_fields():
     text = agent.format_extract_text(_make_candidate(), _make_extract())
     assert 'Posting written in:' not in text
-    assert 'Implied local language:' not in text
+    assert 'Likely working language:' not in text
 
 
 def test_valtech_regression_french_posting_is_capped_and_warned():
@@ -4404,7 +4521,82 @@ def test_valtech_regression_french_posting_is_capped_and_warned():
     # was one sentence in the body ('colleagues outside Quebec'); `Canada (Remote)` implies English,
     # and the implied local language is now a fact about the place alone. The outcome is unchanged
     # — `posting_language` is a fact about the PAGE, still a model judgement, and still caps here.
-    assert not any('Implied local language' in w for w in warnings)
+    assert not any('Likely working language' in w for w in warnings)
+
+
+def _language_bullets(extract: dict) -> list[str]:
+    return [w for w in agent.build_deterministic_warnings(_make_candidate(), extract) if 'language' in w.lower()]
+
+
+def test_luxembourg_work_from_anywhere_regression_is_marginal():
+    """The 2026-09-29 notification: 'Implied local language: Luxembourgish — Luxembourg (Remote —
+    "Remote-First, work from anywhere")'. A work-from-anywhere role must not warn as if the holder
+    sat in a Luxembourg office; if the location's language is foreign at all, it is marginal."""
+    extract = _make_extract(
+        location='Luxembourg (Remote — "Remote-First, work from anywhere")', workplace_type='remote',
+        description=_NEUTRAL_DESCRIPTION, likely_working_language='french',
+        salary='EUR 120,000 - 150,000 per year',
+    )
+    extract['residency_scope'] = agent.derive_residency_scope(extract)
+    assert extract['residency_scope'] == 'area_wide'
+    bullets = _language_bullets(extract)
+    assert len(bullets) == 1
+    assert bullets[0].startswith('Likely working language (marginal — remote across a multilingual area): French')
+
+
+def test_remote_in_a_broad_area_is_marginal():
+    extract = _make_extract(
+        location='European Union (Remote)', workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
+        likely_working_language='german', location_broad_area=True,
+    )
+    assert 'marginal' in _language_bullets(extract)[0]
+
+
+def test_hybrid_in_an_area_wide_posting_is_not_marginal():
+    """Marginal needs the holder to be remote: a hybrid role sits in the office's language."""
+    extract = _make_extract(
+        location='Madrid, Spain (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
+        likely_working_language='spanish', residency_scope='area_wide',
+    )
+    assert _language_bullets(extract) == ['Likely working language: Spanish — Madrid, Spain (Hybrid)']
+
+
+def test_a_stated_english_working_language_silences_the_location_guess():
+    extract = _make_extract(
+        location='Berlin, Germany (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
+        likely_working_language='german', stated_working_language='english',
+    )
+    assert _language_bullets(extract) == []
+    text = agent.format_extract_text(_make_candidate(), extract)
+    assert 'Stated working language: english' in text
+    assert 'Likely working language:' not in text
+
+
+def test_a_stated_foreign_working_language_gets_its_own_bullet():
+    extract = _make_extract(
+        location='Toronto, Canada (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
+        likely_working_language='english', stated_working_language='german',
+    )
+    assert _language_bullets(extract) == ['Working language: German (stated in posting)']
+
+
+def test_a_language_requirement_silences_the_location_guess():
+    """A required language the user lacks is already a hard rejection, so a surviving requirement
+    names only languages the user speaks -- and it is the posting speaking, which wins."""
+    extract = _make_extract(
+        location='Paris, France (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
+        likely_working_language='french', language_requirement='english',
+    )
+    assert _language_bullets(extract) == []
+
+
+def test_format_extract_text_marks_a_marginal_working_language():
+    extract = _make_extract(
+        location='European Union (Remote)', workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
+        likely_working_language='german', location_broad_area=True,
+    )
+    text = agent.format_extract_text(_make_candidate(), extract)
+    assert 'Likely working language: german (marginal: remote across a multilingual area)' in text
 
 
 # ---------------------------------------------------------------------------
@@ -4991,7 +5183,7 @@ def test_merge_warnings_leaves_salary_bullets_alone_when_a_figure_is_listed():
 
 
 @pytest.mark.parametrize('clause', [
-    'Do not write a warning bullet for either: both are detected deterministically and added for you.',
+    'Do not write a warning bullet for any of these: they are detected deterministically and added for you.',
     'Do NOT write a warning about the poster being a recruiting agency',
     'do not write a bullet stating that the role is hybrid or on-site',
     'do not write a bullet that only restates that the role is a contract',
@@ -5118,10 +5310,10 @@ async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences
 def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences):
     """With no languages configured there is nothing to be foreign to — no cap, no warning."""
     extract = _make_extract(
-        posting_language='french', implied_local_language='french', salary='CAD 200,000 - 240,000 per year',
+        posting_language='french', likely_working_language='french', salary='CAD 200,000 - 240,000 per year',
     )
     assert agent.foreign_posting_language(extract) == ''
-    assert agent.foreign_implied_local_language(extract) == ''
+    assert agent.foreign_likely_working_language(extract) == ''
     assert agent.apply_rating_caps(extract, 5) == (5, '')
     assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
 
@@ -5285,12 +5477,51 @@ async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatc
     assert facts['source'] == 'stale'
     assert facts['regions'] == ['western_europe'], 'the region gate still works from the old answer'
     assert facts['place_names'] == [], 'but no aliases until it can actually be upgraded'
-    assert facts['implied_local_language'] == 'german', (
+    assert facts['likely_working_language'] == 'german', (
         'the pre-rename key still reads: this is the one path that serves an un-upgraded entry'
     )
 
     unseen = await location.classify_location('Somewhere Never Seen')
     assert unseen['source'] == 'error' and unseen['countries'] == []
+
+
+async def test_an_entry_from_the_national_language_question_is_re_asked(monkeypatch, tmp_path):
+    """The old question asked for the first COUNTRY's national language (Luxembourg ->
+    luxembourgish, Montreal -> english). An entry carrying only that answer is a miss."""
+    calls = []
+
+    async def fake_chat(prompt, **kwargs):
+        calls.append(prompt)
+        return ('{"countries": ["Luxembourg"], "regions": ["western_europe"], "broad_area": false, '
+                '"likely_working_language": "english", "place_names": ["Luxembourg"]}'), 0.0
+
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {
+        'luxembourg (remote)': {'countries': ['Luxembourg'], 'regions': ['western_europe'],
+                                'broad_area': False, 'implied_local_language': 'luxembourgish',
+                                'place_names': ['Luxembourg']},
+    })
+    monkeypatch.setattr(location, 'chat_openrouter', fake_chat)
+
+    facts = await location.classify_location('Luxembourg (Remote)')
+    assert len(calls) == 1 and facts['source'] == 'llm'
+    assert facts['likely_working_language'] == 'english'
+
+
+async def test_a_failed_re_ask_serves_the_old_language_answer(monkeypatch, tmp_path):
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {
+        'berlin, germany': {'countries': ['Germany'], 'regions': ['western_europe'], 'broad_area': False,
+                            'implied_local_language': 'german', 'place_names': ['Berlin']},
+    })
+    async def _down(*a, **k):
+        raise RuntimeError('tool server down')
+    monkeypatch.setattr(location, 'chat_openrouter', _down)
+
+    facts = await location.classify_location('Berlin, Germany')
+    assert facts['source'] == 'stale'
+    assert facts['likely_working_language'] == 'german'
+    assert facts['place_names'] == ['Berlin']
 
 
 def test_collisions_ignore_deliberate_spelling_pairs(monkeypatch):
@@ -5375,11 +5606,11 @@ def test_classifier_keeps_country_names_proper():
     """`_coerce` must not fold a name. Regions and languages ARE folded — they are vocabularies."""
     coerced = location._coerce({
         'countries': ['Spain', '  United  Kingdom '], 'regions': ['Southern_Europe', 'WESTERN_EUROPE'],
-        'implied_local_language': 'Spanish',
+        'likely_working_language': 'Spanish',
     })
     assert coerced['countries'] == ['Spain', 'United Kingdom']
     assert coerced['regions'] == ['southern_europe', 'western_europe']
-    assert coerced['implied_local_language'] == 'spanish'
+    assert coerced['likely_working_language'] == 'spanish'
 
 
 async def test_review_skips_rather_than_rebuilds_a_corrupt_file(monkeypatch):
@@ -5938,7 +6169,7 @@ def test_eu_constants_are_written_as_proper_names():
 #
 # Purely geographic. These tests exist as much to pin what the rule must NOT look at as what it
 # does: it reads no language field, because a "non-English" conjunct would exclude a
-# French-language remote role in Canada. See test_location_gate_ignores_implied_local_language.
+# French-language remote role in Canada. See test_location_gate_ignores_likely_working_language.
 # ---------------------------------------------------------------------------
 
 async def test_rejected_location_flags_a_country_in_a_rejected_region():
@@ -6104,7 +6335,7 @@ def test_hard_rule_category_order_is_stable():
 # the four language/location facts stay independent
 # ---------------------------------------------------------------------------
 
-async def test_location_gate_ignores_implied_local_language():
+async def test_location_gate_ignores_likely_working_language():
     """A Spanish-speaking location is acceptable; the gate is geographic, not linguistic.
 
     This is the pin for the design error that nearly shipped: "non-English AND not on the
@@ -6115,15 +6346,15 @@ async def test_location_gate_ignores_implied_local_language():
     # `agent.classify_location`, which is the stub. Calling `location.classify_location` here made
     # this test pass only on a machine whose real cache happened to hold 'spain (remote)' — on a
     # clean checkout it would have made a live, paid call, or failed open and asserted on that.
-    assert (await agent.classify_location('Spain (Remote)'))['implied_local_language'] == 'spanish'
+    assert (await agent.classify_location('Spain (Remote)'))['likely_working_language'] == 'spanish'
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
-async def test_implied_local_language_alone_never_rejects_or_caps():
+async def test_likely_working_language_alone_never_rejects_or_caps():
     """French-speaking Quebec: warned about, never gated. The Valtech mechanism, restated."""
     extract = _make_extract(location='Montreal, Canada (Remote)')
-    extract['implied_local_language'] = await agent.derive_implied_local_language(extract)
-    assert extract['implied_local_language'] == 'french'
+    extract['likely_working_language'] = await agent.derive_likely_working_language(extract)
+    assert extract['likely_working_language'] == 'french'
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
     assert agent.apply_rating_caps(extract, 5) == (5, '')
 
@@ -6167,32 +6398,32 @@ async def test_september_2026_regression_is_superseded_for_silent_remote_posting
 
 
 # ---------------------------------------------------------------------------
-# derive_implied_local_language  (cosmetic: no gate reads it)
+# derive_likely_working_language  (cosmetic: no gate reads it)
 #
 # The location is the ONLY source. The extractor no longer supplies a claim, so there is no
 # precedence rule left to test -- which is the point: a fact about a place cannot be decided
 # differently for two jobs in the same place.
 # ---------------------------------------------------------------------------
 
-async def test_derive_implied_local_language_comes_from_the_location():
-    assert await agent.derive_implied_local_language(
+async def test_derive_likely_working_language_comes_from_the_location():
+    assert await agent.derive_likely_working_language(
         _make_extract(location='Berlin, Germany (Remote)')
     ) == 'german'
 
 
-async def test_derive_implied_local_language_ignores_a_stale_field_on_the_extract():
+async def test_derive_likely_working_language_ignores_a_stale_field_on_the_extract():
     """team.blue's Berlin posting once came back 'english' while Finom's came back 'german'.
 
     Nothing populates this field before resolution any more, but if anything ever did, the
     classifier still decides -- two Berlin jobs cannot disagree.
     """
-    assert await agent.derive_implied_local_language(
-        _make_extract(location='Berlin, Germany (Remote)', implied_local_language='english')
+    assert await agent.derive_likely_working_language(
+        _make_extract(location='Berlin, Germany (Remote)', likely_working_language='english')
     ) == 'german'
 
 
-async def test_derive_implied_local_language_empty_for_an_unnamed_location():
-    assert await agent.derive_implied_local_language(
+async def test_derive_likely_working_language_empty_for_an_unnamed_location():
+    assert await agent.derive_likely_working_language(
         _make_extract(location='Remote (Anywhere)')
     ) == ''
 
@@ -6233,7 +6464,7 @@ def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_th
     """An out-of-vocabulary region must read as 'I could not tell', not as 'acceptable'."""
     from agentic_job_search import location
     coerced = location._coerce(
-        {'countries': ['Germany'], 'regions': ['middle_earth'], 'implied_local_language': 'german'})
+        {'countries': ['Germany'], 'regions': ['middle_earth'], 'likely_working_language': 'german'})
     assert coerced['regions'] == ['unknown']
 
 
@@ -6246,7 +6477,7 @@ async def test_location_classification_is_cached(monkeypatch, tmp_path):
     async def fake_chat(prompt, **kwargs):
         calls.append(prompt)
         return ('{"countries": ["germany"], "regions": ["western_europe"], '
-                '"implied_local_language": "german"}'), 0.0
+                '"likely_working_language": "german"}'), 0.0
 
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {})
@@ -6754,6 +6985,23 @@ def test_fingerprint_ignores_linkedins_per_query_topical_chips(tmp_path, monkeyp
     tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'Gen AI', 'AWS']))
     drift = tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'AI/ML', 'Analytics']))
     assert drift == '', 'topical suggestion chips must not count as a UI change'
+
+
+def test_the_in_my_network_chip_flapping_is_not_drift(tmp_path, monkeypatch):
+    """2026-09-28: 'chips gone' on one query, 'new chips' on the next, same run, nothing changed."""
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    structural = ['Jobs', 'Past week', 'Senior', 'Employment type', 'Company']
+    tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network']))
+    assert tools.check_fingerprint_drift(_sound_report(chips=structural)) == ''
+    assert tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network'])) == ''
+
+
+def test_a_fingerprint_written_with_a_since_dropped_chip_does_not_alarm(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    structural = ['Company', 'Employment type', 'Jobs', 'Past week', 'Senior']
+    (tmp_path / config.UI_FINGERPRINT_FILENAME).write_text(
+        yaml.safe_dump({'chips': [*structural, 'In my network']}), encoding='utf-8')
+    assert tools.check_fingerprint_drift(_sound_report(chips=structural)) == ''
 
 
 # --- Discovery-health alerts -------------------------------------------------
@@ -8187,6 +8435,9 @@ class _FakeBrowser:
     def is_dead(self):
         return self.dead
 
+    async def confirm_dead(self):
+        return self.dead
+
     async def restart(self):
         self.restarts += 1
         self.dead = False
@@ -8267,6 +8518,40 @@ async def test_stage2_stops_and_releases_jobs_when_the_browser_stays_dead(monkey
         {'ui_alerts': agent.tools_module._ui_alerts}))
 
 
+async def test_a_closed_port_counts_as_dead_before_the_exit_is_reaped(monkeypatch):
+    """2026-09-28: the port closed and 3 jobs failed in 43 ms while proc.returncode was still None."""
+    browser = agent.BrowserServer('headless')
+    browser.proc = type('Running', (), {'returncode': None})()
+    browser.port = 1
+
+    async def refused(host, port):
+        raise ConnectionRefusedError(61, 'Connect call failed')
+
+    monkeypatch.setattr(agent.asyncio, 'open_connection', refused)
+    assert browser.is_dead() is False
+    assert await browser.confirm_dead() is True
+    assert browser.is_dead() is True, 'browser_usable reads is_dead(), so the verdict must stick'
+
+
+async def test_a_listening_port_means_the_page_failed_not_the_browser(monkeypatch):
+    browser = agent.BrowserServer('headless')
+    browser.proc = type('Running', (), {'returncode': None})()
+    browser.port = 1
+
+    class _Writer:
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    async def accepted(host, port):
+        return object(), _Writer()
+
+    monkeypatch.setattr(agent.asyncio, 'open_connection', accepted)
+    assert await browser.confirm_dead() is False
+
+
 def test_forget_processed_job_removes_the_record(tmp_path, monkeypatch):
     processed = tmp_path / 'processed_jobs'
     processed.mkdir()
@@ -8337,6 +8622,51 @@ def test_scraper_bad_tool_json_is_logged_and_returned_to_the_model(monkeypatch, 
     tool_reply = sent[1]['messages'][-1]
     assert tool_reply['role'] == 'tool' and 'invalid JSON arguments' in tool_reply['content']
     assert any('invalid JSON arguments' in m and '{not json' in m for m in _warnings(caplog))
+
+
+def _run_scraper_with_one_browser_call(monkeypatch, tool_name: str, result: str) -> str:
+    """Run a ScrapeSession whose model calls tool_name once; return what the model was sent back."""
+    call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
+                       'tool_calls': [{'id': 'c1', 'function': {'name': tool_name, 'arguments': '{}'}}]})
+    sent = []
+
+    async def fake_call_mcp_tool(url, name, args, timeout_seconds=None):
+        sent.append(args)
+        return [call, _CHAT_DONE][len(sent) - 1]
+
+    async def browser(name, args):
+        return result
+
+    monkeypatch.setattr(scrape_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    asyncio.run(scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer').run('sys', 'user', []))
+    return sent[1]['messages'][-1]['content']
+
+
+def test_scraper_snapshot_drops_the_detail_pane_and_keeps_every_card(monkeypatch, caplog):
+    """The pane inflated every snapshot past the cap, and the cut fell inside the cards (2026-09-30)."""
+    card = '    - button "Acme Toronto (Remote) Dismiss Staff ML Engineer job" [ref=e{}] [cursor=pointer]\n'
+    cards = ''.join(card.format(i) for i in range(config.SCRAPER_TOOL_RESULT_MAX_CHARS // len(card) + 1))
+    pane_filler = '      - paragraph: posting text\n' * (config.SCRAPER_SNAPSHOT_RESULT_MAX_CHARS // 10)
+    snapshot = ('- main [ref=e1]:\n  - paragraph [ref=e2]: 99+ results\n  - generic [ref=e3]:\n' + cards
+                + '  - generic [ref=e4]:\n    - generic [ref=e5]:\n      - heading "About the job" [level=2]\n'
+                + pane_filler)
+    assert len(cards) > config.SCRAPER_TOOL_RESULT_MAX_CHARS
+    assert len(snapshot) > config.SCRAPER_SNAPSHOT_RESULT_MAX_CHARS
+
+    with caplog.at_level(logging.INFO):
+        content = _run_scraper_with_one_browser_call(monkeypatch, 'browser_snapshot', snapshot)
+
+    assert cards in content, 'every result card reaches the model'
+    assert 'About the job' not in content and '[job detail pane omitted: ' in content
+    assert '[truncated' not in content
+    assert not any('Truncating' in m for m in _warnings(caplog))
+
+
+def test_scraper_evaluate_result_over_the_shared_cap_still_warns(monkeypatch, caplog):
+    result = 'x' * (config.SCRAPER_TOOL_RESULT_MAX_CHARS + 1)
+    content = _run_scraper_with_one_browser_call(monkeypatch, 'browser_evaluate', result)
+    assert '[truncated: kept ' in content
+    assert any('Truncating browser_evaluate result' in m for m in _warnings(caplog))
 
 
 def test_parse_posting_date_raises_on_an_unknown_format():
@@ -8428,3 +8758,89 @@ def test_extract_json_object_chains_the_last_decode_error():
     with pytest.raises(ValueError) as info:
         triage.extract_json_object('prose {not json} more prose')
     assert isinstance(info.value.__cause__, json.JSONDecodeError)
+
+
+# ---------------------------------------------------------------------------
+# Scraper prompt / tool parity (2026-08-31..09-28: the fallback's prompt named tools it did not have)
+# ---------------------------------------------------------------------------
+
+def _every_tool_name_there_is() -> set[str]:
+    """Every tool name either scraper has ever served: the SDK tools here plus the local defs."""
+    sdk = {value.name for value in vars(tools).values() if isinstance(value, SdkMcpTool)}
+    return sdk | {d['function']['name'] for d in scrape_openrouter.LOCAL_TOOL_DEFS}
+
+
+def _tools_named_in(text: str) -> set[str]:
+    known = _every_tool_name_there_is()
+    return {word for word in re.findall(r'\b[a-z]+(?:_[a-z]+)+\b', text)
+            if word in known or word.startswith('browser_')}
+
+
+async def _scraper_prompts(monkeypatch) -> list[str]:
+    """The system prompt plus both recovery instructions run_scraper can send."""
+    for name in ('_check_status_counts', '_candidates_per_query', '_queries_searched', '_query_errors',
+                 '_check_status_per_query'):
+        monkeypatch.setattr(tools, name, {})
+    for name in ('_ui_alerts', '_search_reports', '_candidates'):
+        monkeypatch.setattr(tools, name, [])
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_ids', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_SEARCH_DELAY_SECONDS', (0, 0))
+    sent = []
+
+    async def run_pass(instruction):
+        sent.append(instruction)
+        if tools._current_query == 'one listing' and len(sent) == 3:
+            tools._distinct_listing_ids.add('linkedin/1')   # a first pass that saw exactly one
+        return None
+
+    await agent.run_scraper(run_pass, ['no listings', 'one listing'], {'cost': 0.0})
+    assert any('no job listings at all' in s for s in sent) and any('inspected only 1' in s for s in sent)
+    return [agent.build_scraper_instructions(), *sent]
+
+
+def test_the_anthropic_scraper_serves_exactly_the_openrouter_scrapers_own_tools(monkeypatch):
+    served = []
+    monkeypatch.setattr(agent, 'create_sdk_mcp_server', lambda **kw: served.extend(t.name for t in kw['tools']))
+    agent.make_anthropic_scraper_server(browser_call=None)
+    assert served == [d['function']['name'] for d in scrape_openrouter.LOCAL_TOOL_DEFS]
+
+
+async def test_every_tool_a_scraper_prompt_names_is_served_by_both_scrapers(monkeypatch):
+    served = []
+    monkeypatch.setattr(agent, 'create_sdk_mcp_server', lambda **kw: served.extend(t.name for t in kw['tools']))
+    agent.make_anthropic_scraper_server(browser_call=None)
+    anthropic = set(served)
+    openrouter = {d['function']['name'] for d in scrape_openrouter.LOCAL_TOOL_DEFS}
+    disallowed = {name.removeprefix('mcp__playwright__') for name in config.SCRAPER_DISALLOWED_BROWSER_TOOLS}
+
+    named = set().union(*(_tools_named_in(p) for p in await _scraper_prompts(monkeypatch)))
+    assert {'run_ui_contract', 'harvest_listings', 'record_listings'} <= named, 'the guard must see the prompt'
+    for name in sorted(named):
+        if name.startswith('browser_'):
+            assert name not in disallowed, f'the prompt names {name}, which neither scraper exposes'
+        else:
+            assert name in anthropic, f'the prompt names {name}, which the Anthropic fallback does not serve'
+            assert name in openrouter, f'the prompt names {name}, which the OpenRouter scraper does not serve'
+
+
+async def test_an_anthropic_tool_runs_the_same_code_on_the_current_query(monkeypatch):
+    captured = {}
+
+    def capture(**kw):
+        captured.update({t.name: t for t in kw['tools']})
+
+    monkeypatch.setattr(agent, 'create_sdk_mcp_server', capture)
+    seen = []
+
+    async def fake_dispatch(self, name, args):
+        seen.append((self.query, name, args))
+        return 'ok'
+
+    monkeypatch.setattr(scrape_openrouter.ScrapeSession, 'dispatch_local', fake_dispatch)
+    monkeypatch.setattr(tools, '_current_query', 'AI Architect')
+    agent.make_anthropic_scraper_server(browser_call=None)
+    result = await captured['run_ui_contract'].handler({'region': 'Canada'})
+    assert result == {'content': [{'type': 'text', 'text': 'ok'}]}
+    assert seen == [('AI Architect', 'run_ui_contract', {'region': 'Canada'})]

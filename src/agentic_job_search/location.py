@@ -150,7 +150,7 @@ Return ONLY a JSON object, no prose and no code fence:
 {{"countries": ["<country in English, properly capitalised>", ...],
   "regions": ["<one region per country, same order>", ...],
   "broad_area": <true|false>,
-  "implied_local_language": "<dominant working language of the FIRST country, lowercase English name>",
+  "likely_working_language": "<language a professional office team there most likely works in, lowercase English name>",
   "place_names": ["<every place this text refers to, English and local spellings>", ...]}}
 
 Rules:
@@ -166,6 +166,12 @@ Rules:
 - southern_europe means the Mediterranean and Iberia, including SOUTHERN France (Nice, Marseille,
   Montpellier, Toulouse). Northern France, including Paris, is western_europe.
 - A city implies its country: "Berlin" -> Germany, "Barcelona" -> Spain.
+- `likely_working_language` is the language a professional, office-based team at the FIRST place
+  named most likely works in day to day. Judge it at the most specific level named -- the city or
+  province when one is given, else the country -- because a country can be split: "Montreal, QC,
+  Canada" is french, "Toronto, Canada" is english. Answer the language business is actually done
+  in, not a national or heritage language that is not the working one, and answer english where
+  that is the realistic working language even in a non-English country.
 - `countries` are proper names, like `place_names` below: write "Germany", never
   "germany". Code folds case where it needs to; it cannot restore a name you folded.
 - `place_names` lists every place the text refers to at EVERY level -- city, region/state, country
@@ -288,7 +294,7 @@ def cache_key(text: str) -> str:
 def _empty(reason: str) -> dict[str, Any]:
     """The fail-open answer: no country named, so no policy can reject."""
     return {
-        'countries': [], 'regions': [], 'broad_area': False, 'implied_local_language': '',
+        'countries': [], 'regions': [], 'broad_area': False, 'likely_working_language': '',
         'place_names': [], 'source': reason,
     }
 
@@ -312,7 +318,7 @@ def _coerce(raw: dict) -> dict[str, Any]:
         'countries': countries,
         'regions': regions,
         'broad_area': bool(raw.get('broad_area')),
-        'implied_local_language': str(raw.get('implied_local_language') or '').strip().lower(),
+        'likely_working_language': str(raw.get('likely_working_language') or '').strip().lower(),
         # Proper names, deliberately NOT lowercased: they are matched case-sensitively against the
         # user's lists. Deduped preserving order so the cache file stays stable.
         'place_names': list(dict.fromkeys(
@@ -324,7 +330,7 @@ def _coerce(raw: dict) -> dict[str, Any]:
 
 
 async def classify_location(text: str) -> dict[str, Any]:
-    """Geographic facts about `text`: {countries, regions, implied_local_language}.
+    """Geographic facts about `text`: {countries, regions, likely_working_language}.
 
     Cached on disk by normalized location string, so a repeated location costs nothing and — more
     importantly — cannot be answered two different ways. Every failure returns the empty answer,
@@ -339,7 +345,11 @@ async def classify_location(text: str) -> dict[str, Any]:
     # would silently disable alias matching for that location forever, which is the same shape as
     # the dead `malaga` entry this field exists to fix -- a mechanism that reports success while
     # doing nothing. One-off cost: ~81 entries at the flash-tier rate.
-    if key in cache and 'place_names' in cache[key]:
+    # Likewise an entry predating `likely_working_language` (2026-09-29): the old question asked
+    # for the national language of the first COUNTRY, which answered Luxembourg `luxembourgish`
+    # and Montreal `english`. Keeping those answers would keep the wrong warnings, so every such
+    # entry is re-asked the next time its location is seen.
+    if key in cache and 'place_names' in cache[key] and 'likely_working_language' in cache[key]:
         entry = dict(cache[key])
         entry['source'] = 'cache'
         _record_countries(entry)
@@ -358,10 +368,13 @@ async def classify_location(text: str) -> dict[str, Any]:
             # this, one outage silently disables the region gate for every location ever cached.
             entry = dict(stale)
             entry.setdefault('place_names', [])
-            # Same for the pre-rename language key. This is the one path that serves an entry the
-            # `place_names` guard above would otherwise have reclassified, so it is the only place
-            # the old name can still reach a consumer.
-            entry.setdefault('implied_local_language', stale.get('local_language', ''))
+            # Same for the pre-rename language keys, newest first. This is the one path that
+            # serves an entry the guard above would otherwise have reclassified, so it is the only
+            # place an old name can still reach a consumer.
+            entry.setdefault(
+                'likely_working_language',
+                stale.get('implied_local_language', stale.get('local_language', '')),
+            )
             entry['source'] = 'stale'
             _record_countries(entry)
             return entry
@@ -373,7 +386,7 @@ async def classify_location(text: str) -> dict[str, Any]:
     _write_cache()
     logger.info(
         f'Location classified: {text!r} -> countries={result["countries"]} '
-        f'regions={result["regions"]} implied_local_language={result["implied_local_language"]!r} (${cost:.6f})'
+        f'regions={result["regions"]} likely_working_language={result["likely_working_language"]!r} (${cost:.6f})'
     )
     entry = dict(result)
     entry['source'] = 'llm'

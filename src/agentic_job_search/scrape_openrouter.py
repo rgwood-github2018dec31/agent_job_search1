@@ -32,23 +32,35 @@ from agentic_job_search.config import (
     SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_FIND_RESULT_MAX_CHARS,
+    SCRAPER_MIN_BITS_PER_WEIGHT,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
     SCRAPER_PROVIDER_MAX_SWITCHES,
+    SCRAPER_SNAPSHOT_RESULT_MAX_CHARS,
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     SCRAPER_WHAT_HAPPENED_MAX_CHARS,
     UI_BLOCK_SIGNATURES,
 )
+from agentic_job_search.snapshot_prune import drop_job_detail_pane
 from agentic_job_search.text_budget import snippet, truncate_reported
 from agentic_job_search.triage import http_status_of, provider_error
 
 logger = logging.getLogger(__name__)
 
 _FIND_TOOL_NAME = 'browser_find'
+_SNAPSHOT_TOOL_NAME = 'browser_snapshot'
 
 
 def _result_cap(tool_name: str) -> int:
-    """The char budget for one tool result: browser_find returns only matches, so it gets more room."""
-    return SCRAPER_FIND_RESULT_MAX_CHARS if tool_name == _FIND_TOOL_NAME else SCRAPER_TOOL_RESULT_MAX_CHARS
+    """The char budget for one tool result.
+
+    browser_find returns only matches, and a snapshot arrives with its job detail pane removed and
+    must keep every result card, so both get more room than the shared cap.
+    """
+    if tool_name == _FIND_TOOL_NAME:
+        return SCRAPER_FIND_RESULT_MAX_CHARS
+    if tool_name == _SNAPSHOT_TOOL_NAME:
+        return SCRAPER_SNAPSHOT_RESULT_MAX_CHARS
+    return SCRAPER_TOOL_RESULT_MAX_CHARS
 
 # Gateway/server errors worth one retry of the same chat call. Deliberately disjoint from
 # PROVIDER_UNAVAILABLE_STATUSES (401/402/403/429): those break every query and must abort at once.
@@ -77,23 +89,41 @@ def effective_price_per_million(endpoint: dict) -> float | None:
     return per_token * PER_MILLION
 
 
-def rank_endpoints(listing: dict, exclude: list[str]) -> list[tuple[float, dict]]:
-    """Usable endpoints, cheapest effective price first.
+def min_bits_for(model: str) -> int:
+    """The lowest bits-per-weight the scraper accepts for this model. Raises when it has no entry."""
+    try:
+        return SCRAPER_MIN_BITS_PER_WEIGHT[model]
+    except KeyError as ex:
+        raise KeyError(
+            f'Scraper model {model!r} has no entry in SCRAPER_MIN_BITS_PER_WEIGHT (config.py), which has '
+            f'entries for {sorted(SCRAPER_MIN_BITS_PER_WEIGHT)}. Add the lowest precision this model '
+            f'is acceptable at before running it: without one, the endpoint list could fall to a '
+            f'4-bit quantization no one chose.'
+        ) from ex
 
-    Usable: up (status 0), tool-calling, at the precision the server pins by default (a pin at
-    another precision is refused by the server), with a tag to pin, not already failed this run.
+
+def rank_endpoints(listing: dict, exclude: list[str], min_bits: int) -> list[tuple[float, dict]]:
+    """Usable endpoints, cheapest effective price first: the run's ordered fallback list.
+
+    Usable: up (status 0), tool-calling, at a declared precision of at least `min_bits` (an
+    endpoint with unknown bits is excluded, never assumed good), with a tag to pin, not already
+    failed this run. The chat call carries the endpoint's own quantization, so a precision other
+    than the server's default is not refused. A tag listed twice is kept once.
     """
-    default_bits = next((e.get('bits') for e in listing.get('endpoints') or []
-                         if e.get('quantization') == listing.get('default_quantization')), None)
     ranked = []
+    seen: set[str] = set()
     for endpoint in listing.get('endpoints') or []:
         tag = endpoint.get('tag')
-        if not tag or tag in exclude or endpoint.get('status') != 0 or endpoint.get('supports_tools') is not True:
+        if not tag or tag in exclude or tag in seen:
             continue
-        if default_bits is not None and endpoint.get('bits') != default_bits:
+        if endpoint.get('status') != 0 or endpoint.get('supports_tools') is not True:
+            continue
+        bits = endpoint.get('bits')
+        if bits is None or bits < min_bits:
             continue
         price = effective_price_per_million(endpoint)
         if price is not None:
+            seen.add(tag)
             ranked.append((price, endpoint))
     return sorted(ranked, key=lambda pair: pair[0])
 
@@ -108,6 +138,7 @@ class ProviderPin:
     """
     model: str
     tag: str | None = None
+    quantization: str | None = None
     estimate_per_million: float | None = None
     failed: list[str] = field(default_factory=list)
     switches: int = 0
@@ -119,13 +150,13 @@ class ProviderPin:
         listing = json.loads(raw)
         if not listing.get('ok'):
             raise RuntimeError(f'list_endpoints failed for {self.model}: {listing.get("error") or snippet(raw)}')
-        ranked = rank_endpoints(listing, self.failed)
+        ranked = rank_endpoints(listing, self.failed, min_bits_for(self.model))
         if not ranked:
-            self.tag, self.estimate_per_million = None, None
+            self.tag, self.quantization, self.estimate_per_million = None, None, None
             return False
         self.estimate_per_million, best = ranked[0]
-        self.tag = best['tag']
-        runners_up = ', '.join(f"{e['tag']} ${price:.4f}/M" for price, e in ranked[1:4])
+        self.tag, self.quantization = best['tag'], best.get('quantization')
+        runners_up = ', '.join(f"{e['tag']} ${price:.4f}/M" for price, e in ranked[1:])
         logger.info(
             f'Stage 1b: pinned {self.model} to {self.tag} — est. ${self.estimate_per_million:.4f} per '
             f'million prompt tokens at the scraper\'s token mix (next: {runners_up or "none"})'
@@ -161,6 +192,9 @@ class ProviderPin:
 async def pin_scraper_provider(model: str) -> ProviderPin:
     """Choose this run's scraper endpoint. A failure to choose is logged and leaves the run unpinned."""
     pin = ProviderPin(model)
+    # Outside the try below: a model with no precision floor is a configuration error to fix,
+    # not a provider hiccup to run unpinned through.
+    min_bits_for(model)
     try:
         if not await pin.choose():
             logger.warning(f'Stage 1b: no usable endpoint to pin {model} to — running unpinned')
@@ -401,6 +435,7 @@ class ScrapeSession:
             chat_args = {'messages': messages, 'model': self.model, 'tools': tools}
             if self.pin is not None and self.pin.tag:
                 chat_args['provider'] = self.pin.tag
+                chat_args['quantization'] = self.pin.quantization
             raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                       timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
             data = json.loads(raw)
@@ -419,6 +454,7 @@ class ScrapeSession:
                     and await self.pin.switch(error, self.query)):
                 # The pinned endpoint failed, not the account: carry on on the next-cheapest one.
                 chat_args['provider'] = self.pin.tag
+                chat_args['quantization'] = self.pin.quantization
                 raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                           timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
                 data = json.loads(raw)
@@ -480,6 +516,9 @@ class ScrapeSession:
                             f'(args {snippet(args)}): {type(ex).__name__}: {ex}'
                         )
                         out = f'ERROR calling {name}: {ex}'
+                    else:
+                        if name == _SNAPSHOT_TOOL_NAME:
+                            out = drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
                 messages.append({'role': 'tool', 'tool_call_id': call.get('id', ''),
                                  'content': truncate_reported(out, _result_cap(name),
                                                               f'{name} result for query {self.query!r}')})

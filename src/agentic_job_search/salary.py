@@ -167,6 +167,10 @@ _COMPENSATION_SENTENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|\n+')
+# A currency written against a bare zero is a price tag, not pay: LinkedIn's Premium upsell reads
+# 'Activate Premium for CA$0 1-month free trial', which kept a page section marked for removal
+# 11 times across 2026-09-24..28.
+_ZERO_PRICE_RE = re.compile(rf'(?:{_CURRENCY_RE.pattern}|\$)\s?0(?![\d.,]*\d)', re.IGNORECASE)
 
 _PROMPT = """You are a compensation-string parser. Read ONLY the text below and report what
 amounts it states. Do not estimate, do not infer a market rate, do not judge whether the pay is
@@ -375,6 +379,14 @@ def compensation_context(description: str) -> str:
     return truncate_reported(
         ' '.join(sentences), SALARY_CONTEXT_MAX_CHARS, 'salary context excerpt'
     )
+
+
+def mentions_pay(text: str) -> bool:
+    """True when the text carries pay wording once zero-amount prices ('CA$0') are set aside.
+
+    A deterministic check over the WHOLE text: nothing is truncated or excerpted first.
+    """
+    return bool(_COMPENSATION_SENTENCE_RE.search(_ZERO_PRICE_RE.sub(' ', str(text or ''))))
 
 
 def _coerce(raw: dict, text: str) -> dict[str, Any]:

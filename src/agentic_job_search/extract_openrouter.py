@@ -19,6 +19,7 @@ from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_EXTRACTOR,
     SALARY_FIELD_DESCRIPTION,
+    STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
 )
 from agentic_job_search.text_budget import snippet
 
@@ -52,6 +53,8 @@ OPENROUTER_EXTRACT_TOOLS = [
                 'English text you are writing here — you translate as you condense. The original job '
                 "title is the clearest tell ('Scientifique principal des données en IA' means "
                 "'french'). Omit only if genuinely undeterminable. "
+                'Pass stated_working_language with the language the posting SAYS the team works in '
+                "('our working language is English'); omit it unless stated. "
                 'Pass relocation with the country/city if the posting requires relocating to or '
                 'residing in a specific place; omit for work-from-anywhere roles. '
                 "Pass education_requirement as 'master' or 'phd' ONLY if an advanced degree is a hard "
@@ -77,6 +80,7 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'sponsorship_note': {'type': 'string'},
                     'language_requirement': {'type': 'string', 'description': 'Explicitly required languages, comma-separated lowercase'},
                     'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output"},
+                    'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
                     'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
                                         'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
                     'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if required'},
@@ -113,6 +117,7 @@ def _extract_from_submit_args(args: dict) -> dict:
         'sponsorship_note': args.get('sponsorship_note', ''),
         'language_requirement': args.get('language_requirement', ''),
         'posting_language': str(args.get('posting_language') or '').strip().lower(),
+        'stated_working_language': str(args.get('stated_working_language') or '').strip().lower(),
         'relocation': args.get('relocation', ''),
         'residency_scope': str(args.get('residency_scope') or '').strip().lower(),
         'workplace_type': str(args.get('workplace_type') or '').strip().lower(),
