@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 _FIND_TOOL_NAME = 'browser_find'
 _SNAPSHOT_TOOL_NAME = 'browser_snapshot'
+_FILENAME_ARG = 'filename'
 
 
 def _result_cap(tool_name: str) -> int:
@@ -505,9 +506,14 @@ class ScrapeSession:
                     out = await self.dispatch_local(name, args)
                 else:
                     # `filename` diverts the result to disk, leaving the model with nothing to read
-                    # -- the exact condition that produced a fabricated report on 2026-08-21.
-                    if name in ('browser_evaluate', 'browser_snapshot') and 'filename' in args:
-                        args.pop('filename')
+                    # -- the exact condition that produced a fabricated report on 2026-08-21. Dropped
+                    # for EVERY browser tool, not a named few: the schemas come from the live
+                    # server, and a release can add the argument to another tool with no change
+                    # here (@playwright/mcp did, for browser_find).
+                    if _FILENAME_ARG in args:
+                        dropped = args.pop(_FILENAME_ARG)
+                        logger.warning(f'Stage 1b: dropped filename={dropped!r} from {name} for query '
+                                       f'{self.query!r} so the result is returned, not written to disk')
                     try:
                         out = await self._browser(name, args)
                     except Exception as ex:

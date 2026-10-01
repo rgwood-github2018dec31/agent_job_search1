@@ -7584,6 +7584,35 @@ async def test_result_diverted_to_a_file_is_reported_not_reconstructed(monkeypat
     assert tools._search_reports == [], 'nothing may be recorded from a page code could not read'
 
 
+@pytest.mark.parametrize('tool_name, tool_args', [
+    ('browser_evaluate', {'function': '() => document.title'}),
+    ('browser_snapshot', {}),
+    ('browser_find', {'text': 'results'}),
+    ('browser_console_messages', {'level': 'error'}),
+    ('browser_tool_a_later_release_adds', {}),
+])
+def test_model_supplied_filename_never_reaches_the_browser(monkeypatch, tool_name, tool_args):
+    """`filename` diverts a result to disk and leaves the model a link to reason from. The tool
+    schemas come from the live server, so a release that adds the argument to another tool (as
+    @playwright/mcp did for browser_find) exposes it to the model with no change here."""
+    browser_calls = []
+
+    async def browser(name, args):
+        browser_calls.append((name, dict(args)))
+        return 'ok'
+
+    tool_call = {'id': 'call1', 'function': {
+        'name': tool_name, 'arguments': json.dumps({**tool_args, 'filename': 'matches.md'})}}
+    replies = [json.dumps({'ok': True, 'content': None, 'tool_calls': [tool_call], 'usage': {}}), _CHAT_DONE]
+
+    async def fake_call_mcp_tool(url, name, args, timeout_seconds=None):
+        return replies.pop(0)
+
+    monkeypatch.setattr(scrape_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    asyncio.run(scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer').run('sys', 'user', []))
+    assert browser_calls == [(tool_name, tool_args)]
+
+
 @pytest.mark.asyncio
 async def test_record_before_harvest_refuses(monkeypatch):
     monkeypatch.setattr(tools, '_check_status_counts', {})
