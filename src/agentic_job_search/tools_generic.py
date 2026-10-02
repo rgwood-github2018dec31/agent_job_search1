@@ -1992,7 +1992,8 @@ async def update_job_requirements(args: dict[str, Any]) -> dict:
 @tool(
     'check_and_record_job',
     "Before evaluating any job, call this with the site name, job ID, company name, and job title/description. "
-    "Returns 'already_processed' (skip it), 'too_old' (skip it), 'already_applied' (skip it), 'auth_required' (skip it — requires current US work authorization), or 'new' (proceed to evaluate). "
+    "Returns 'already_processed' (skip it), 'too_old' (skip it), 'already_applied' (skip it), "
+    "'auth_required' (skip it — requires current US work authorization), or 'new' (proceed to evaluate). "
     "date_posted is optional — pass whatever is visible (YYYY-MM-DD or relative like '4 days ago'); omit if not shown. "
     "Optionally pass url (the job posting URL) and content (full text of the posting) to persist them in the record.",
     {
@@ -2095,13 +2096,27 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
             'closed': {'type': 'boolean'},
             'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
             'sponsorship_note': {'type': 'string'},
-            'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
-            'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
+            'language_requirement': {
+                'type': 'string',
+                'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'",
+            },
+            'posting_language': {
+                'type': 'string',
+                'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — "
+                               'judge the original page, not your condensed English output; '
+                               'the original title is the clearest tell',
+            },
             'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
             'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
-                                'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
+                                'description': "Whether the posting pins residence to the country it is anchored in "
+                                               "('country_only') or offers a whole multi-country area ('area_wide'); "
+                                               'empty when the posting does not say'},
             'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
-            'education_requirement': {'type': 'string', 'description': "'master' or 'phd' if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
+            'education_requirement': {
+                'type': 'string',
+                'description': "'master' or 'phd' if an advanced degree is a HARD requirement; "
+                               'empty when merely preferred or when equivalent experience is accepted',
+            },
             # Wording mirrors _extract_applied_job_metadata's is_recruiting_agency/end_client_name
             # so the applied-job and scraped sides classify a poster identically.
             'is_agency': {

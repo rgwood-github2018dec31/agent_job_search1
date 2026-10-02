@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import hashlib
@@ -184,7 +186,8 @@ Do not write files directly to disk. Use the save_job_posting tool to persist jo
 When browsing LinkedIn:
 - Navigate to https://www.linkedin.com/jobs/ to search for jobs
 - Extract: job title, company, location, remote/in-person/hybrid (if shown), salary (if shown), and key requirements
-- **Before evaluating any job, call `check_and_record_job` with the site, job ID, posting date (YYYY-MM-DD), company, and job title. If it returns `already_processed`, `too_old`, `already_applied`, or `auth_required`, skip the job entirely. Only proceed with jobs that return `new`.**
+- **Before evaluating any job, call `check_and_record_job` with the site, job ID, posting date (YYYY-MM-DD), company, and job title. If it returns
+`already_processed`, `too_old`, `already_applied`, or `auth_required`, skip the job entirely. Only proceed with jobs that return `new`.**
 
 The user's LinkedIn session is persisted so they should already be logged in. If not, ask them to log in via the browser.
 
@@ -328,7 +331,8 @@ SCRAPER_UI_CONTRACT_JS = r"""() => {
   };
 }"""
 
-SCRAPER_INSTRUCTIONS_TEMPLATE = """You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation queue.
+SCRAPER_INSTRUCTIONS_TEMPLATE = """You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation
+queue.
 
 You are fully authorized to call all available tools. Call them directly — do not ask for permission.
 
@@ -501,16 +505,32 @@ Stage 2 will fill in the details from the job page.
 """
 
 # What to capture and how, shared by both extractor prompts below.
-EXTRACT_FIELD_GUIDANCE = """Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or "no longer accepting applications" statements. In the location field, always include the workplace type shown on the page (Remote / Hybrid / On-site), e.g. "Bucharest, Romania (Remote within country)". Strip navigation chrome, footers, "similar jobs" lists, and marketing boilerplate.
+EXTRACT_FIELD_GUIDANCE = """Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack,
+seniority, and any visa/work-authorization or "no longer accepting applications" statements. In the location field, always include the workplace type shown on
+the page (Remote / Hybrid / On-site), e.g. "Bucharest, Romania (Remote within country)". Strip navigation chrome, footers, "similar jobs" lists, and marketing
+boilerplate.
 
 Also capture:
-- workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office (e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote. Leave empty only if the page genuinely does not say.
-- language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no language requirement is stated.
-- posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely undeterminable.
-- stated_working_language: the language(s) the posting SAYS the team or company works in, lowercase, e.g. "english" for "our working language is English" or "international English-speaking team". Leave empty unless the posting states it — never infer it from the location.
-- residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany", "open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere", "any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is advertised: "Romania (Remote)" on its own says nothing here.
-- relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
-- education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a plus", "Bachelor's or Master's"), or when only a Bachelor's is required."""
+- workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office
+(e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote.
+Leave empty only if the page genuinely does not say.
+- language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no
+language requirement is stated.
+- posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you
+read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original
+job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely
+undeterminable.
+- stated_working_language: the language(s) the posting SAYS the team or company works in, lowercase, e.g. "english" for "our working language is English" or
+"international English-speaking team". Leave empty unless the posting states it — never infer it from the location.
+- residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany",
+"open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere",
+"any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is
+advertised: "Romania (Remote)" on its own says nothing here.
+- relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within
+Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
+- education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD
+is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a
+plus", "Bachelor's or Master's"), or when only a Bachelor's is required."""
 
 # The Anthropic agentic path (the non-default route) still browses for itself.
 EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. Navigate to the job URL provided and capture a condensed extract of the posting.
@@ -518,10 +538,13 @@ EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. Navigate to the job UR
 Follow EXACTLY this sequence — you have a hard turn budget, and calling submit_job_extract is the only thing that counts as success:
 1. browser_navigate to the URL.
 2. browser_snapshot.
-3. If (and only if) the job description text is visibly cut off and a "… more" / "See more" button exists inside the description: click it, then browser_snapshot once more.
-4. Call submit_job_extract IMMEDIATELY with what you have. Do not scroll, do not take additional snapshots, do not search the page, do not run JavaScript, do not verify anything else. A partial description is acceptable — submitting something always beats running out of turns.
+3. If (and only if) the job description text is visibly cut off and a "… more" / "See more" button exists inside the description: click it, then
+browser_snapshot once more.
+4. Call submit_job_extract IMMEDIATELY with what you have. Do not scroll, do not take additional snapshots, do not search the page, do not run JavaScript, do
+not verify anything else. A partial description is acceptable — submitting something always beats running out of turns.
 
-If you have a title, company, and any description text, calling submit_job_extract is ALWAYS your next action. Never end a turn without having either taken your one snapshot or submitted the extract.
+If you have a title, company, and any description text, calling submit_job_extract is ALWAYS your next action. Never end a turn without having either taken
+your one snapshot or submitted the extract.
 
 """ + EXTRACT_FIELD_GUIDANCE + """
 
@@ -530,7 +553,8 @@ Do not rate the job. Do not browse other pages. Extract this one posting, submit
 
 # The default path: code has already read the page (linkedin_page.read_job_page), so the model
 # has the text and one tool, and no browser.
-PAGE_EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code — you have no browser and need none.
+PAGE_EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code — you
+have no browser and need none.
 
 Call submit_job_extract exactly once, with what the page text says. Never invent a field the text does not support; leave it empty instead.
 
@@ -539,13 +563,15 @@ Call submit_job_extract exactly once, with what the page text says. Never invent
 Do not rate the job. Extract this one posting, submit it, then stop.
 """
 
-EVALUATOR_INSTRUCTIONS_TEMPLATE = """You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not need to browse anywhere.
+EVALUATOR_INSTRUCTIONS_TEMPLATE = """You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not
+need to browse anywhere.
 {sponsorship_section}{relocation_section}
 ## Workplace type
 Check the `Workplace:` and `Location:` lines. Any requirement to be in an office some days a week is **hybrid**, even if the listing is badged "Remote".
 
 - **Remote** — the expectation. No penalty.
-- **Hybrid or on-site** — always a negative. Rate **4 or 5 only if BOTH**: (a) the location is one of the acceptable hybrid locations listed below; **and** (b) the role is strong in other respects, notably compensation well above target. If either fails, rate **3 at most**.
+- **Hybrid or on-site** — always a negative. Rate **4 or 5 only if BOTH**: (a) the location is one of the acceptable hybrid locations listed below; **and**
+(b) the role is strong in other respects, notably compensation well above target. If either fails, rate **3 at most**.
 {hybrid_locations_section}
 Rate the job 1–5 based on the requirements below:
 - 1 — Poor fit (missing key requirements or deal-breakers)
@@ -558,18 +584,33 @@ Also produce:
 - reasoning: 2–3 sentences on the fit
 - summary: a short label summarising the job (used in the saved filename)
 - pros: 2–4 short bullet phrases (~100 chars each) naming the concrete strengths — matching tech, seniority, compensation, domain
-- warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — salary below target, stack mismatch. Every conflict you notice MUST appear here, even when you still rate the job highly.
+- warnings: 0–4 short bullet phrases naming anything that conflicts with the requirements above — salary below target, stack mismatch. Every conflict you
+notice MUST appear here, even when you still rate the job highly.
 
 ## Language
-Check the `Posting written in:`, `Stated working language:` and `Likely working language:` lines. A posting written in another language, and a workplace whose working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English. A `Stated working language:` is what the posting itself says and overrides any guess from the location. A `Likely working language:` marked marginal is a remote role across a multi-country area — a minor friction at most. Do not write a warning bullet for any of these: they are detected deterministically and added for you.
+Check the `Posting written in:`, `Stated working language:` and `Likely working language:` lines. A posting written in another language, and a workplace whose
+working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English.
+A `Stated working language:` is what the posting itself says and overrides any guess from the location. A `Likely working language:` marked marginal is a
+remote role across a multi-country area — a minor friction at most.
+Do not write a warning bullet for any of these: they are detected deterministically and added for you.
 
-Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
+Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for
+you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
 
 ## Detected for you
-Three more facts are detected deterministically and added for you. Factor each into the rating, but do not write a warning bullet that only restates it — repeating it just duplicates the bullet in different words:
-- **Workplace:** do not write a bullet stating that the role is hybrid or on-site, or whether its location is one you would commute to. Travel, or occasional on-site customer work, is a different concern: do warn about that.
-- **Contract:** do not write a bullet that only restates that the role is a contract, freelance, temporary or fixed-term position. You may still warn about contractor-style terms the posting does not label as a contract.
-- **Salary:** the structure of the pay figure is added for you — "No salary listed" when there is none, and a "Partial salary" line when the posting states only a lower bound, only an upper bound, or a single figure. The `Salary structure:` line in the extract tells you which. Do not write a bullet that only says the salary is missing, that the range has one end, or that the target can't be verified. Judging the pay itself is still yours: if the figure (or its absence) makes you think the pay is likely below target, say that in one bullet. A range whose upper bound reaches the target is on target, because the band is negotiable: never warn about its midpoint, its lower half or its floor. Warn only when the whole range, converted if it is in another currency, sits below the target. When a `Salary vs target:` line is present, that comparison has already been made for you: do not write a bullet about it.
+Three more facts are detected deterministically and added for you. Factor each into the rating, but do not write a warning bullet that only restates it —
+repeating it just duplicates the bullet in different words:
+- **Workplace:** do not write a bullet stating that the role is hybrid or on-site, or whether its location is one you would commute to. Travel, or occasional
+on-site customer work, is a different concern: do warn about that.
+- **Contract:** do not write a bullet that only restates that the role is a contract, freelance, temporary or fixed-term position. You may still warn about
+contractor-style terms the posting does not label as a contract.
+- **Salary:** the structure of the pay figure is added for you — "No salary listed" when there is none, and a "Partial salary" line when the posting states
+only a lower bound, only an upper bound, or a single figure. The `Salary structure:` line in the extract tells you which.
+Do not write a bullet that only says the salary is missing, that the range has one end, or that the target can't be verified.
+Judging the pay itself is still yours: if the figure (or its absence)
+makes you think the pay is likely below target, say that in one bullet. A range whose upper bound reaches the target is on target, because the band is
+negotiable: never warn about its midpoint, its lower half or its floor. Warn only when the whole range, converted if it is in another currency, sits below the
+target. When a `Salary vs target:` line is present, that comparison has already been made for you: do not write a bullet about it.
 """
 
 
@@ -673,13 +714,28 @@ EXTRACT_OUTPUT_SCHEMA = {
         'closed': {'type': 'boolean', 'description': 'True if the page shows "No longer accepting applications"'},
         'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
         'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
-        'language_requirement': {'type': 'string', 'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'"},
-        'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output; the original title is the clearest tell"},
+        'language_requirement': {
+            'type': 'string',
+            'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'",
+        },
+        'posting_language': {
+            'type': 'string',
+            'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — "
+                           "judge the original page, not your condensed English output; "
+                           'the original title is the clearest tell',
+        },
         'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
         'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
-                            'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
+                            'description': "Whether the posting pins residence to the country it is anchored in "
+                                           "('country_only') or offers a whole multi-country area ('area_wide'); "
+                                           'empty when the posting does not say'},
         'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
-        'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement (e.g. 'MSc required', 'PhD is a must'); empty when merely preferred, when equivalent experience is accepted, or when only a Bachelor's is required"},
+        'education_requirement': {
+            'type': 'string',
+            'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement "
+                           "(e.g. 'MSc required', 'PhD is a must'); empty when merely preferred, "
+                           "when equivalent experience is accepted, or when only a Bachelor's is required",
+        },
     },
     'required': ['title', 'company', 'description'],
 }

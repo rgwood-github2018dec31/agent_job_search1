@@ -78,13 +78,26 @@ OPENROUTER_EXTRACT_TOOLS = [
                     'closed': {'type': 'boolean'},
                     'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
                     'sponsorship_note': {'type': 'string'},
-                    'language_requirement': {'type': 'string', 'description': 'Explicitly required languages, comma-separated lowercase'},
-                    'posting_language': {'type': 'string', 'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — judge the original page, not your condensed English output"},
+                    'language_requirement': {
+                        'type': 'string',
+                        'description': 'Explicitly required languages, comma-separated lowercase',
+                    },
+                    'posting_language': {
+                        'type': 'string',
+                        'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — "
+                                       'judge the original page, not your condensed English output',
+                    },
                     'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
                     'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
-                                        'description': "Whether the posting pins residence to the country it is anchored in ('country_only') or offers a whole multi-country area ('area_wide'); empty when the posting does not say"},
+                                        'description': "Whether the posting pins residence to the country it is anchored in "
+                                                       "('country_only') or offers a whole multi-country area ('area_wide'); "
+                                                       'empty when the posting does not say'},
                     'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if required'},
-                    'education_requirement': {'type': 'string', 'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; empty when merely preferred or when equivalent experience is accepted"},
+                    'education_requirement': {
+                        'type': 'string',
+                        'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; "
+                                       'empty when merely preferred or when equivalent experience is accepted',
+                    },
                     # Must stay in sync with submit_job_extract in tools_generic.py — a field added
                     # to one extractor and not the other silently returns empty for that provider.
                     'is_agency': {
