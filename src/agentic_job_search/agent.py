@@ -2415,6 +2415,42 @@ def check_salary_provenance(candidate: dict, extract: dict) -> bool:
     return False
 
 
+# Words the extractor wraps around a country when the requirement is the country itself ('Canada
+# (remote within country)', 'must be based in Canada'). Closed on purpose: any word outside it --
+# a province, a city, a second country -- may narrow the requirement, and keeps the warning.
+_RESIDENCE_FILLER_WORDS = frozenset({
+    'a', 'any', 'anywhere', 'are', 'across', 'authorised', 'authorized', 'based', 'be', 'candidate',
+    'candidates', 'country', 'eligible', 'for', 'from', 'fully', 'home', 'in', 'is', 'legally', 'live', 'living',
+    'located', 'must', 'of', 'only', 'open', 'position', 'relocate', 'relocation', 'remote',
+    'remotely', 'reside', 'residence', 'resident', 'residents', 'residing', 'required', 'role',
+    'the', 'this', 'throughout', 'to', 'within', 'work', 'working',
+})
+_RESIDENCE_ALTERNATIVE_RE = re.compile(r'\bor\b', re.IGNORECASE)
+_RESIDENCE_WORD_RE = re.compile(r'[^\W_]+')
+
+
+def relocation_already_met(relocation: str) -> bool:
+    """True when a stated residence requirement is just the country the user already lives in.
+
+    The extractor fills `relocation` for 'remote within Canada' as it does for 'relocate to
+    Madrid', and the warning followed from the field alone -- so every posting in the user's own
+    country was flagged as a move (2026-10-05). Met only when one alternative names
+    `current_tax_residence` and nothing narrower: 'Ontario, Canada' can still mean a move, and tax
+    residence says nothing about which province. Wording this does not recognise keeps the
+    warning, so a miss is visible rather than silent.
+    """
+    residence = preferences.current_tax_residence()
+    if not residence:
+        return False
+    for alternative in _RESIDENCE_ALTERNATIVE_RE.split(' '.join(str(relocation or '').split())):
+        if not location_token_matches(residence, alternative):
+            continue
+        rest = _RESIDENCE_WORD_RE.findall(alternative.replace(residence, ' '))
+        if all(word.casefold() in _RESIDENCE_FILLER_WORDS for word in rest):
+            return True
+    return False
+
+
 def format_extract_text(candidate: dict, extract: dict) -> str:
     workplace_type = derive_workplace_type(extract)
     # Who would actually hire, when a recruiter names them — the poster's name is not the employer.
@@ -2453,7 +2489,12 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     if extract.get('likely_working_language') and not posting_states_working_language(extract):
         marginal = ' (marginal: remote across a multilingual area)' if working_language_is_marginal(extract) else ''
         lines.append(f"Likely working language: {extract['likely_working_language']}{marginal}")
-    if extract.get('relocation'):
+    # A requirement the user already meets is told to the rater as met, not dropped: the JD still
+    # says 'remote within Canada', and the rater does not otherwise know where the user lives.
+    if relocation_already_met(extract.get('relocation', '')):
+        lines.append(
+            f"Residence requirement: {extract['relocation']} — already met (current tax residence)")
+    elif extract.get('relocation'):
         lines.append(f"Relocation required: {extract['relocation']}")
     if extract.get('education_requirement'):
         lines.append(f"Education requirement: {extract['education_requirement']}")
@@ -3059,7 +3100,7 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
             f'preferences.yaml'
         )
 
-    if extract.get('relocation'):
+    if extract.get('relocation') and not relocation_already_met(extract['relocation']):
         warnings.append(f"Relocation required: {extract['relocation']}")
 
     if _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')}"):

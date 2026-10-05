@@ -66,6 +66,10 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
         'exclude': [],   # title words that must never appear in a generated query
     },
     'relocation_note': '',  # free text for the evaluator on acceptable relocation
+    # The country the user is tax-resident in today, as written ('Canada'). A posting that only
+    # requires residence in that country asks for no move, so it carries no relocation warning.
+    # Empty = every stated residence requirement is flagged as a relocation.
+    'current_tax_residence': '',
     # Annual base pay a complete salary range must REACH (by its upper bound) to count as on
     # target. Both unset = no code-side comparison; the rater still judges pay on its own.
     'compensation': {
@@ -263,6 +267,24 @@ def excluded_title_words() -> tuple[str, ...]:
 
 def relocation_note() -> str:
     return str(load_preferences()['relocation_note'] or '')
+
+
+def current_tax_residence() -> str:
+    """The country the user is tax-resident in today, as written; '' when unset.
+
+    Returned unfolded like the place lists: it is a proper name, matched case-sensitively. A value
+    that is not a string raises rather than reading as unset -- an ignored residence silently puts
+    the relocation warning back on every posting in the user's own country.
+    """
+    raw = load_preferences()['current_tax_residence']
+    if raw is None:
+        return ''
+    if not isinstance(raw, str):
+        raise ValueError(
+            f'{PREFERENCES_PATH}: `current_tax_residence` must be one country name such as '
+            f'Canada, got {raw!r} ({type(raw).__name__})'
+        )
+    return ' '.join(raw.split())
 
 
 def salary_target() -> tuple[float, str] | None:

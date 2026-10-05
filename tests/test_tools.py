@@ -1336,6 +1336,72 @@ async def test_apply_hard_rules_relocation_does_not_reject():
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
+@pytest.fixture
+def tax_residence_canada(monkeypatch):
+    merged = preferences._deep_merge(preferences.load_preferences(), {'current_tax_residence': 'Canada'})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+
+
+@pytest.mark.parametrize('relocation', [
+    'Canada',
+    'Canada (remote within Canada)',
+    'Canada (remote within country)',
+    'Canada (must be based in Canada)',
+    'Remote within  Canada',
+    'United States or Canada',
+])
+def test_relocation_already_met_for_the_residence_country_alone(tax_residence_canada, relocation):
+    assert agent.relocation_already_met(relocation)
+
+
+@pytest.mark.parametrize('relocation', [
+    '',
+    'Portugal',
+    'Germany or UK',
+    'Ontario, Canada',
+    'Toronto, ON, Canada',
+    'Vancouver, BC, Canada',
+    'Canada (Ontario, British Columbia, or Alberta)',
+    'Canada and United States',
+    'canada',          # proper names match case-sensitively, like every place list
+    'Canadair',
+])
+def test_relocation_not_met_when_narrower_or_elsewhere(tax_residence_canada, relocation):
+    assert not agent.relocation_already_met(relocation)
+
+
+def test_relocation_is_never_met_without_a_tax_residence():
+    assert preferences.current_tax_residence() == ''
+    assert not agent.relocation_already_met('Canada')
+
+
+def test_build_deterministic_warnings_omits_relocation_to_the_residence_country(tax_residence_canada):
+    def relocation_warnings(relocation):
+        extract = _make_extract(relocation=relocation, salary='CAD 200,000 - 240,000 per year')
+        return [w for w in agent.build_deterministic_warnings(_make_candidate(), extract)
+                if w.startswith('Relocation required')]
+    assert relocation_warnings('Canada (remote within Canada)') == []
+    assert relocation_warnings('Ontario, Canada') == ['Relocation required: Ontario, Canada']
+    assert relocation_warnings('Portugal') == ['Relocation required: Portugal']
+
+
+def test_format_extract_text_tells_the_rater_a_residence_requirement_is_met(tax_residence_canada):
+    text = agent.format_extract_text(_make_candidate(), _make_extract(relocation='Canada'))
+    assert 'Residence requirement: Canada — already met (current tax residence)' in text
+    assert 'Relocation required' not in text
+    elsewhere = agent.format_extract_text(_make_candidate(), _make_extract(relocation='Portugal'))
+    assert 'Relocation required: Portugal' in elsewhere
+    assert 'Residence requirement' not in elsewhere
+
+
+def test_current_tax_residence_rejects_a_non_string(monkeypatch):
+    merged = preferences._deep_merge(
+        preferences.load_preferences(), {'current_tax_residence': ['Canada', 'Spain']})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    with pytest.raises(ValueError, match='current_tax_residence'):
+        preferences.current_tax_residence()
+
+
 def test_format_extract_text_includes_language_and_relocation():
     extract = _make_extract(
         language_requirement='english, german', relocation='Berlin, Germany',
@@ -5489,6 +5555,7 @@ def test_example_preferences_file_is_neutral():
     loaded = yaml.safe_load(text)
     assert loaded['sponsorship_required_in'] == []
     assert loaded['reject_required_degrees'] == []
+    assert loaded['current_tax_residence'] == ''
     for key in ('would_live_here', 'would_not_live_here', 'not_yet_bucketed', 'would_commute_here'):
         assert loaded['locations'][key] == [], key
     assert 'acceptable_locations' not in loaded['hybrid'], 'the example must use the new key names'

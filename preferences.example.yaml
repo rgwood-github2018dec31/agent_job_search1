@@ -111,6 +111,12 @@ titles:
 # is given no relocation guidance and judges the role on its own merits.
 relocation_note: ''
 
+# The country you are tax-resident in today, written as a place name (e.g. Portugal). A posting
+# that only requires residence in that country ("remote within Portugal") is then not flagged as
+# a relocation; one naming a region or city inside it still is. Empty means every stated residence
+# requirement is flagged.
+current_tax_residence: ''
+
 compensation:
   # Annual base pay you are targeting, and the ISO 4217 currency it is quoted in. When BOTH are set
   # and a posting states a complete annual range in that same currency, code decides the pay
