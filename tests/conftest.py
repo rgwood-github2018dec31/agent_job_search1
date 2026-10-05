@@ -327,6 +327,14 @@ def _unpinned_scraper_provider(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_scraper_nudge(monkeypatch):
+    '''A canned scraper conversation ends on a text-only reply; with the nudge on, every such test
+    would need one more reply that says nothing about what it tests. Tests of the nudge itself set
+    SCRAPER_NO_TOOL_NUDGES back.'''
+    monkeypatch.setattr(scrape_openrouter, 'SCRAPER_NO_TOOL_NUDGES', 0)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_linkedin_page(monkeypatch, tmp_path):
     """No test may write the real company_assets/ or linkedin_page_sections.yaml, or fetch an asset
     or classify a page section over the network. Tests exercising those patch them themselves."""

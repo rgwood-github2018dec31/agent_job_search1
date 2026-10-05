@@ -1789,30 +1789,6 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
                 tools_module._check_status_per_query[query] = partial
             continue
 
-        # Every configured region must actually be searched, and each search must have been
-        # verified. Both are prompted steps, and a model skips prompted steps: on the first live
-        # run report_search was called 5 times across 12 expected searches, and one query searched
-        # only one of its two regions -- with turn budget to spare (49 of 260), so this is choice,
-        # not starvation. An unverified search is silently unfiltered, which is the whole failure
-        # this guard exists to catch, so the omission itself has to be loud.
-        expected_regions = [
-            str(r.get('name') or r.get('linkedin_location', '')) for r in preferences.search_regions()
-        ] or ['(unfiltered)']
-        reported = {
-            str(rec.get('region', '')) for rec in tools_module._search_reports
-            if _same_query(rec.get('query', ''), query)
-        }
-        if missing := [r for r in expected_regions if r not in reported]:
-            logger.warning(
-                f'Stage 1b: query "{query}" never verified {len(missing)} of '
-                f'{len(expected_regions)} region(s): {", ".join(missing)} — the search either did '
-                'not run or ran without its filters confirmed.'
-            )
-            tools_module._ui_alerts.append({
-                'kind': 'unverified_search', 'query': query, 'region': ', '.join(missing),
-                'detail': f'no report_search for {", ".join(missing)} — search unrun or unverified',
-            })
-
         delta = _check_status_delta(before)
         # DISTINCT, not the sum of call counts: two regions returning the same cards would
         # otherwise read as double coverage and push a collapsed query away from this retry.
@@ -1879,6 +1855,34 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
             seen = len(_distinct_snapshot() - before_distinct)
             calls = sum(delta.values())
 
+        # Every configured region must actually be searched, and each search must have been
+        # verified. Both are prompted steps, and a model skips prompted steps: on the first live
+        # run report_search was called 5 times across 12 expected searches, and one query searched
+        # only one of its two regions -- with turn budget to spare (49 of 260), so this is choice,
+        # not starvation. An unverified search is silently unfiltered, which is the whole failure
+        # this guard exists to catch, so the omission itself has to be loud.
+        #
+        # Judged AFTER the recovery pass: on 2026-09-28 a first pass that never started raised
+        # this for both regions, the recovery pass then verified both, and the alert stayed.
+        expected_regions = [
+            str(r.get('name') or r.get('linkedin_location', '')) for r in preferences.search_regions()
+        ] or ['(unfiltered)']
+        reported = {
+            str(rec.get('region', '')) for rec in tools_module._search_reports
+            if _same_query(rec.get('query', ''), query)
+        }
+        missing = [r for r in expected_regions if r not in reported]
+        if missing:
+            logger.warning(
+                f'Stage 1b: query "{query}" never verified {len(missing)} of '
+                f'{len(expected_regions)} region(s): {", ".join(missing)} — the search either did '
+                'not run or ran without its filters confirmed.'
+            )
+            tools_module._ui_alerts.append({
+                'kind': 'unverified_search', 'query': query, 'region': ', '.join(missing),
+                'detail': f'no report_search for {", ".join(missing)} — search unrun or unverified',
+            })
+
         if seen < SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY:
             expected, basis = expected_listings_per_query(query)
             expected_text = f'expected ~{expected:g} ({basis})' if expected is not None else basis
@@ -1899,7 +1903,17 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
         # budget is sized for the worst case, so `budget // 3` fired on every healthy query once
         # harvesting replaced click-to-reveal and a full query legitimately took ~50 of 180 turns.
         # A warning that fires on success trains the reader to ignore it.
-        if turns is not None and turns < SCRAPER_MIN_TURNS_PER_QUERY:
+        #
+        # A short first pass the recovery pass made good (enough listings, every region verified)
+        # needs nobody's attention: logged, not alerted (2026-09-28).
+        if (turns is not None and turns < SCRAPER_MIN_TURNS_PER_QUERY
+                and seen >= SCRAPER_MIN_LISTINGS_PER_QUERY and not missing):
+            logger.info(
+                f'Stage 1b: query "{query}" used only {turns} turns on its first pass (expected at '
+                f'least {SCRAPER_MIN_TURNS_PER_QUERY}); the recovery pass completed it '
+                f'({seen} distinct listing(s), every region verified) — no alert.'
+            )
+        elif turns is not None and turns < SCRAPER_MIN_TURNS_PER_QUERY:
             logger.warning(
                 f'Stage 1b: query "{query}" used only {turns} turns on its first pass (expected at '
                 f'least {SCRAPER_MIN_TURNS_PER_QUERY}) — it stopped before completing a harvest '
@@ -4039,11 +4053,24 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
         except Exception as ex:
             # A provider outage must not end the run: fall through to the Anthropic scraper,
             # exactly as query generation, rating and extraction already do.
+            # Only what OpenRouter did not finish. On 2026-09-28 the fallback re-scraped the two
+            # queries already complete: twice the LinkedIn traffic for them, and under
+            # SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD it would now spend the budget there and skip
+            # the queries that needed it.
+            done = [q for q in queries if isinstance(tools_module._queries_searched.get(q), int)]
+            queries = [q for q in queries if q not in done]
+            scope = (f'{len(queries)} unfinished quer(ies); {len(done)} already complete, not re-run'
+                     if done else f'all {len(queries)} quer(ies)')
             logger.warning(f'Stage 1b: OpenRouter scraper failed ({unwrap_exception(ex)}) — '
-                           'falling back to the Anthropic scraper')
+                           f'falling back to the Anthropic scraper for {scope}')
+            if done:
+                logger.info(f'Stage 1b: fallback skips {", ".join(done)} — completed on OpenRouter')
             tools_module._ui_alerts.append({
                 'kind': 'provider_fallback', 'query': '(all)', 'region': '(all)',
-                'detail': f'OpenRouter scraper failed, fell back to Anthropic: {unwrap_exception(ex)}'})
+                'detail': f'OpenRouter scraper failed, fell back to Anthropic for {scope}: '
+                          f'{unwrap_exception(ex)}'})
+            if not queries:
+                return False
 
     await _run_anthropic_scraper(playwright_mcp, queries, scraping_stats)
     return False

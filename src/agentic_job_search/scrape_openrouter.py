@@ -33,6 +33,7 @@ from agentic_job_search.config import (
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_FIND_RESULT_MAX_CHARS,
     SCRAPER_MIN_BITS_PER_WEIGHT,
+    SCRAPER_NO_TOOL_NUDGES,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
     SCRAPER_PROVIDER_MAX_SWITCHES,
     SCRAPER_SNAPSHOT_RESULT_MAX_CHARS,
@@ -67,6 +68,12 @@ def _result_cap(tool_name: str) -> int:
 # PROVIDER_UNAVAILABLE_STATUSES (401/402/403/429): those break every query and must abort at once.
 TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 TRANSIENT_RETRY_DELAY_SECONDS = 5
+# Sent when the model answers with text alone before recording anything (SCRAPER_NO_TOOL_NUDGES).
+NO_TOOL_NUDGE = (
+    'You replied without calling a tool, and no listings have been recorded for this query yet. '
+    'Describing a step does not perform it. Continue now by calling the tools, as instructed. '
+    'If something is missing, unreadable, or blocking you, call report_problem instead and stop.'
+)
 # Failures that belong to the ACCOUNT (auth, credits), not to the endpoint serving the call: moving
 # to another provider cannot help, so these still abort the OpenRouter scraper at once. A 429 is
 # not among them once an endpoint is pinned with fallbacks off — it is that provider's rate limit.
@@ -354,6 +361,8 @@ class ScrapeSession:
         self.region = ''
         self.problems: list[str] = []
         self.blocked = False
+        self.records = 0          # completed record_listings calls
+        self.nudges = 0
         self.iterations = 0
         self.cost = 0.0
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
@@ -410,6 +419,7 @@ class ScrapeSession:
                 return ('nothing harvested yet, or the last harvest failed. Call harvest_listings '
                         'first — do not describe listings yourself.')
             summary = await tools_generic.do_record_listings(self._harvest, query=self.query)
+            self.records += 1
             self._harvest = None      # consumed, so each search must re-harvest
             return summary
 
@@ -479,6 +489,21 @@ class ScrapeSession:
                 log_agent_text('Stage 1b', str(text))
 
             tool_calls = data.get('tool_calls')
+            if (not tool_calls and not self.records and not self.blocked and not self.problems
+                    and self.nudges < SCRAPER_NO_TOOL_NUDGES):
+                # Text and no tool call, with nothing recorded: the model announced a step and
+                # never took it. On 2026-09-28 "I'll start by navigating..." ended a query after
+                # 2 iterations. Never after a block or a reported problem -- stopping there is
+                # right, and pushing on is what Account safety forbids.
+                self.nudges += 1
+                logger.warning(
+                    f'Stage 1b: model replied without a tool call after {self.iterations} '
+                    f'iteration(s) for query {self.query!r} with nothing recorded '
+                    f'(finish_reason={data.get("finish_reason")}) — nudging it to continue '
+                    f'({self.nudges} of {SCRAPER_NO_TOOL_NUDGES})')
+                messages.append({'role': 'assistant', 'content': data.get('content') or ''})
+                messages.append({'role': 'user', 'content': NO_TOOL_NUDGE})
+                continue
             if not tool_calls:
                 logger.info(f'Stage 1b: model finished after {self.iterations} iteration(s) '
                             f'(finish_reason={data.get("finish_reason")})')

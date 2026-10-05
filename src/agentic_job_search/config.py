@@ -120,6 +120,11 @@ SCRAPER_MAX_TURNS_PER_QUERY = 260
 # harvesting replaced click-to-reveal (a good query legitimately runs ~50 of 180 turns), and a
 # warning that fires on success trains the reader to ignore it.
 SCRAPER_MIN_TURNS_PER_QUERY = 12
+# Times per pass the OpenRouter scraper is told to carry on after answering with text and no tool
+# call before recording anything. The loop used to read that as "finished": on 2026-09-28 one
+# sentence of intent ended a query after 2 iterations, and it recurred on 09-29 and 10-02. One, so
+# a model that will not act still ends the pass and reaches the recovery pass and its alerts.
+SCRAPER_NO_TOOL_NUDGES = 1
 
 # Human-emulation pacing for Stage 1b.
 #

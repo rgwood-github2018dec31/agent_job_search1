@@ -3114,6 +3114,132 @@ async def test_a_query_the_fallback_re_runs_is_not_still_reported_failed(monkeyp
     assert 'error' not in tools._queries_searched.values()
 
 
+def _stage_1b_with_a_provider_failure(monkeypatch, completed: dict) -> list[list[str]]:
+    '''Wire run_stage_1b so the OpenRouter path dies with `completed` already searched; returns the
+    list the Anthropic fallback is handed (one entry per fallback run).'''
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_scrape_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
+
+    class _Session:
+        async def __aenter__(self):
+            async def call(*a, **k):
+                return ''
+
+            async def list_tools():
+                return []
+            call.list_tools = list_tools
+            return call
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(agent, 'mcp_session', lambda url: _Session())
+
+    async def dying_scraper(run_pass, queries, stats):
+        tools._queries_searched.update(completed)
+        raise triage.ProviderUnavailableError('429 Client Error: Too Many Requests', status=429)
+
+    monkeypatch.setattr(agent, 'run_scraper', dying_scraper)
+    fallback_ran: list[list[str]] = []
+
+    async def fake_anthropic(playwright_mcp, queries, stats):
+        fallback_ran.append(queries)
+
+    monkeypatch.setattr(agent, '_run_anthropic_scraper', fake_anthropic)
+    return fallback_ran
+
+
+async def test_fallback_runs_only_the_queries_openrouter_did_not_finish(monkeypatch):
+    '''2026-09-28: the 429 came on query 3 and the fallback re-scraped queries 1 and 2 as well --
+    twice the LinkedIn traffic for them, and most of what is now the whole fallback budget.'''
+    fallback_ran = _stage_1b_with_a_provider_failure(
+        monkeypatch, {'Q1': 50, 'Q2': 14, 'Q3': 'error', 'Q4': 'error'})
+
+    assert await agent.run_stage_1b(1234, {'type': 'http'}, ['Q1', 'Q2', 'Q3', 'Q4'], {'cost': 0.0}) is False
+
+    assert fallback_ran == [['Q3', 'Q4']]
+    detail = next(a['detail'] for a in tools._ui_alerts if a['kind'] == 'provider_fallback')
+    assert '2 unfinished' in detail and '2 already complete' in detail and '429' in detail
+
+
+async def test_fallback_runs_every_query_when_none_completed(monkeypatch):
+    fallback_ran = _stage_1b_with_a_provider_failure(monkeypatch, {})
+
+    await agent.run_stage_1b(1234, {'type': 'http'}, ['Q1', 'Q2'], {'cost': 0.0})
+
+    assert fallback_ran == [['Q1', 'Q2']]
+
+
+async def test_fallback_does_not_start_when_every_query_completed(monkeypatch):
+    '''A zero-listing query counts as completed (int 0): searched, found nothing.'''
+    fallback_ran = _stage_1b_with_a_provider_failure(monkeypatch, {'Q1': 50, 'Q2': 0})
+
+    assert await agent.run_stage_1b(1234, {'type': 'http'}, ['Q1', 'Q2'], {'cost': 0.0}) is False
+
+    assert fallback_ran == []
+    assert [a['kind'] for a in tools._ui_alerts] == ['provider_fallback'], 'the failure is still reported'
+
+
+def _two_pass_scraper(first_turns: int, recovery_listings: int, recovery_verifies: bool):
+    '''A run_pass whose first pass does nothing in `first_turns` turns; the recovery pass records
+    `recovery_listings` distinct listings and, if asked, verifies every configured region.'''
+    passes = []
+
+    async def run_pass(instruction):
+        passes.append(instruction)
+        if len(passes) == 1:
+            return first_turns
+        for i in range(recovery_listings):
+            tools._check_status_counts[f'rec-{i}'] = 1
+            tools._distinct_listing_ids.add(f'linkedin/rec-{i}')
+        if recovery_verifies:
+            for region in preferences.search_regions():
+                tools._search_reports.append({'query': 'Staff AI Engineer', 'region': region['name']})
+        return agent.SCRAPER_MIN_TURNS_PER_QUERY
+    run_pass.passes = passes
+    return run_pass
+
+
+def _alert_kinds() -> list[str]:
+    return [a['kind'] for a in tools._ui_alerts]
+
+
+async def test_a_region_the_recovery_pass_verified_is_not_reported_unverified(monkeypatch):
+    '''2026-09-28: the first pass never started, the alert was raised, the recovery pass verified
+    both regions and harvested 50 listings -- and the run still said SEARCH NOT VERIFIED.'''
+    _reset_scrape_globals(monkeypatch)
+    run_pass = _two_pass_scraper(first_turns=2, recovery_listings=25, recovery_verifies=True)
+
+    await agent.run_scraper(run_pass, ['Staff AI Engineer'], {'cost': 0.0})
+
+    assert len(run_pass.passes) == 2
+    assert 'unverified_search' not in _alert_kinds()
+    assert 'stopped_early' not in _alert_kinds(), 'a fully recovered query needs no attention'
+    assert tools._queries_searched['Staff AI Engineer'] == 25
+
+
+async def test_a_region_no_pass_verified_is_still_reported(monkeypatch):
+    _reset_scrape_globals(monkeypatch)
+    run_pass = _two_pass_scraper(first_turns=2, recovery_listings=25, recovery_verifies=False)
+
+    await agent.run_scraper(run_pass, ['Staff AI Engineer'], {'cost': 0.0})
+
+    assert _alert_kinds().count('unverified_search') == 1
+    assert 'stopped_early' in _alert_kinds(), 'an unverified query that bailed early is not recovered'
+
+
+async def test_stopped_early_is_kept_when_recovery_finds_too_little(monkeypatch):
+    _reset_scrape_globals(monkeypatch)
+    too_few = agent.SCRAPER_MIN_LISTINGS_PER_QUERY - 1
+    run_pass = _two_pass_scraper(first_turns=2, recovery_listings=too_few, recovery_verifies=True)
+
+    await agent.run_scraper(run_pass, ['Staff AI Engineer'], {'cost': 0.0})
+
+    assert 'stopped_early' in _alert_kinds()
+
+
 def test_audit_log_reports_what_a_failed_query_recorded(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, '_queries_searched', {'Q1': 'error'})
     monkeypatch.setattr(tools, '_query_errors', {'Q1': '502 Server Error: Bad Gateway'})
@@ -7495,6 +7621,76 @@ def _run_with_chat_replies(monkeypatch, replies):
     monkeypatch.setattr(scrape_openrouter, 'TRANSIENT_RETRY_DELAY_SECONDS', 0)
     asyncio.run(_session('').run('sys', 'user', []))
     return len(calls)
+
+
+_CHAT_INTENT = json.dumps({'ok': True, 'content': "I'll start by navigating.", 'tool_calls': None,
+                           'finish_reason': 'stop', 'usage': {}})
+
+
+def _chat_tool_call(name: str, arguments: dict | None = None) -> str:
+    call = {'id': 'c1', 'function': {'name': name, 'arguments': json.dumps(arguments or {})}}
+    return json.dumps({'ok': True, 'content': None, 'tool_calls': [call], 'usage': {}})
+
+
+def _nudged_session(monkeypatch, replies, session=None):
+    '''Run a session with the nudge on; returns (session, the messages of each chat call).'''
+    sent = []
+
+    async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
+        sent.append(json.loads(json.dumps(args['messages'])))
+        return replies[len(sent) - 1]
+
+    monkeypatch.setattr(scrape_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    monkeypatch.setattr(scrape_openrouter, 'SCRAPER_NO_TOOL_NUDGES', config.SCRAPER_NO_TOOL_NUDGES)
+    session = session or _session('')
+    asyncio.run(session.run('sys', 'user', []))
+    return session, sent
+
+
+def test_a_text_only_reply_before_any_record_is_nudged_not_taken_as_done(monkeypatch):
+    '''2026-09-28: "I'll start by navigating..." and no tool call ended a query after 2 iterations.'''
+    session, sent = _nudged_session(monkeypatch, [_CHAT_INTENT, _CHAT_DONE, _CHAT_DONE])
+
+    assert len(sent) == config.SCRAPER_NO_TOOL_NUDGES + 1, 'nudged, then a second silence ends the pass'
+    assert sent[1][-2] == {'role': 'assistant', 'content': "I'll start by navigating."}
+    assert sent[1][-1] == {'role': 'user', 'content': scrape_openrouter.NO_TOOL_NUDGE}
+    assert session.nudges == config.SCRAPER_NO_TOOL_NUDGES
+
+
+def test_no_nudge_once_listings_were_recorded(monkeypatch):
+    '''Text and no tool call after a record is the model finishing, which is the normal ending.'''
+    session = _session('')
+    session._harvest = [{'job_id': '1'}]
+
+    async def fake_record(jobs, query):
+        return 'recorded 1'
+
+    monkeypatch.setattr(tools, 'do_record_listings', fake_record)
+    session, sent = _nudged_session(
+        monkeypatch, [_chat_tool_call('record_listings'), _CHAT_DONE, _CHAT_DONE], session)
+
+    assert len(sent) == 2
+    assert session.nudges == 0
+
+
+def test_no_nudge_after_the_model_reported_a_problem(monkeypatch):
+    '''Stopping after report_problem is what the prompt asks for; a nudge would push it to guess.'''
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    session, sent = _nudged_session(monkeypatch, [
+        _chat_tool_call('report_problem', {'what_happened': 'no chips'}), _CHAT_DONE, _CHAT_DONE])
+
+    assert len(sent) == 2
+    assert session.nudges == 0
+
+
+def test_no_nudge_after_a_block(monkeypatch):
+    '''Account safety: a blocked session is never pushed on.'''
+    session = _session('')
+    session.blocked = True
+    session, sent = _nudged_session(monkeypatch, [_CHAT_INTENT, _CHAT_DONE], session)
+
+    assert len(sent) == 1
+    assert session.nudges == 0
 
 
 def test_scraper_retries_a_transient_502_once(monkeypatch):
