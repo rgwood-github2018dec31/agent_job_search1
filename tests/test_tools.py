@@ -7097,7 +7097,7 @@ def test_fingerprint_drift_reports_changed_chips(tmp_path, monkeypatch):
     assert again == '', 'an unchanged page must not alarm'
     # A STRUCTURAL chip disappearing is a real change and must be reported.
     drift = tools.check_fingerprint_drift(_sound_report(chips=['Jobs', 'Past week']))
-    assert 'Senior' in drift and 'gone' in drift
+    assert 'Experience level' in drift and 'gone' in drift
 
 
 def test_fingerprint_ignores_linkedins_per_query_topical_chips(tmp_path, monkeypatch):
@@ -7120,6 +7120,27 @@ def test_the_in_my_network_chip_flapping_is_not_drift(tmp_path, monkeypatch):
     tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network']))
     assert tools.check_fingerprint_drift(_sound_report(chips=structural)) == ''
     assert tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network'])) == ''
+
+
+def test_a_chip_showing_its_chosen_value_is_the_same_chip(tmp_path, monkeypatch):
+    '''2026-10-02 an unfiltered page rewrote the fingerprint to "Date posted"/"Experience level";
+    2026-10-05 the filtered page read as two chips new and two gone. Filters are not page shape.'''
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    rest = ['Jobs', 'Employment type', 'Company']
+    tools.check_fingerprint_drift(_sound_report(chips=[*rest, 'Past week', 'Senior']))
+    assert tools.check_fingerprint_drift(_sound_report(chips=[*rest, 'Date posted', 'Experience level'])) == ''
+    assert tools.check_fingerprint_drift(_sound_report(chips=[*rest, 'Past 24 hours', 'Director'])) == ''
+    stored = yaml.safe_load((tmp_path / config.UI_FINGERPRINT_FILENAME).read_text(encoding='utf-8'))
+    assert 'Date posted' in stored['chips'] and 'Past week' not in stored['chips']
+
+
+def test_a_fingerprint_stored_under_chosen_values_does_not_alarm(tmp_path, monkeypatch):
+    '''The file written before this rule holds "Past week" and "Senior"; the next run must not flag it.'''
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    rest = ['Company', 'Employment type', 'Jobs']
+    (tmp_path / config.UI_FINGERPRINT_FILENAME).write_text(
+        yaml.safe_dump({'chips': [*rest, 'Past week', 'Senior']}), encoding='utf-8')
+    assert tools.check_fingerprint_drift(_sound_report(chips=[*rest, 'Past week', 'Senior'])) == ''
 
 
 def test_a_fingerprint_written_with_a_since_dropped_chip_does_not_alarm(tmp_path, monkeypatch):

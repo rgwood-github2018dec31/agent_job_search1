@@ -13,8 +13,10 @@ from agentic_job_search import scrape_openrouter as so
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.config import (
     SCRAPER_COST_ALERT_FACTOR,
+    SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION,
     SCRAPER_MIN_BITS_PER_WEIGHT,
     SCRAPER_PROVIDER_MAX_SWITCHES,
+    SCRAPER_VERBOSE_MIN_ITERATIONS,
 )
 from agentic_job_search.triage import ProviderUnavailableError
 
@@ -221,6 +223,102 @@ async def test_switching_stops_at_the_cap(monkeypatch):
     assert pin.switches == SCRAPER_PROVIDER_MAX_SWITCHES
     assert pin.failed == [f'p{i}/fp8' for i in range(SCRAPER_PROVIDER_MAX_SWITCHES + 1)]
     assert len(tools._ui_alerts) == SCRAPER_PROVIDER_MAX_SWITCHES
+
+
+def _turn(completion_tokens: int, done: bool = False) -> str:
+    '''One chat reply: a harmless local tool call, or the closing text when `done`.'''
+    call = {'id': 'c', 'function': {'name': 'record_listings', 'arguments': '{}'}}
+    return json.dumps({
+        'ok': True, 'content': 'done' if done else None, 'tool_calls': None if done else [call],
+        'finish_reason': 'stop', 'usage': {'prompt_tokens': 1000, 'completion_tokens': completion_tokens}})
+
+
+async def test_an_endpoint_that_rambles_is_dropped_for_the_rest_of_the_run(monkeypatch):
+    '''2026-10-02: open-inference/fp8 answered every call, at ~13x the usual output per turn, and
+    never finished a search. Nothing counted that as a failure, so the run stayed on it for hours.'''
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    sent = []
+    rambling = SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION + 1
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE),
+          [_turn(rambling)] * SCRAPER_VERBOSE_MIN_ITERATIONS + [_turn(10, done=True)], sent)
+
+    await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+
+    providers = [args['provider'] for tool, args in sent if tool == 'chat']
+    assert providers == ['streamlake/fp8'] * SCRAPER_VERBOSE_MIN_ITERATIONS + ['deepinfra/fp8']
+    assert pin.failed == ['streamlake/fp8']
+    assert [a['kind'] for a in tools._ui_alerts] == ['provider_switch']
+    assert 'completion tokens per turn' in tools._ui_alerts[0]['detail']
+
+
+async def test_an_endpoint_at_normal_output_is_kept(monkeypatch):
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    at_the_limit = SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE),
+          [_turn(at_the_limit)] * (SCRAPER_VERBOSE_MIN_ITERATIONS + 2) + [_turn(10, done=True)])
+
+    await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+
+    assert pin.tag == 'streamlake/fp8' and pin.switches == 0
+
+
+async def test_one_long_turn_early_in_a_pass_is_not_rambling(monkeypatch):
+    '''The average is not judged before SCRAPER_VERBOSE_MIN_ITERATIONS turns.'''
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    long_turn = SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION * SCRAPER_VERBOSE_MIN_ITERATIONS
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE), [_turn(long_turn), _turn(10, done=True)])
+
+    await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+
+    assert pin.switches == 0
+
+
+async def test_a_chat_timeout_drops_the_pinned_endpoint_and_asks_the_next(monkeypatch):
+    '''2026-10-02: three 300 s timeouts on one endpoint, each failing a query and changing nothing.'''
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    providers = []
+
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        if tool == 'list_endpoints':
+            return json.dumps(_listing(DEEPINFRA, STREAMLAKE))
+        providers.append(args['provider'])
+        if args['provider'] == 'streamlake/fp8':
+            raise RuntimeError(f"MCP tool 'chat' at {url} timed out after {timeout_seconds}s")
+        return _chat()
+
+    monkeypatch.setattr(so, 'call_mcp_tool', fake_call)
+    await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+
+    assert providers == ['streamlake/fp8', 'deepinfra/fp8']
+    assert pin.tag == 'deepinfra/fp8'
+    assert [a['kind'] for a in tools._ui_alerts] == ['provider_switch']
+
+
+async def test_a_chat_failure_that_is_not_a_timeout_still_raises(monkeypatch):
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        raise RuntimeError('All connection attempts failed')
+
+    monkeypatch.setattr(so, 'call_mcp_tool', fake_call)
+    with pytest.raises(RuntimeError, match='connection attempts'):
+        await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+    assert pin.switches == 0
+
+
+async def test_a_timeout_with_no_endpoint_left_still_fails_the_query(monkeypatch):
+    pin = await _pinned(monkeypatch, _listing(STREAMLAKE))
+
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        if tool == 'list_endpoints':
+            return json.dumps(_listing(STREAMLAKE))
+        raise RuntimeError(f"MCP tool 'chat' at {url} timed out after {timeout_seconds}s")
+
+    monkeypatch.setattr(so, 'call_mcp_tool', fake_call)
+    with pytest.raises(RuntimeError, match='timed out'):
+        await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
 
 
 async def test_an_unpinned_run_sends_no_provider(monkeypatch):

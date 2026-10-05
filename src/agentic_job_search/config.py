@@ -230,11 +230,20 @@ UI_BLOCK_SIGNATURES = (
 # 'In my network' is deliberately absent: LinkedIn shows it on some searches and not others, even
 # within one run (gone on one query, back on the next, 2026-09-28), and it flapped in 5 of the 12
 # logged runs 2026-09-21..28. Each flap raised a drift alert about nothing.
+#
+# The fingerprint stores the chip, never its chosen value: UI_CHIP_CHOSEN_VALUES folds "Past week"
+# back to "Date posted". Stored as displayed, a page whose filters had not been set (2026-10-02)
+# rewrote the fingerprint to the unchosen labels, and the next healthy run (2026-10-05) reported
+# "new chips ['Past week', 'Senior']; chips gone ['Date posted', 'Experience level']" -- a filter
+# state, which check_filters_applied already judges, read as a change to the page.
+UI_CHIP_CHOSEN_VALUES: dict[str, tuple[str, ...]] = {
+    'Date posted': ('Past month', 'Past week', 'Past 24 hours'),
+    'Experience level': ('Entry-level', 'Senior', 'Manager', 'Director', 'Executive'),
+}
 UI_STRUCTURAL_CHIPS = (
     'Jobs', 'Date posted', 'Experience level', 'Employment type', 'Company',
     'Under 10 applicants', 'Easy Apply',
-    'Past month', 'Past week', 'Past 24 hours',
-    'Entry-level', 'Senior', 'Manager', 'Director', 'Executive',
+    *(value for values in UI_CHIP_CHOSEN_VALUES.values() for value in values),
 )
 
 # Where the last-known-good page shape is remembered, so a change is noticed the run it happens
@@ -349,6 +358,15 @@ SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN = 0.002
 # gives up on OpenRouter and falls back to the Anthropic scraper. Raised from 2 (2026-09-29) once
 # the candidate list stopped being one endpoint long: a 429 now walks down the ranked list.
 SCRAPER_PROVIDER_MAX_SWITCHES = 4
+# An endpoint that answers but cannot do the job is dropped like one that refuses. On 2026-10-02 a
+# 429 moved the run to open-inference/fp8, where the model re-announced "let me examine the current
+# page state" turn after turn, wrote ~1,600 completion tokens per turn (StreamLake ~125, Morph ~230
+# over 2026-09-21..10-05), took minutes per turn and timed out three times. Nothing counted that as
+# a failure, so the run stayed there 6.5 hours: three queries hit the iteration cap with 0 listings.
+# Once an endpoint has served the first number of turns in a pass, averaging more than the second in
+# completion tokens per turn switches the run off it.
+SCRAPER_VERBOSE_MIN_ITERATIONS = 8
+SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION = 800
 # Spend ceiling for the Anthropic scraper fallback, per run. The fallback bills Haiku prices on the
 # same ~13M-token scrape the OpenRouter path runs for cents: on 2026-09-28 it cost ~$4.96 of a $5.30
 # run. Past this, the remaining queries are skipped and reported (a `scrape_budget` alert) — a thinner

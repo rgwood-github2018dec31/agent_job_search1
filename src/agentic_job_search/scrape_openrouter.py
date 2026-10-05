@@ -32,12 +32,14 @@ from agentic_job_search.config import (
     SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_FIND_RESULT_MAX_CHARS,
+    SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION,
     SCRAPER_MIN_BITS_PER_WEIGHT,
     SCRAPER_NO_TOOL_NUDGES,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
     SCRAPER_PROVIDER_MAX_SWITCHES,
     SCRAPER_SNAPSHOT_RESULT_MAX_CHARS,
     SCRAPER_TOOL_RESULT_MAX_CHARS,
+    SCRAPER_VERBOSE_MIN_ITERATIONS,
     SCRAPER_WHAT_HAPPENED_MAX_CHARS,
     UI_BLOCK_SIGNATURES,
 )
@@ -68,6 +70,9 @@ def _result_cap(tool_name: str) -> int:
 # PROVIDER_UNAVAILABLE_STATUSES (401/402/403/429): those break every query and must abort at once.
 TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 TRANSIENT_RETRY_DELAY_SECONDS = 5
+# How utils_tools_n_agents_common.mcp_client words a call that outran its timeout; it raises a plain
+# RuntimeError, so the wording is the only thing that tells a timeout from any other failure.
+MCP_TIMEOUT_MARKER = 'timed out after'
 # Sent when the model answers with text alone before recording anything (SCRAPER_NO_TOOL_NUDGES).
 NO_TOOL_NUDGE = (
     'You replied without calling a tool, and no listings have been recorded for this query yet. '
@@ -363,6 +368,9 @@ class ScrapeSession:
         self.blocked = False
         self.records = 0          # completed record_listings calls
         self.nudges = 0
+        # Turns and completion tokens on the endpoint currently pinned, for _drop_verbose_endpoint.
+        self._endpoint_turns = 0
+        self._endpoint_completion = 0
         self.iterations = 0
         self.cost = 0.0
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
@@ -435,6 +443,46 @@ class ScrapeSession:
 
         return f'ERROR: unknown tool {name}'
 
+    async def _chat(self, chat_args: dict) -> str:
+        '''One chat call. A timeout on a pinned endpoint drops that endpoint and asks the next.
+
+        A timeout used to fail the query and leave the run pinned where it was, so the next query
+        met the same endpoint: three timeouts on one endpoint on 2026-10-02.
+        '''
+        try:
+            return await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
+                                       timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+        except RuntimeError as ex:
+            if (MCP_TIMEOUT_MARKER not in str(ex) or 'provider' not in chat_args
+                    or not await self.pin.switch(str(ex), self.query)):
+                raise
+            self._endpoint_turns = self._endpoint_completion = 0
+            chat_args['provider'] = self.pin.tag
+            chat_args['quantization'] = self.pin.quantization
+            return await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
+                                       timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+
+    async def _drop_verbose_endpoint(self, completion_tokens: int) -> None:
+        '''Switch off an endpoint whose turns are far longer than this job needs.
+
+        See SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION. Counted per endpoint, so the one switched
+        to starts clean; when no endpoint is left to switch to, the pass carries on where it is and
+        ProviderPin.switch has already logged why.
+        '''
+        if self.pin is None or not self.pin.tag:
+            return
+        self._endpoint_turns += 1
+        self._endpoint_completion += completion_tokens
+        if self._endpoint_turns < SCRAPER_VERBOSE_MIN_ITERATIONS:
+            return
+        per_turn = self._endpoint_completion / self._endpoint_turns
+        if per_turn <= SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION:
+            return
+        reason = (f'averaged {per_turn:.0f} completion tokens per turn over {self._endpoint_turns} turns, '
+                  f'above the {SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION} a working scraper endpoint stays under')
+        self._endpoint_turns = self._endpoint_completion = 0
+        await self.pin.switch(reason, self.query)
+
     async def run(self, system_prompt: str, user_prompt: str, tools: list[dict]) -> None:
         """Drive the conversation until the model stops, it is blocked, or iterations run out."""
         messages: list[dict[str, Any]] = [
@@ -447,8 +495,7 @@ class ScrapeSession:
             if self.pin is not None and self.pin.tag:
                 chat_args['provider'] = self.pin.tag
                 chat_args['quantization'] = self.pin.quantization
-            raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
-                                      timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+            raw = await self._chat(chat_args)
             data = json.loads(raw)
             if not data.get('ok') and http_status_of(str(data.get('error') or '')) in TRANSIENT_HTTP_STATUSES:
                 # A gateway hiccup is not this query failing. Without a retry one 502 discarded a
@@ -483,6 +530,7 @@ class ScrapeSession:
             self.usage['prompt'] += usage.get('prompt_tokens', 0)
             self.usage['completion'] += usage.get('completion_tokens', 0)
             self.usage['cached'] += (usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0) or 0
+            await self._drop_verbose_endpoint(usage.get('completion_tokens', 0))
 
             if text := data.get('content'):
                 from agentic_job_search.agent import log_agent_text

@@ -48,6 +48,7 @@ from agentic_job_search.config import (
     SECONDS_PER_MINUTE,
     STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
     UI_BLOCK_SIGNATURES,
+    UI_CHIP_CHOSEN_VALUES,
     UI_CONTRACT_ELEMENTS,
     UI_FINGERPRINT_FILENAME,
     UI_STRUCTURAL_CHIPS,
@@ -2239,6 +2240,15 @@ def check_filters_applied(report: dict, region: dict) -> list[str]:
     return problems
 
 
+_CHIP_OF_CHOSEN_VALUE = {value: chip for chip, values in UI_CHIP_CHOSEN_VALUES.items() for value in values}
+
+
+def _structural_chips(labels: list | None) -> list[str]:
+    '''The structural chips among `labels`, each under its own name whatever value is chosen.'''
+    return sorted({_CHIP_OF_CHOSEN_VALUE.get(str(c), str(c)) for c in labels or []
+                   if str(c) in UI_STRUCTURAL_CHIPS})
+
+
 def check_fingerprint_drift(report: dict) -> str:
     """Compare the page shape against the last known good one; returns a description or ''.
 
@@ -2247,7 +2257,7 @@ def check_fingerprint_drift(report: dict) -> str:
     """
     # Structural chips only: the topical suggestions vary per query by design, and including
     # them made this fire on every single query.
-    observed = sorted({str(c) for c in (report.get('chips') or []) if str(c) in UI_STRUCTURAL_CHIPS})
+    observed = _structural_chips(report.get('chips'))
     path = _fingerprint_path()
     previous: list[str] = []
     if path.exists():
@@ -2255,7 +2265,7 @@ def check_fingerprint_drift(report: dict) -> str:
             stored = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
             # Filtered like `observed`, so a chip later dropped from UI_STRUCTURAL_CHIPS does not
             # read as "gone" against a fingerprint written before it was dropped.
-            previous = sorted(str(c) for c in (stored.get('chips') or []) if str(c) in UI_STRUCTURAL_CHIPS)
+            previous = _structural_chips(stored.get('chips'))
         except Exception as ex:
             logger.warning(f'UI fingerprint at {path} unreadable, treating as absent: {ex}')
 
