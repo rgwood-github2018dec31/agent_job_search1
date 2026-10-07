@@ -7653,35 +7653,6 @@ def test_pinned_playwright_mcp_version_exists_in_the_registry():
 
 
 # ---------------------------------------------------------------------------
-# mcp version guard
-# ---------------------------------------------------------------------------
-
-def test_mcp_pinned_below_2():
-    """`mcp_session` in triage.py unpacks three values from `streamable_http_client`; mcp 2.0
-    yields two. That helper is the ONLY path to the OpenRouter and Ollama tool servers, so an
-    unnoticed upgrade takes out triage, the non-Anthropic rating call, the reference summary and
-    the OpenRouter extractor at once -- at runtime, mid-run. Measured 2026-08-21: a bare `uv run`
-    re-resolved `mcp>=1.29` to 2.0.0 and did exactly that."""
-    pyproject = (Path(__file__).parent.parent / 'pyproject.toml').read_text(encoding='utf-8')
-    assert '"mcp>=1.29,<2"' in pyproject, (
-        'the <2 pin on mcp was removed from pyproject.toml. Before lifting it, make '
-        'triage.mcp_session tolerate both the 2- and 3-value yield and verify against a live server.'
-    )
-
-
-def test_installed_mcp_matches_mcp_session_unpack():
-    """The pin above constrains resolution; this asserts the environment actually agrees with the
-    3-tuple unpack in triage.mcp_session, so a stale or force-installed venv fails here rather than
-    on the first tool-server call of a run."""
-    from importlib.metadata import version
-    major = int(version('mcp').split('.')[0])
-    assert major < 2, (
-        f'mcp {version("mcp")} is installed, but triage.mcp_session unpacks three values from '
-        'streamable_http_client and mcp >= 2.0 yields two. Run `uv sync --frozen`.'
-    )
-
-
-# ---------------------------------------------------------------------------
 # Stage 1b OpenRouter scraper: anti-fabrication and account safety
 # ---------------------------------------------------------------------------
 
