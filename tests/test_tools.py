@@ -9682,3 +9682,178 @@ async def test_estimate_salary_live(monkeypatch):
     if estimate is not None:
         assert estimate['currency'] in salary_estimate.ESTIMATE_CURRENCIES
         assert 0 < estimate['minimum'] <= estimate['maximum']
+
+
+# ---------------------------------------------------------------------------
+# A rating call that fails must not cost the job (2026-10-09)
+# ---------------------------------------------------------------------------
+
+def _processed_record(tmp_path, monkeypatch, job_id: str) -> Path:
+    processed = tmp_path / 'processed_jobs'
+    processed.mkdir(exist_ok=True)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', processed)
+    monkeypatch.setattr(tools, '_processed_jobs', {('linkedin', job_id)})
+    record = processed / f'job_posting-linkedin-{job_id}-2026Oct08-1-acme-engineer.yaml'
+    record.write_text('site: linkedin\n')
+    return record
+
+
+async def _stage2_with_a_broken_rater(monkeypatch, caplog, job_id: str) -> tuple[dict, list[str]]:
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+
+    async def broken_rate(evaluator_prompt, extract_text, stats):
+        raise ValueError('No JSON object found in LLM response')
+    monkeypatch.setattr(agent, 'rate_job', broken_rate)
+    funnel: dict = {}
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _run_stage2(_make_candidate(job_id=job_id, company='Acme'), funnel)
+    return funnel, [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_stage_2_error_releases_the_job_for_the_next_run(tmp_path, monkeypatch, caplog):
+    """An errored job used to stay in processed_jobs/ and never be rated: on 2026-10-08 the reply
+    lost that way held a rating of 5."""
+    record = _processed_record(tmp_path, monkeypatch, '222')
+
+    funnel, errors = await _stage2_with_a_broken_rater(monkeypatch, caplog, '222')
+
+    assert funnel.get('eval_error') == 1 and funnel.get('eval_error_released') == 1
+    assert not record.exists() and ('linkedin', '222') not in tools._processed_jobs
+    assert len(errors) == 1 and '(job 222)' in errors[0]
+    assert 'released for the next run (release 1 of ' in errors[0]
+    assert 'ValueError: No JSON object found' in errors[0]
+
+
+async def test_stage_2_error_stops_releasing_a_job_that_keeps_failing(tmp_path, monkeypatch, caplog):
+    """Bounded: a posting that errors every time must not be opened on the real account every run."""
+    for _ in range(agent.tools_module.EVAL_ERROR_MAX_RELEASES):
+        _processed_record(tmp_path, monkeypatch, '222')   # the next run's Stage 1b queues it again
+        assert tools.release_errored_job('linkedin', '222').startswith('released')
+    record = _processed_record(tmp_path, monkeypatch, '222')
+
+    funnel, errors = await _stage2_with_a_broken_rater(monkeypatch, caplog, '222')
+
+    assert record.exists(), 'past the cap the job stays processed'
+    assert funnel.get('eval_error') == 1 and 'eval_error_released' not in funnel
+    assert 'NOT retried: already released' in errors[0]
+
+
+async def test_stage_2_error_says_so_when_the_job_cannot_be_released(monkeypatch, caplog):
+    funnel, errors = await _stage2_with_a_broken_rater(monkeypatch, caplog, '222')   # no processed record
+    assert funnel.get('eval_error') == 1 and 'eval_error_released' not in funnel
+    assert 'NOT retried: could not release it (FileNotFoundError' in errors[0]
+
+
+def test_release_errored_job_counts_per_job(tmp_path, monkeypatch):
+    _processed_record(tmp_path, monkeypatch, '222')
+    tools.release_errored_job('linkedin', '222')
+    assert yaml.safe_load(tools.EVAL_ERROR_RELEASES_PATH.read_text()) == {'linkedin/222': 1}
+
+    tools.EVAL_ERROR_RELEASES_PATH.write_text('- not a mapping\n')
+    record = _processed_record(tmp_path, monkeypatch, '333')
+    with pytest.raises(ValueError, match='linkedin/333 was not released'):
+        tools.release_errored_job('linkedin', '333')
+    assert record.exists()
+
+
+# The 2026-10-08 reply: whole (finish_reason stop), a rating of 5, and one array left unclosed.
+UNCLOSED_ARRAY_REPLY = '{"rating": 5, "reasoning": "near-perfect", "warnings": ["verify remote flexibility"}'
+
+
+async def test_rate_with_openrouter_names_a_malformed_reply_and_does_not_repair_it(monkeypatch):
+    async def fake_chat(prompt, system='', model='', max_tokens=None):
+        return UNCLOSED_ARRAY_REPLY, 0.002
+
+    monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
+    with pytest.raises(triage.MalformedRatingReplyError, match='No JSON object found'):
+        await triage.rate_with_openrouter('sys', 'user')
+
+
+async def test_rate_with_ollama_names_a_reply_without_a_rating(monkeypatch):
+    async def fake_generate(prompt, system='', model=''):
+        return '{"reasoning": "no rating key"}'
+
+    monkeypatch.setattr(triage, 'generate_local', fake_generate)
+    with pytest.raises(triage.MalformedRatingReplyError, match='KeyError'):
+        await triage.rate_with_ollama('sys', 'user')
+
+
+GOOD_RATING_REPLY = '{"rating": 4, "reasoning": "from a fallback"}'
+
+
+def _rating_models(monkeypatch, replies: dict[str, str]) -> list[str]:
+    """Three rating models on OpenRouter, each answering with its entry in `replies`."""
+    asked: list[str] = []
+    monkeypatch.setattr(agent, 'MODEL_NAME_RATING', 'vendor/first')
+    monkeypatch.setattr(agent, 'MODEL_NAME_RATING_FALLBACKS', ('vendor/second', 'vendor/third'))
+    monkeypatch.setattr(agent, 'route_for', lambda model: 'openrouter')
+
+    async def fake_chat(prompt, system='', model='', max_tokens=None):
+        asked.append(model)
+        return replies[model], 0.002
+
+    monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
+    return asked
+
+
+async def test_rate_job_asks_a_different_model_when_the_rater_reply_is_malformed(monkeypatch, caplog):
+    """2026-10-08: a reply holding a rating of 5 in unclosed JSON errored the job, and it was never rated."""
+    asked = _rating_models(monkeypatch, {'vendor/first': UNCLOSED_ARRAY_REPLY, 'vendor/second': GOOD_RATING_REPLY})
+    stats = agent.new_stage_stats()
+    with caplog.at_level(logging.WARNING, logger='agentic_job_search.agent'):
+        result = await agent.rate_job('system', 'job text', stats)
+    assert asked == ['vendor/first', 'vendor/second'], 'the third model is not asked once the second answers'
+    assert result['rating'] == 4 and result['rated_by'] == 'vendor/second'
+    warning = next(r.getMessage() for r in caplog.records)
+    assert 'Rating by vendor/first failed, asking vendor/second instead' in warning
+    assert 'MalformedRatingReplyError' in warning
+
+
+async def test_rate_job_works_down_the_whole_list(monkeypatch):
+    asked = _rating_models(monkeypatch, {
+        'vendor/first': UNCLOSED_ARRAY_REPLY, 'vendor/second': 'no json at all', 'vendor/third': GOOD_RATING_REPLY})
+    result = await agent.rate_job('system', 'job text', agent.new_stage_stats())
+    assert asked == ['vendor/first', 'vendor/second', 'vendor/third']
+    assert result['rated_by'] == 'vendor/third'
+
+
+async def test_rate_job_does_not_ask_a_fallback_when_the_rater_answers(monkeypatch):
+    asked = _rating_models(monkeypatch, {'vendor/first': '{"rating": 5, "reasoning": "great"}'})
+    result = await agent.rate_job('system', 'job text', agent.new_stage_stats())
+    assert asked == ['vendor/first']
+    assert result['rating'] == 5 and result['rated_by'] == 'vendor/first'
+
+
+async def test_rate_job_raises_the_last_models_failure(monkeypatch):
+    asked = _rating_models(monkeypatch, dict.fromkeys(('vendor/first', 'vendor/second', 'vendor/third'),
+                                                      UNCLOSED_ARRAY_REPLY))
+    with pytest.raises(triage.MalformedRatingReplyError):
+        await agent.rate_job('system', 'job text', agent.new_stage_stats())
+    assert len(asked) == 3
+
+
+async def test_rate_job_asks_no_model_twice(monkeypatch):
+    asked = _rating_models(monkeypatch, {'vendor/first': UNCLOSED_ARRAY_REPLY})
+    monkeypatch.setattr(agent, 'MODEL_NAME_RATING_FALLBACKS', ('vendor/first',))
+    with pytest.raises(triage.MalformedRatingReplyError):
+        await agent.rate_job('system', 'job text', agent.new_stage_stats())
+    assert asked == ['vendor/first'], 'asking the same model again is not a fallback'
+
+
+def test_no_model_constant_is_the_undated_deepseek_v4_flash():
+    """DeepSeek V4 Flash is only ever used as a dated snapshot (2026-10-09, the user's rule): the
+    undated id is the older 0423 one."""
+    undated = 'deepseek/deepseek-v4-flash'
+    names = [name for name in dir(config) if 'MODEL_NAME' in name]
+    assert names
+    for name in names:
+        value = getattr(config, name)
+        models = value if isinstance(value, tuple) else (value,)
+        assert undated not in models, f'config.{name} uses {undated}; use the dated snapshot'
+
+
+def test_the_rating_fallbacks_are_other_openrouter_models():
+    assert config.MODEL_NAME_RATING not in config.MODEL_NAME_RATING_FALLBACKS
+    assert len(set(config.MODEL_NAME_RATING_FALLBACKS)) == len(config.MODEL_NAME_RATING_FALLBACKS)
+    assert all(agent.route_for(model) == 'openrouter' for model in config.MODEL_NAME_RATING_FALLBACKS)

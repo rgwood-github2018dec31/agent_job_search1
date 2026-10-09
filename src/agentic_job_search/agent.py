@@ -67,6 +67,7 @@ from agentic_job_search.config import (
     MODEL_NAME_EXTRACTOR,
     MODEL_NAME_QUERY,
     MODEL_NAME_RATING,
+    MODEL_NAME_RATING_FALLBACKS,
     MODEL_NAME_SCRAPER,
     NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_SALARY_MAX_CHARS,
@@ -3464,19 +3465,43 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
     return structured
 
 
-async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
-    """Stage 2d: one non-agentic rating call; MODEL_NAME_RATING's family prefix picks the
-    route (route_for) and the model together."""
-    route = route_for(MODEL_NAME_RATING)
+async def _rate_with(model: str, evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
+    """One non-agentic rating call; the model's family prefix picks the route (route_for)."""
+    route = route_for(model)
     if route == 'openrouter':
         result, cost_usd = await rate_with_openrouter(
-            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=MODEL_NAME_RATING)
+            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=model)
         stage_stats['cost'] += cost_usd
         return result
     if route == 'ollama':
         return await rate_with_ollama(
-            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=MODEL_NAME_RATING)
-    return await _rate_with_anthropic(evaluator_prompt, extract_text, stage_stats, model=MODEL_NAME_RATING)
+            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=model)
+    return await _rate_with_anthropic(evaluator_prompt, extract_text, stage_stats, model=model)
+
+
+async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
+    """Stage 2d: rate with MODEL_NAME_RATING, then each of MODEL_NAME_RATING_FALLBACKS in order.
+
+    A different model is asked rather than the same one again: on 2026-10-08 the rater's reply
+    held a rating of 5 inside JSON it had left unclosed, the job errored, and it was never rated.
+    The result's `rated_by` names the model that answered. The last model's failure propagates.
+    """
+    models = list(dict.fromkeys((MODEL_NAME_RATING, *MODEL_NAME_RATING_FALLBACKS)))
+    for position, model in enumerate(models):
+        try:
+            result = await _rate_with(model, evaluator_prompt, extract_text, stage_stats)
+        except Exception as ex:
+            if position == len(models) - 1:
+                raise
+            logger.warning(
+                f'Rating by {model} failed, asking {models[position + 1]} instead '
+                f'({position + 1} of {len(models)} rating models tried): '
+                f'{type(ex).__name__}: {unwrap_exception(ex)}'
+            )
+            continue
+        result['rated_by'] = model
+        return result
+    raise AssertionError('unreachable: the last rating model returns or raises')
 
 
 async def _save_and_notify(
@@ -3766,10 +3791,13 @@ async def evaluate_all_candidates(
                     f"{result['rating']} → {rating} ({cap_reason})"
                 )
             bump(f'rated_{rating}')
+            rated_by = result.get('rated_by') or MODEL_NAME_RATING
+            if rated_by != MODEL_NAME_RATING:
+                bump('rating_fallback')
             triage_note = f" (triage said {triage_result['score']})" if triage_result else ''
             logger.info(
                 f"Rating: {candidate['company']} — {candidate['title']}: "
-                f"{rating}/5 via {MODEL_NAME_RATING}{triage_note} — {result['reasoning']}"
+                f"{rating}/5 via {rated_by}{triage_note} — {result['reasoning']}"
             )
             pros = [str(p) for p in (result.get('pros') or [])]
             deterministic = build_deterministic_warnings(candidate, extract)
@@ -3843,13 +3871,23 @@ async def evaluate_all_candidates(
                 index -= 1   # retried after the restart, or released if the browser stays down
                 continue
             bump('eval_error')
+            # The job is in processed_jobs/ since Stage 1b, so left alone the next run returns
+            # already_processed and it is never rated: release it, a bounded number of times.
+            try:
+                retry_note = tools_module.release_errored_job(candidate['site'], candidate['job_id'])
+            except Exception as release_ex:
+                retry_note = f'NOT retried: could not release it ({type(release_ex).__name__}: {release_ex})'
+            if retry_note.startswith('released'):
+                bump('eval_error_released')
             tools_module.record_job_outcome(
-                candidate['site'], candidate['job_id'], 'eval_error', summary=snippet(ex)
+                candidate['site'], candidate['job_id'], 'eval_error', summary=f'{retry_note} — {snippet(ex)}'
             )
             console.print(f"[red]Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}[/red]")
-            logger.warning(f"Stage 2 error evaluating {candidate['company']} — {candidate['title']}: {ex}")
-
-
+            logger.error(
+                f"Stage 2 error evaluating {candidate['company']} — {candidate['title']} "
+                f"(job {candidate['job_id']}); not rated, saved or notified this run; {retry_note}: "
+                f'{type(ex).__name__}: {ex}'
+            )
 async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
     """One non-agentic Opus rating call — the reference standard for audits only."""
     options = ClaudeAgentOptions(

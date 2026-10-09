@@ -294,13 +294,30 @@ RATING_JSON_INSTRUCTIONS = (
 _TRUNCATION_RETRY_MAX_TOKENS = 32_000
 
 
+class MalformedRatingReplyError(ValueError):
+    """A rating reply that arrived whole but holds no JSON object with an integer `rating`."""
+
+
+def parse_rating_reply(content: str) -> dict:
+    """The rating dict from a model reply; MalformedRatingReplyError names what was wrong with it."""
+    try:
+        result = extract_json_object(content)
+        result['rating'] = int(result['rating'])
+    except (ValueError, KeyError, TypeError) as ex:
+        raise MalformedRatingReplyError(f'{type(ex).__name__}: {ex}') from ex
+    return result
+
+
 async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE) -> tuple[dict, float]:
     """Rate a job via OpenRouter. Returns (rating dict, cost_usd).
 
-    Retries once on truncation because losing this call is not recoverable later: the job was
-    written to processed_jobs/ back in Stage 1b, so an eval_error means the next run returns
-    `already_processed` and it is never rated again. A posting the model had scored 5 was lost
-    that way on 2026-09-03.
+    Retries once on truncation because losing this call is costly: the job was written to
+    processed_jobs/ back in Stage 1b. A posting the model had scored 5 was lost that way on
+    2026-09-03.
+
+    A complete reply that is not a usable rating raises MalformedRatingReplyError and is never
+    repaired; `rate_job` then asks MODEL_NAME_RATING_FALLBACKS. On 2026-10-08 a reply holding
+    `"rating": 5` left its last array unclosed.
     """
     prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}'
     try:
@@ -310,9 +327,7 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
         content, cost_usd = await chat_openrouter(
             prompt, system=system_prompt, model=model, max_tokens=_TRUNCATION_RETRY_MAX_TOKENS
         )
-    result = extract_json_object(content)
-    result['rating'] = int(result['rating'])
-    return result, cost_usd
+    return parse_rating_reply(content), cost_usd
 
 
 async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OLLAMA_MODEL_NAME_TRIAGE) -> dict:
@@ -320,6 +335,4 @@ async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OL
     response = await generate_local(
         f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}', system=system_prompt, model=model
     )
-    result = extract_json_object(response)
-    result['rating'] = int(result['rating'])
-    return result
+    return parse_rating_reply(response)

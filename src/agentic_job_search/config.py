@@ -323,6 +323,14 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
 MODEL_NAME_QUERY = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 MODEL_NAME_COMPANY_MATCH = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 MODEL_NAME_RATING = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH = 'deepseek/deepseek-v4.1-flash'
+# Asked in order when the MODEL_NAME_RATING call fails or its reply is not a usable rating: a
+# different model rather than the same one again. All three are flash-tier OpenRouter models, so
+# a fallback rating costs about what a normal one does — and an OpenRouter outage fails all of
+# them. Empty turns the fallback off.
+# DeepSeek V4 Flash is always the dated snapshot (OPENROUTER_MODEL_NAME_SCRAPER), never the
+# undated id, which is an older and slower one; a test enforces this for every model constant.
+MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH, OPENROUTER_MODEL_NAME_SCRAPER)
 # Reading amounts out of a compensation phrase is a PARSE, not a judgement — the deterministic
 # tiers in salary.py answer all but a few strings, and this only sees what they could not read.
 # Flash tier for that reason, and cached per string so a phrase is parsed once, ever.
@@ -447,6 +455,9 @@ STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION = (
 )
 TRIAGE_ENABLED = True
 TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (clear low fits)
+# A job whose Stage 2 evaluation errored is released for a later run at most this many times;
+# past it the error is terminal, so one posting that always fails cannot be re-read every run.
+EVAL_ERROR_MAX_RELEASES = 2
 REFERENCE_SUMMARY_MAX_CHARS = 2500
 # No output-token cap is set anywhere, deliberately. There used to be LLM_JSON_MAX_TOKENS = 3000,
 # which no call site ever chose — all eight inherited it as a default argument — against models

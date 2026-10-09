@@ -439,6 +439,17 @@ def _isolated_recruiter_notifications(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_eval_error_releases(monkeypatch, tmp_path):
+    """No test may touch the developer's real run_dir/eval_error_releases.yaml or processed_jobs/.
+
+    A Stage 2 test whose evaluation errors now RELEASES the job, which deletes its processed-job
+    record: against the real directory that would un-process a real job with the same id.
+    """
+    monkeypatch.setattr(tools, 'EVAL_ERROR_RELEASES_PATH', tmp_path / 'eval_error_releases.yaml')
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+
+
+@pytest.fixture(autouse=True)
 def _reset_scraper_run_state(monkeypatch):
     """Clear Stage 1b module state that run_scraper writes, so tests cannot leak into each other.
 

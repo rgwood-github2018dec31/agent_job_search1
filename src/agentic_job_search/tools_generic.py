@@ -33,6 +33,7 @@ from agentic_job_search import location_review
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
+    EVAL_ERROR_MAX_RELEASES,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
     PDF_PROMPT_MAX_CHARS,
@@ -1656,6 +1657,49 @@ def forget_processed_job(site: str, job_id: str) -> int:
         record.unlink()
     _processed_jobs.discard((site, job_id))
     return len(records)
+
+
+EVAL_ERROR_RELEASES_PATH = RUN_DIR / 'eval_error_releases.yaml'
+
+_EVAL_ERROR_RELEASES_HEADER = (
+    '# How many times each job was released for another run after its Stage 2 evaluation errored.\n'
+    '# At EVAL_ERROR_MAX_RELEASES a job is no longer released. Rewritten by the agent; safe to delete.\n'
+)
+
+
+def release_errored_job(site: str, job_id: str) -> str:
+    """Release a job whose evaluation errored so the next run rates it; returns what was done, for the log.
+
+    Stage 1 marks a job processed when it is queued, so an error in Stage 2 used to end the job for
+    good: a posting the rater had scored 5 was lost on 2026-09-03 and again on 2026-10-08. The
+    count is kept on disk and capped, because a posting that fails every time would otherwise be
+    opened on the real account on every run.
+
+    Raises when the count file cannot be read or written, or the job has no processed record: the
+    caller is already reporting an error for this job and adds this one to it.
+    """
+    key = f'{site}/{job_id}'
+    releases: dict = {}
+    if EVAL_ERROR_RELEASES_PATH.exists():
+        loaded = yaml.safe_load(EVAL_ERROR_RELEASES_PATH.read_text(encoding='utf-8')) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                f'{EVAL_ERROR_RELEASES_PATH} must contain a YAML mapping of job to release count, '
+                f'got {type(loaded).__name__}; {key} was not released'
+            )
+        releases = loaded
+    released_before = int(releases.get(key, 0))
+    if released_before >= EVAL_ERROR_MAX_RELEASES:
+        return (f'NOT retried: already released {released_before} time(s) '
+                f'(EVAL_ERROR_MAX_RELEASES), so it stays in processed_jobs/')
+    # Count first: if the write fails the job stays processed, which is the old behaviour, rather
+    # than released with no record of it.
+    releases[key] = released_before + 1
+    EVAL_ERROR_RELEASES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    EVAL_ERROR_RELEASES_PATH.write_text(
+        _EVAL_ERROR_RELEASES_HEADER + yaml.safe_dump(releases, sort_keys=True), encoding='utf-8')
+    forget_processed_job(site, job_id)
+    return f'released for the next run (release {released_before + 1} of {EVAL_ERROR_MAX_RELEASES})'
 
 
 # --- Tool implementations (plain async functions, directly testable) ---

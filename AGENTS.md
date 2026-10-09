@@ -169,6 +169,7 @@ run_dir/
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
   recruiter_notifications.yaml    # Agency postings already notified (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
+  eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error (EVAL_ERROR_MAX_RELEASES)
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
