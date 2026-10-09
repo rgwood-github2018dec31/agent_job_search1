@@ -10,6 +10,7 @@ The deterministic Haiku fallback in agent.py covers loop failures.
 
 import json
 import logging
+import time
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
@@ -160,6 +161,7 @@ async def extract_job_page_openrouter(
         )},
     ]
     total_cost = 0.0
+    started = time.monotonic()
     for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
         raw = await call_mcp_tool(
             LLM_OPENROUTER_MCP_URL, 'chat',
@@ -224,7 +226,9 @@ async def extract_job_page_openrouter(
             logger.info(
                 f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
                 f"{len(page_text)} page chars → {len(extract['description'])} chars condensed in "
-                f"{iteration + 1} iteration(s), ${total_cost:.4f}"
+                f'{time.monotonic() - started:.0f}s'
+                + (f' over {iteration + 1} iterations' if iteration else '')
+                + f', ${total_cost:.4f}'
             )
             return extract
 

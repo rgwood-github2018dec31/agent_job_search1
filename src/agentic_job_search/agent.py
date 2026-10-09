@@ -104,6 +104,7 @@ from agentic_job_search.config import (
     SECONDS_PER_MINUTE,
     STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
     THINKING_MAX_CHARS,
+    TRIAGE_DISAGREEMENT_LOG_MIN,
     TRIAGE_ENABLED,
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
@@ -112,6 +113,7 @@ from agentic_job_search.extract_openrouter import extract_job_page_openrouter
 from agentic_job_search.linkedin_page import JobPage, read_job_page, strip_saved_page_furniture
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search.salary import (
+    SALARY_KIND_ABSENT,
     count_ranges,
     resolve_salary,
     salary_digits_are_in_the_source,
@@ -169,7 +171,8 @@ PLAYWRIGHT_OUTPUT_DIR = Path(tempfile.gettempdir()) / 'linkedin-agent-playwright
 REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
 
 
-async def _send_pipeline_notification(text: str) -> None:
+async def _send_pipeline_notification(text: str) -> bool:
+    """Send one Telegram message. False (after a WARNING) when the send failed; never raises."""
     try:
         await telegram_send_message(text)
     except Exception as ex:
@@ -178,6 +181,8 @@ async def _send_pipeline_notification(text: str) -> None:
             f'{type(ex).__name__}: {unwrap_exception(ex)}'
         )
         console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
+        return False
+    return True
 
 
 # --- Prompt construction ---
@@ -1105,8 +1110,85 @@ def log_agent_text(stage: str, text: str) -> None:
     findings live in the text blocks.
     """
     for line in text.strip().splitlines():
-        if line.strip():
+        if not line.strip():
+            continue
+        if stage == SCRAPER_NARRATION_STAGE and _active_narration is not None:
+            _active_narration.add(line.strip())
+        else:
             logger.info(f'{stage}: {line.strip()}')
+
+
+SCRAPER_NARRATION_STAGE = 'Stage 1b'
+NARRATION_TIME_FORMAT = '%H:%M:%S'
+_PACKAGE_LOGGER = logging.getLogger(__name__.rpartition('.')[0])
+
+
+class _WarningCounter(logging.Handler):
+    """Counts WARNING-and-above records, so a query can tell whether anything went wrong in it."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.count += 1
+
+
+class QueryNarration:
+    """Stage 1b narration for one query, written to the run log only if the query had trouble.
+
+    Most of it is "Let me take a snapshot" — 356 lines of a 1,125-line log on 2026-10-08. What
+    the mirroring exists for (see log_agent_text) is the model's account of a query that went
+    wrong, so each query's lines are held and written at INFO only when that query logged a
+    WARNING or above, raised a ui_alert, or did not finish. Every line still goes to DEBUG as
+    it arrives.
+    """
+
+    def __init__(self) -> None:
+        self.query: str | None = None
+        self._lines: list[tuple[str, str]] = []
+        self._counter: _WarningCounter | None = None
+        self._alerts_before = 0
+
+    def begin(self, query: str) -> None:
+        global _active_narration
+        self.close()
+        self.query = query
+        self._lines = []
+        self._counter = _WarningCounter()
+        _PACKAGE_LOGGER.addHandler(self._counter)
+        self._alerts_before = len(tools_module._ui_alerts)
+        _active_narration = self
+
+    def add(self, line: str) -> None:
+        logger.debug(f'{SCRAPER_NARRATION_STAGE}: {line}')
+        self._lines.append((datetime.now().strftime(NARRATION_TIME_FORMAT), line))
+
+    def close(self, unfinished: bool = False) -> None:
+        """End the current query: write its narration if it had trouble, else say how much was withheld."""
+        global _active_narration
+        if self.query is None:
+            return
+        _active_narration = None
+        _PACKAGE_LOGGER.removeHandler(self._counter)
+        warnings_logged = self._counter.count
+        alerts_raised = len(tools_module._ui_alerts) - self._alerts_before
+        query, lines = self.query, self._lines
+        self.query, self._lines, self._counter = None, [], None
+        if not lines:
+            return
+        if not (unfinished or warnings_logged or alerts_raised > 0):
+            logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration withheld — {len(lines)} '
+                        f'line(s), no warnings or alerts (LOG_LEVEL=DEBUG shows it)')
+            return
+        why = ('the query did not finish' if unfinished
+               else f'{warnings_logged} warning(s), {max(alerts_raised, 0)} alert(s)')
+        logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration follows ({len(lines)} line(s); {why})')
+        for stamp, line in lines:
+            logger.info(f'{SCRAPER_NARRATION_STAGE} narration [{stamp}]: {line}')
+
+
+_active_narration: QueryNarration | None = None
 
 
 def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> None:
@@ -1293,7 +1375,7 @@ async def _human_pause(delay_range: tuple[float, float], reason: str) -> None:
     uniformly because a fixed delay is itself a robotic signature.
     """
     seconds = random.uniform(*delay_range)
-    logger.info(f'Pausing {seconds:.1f}s before {reason} (human-emulation pacing)')
+    logger.debug(f'Pausing {seconds:.1f}s before {reason} (human-emulation pacing)')
     await asyncio.sleep(seconds)
 
 
@@ -1736,8 +1818,19 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
     pass — is shared between the OpenRouter and Anthropic scrapers rather than duplicated. The two
     differ only in how one request is executed.
     """
+    narration = QueryNarration()
+    try:
+        await _run_scraper_queries(run_pass, queries, narration)
+    finally:
+        # Still open here means an exception left the loop mid-query: write what the model said.
+        narration.close(unfinished=True)
+
+
+async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNarration) -> None:
+    """The per-query loop of `run_scraper`, which owns the narration's lifetime."""
     for i, query in enumerate(queries, 1):
         console.print(f'[cyan]Stage 1b: query {i}/{len(queries)} — "{query}"[/cyan]')
+        narration.begin(query)
         if i > 1:
             await _human_pause(SCRAPER_INTER_QUERY_DELAY_SECONDS, f'query {i}/{len(queries)}')
         tools_module._current_query = query
@@ -1790,6 +1883,7 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
             # left audit §3 reading "error | 0 listings | 2 queued" on 2026-09-10.
             if partial := _check_status_delta(before):
                 tools_module._check_status_per_query[query] = partial
+            narration.close()
             continue
 
         delta = _check_status_delta(before)
@@ -1797,13 +1891,6 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
         # otherwise read as double coverage and push a collapsed query away from this retry.
         seen = len(_distinct_snapshot() - before_distinct)
         calls = sum(delta.values())
-        if calls > seen:
-            logger.info(
-                f'Stage 1b: query "{query}" inspected {calls} listing(s) but only {seen} distinct '
-                f'— {calls - seen} repeat check(s): the same listing recorded more than once, '
-                f'across regions or re-harvested by a recovery pass. '
-                f'See region_overlap for actual cross-region duplication.'
-            )
         first_pass_seen = seen
         recovered = seen < SCRAPER_MIN_LISTINGS_PER_QUERY
         if recovered:
@@ -1932,6 +2019,7 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
             f'[{tools_module.format_status_counts(delta)}], '
             f'{tools_module._candidates_per_query.get(query, 0)} queued'
         )
+        narration.close()
 
     logger.info(
         f'Stage 1b complete: {len(queries)} quer(ies) searched, {_listings_seen()} listing(s) inspected, '
@@ -3507,15 +3595,56 @@ async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) 
 async def _save_and_notify(
     candidate: dict, rating: int, summary: str, content: str, notify: bool = True,
     extract: dict | None = None, pros: list[str] | None = None, warnings: list[str] | None = None,
-) -> None:
+) -> bool | None:
+    """Save the job, and notify when asked and rated high enough.
+
+    Returns whether the notification was sent, or None when none was attempted.
+    """
     await tools_module.do_save_job_posting(
         company=candidate['company'], description=summary, rating=rating,
         content=content, job_id=candidate['job_id'],
     )
     if notify and should_notify_based_on_rating(rating):
-        await _send_pipeline_notification(
+        return await _send_pipeline_notification(
             format_job_notification(candidate, extract or {}, rating, pros or [], warnings or [])
         )
+    return None
+
+
+EXTRACT_SIGNAL_FIELDS = (
+    'date_posted', 'location', 'closed', 'language_requirement', 'posting_language',
+    'likely_working_language', 'stated_working_language', 'relocation',
+)
+EXTRACT_SIGNAL_FIELDS_AFTER_RESIDENCY = ('place_names', 'education_requirement')
+
+
+def format_extract_signal(extract: dict, raw_residency_scope: str) -> str:
+    """The extract-signal fields for the run log, as `name=value` pairs.
+
+    A field that is empty, False or [] is left out, so absent means empty: on 2026-10-08 the line
+    averaged 600 chars per job, most of it `''`. `residency_scope` shows `raw->derived` only when
+    the two differ, and the salary reading only when the posting states a salary or the reading
+    is anything but absent.
+    """
+    parts = [f'{name}={extract.get(name)!r}' for name in EXTRACT_SIGNAL_FIELDS if extract.get(name)]
+    derived_residency_scope = str(extract.get('residency_scope') or '')
+    if raw_residency_scope != derived_residency_scope:
+        parts.append(f'residency_scope={raw_residency_scope!r}->{derived_residency_scope!r}')
+    elif derived_residency_scope:
+        parts.append(f'residency_scope={derived_residency_scope!r}')
+    parts += [f'{name}={extract.get(name)!r}' for name in EXTRACT_SIGNAL_FIELDS_AFTER_RESIDENCY
+              if extract.get(name)]
+    if derive_agency_posting(extract):
+        parts.append('is_agency=True')
+    if extract.get('end_client'):
+        parts.append(f"end_client={extract.get('end_client')!r}")
+    facts = extract['salary_facts']
+    if extract.get('salary') or facts['kind'] != SALARY_KIND_ABSENT:
+        parts.append(
+            f"salary={extract.get('salary')!r}->kind={facts['kind']} currency={facts['currency']!r} "
+            f"period={facts['period']!r} salary_source={facts['source']}"
+        )
+    return ' '.join(parts) or '(every field empty)'
 
 
 def _hard_rule_category(reason: str) -> str:
@@ -3628,6 +3757,9 @@ async def evaluate_all_candidates(
                       f'evaluated, released for the next run',
         })
 
+    logger.info(f'Stage 2: evaluating {len(candidates)} candidate(s)')
+    stage_started = time.monotonic()
+    cost_before = sum(s['cost'] for s in stage_stats.values())
     index = 0
     while index < len(candidates):
         if not await browser_usable(candidates[index:]):
@@ -3687,20 +3819,7 @@ async def evaluate_all_candidates(
             extract_text = format_extract_text(candidate, extract)
             logger.info(
                 f"Extract signal: {candidate['company']} — {candidate['title']}: "
-                f"date_posted={extract.get('date_posted')!r} location={extract.get('location')!r} "
-                f"closed={extract.get('closed')} language_requirement={extract.get('language_requirement')!r} "
-                f"posting_language={extract.get('posting_language')!r} "
-                f"likely_working_language={extract.get('likely_working_language')!r} "
-                f"stated_working_language={extract.get('stated_working_language')!r} "
-                f"relocation={extract.get('relocation')!r} "
-                f"residency_scope={raw_residency_scope!r}->{extract.get('residency_scope')!r} "
-                f"place_names={extract.get('place_names')} "
-                f"education_requirement={extract.get('education_requirement')!r} "
-                f"is_agency={derive_agency_posting(extract)} end_client={extract.get('end_client')!r} "
-                f"salary={extract.get('salary')!r}->kind={extract['salary_facts']['kind']} "
-                f"currency={extract['salary_facts']['currency']!r} "
-                f"period={extract['salary_facts']['period']!r} "
-                f"salary_source={extract['salary_facts']['source']}"
+                f'{format_extract_signal(extract, raw_residency_scope)}'
             )
 
             # Already-applied, checked against the END CLIENT only.
@@ -3757,13 +3876,12 @@ async def evaluate_all_candidates(
             triage_result = None
             if TRIAGE_ENABLED and triage_enabled:
                 triage_result = await triage_job_fit(extract_text, profile_block)
-                if triage_result:
-                    logger.info(
-                        f"Triage: {candidate['company']} — {candidate['title']}: "
-                        f"score {triage_result['score']} ({triage_result['reason']})"
-                    )
                 if triage_rejects(triage_result):
                     bump('triaged_out')
+                    logger.info(
+                        f"Triaged out [{index}/{len(candidates)}]: {candidate['company']} — "
+                        f"{candidate['title']}: score {triage_result['score']} ({triage_result['reason']})"
+                    )
                     await _save_and_notify(
                         candidate, rating=triage_result['score'],
                         summary=f"triaged out {triage_result['reason']}",
@@ -3782,7 +3900,9 @@ async def evaluate_all_candidates(
                     )
                     continue
 
+            rating_started = time.monotonic()
             result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
+            rating_seconds = time.monotonic() - rating_started
             rating, cap_reason = apply_rating_caps(extract, result['rating'])
             if cap_reason:
                 bump('rating_capped')
@@ -3794,11 +3914,6 @@ async def evaluate_all_candidates(
             rated_by = result.get('rated_by') or MODEL_NAME_RATING
             if rated_by != MODEL_NAME_RATING:
                 bump('rating_fallback')
-            triage_note = f" (triage said {triage_result['score']})" if triage_result else ''
-            logger.info(
-                f"Rating: {candidate['company']} — {candidate['title']}: "
-                f"{rating}/5 via {rated_by}{triage_note} — {result['reasoning']}"
-            )
             pros = [str(p) for p in (result.get('pros') or [])]
             deterministic = build_deterministic_warnings(candidate, extract)
 
@@ -3856,9 +3971,28 @@ async def evaluate_all_candidates(
                 candidate['site'], candidate['job_id'], 'recruiter_repost' if repost else 'rated',
                 rating=rating, summary=result['reasoning'],
             )
-            await _save_and_notify(
+            sent = await _save_and_notify(
                 candidate, rating=rating, summary=result['summary'], content=content,
                 extract=extract, pros=pros, warnings=warnings, notify=not repost,
+            )
+            # The reasoning is in the saved job and audit §4. Triage's reason appears only when
+            # the two scores are far enough apart to be worth reading.
+            triage_note = ''
+            if triage_result:
+                triage_note = f", triage {triage_result['score']}"
+                if abs(triage_result['score'] - result['rating']) >= TRIAGE_DISAGREEMENT_LOG_MIN:
+                    triage_note += f" ({triage_result['reason']})"
+            if repost:
+                notify_note = 'not notified (recruiter repost)'
+            elif sent is None:
+                notify_note = 'not notified (below the notification rating)'
+            else:
+                notify_note = 'notified' if sent else 'notification FAILED'
+            logger.info(
+                f"Rating [{index}/{len(candidates)}]: {candidate['company']} — {candidate['title']} "
+                f"(job {candidate['job_id']}): {rating}/5 via {rated_by}"
+                + (f' (fallback: {MODEL_NAME_RATING} failed)' if rated_by != MODEL_NAME_RATING else '')
+                + f'{triage_note}, {rating_seconds:.0f}s — saved, {notify_note}'
             )
             # Only what was actually SENT is recorded: a role first rated 3 never reached the user,
             # so a later repost of it that rates 4 must still notify.
@@ -3888,6 +4022,14 @@ async def evaluate_all_candidates(
                 f"(job {candidate['job_id']}); not rated, saved or notified this run; {retry_note}: "
                 f'{type(ex).__name__}: {ex}'
             )
+
+    logger.info(
+        f'Stage 2 complete: {index} of {len(candidates)} job(s) in '
+        f'{(time.monotonic() - stage_started) / SECONDS_PER_MINUTE:.1f} min, '
+        f"${sum(s['cost'] for s in stage_stats.values()) - cost_before:.4f}"
+    )
+
+
 async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
     """One non-agentic Opus rating call — the reference standard for audits only."""
     options = ClaudeAgentOptions(
@@ -4190,9 +4332,12 @@ class BrowserServer:
             f'A negative code is the signal; a node crash report is in ~/Library/Logs/DiagnosticReports'
         )
         self.restarts += 1
+        restart_started = time.monotonic()
         # A server that stopped answering may still be running and holding the browser profile.
         await self.stop()
         await self.start()
+        logger.info(f'{PLAYWRIGHT_MCP_PACKAGE} restarted on port {self.port} in '
+                    f'{time.monotonic() - restart_started:.0f}s')
 
     async def stop(self) -> None:
         # terminate() on an already-exited process raises ProcessLookupError. On 2026-09-21 that

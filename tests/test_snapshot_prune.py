@@ -40,7 +40,7 @@ FOOTER = '''
 
 def test_removes_the_pane_and_keeps_the_search_ui(caplog):
     snapshot = SEARCH_UI + PANE + FOOTER
-    with caplog.at_level(logging.INFO, logger=snapshot_prune.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=snapshot_prune.logger.name):
         pruned = snapshot_prune.drop_job_detail_pane(snapshot, WHAT)
 
     assert 'About the job' not in pruned and 'Acme makes anvils' not in pruned
@@ -48,7 +48,8 @@ def test_removes_the_pane_and_keeps_the_search_ui(caplog):
     assert pruned.startswith(SEARCH_UI), 'chips, count, location chip and every card kept verbatim'
     assert pruned.count('Dismiss') == snapshot.count('Dismiss')
     assert pruned.endswith(FOOTER), 'content after the pane is kept'
-    messages = [r.message for r in caplog.records if r.levelno == logging.INFO]
+    assert not [r for r in caplog.records if r.levelno > logging.DEBUG], 'a routine prune is DEBUG only'
+    messages = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
     assert messages == [f'{WHAT}: removed job detail pane, {len(snapshot)} -> {len(pruned)} chars']
 
 

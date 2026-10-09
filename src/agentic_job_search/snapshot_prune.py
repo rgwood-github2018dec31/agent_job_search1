@@ -81,5 +81,5 @@ def drop_job_detail_pane(text: str, what: str) -> str:
     marker = (f'{" " * _indent(lines[start])}- [job detail pane omitted: {removed_chars} chars; '
               f'this search does not read postings]')
     pruned = '\n'.join([*lines[:start], marker, *lines[end:]])
-    logger.info(f'{what}: removed job detail pane, {len(text)} -> {len(pruned)} chars')
+    logger.debug(f'{what}: removed job detail pane, {len(text)} -> {len(pruned)} chars')
     return pruned

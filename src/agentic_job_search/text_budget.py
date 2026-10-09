@@ -84,7 +84,7 @@ def normalize_whitespace(text: str) -> str:
 def pages_to_prompt(pages: list[str], name: str, max_chars: int) -> str:
     """Serialize per-page text for a prompt, reporting its size and normalizing/truncating to fit.
 
-    The only place page lists are joined. Always logs page count and chars per page. Over the cap
+    The only place page lists are joined. Page count and chars per page go to DEBUG. Over the cap
     it first normalizes whitespace (a PDF of mostly padding must not push real content past the
     cap) with a WARNING, and only if still over truncates at a page-aware point with a second
     WARNING and a marker naming how many pages survived.
@@ -92,7 +92,7 @@ def pages_to_prompt(pages: list[str], name: str, max_chars: int) -> str:
     sizes = [len(p) for p in pages]
     total = sum(sizes)
     mean = total / len(pages) if pages else 0
-    logger.info(
+    logger.debug(
         f'{name}: {len(pages)} page(s), {total} chars, {mean:.0f} chars/page (per page: {sizes})'
     )
     if total <= max_chars:

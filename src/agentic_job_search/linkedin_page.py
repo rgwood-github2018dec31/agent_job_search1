@@ -65,6 +65,9 @@ STYLESHEET_DIR_NAME = 'assets'
 CONTENT_HASH_CHARS = 16
 
 _ABOUT_JOB_ID_RE = re.compile(r'^JobDetails_AboutTheJob_')
+# Counts worth a place on the per-page INFO line when non-zero; the rest are the same every page.
+_UNUSUAL_JS_KEYS = ('script_links', 'handler_attrs', 'js_urls')
+_UNUSUAL_ASSET_KEYS = ('fetch_failures',)
 _ABOUT_COMPANY_ID_RE = re.compile(r'^JobDetails_AboutTheCompany_')
 _COMPANY_LOGO_ALT_RE = re.compile(r'^Company logo for,\s*(?P<company>.+?)\.?$')
 _FOLLOWERS_RE = re.compile(r'^[\d,.]+[KkMm]?\s+followers$')
@@ -573,10 +576,18 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     text = page_text(soup)
     tools_generic.save_raw_posting(candidate, text, 'dom', len(text))
     removed_summary = ', '.join(f"{r['what']} ({r['chars']})" for r in removed) or 'nothing'
+    # The block list, inline-script count and logo reuse are the same on every page, so INFO
+    # carries totals and only what is unusual; DEBUG carries the rest.
+    unusual = ''
+    if any(js_counts.get(key) for key in _UNUSUAL_JS_KEYS):
+        unusual += f'; JS {js_counts}'
+    if any(asset_counts.get(key) for key in _UNUSUAL_ASSET_KEYS):
+        unusual += f'; assets {asset_counts}'
     logger.info(
         f"Job page {job_id}: DOM {len(capture['html']):,} chars → {len(text):,} chars of text; "
-        f'removed {removed_summary}; JS {js_counts}; assets {asset_counts}'
+        f"removed {len(removed)} block(s) ({sum(r['chars'] for r in removed):,} chars){unusual}"
     )
+    logger.debug(f'Job page {job_id}: removed {removed_summary}; JS {js_counts}; assets {asset_counts}')
     return JobPage(text=text, source='dom', removed=removed)
 
 

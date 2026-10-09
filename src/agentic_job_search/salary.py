@@ -68,7 +68,8 @@ CACHE_SCHEMA_VERSION = 1
 # The vocabulary of answers. `unclassified` is not a failure mode to be minimised — it is the
 # honest answer for a string no rule could read, and it is what tier 8 exists to produce rather
 # than guessing.
-SALARY_KINDS = ('absent', 'floor_only', 'ceiling_only', 'single', 'range', 'unclassified')
+SALARY_KIND_ABSENT = 'absent'
+SALARY_KINDS = (SALARY_KIND_ABSENT, 'floor_only', 'ceiling_only', 'single', 'range', 'unclassified')
 SALARY_PERIODS = ('year', 'month', 'week', 'day', 'hour')
 
 # Currency symbols and codes, longest-first so 'CA$' wins over '$' and 'CAD' over 'CA'. A BARE '$'

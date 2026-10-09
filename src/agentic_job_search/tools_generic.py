@@ -352,7 +352,7 @@ async def company_matches_applied(candidate: str) -> str | None:
     normalized = {_normalize_company(name): name for name in _applied_companies}
     exact = normalized.get(_normalize_company(candidate))
     if exact:
-        logger.info(f'company_matches_applied: exact normalized match {candidate!r} -> {exact!r} (no LLM call)')
+        logger.debug(f'company_matches_applied: exact normalized match {candidate!r} -> {exact!r} (no LLM call)')
         return _applied_companies[exact]
 
     companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
@@ -1741,6 +1741,16 @@ def log_run_cost(record: dict, log_path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a', encoding='utf-8') as f:
         f.write(json.dumps(record) + '\n')
+    # Elapsed and cost otherwise reach only this file and Telegram, never the run log.
+    if 'total_cost' in record and 'elapsed_minutes' in record:
+        stage_costs = ', '.join(
+            f"{stage} ${stats['cost']:.4f}"
+            for stage, stats in (record.get('stage_stats') or {}).items() if stats.get('cost')
+        )
+        logger.info(
+            f"Run complete ({record.get('status')}): {record['elapsed_minutes']:.1f} min, "
+            f"${record['total_cost']:.4f} total ({stage_costs or 'no stage cost'})"
+        )
 
 
 # Written as the name is written, like every other place name (see docs/requirements.md, Names
@@ -2375,7 +2385,8 @@ async def report_search(args: dict) -> dict:
     }
     _search_reports.append(record)
 
-    logger.info(
+    # A passing report is DEBUG: every failing branch below logs its own WARNING.
+    logger.debug(
         f'report_search: query="{query}" region="{region_name}" cards={report.get("job_cards")} '
         f'pin="{report.get("location_pin")}" blocked={blocked or "no"} '
         f'violations={len(violations)} filter_problems={len(filter_problems)}'

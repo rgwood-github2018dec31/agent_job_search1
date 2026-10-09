@@ -5132,6 +5132,7 @@ def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, li
 
     async def fake_notify(text):
         notifications.append(text)
+        return True
 
     async def fake_estimate(candidate, extract, page_text='', stage_stats=None):
         return None
@@ -8441,8 +8442,10 @@ async def test_duplicate_listing_line_makes_no_region_claim(monkeypatch, caplog)
     with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
         await _scrape(client, ['Staff AI Engineer'])
 
-    dup_lines = [r.message for r in caplog.records if 'but only' in r.message and 'distinct' in r.message]
-    assert dup_lines, 'expected the duplicate-listing line'
+    # The separate "N but only M distinct" line is gone (2026-10-09): the summary states both counts.
+    dup_lines = [r.message for r in caplog.records if 'distinct listing(s) of' in r.message]
+    assert dup_lines, 'expected the per-query summary line'
+    assert not any('but only' in r.message for r in caplog.records)
     for line in dup_lines:
         assert 'more than one region' not in line, (
             f'the line must not attribute duplicates to regions: {line}'
@@ -8567,7 +8570,7 @@ def test_snippet_says_how_much_it_hid():
 
 
 def test_pages_to_prompt_reports_chars_per_page(caplog):
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
     out = text_budget.pages_to_prompt(['page one', 'page two!'], 'PDF x.pdf', 1000)
     assert out == 'page one\n\npage two!'
     assert any('2 page(s), 17 chars' in r.getMessage() and '[8, 9]' in r.getMessage()
@@ -9685,8 +9688,151 @@ async def test_estimate_salary_live(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# A rating call that fails must not cost the job (2026-10-09)
+# Run-log volume (2026-10-09): routine success is brief or DEBUG; trouble is not
 # ---------------------------------------------------------------------------
+
+NARRATION_LINE = 'Let me take a snapshot to see the page.'
+
+
+def _narrate_one_query(trouble) -> None:
+    narration = agent.QueryNarration()
+    narration.begin('Staff AI Engineer')
+    agent.log_agent_text('Stage 1b', NARRATION_LINE)
+    unfinished = trouble()
+    narration.close(unfinished=bool(unfinished))
+
+
+def test_narration_of_a_clean_query_is_withheld(monkeypatch, caplog):
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        _narrate_one_query(lambda: None)
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any(NARRATION_LINE in m for m in messages)
+    assert any('narration withheld — 1 line(s)' in m for m in messages), 'the withholding itself is reported'
+    assert agent._active_narration is None
+    assert not [h for h in agent._PACKAGE_LOGGER.handlers if isinstance(h, agent._WarningCounter)]
+
+
+@pytest.mark.parametrize('trouble', [
+    lambda: agent.logger.warning('Stage 1b: something failed'),
+    lambda: tools.logger.warning('Stage 1b filters not applied'),
+    lambda: tools._ui_alerts.append({'kind': 'low_listings'}),
+    lambda: True,   # the query did not finish
+], ids=['warning', 'warning_in_another_module', 'ui_alert', 'unfinished'])
+def test_narration_is_written_when_the_query_had_trouble(monkeypatch, caplog, trouble):
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        _narrate_one_query(trouble)
+    narrated = [r.getMessage() for r in caplog.records if NARRATION_LINE in r.getMessage()]
+    assert len(narrated) == 1 and r'narration [' in narrated[0], 'written once, with its original time'
+
+
+def test_narration_always_reaches_debug(monkeypatch, caplog):
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    with caplog.at_level(logging.DEBUG, logger='agentic_job_search.agent'):
+        _narrate_one_query(lambda: None)
+    assert any(r.levelno == logging.DEBUG and NARRATION_LINE in r.getMessage() for r in caplog.records)
+
+
+def test_narration_outside_a_scraper_query_is_logged_as_before(caplog):
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        agent.log_agent_text('Stage 2a', NARRATION_LINE)
+        agent.log_agent_text('Stage 1b', NARRATION_LINE)   # no query open: nothing to hold it for
+    assert sum(NARRATION_LINE in r.getMessage() for r in caplog.records) == 2
+
+
+async def test_run_scraper_writes_the_narration_of_a_query_that_aborts(monkeypatch, caplog):
+    _reset_scrape_globals(monkeypatch)
+    monkeypatch.setattr(tools, '_query_errors', {})
+
+    async def run_pass(instruction):
+        agent.log_agent_text('Stage 1b', NARRATION_LINE)
+        raise agent.ProviderUnavailableError('402 insufficient credits')
+
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'), \
+            pytest.raises(agent.ProviderUnavailableError):
+        await agent.run_scraper(run_pass, ['Staff AI Engineer'], {'cost': 0.0})
+    assert any(NARRATION_LINE in r.getMessage() for r in caplog.records)
+    assert agent._active_narration is None
+
+
+def test_extract_signal_omits_empty_fields():
+    absent = {'kind': 'absent', 'currency': '', 'period': '', 'source': 'deterministic'}
+    quiet = agent.format_extract_signal(
+        {'location': 'Canada (Remote)', 'closed': False, 'language_requirement': '', 'place_names': [],
+         'residency_scope': '', 'salary': '', 'salary_facts': absent}, '')
+    assert quiet == "location='Canada (Remote)'"
+
+    full = agent.format_extract_signal(
+        {'location': 'Canada', 'closed': True, 'residency_scope': 'country_only', 'place_names': ['Canada'],
+         'is_agency': True, 'end_client': 'Acme', 'salary': '$100 CAD per year',
+         'salary_facts': {'kind': 'single', 'currency': 'CAD', 'period': 'year', 'source': 'deterministic'}},
+        '')
+    assert 'closed=True' in full and "place_names=['Canada']" in full and "end_client='Acme'" in full
+    assert "residency_scope=''->'country_only'" in full, 'raw and derived shown when they differ'
+    assert "salary='$100 CAD per year'->kind=single currency='CAD' period='year'" in full
+
+    same = agent.format_extract_signal(
+        {'residency_scope': 'country_only', 'salary': '', 'salary_facts': absent}, 'country_only')
+    assert same == "residency_scope='country_only'"
+
+
+def _stage2_messages(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records]
+
+
+async def test_stage_2_rating_line_says_notified_and_carries_no_reasoning(monkeypatch, caplog):
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _run_stage2(_make_candidate(job_id='222', company='Acme'), {})
+    messages = _stage2_messages(caplog)
+    rating_lines = [m for m in messages if m.startswith('Rating [1/1]: ')]
+    assert len(rating_lines) == 1
+    assert '(job 222): 5/5 via ' in rating_lines[0] and rating_lines[0].endswith('— saved, notified')
+    assert 'strong fit' not in rating_lines[0], 'the reasoning lives in the saved job and the audit log'
+    assert any(m == 'Stage 2: evaluating 1 candidate(s)' for m in messages)
+    assert any(m.startswith('Stage 2 complete: 1 of 1 job(s) in ') for m in messages)
+
+
+async def test_stage_2_rating_line_says_why_nothing_was_sent(monkeypatch, caplog):
+    _repost_llm(monkeypatch, '')
+    notifications, _ = _stage2_stubs(
+        monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'), rating=3)
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _run_stage2(_make_candidate(job_id='222', company='Acme'), {})
+    assert notifications == []
+    assert any(m.endswith('— saved, not notified (below the notification rating)') for m in _stage2_messages(caplog))
+
+
+async def test_stage_2_rating_line_reports_a_failed_send(monkeypatch, caplog):
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+
+    async def failed_notify(text):
+        return False
+    monkeypatch.setattr(agent, '_send_pipeline_notification', failed_notify)
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _run_stage2(_make_candidate(job_id='222', company='Acme'), {})
+    assert any(m.endswith('— saved, notification FAILED') for m in _stage2_messages(caplog))
+
+
+async def test_stage_2_rating_line_gives_the_triage_reason_only_on_a_wide_disagreement(monkeypatch, caplog):
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+    scores = iter([5, 5 - agent.TRIAGE_DISAGREEMENT_LOG_MIN])
+
+    async def fake_triage(extract_text, profile_block):
+        return {'score': next(scores), 'reason': 'local model reason'}
+    monkeypatch.setattr(agent, 'triage_job_fit', fake_triage)
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _run_stage2(_make_candidate(job_id='222', company='Acme'), {})
+        await _run_stage2(_make_candidate(job_id='223', company='Acme'), {})
+    agreed, disagreed = [m for m in _stage2_messages(caplog) if m.startswith('Rating [')]
+    assert ', triage 5,' in agreed and 'local model reason' not in agreed
+    assert 'local model reason' in disagreed
+    assert not any(m.startswith('Triage: ') for m in _stage2_messages(caplog))
+
 
 def _processed_record(tmp_path, monkeypatch, job_id: str) -> Path:
     processed = tmp_path / 'processed_jobs'
@@ -9857,3 +10003,29 @@ def test_the_rating_fallbacks_are_other_openrouter_models():
     assert config.MODEL_NAME_RATING not in config.MODEL_NAME_RATING_FALLBACKS
     assert len(set(config.MODEL_NAME_RATING_FALLBACKS)) == len(config.MODEL_NAME_RATING_FALLBACKS)
     assert all(agent.route_for(model) == 'openrouter' for model in config.MODEL_NAME_RATING_FALLBACKS)
+
+
+async def test_stage_2_rating_line_and_funnel_name_the_fallback_model(monkeypatch, caplog):
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+
+    async def fallback_rate(evaluator_prompt, extract_text, stats):
+        return {'rating': 4, 'reasoning': 'ok', 'summary': 'ok', 'title': 'Engineer', 'company': 'Acme',
+                'pros': [], 'warnings': [], 'rated_by': 'other/model'}
+    monkeypatch.setattr(agent, 'rate_job', fallback_rate)
+    funnel: dict = {}
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _run_stage2(_make_candidate(job_id='222', company='Acme'), funnel)
+    assert funnel.get('rating_fallback') == 1
+    assert any(f'4/5 via other/model (fallback: {agent.MODEL_NAME_RATING} failed)' in m
+               for m in _stage2_messages(caplog))
+
+
+def test_log_run_cost_puts_elapsed_and_cost_in_the_run_log(tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger=tools.logger.name):
+        tools.log_run_cost({
+            'status': 'ok', 'total_cost': 0.1234, 'elapsed_minutes': 12.34,
+            'stage_stats': {'scraping': {'cost': 0.1}, 'rating': {'cost': 0.0234}, 'salary': {'cost': 0.0}},
+        }, tmp_path / 'cost_log.jsonl')
+    assert [r.getMessage() for r in caplog.records] == [
+        'Run complete (ok): 12.3 min, $0.1234 total (scraping $0.1000, rating $0.0234)']

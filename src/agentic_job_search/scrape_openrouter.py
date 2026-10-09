@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 _FIND_TOOL_NAME = 'browser_find'
 _SNAPSHOT_TOOL_NAME = 'browser_snapshot'
 _FILENAME_ARG = 'filename'
+_FINISH_REASON_STOP = 'stop'
 
 
 def _result_cap(tool_name: str) -> int:
@@ -169,11 +170,12 @@ class ProviderPin:
             return False
         self.estimate_per_million, best = ranked[0]
         self.tag, self.quantization = best['tag'], best.get('quantization')
-        runners_up = ', '.join(f"{e['tag']} ${price:.4f}/M" for price, e in ranked[1:])
+        runners_up = [f"{e['tag']} ${price:.4f}/M" for price, e in ranked[1:]]
         logger.info(
-            f'Stage 1b: pinned {self.model} to {self.tag} — est. ${self.estimate_per_million:.4f} per '
-            f'million prompt tokens at the scraper\'s token mix (next: {runners_up or "none"})'
+            f'Stage 1b: pinned {self.model} to {self.tag} — est. ${self.estimate_per_million:.4f}/M prompt '
+            f'tokens at the scraper\'s token mix (next: {runners_up[0] if runners_up else "none"})'
         )
+        logger.debug(f'Stage 1b: all ranked endpoints after {self.tag}: {", ".join(runners_up) or "none"}')
         return True
 
     async def switch(self, error: str, query: str) -> bool:
@@ -419,7 +421,7 @@ class ScrapeSession:
                     'detail': 'harvest returned zero listings'})
                 return ('harvested 0 listings. If the page visibly shows results then the markup has '
                         'changed — call report_problem and stop. Do NOT invent listings.')
-            logger.info(f'Stage 1b: harvested {len(jobs)} listing(s) for "{self.query}" / {self.region}')
+            logger.debug(f'Stage 1b: harvested {len(jobs)} listing(s) for "{self.query}" / {self.region}')
             return f'harvested {len(jobs)} listing(s); the system is holding them. Call record_listings next.'
 
         if name == 'record_listings':
@@ -553,8 +555,12 @@ class ScrapeSession:
                 messages.append({'role': 'user', 'content': NO_TOOL_NUDGE})
                 continue
             if not tool_calls:
-                logger.info(f'Stage 1b: model finished after {self.iterations} iteration(s) '
-                            f'(finish_reason={data.get("finish_reason")})')
+                # A normal stop is DEBUG: the iteration count is on the `Stage 1b cost` line.
+                finish_reason = data.get('finish_reason')
+                logger.log(
+                    logging.DEBUG if finish_reason == _FINISH_REASON_STOP else logging.INFO,
+                    f'Stage 1b: model finished after {self.iterations} iteration(s) '
+                    f'(finish_reason={finish_reason})')
                 return
             messages.append({'role': 'assistant', 'content': data.get('content'), 'tool_calls': tool_calls})
 
