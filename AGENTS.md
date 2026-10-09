@@ -51,8 +51,12 @@ anything a rule covers.
   [docs/requirements.md](docs/requirements.md#non-functional-requirements).
 - **A figure the pipeline extracts is shown to the user as extracted, or reported as missing or
   partial — never left to a model's paraphrase.** The salary reached one notification only through
-  the rater's own bullets, which rounded one bound and led with the other. See Notify User of
-  Match and Classify Salary in [docs/requirements.md](docs/requirements.md#use-cases).
+  the rater's own bullets, which rounded one bound and led with the other. Two things may follow
+  the extracted text, each labelled as what it is and neither replacing it: a conversion code
+  computed from a published rate (`≈`), and, only when the posting states no figure, a
+  `model estimate`. Neither may reach the rater, a cap, a gate or a warning. See Notify User of
+  Match, Classify Salary, Convert Salary Currency and Estimate Pay Range in
+  [docs/requirements.md](docs/requirements.md#use-cases).
 - **Every `ClaudeAgentOptions` site passes `setting_sources=[]`, `strict_mcp_config=True` and
   `skills=[]`.** Without them, this file and every global MCP server get loaded into each call.
   An AST test enforces this. See Cost efficiency in
@@ -136,6 +140,8 @@ src/agentic_job_search/
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
   location.py                     # Cached geographic classifier for a job's location
   salary.py                       # Salary reading: deterministic tiers, cached LLM only for the rest
+  fx.py                           # Display-only currency conversion of a salary: daily rate table, fails open
+  salary_estimate.py              # Model pay estimate for a notified posting with no salary; cached per job, gates nothing
   text_budget.py                  # Reported truncation: truncate_reported, pages_to_prompt, snippet
 scripts/
   migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
@@ -156,6 +162,8 @@ run_dir/
   reference_summary_cache.yaml    # Cached distilled ideal-role profile (md5-keyed)
   location_cache.yaml             # Cached geography per location string (country/region/language)
   salary_cache.yaml               # Cached salary reading per salary string (kind/bounds/currency/period)
+  fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
+  salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
   raw_postings/                   # Per job: .html page archive (JS-free) + .txt text the extractor read; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
@@ -180,7 +188,7 @@ measurements) are in git history: `git show dd14c73:docs/diagnoses/README.md`.
 | Stage 1b scraping, `scrape_openrouter.py`, Playwright, anything that drives LinkedIn | Scrape Job Postings, Verify Search UI Contract, Harvest Job Listings; NFRs Account safety, Search coverage, Anti-fabrication |
 | Location gate, `location.py`, `location_review.py`, the `locations.*` preferences | Reject Excluded Location, Classify Job Location, Detect Residency Scope, Review Country Lists; NFRs A matching rule fails silently permissive, Names stay proper |
 | Hard rules, rating caps, warnings, notifications | Apply Hard Rules, Rate Job Fit, Build Deterministic Warnings; NFRs A structural fact is decided in code, Rating hard rules, Rating caps |
-| Salary parsing, `salary.py`, the `💰` line, raw-posting retention | Classify Salary, Retain Raw Posting Text, Check Salary Provenance, Build Deterministic Warnings, Notify User of Match; NFRs A matching rule fails silently permissive, No silent truncation |
+| Salary parsing, `salary.py`, `fx.py`, `salary_estimate.py`, the `💰` line, raw-posting retention | Classify Salary, Convert Salary Currency, Estimate Pay Range, Retain Raw Posting Text, Check Salary Provenance, Build Deterministic Warnings, Notify User of Match; NFRs A matching rule fails silently permissive, No silent truncation |
 | `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks | NFRs Resilience, Observability |
 | A new `ClaudeAgentOptions` / `sdk_query` site, or an SDK tool schema | NFRs Cost efficiency, Observability, Anti-fabrication |
 | Applied-job ingest or the reference profile | [docs/architecture.md](docs/architecture.md); Summarize Reference Jobs |

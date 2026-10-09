@@ -9,7 +9,16 @@ from pathlib import Path
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools
 import pytest
-from agentic_job_search import agent, linkedin_page, location, location_review, salary, scrape_openrouter
+from agentic_job_search import (
+    agent,
+    fx,
+    linkedin_page,
+    location,
+    location_review,
+    salary,
+    salary_estimate,
+    scrape_openrouter,
+)
 from agentic_job_search.agent import load_env
 from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
 
@@ -305,6 +314,61 @@ def stub_salary_classifier(monkeypatch):
         raise AssertionError('a unit test tried to reach the OpenRouter MCP server')
 
     monkeypatch.setattr('agentic_job_search.salary.chat_openrouter', _no_network)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_fx_cache(monkeypatch, tmp_path):
+    """No test may read or write the developer's real run_dir/fx_rates_cache.yaml, and none may
+    inherit another test's loaded table or its once-per-run fetch attempt."""
+    monkeypatch.setattr(fx, 'FX_RATES_CACHE_PATH', tmp_path / 'fx_rates_cache.yaml')
+    fx.reset_run_state()
+    yield
+    fx.reset_run_state()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_salary_estimate_cache(monkeypatch, tmp_path):
+    """No test may read or write the developer's real run_dir/salary_estimate_cache.yaml."""
+    monkeypatch.setattr(salary_estimate, 'SALARY_ESTIMATE_CACHE_PATH', tmp_path / 'salary_estimate_cache.yaml')
+    monkeypatch.setattr(salary_estimate, '_cache', {})
+
+
+@pytest.fixture(autouse=True)
+def stub_fx_fetch(monkeypatch):
+    """Autouse: no unit test may fetch exchange rates from the real service.
+
+    A call COUNT checked at teardown rather than a raising stub, deliberately: `fx.rates_for`
+    fails open, so a stub that raised would be caught, logged, and the test would pass anyway.
+    Tests exercising the fetch patch `fx._http_get` themselves, which wins over this.
+    """
+    calls: list = []
+
+    def _recorded(url, params):
+        calls.append((url, params))
+        raise ConnectionError('a unit test tried to reach the exchange-rate service')
+
+    monkeypatch.setattr(fx, '_http_get', _recorded)
+    yield calls
+    assert calls == [], f'a unit test tried to reach the exchange-rate service: {calls}'
+
+
+@pytest.fixture(autouse=True)
+def stub_salary_estimator(monkeypatch):
+    """Autouse: no unit test may ask the real model for a pay estimate.
+
+    Counted and checked at teardown for the same reason as `stub_fx_fetch`: `estimate_salary`
+    fails open, so a raising stub alone cannot fail a test. Tests exercising the estimator patch
+    `salary_estimate.chat_openrouter` (or `agent.estimate_salary`) themselves.
+    """
+    calls: list = []
+
+    async def _recorded(prompt, *args, **kwargs):
+        calls.append(prompt)
+        raise ConnectionError('a unit test tried to reach the OpenRouter MCP server')
+
+    monkeypatch.setattr(salary_estimate, 'chat_openrouter', _recorded)
+    yield calls
+    assert calls == [], f'a unit test asked the real model for {len(calls)} pay estimate(s)'
 
 
 @pytest.fixture(autouse=True)

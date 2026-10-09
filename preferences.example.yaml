@@ -126,6 +126,12 @@ compensation:
   # Leave both empty for no code-side comparison.
   base_target:      # e.g. 150000
   currency: ''      # e.g. EUR
+  # Display only: a salary quoted in a currency NOT listed in keep_currencies is shown in the
+  # job-match message with its equivalent in convert_to appended, at the day's exchange rate. The
+  # posting's own figure is always shown too. The same rule applies to the model's pay estimate
+  # for a posting that lists no salary. Leave convert_to empty to convert nothing.
+  convert_to: ''        # e.g. EUR
+  keep_currencies: []   # e.g. [EUR, USD]
 
 companies:
   # Companies to always auto-reject, whatever the posting says. Matched on an EXACT,

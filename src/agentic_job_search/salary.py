@@ -73,15 +73,35 @@ SALARY_PERIODS = ('year', 'month', 'week', 'day', 'hour')
 
 # Currency symbols and codes, longest-first so 'CA$' wins over '$' and 'CAD' over 'CA'. A BARE '$'
 # is deliberately absent: it is genuinely ambiguous (USD, CAD, AUD, SGD...), and guessing a
-# currency is not this module's job. An unresolved currency does not make a range partial.
+# currency is not this module's job. An unresolved currency does not make a range partial. A bare
+# 'kr' is absent for the same reason (SEK, NOK, DKK and ISK all write it); it still marks an
+# amount as money in `_MONETARY_MARKER_RE`.
 _CURRENCY_BY_TOKEN = {
     'CA$': 'CAD', 'C$': 'CAD', 'CAD': 'CAD', 'US$': 'USD', 'USD': 'USD', 'A$': 'AUD', 'AUD': 'AUD',
     '€': 'EUR', 'EUR': 'EUR', '£': 'GBP', 'GBP': 'GBP', 'zł': 'PLN', 'PLN': 'PLN', 'CHF': 'CHF',
-    'SEK': 'SEK', 'kr': 'SEK', 'NOK': 'NOK', 'DKK': 'DKK', 'CZK': 'CZK', 'HUF': 'HUF', 'RON': 'RON',
+    'SEK': 'SEK', 'NOK': 'NOK', 'DKK': 'DKK', 'CZK': 'CZK', 'HUF': 'HUF', 'RON': 'RON',
     'INR': 'INR', '₹': 'INR', '¥': 'JPY', 'JPY': 'JPY', 'SGD': 'SGD', 'BRL': 'BRL', 'MXN': 'MXN',
 }
+_CURRENCY_BY_FOLDED_TOKEN = {token.casefold(): code for token, code in _CURRENCY_BY_TOKEN.items()}
+# Every ISO code a reading can carry. The closed vocabulary a model's answer is checked against.
+SALARY_CURRENCIES = frozenset(_CURRENCY_BY_TOKEN.values())
+
+
+def _currency_token_pattern(token: str) -> str:
+    """One token's regex. A letter at either edge must not continue into a word.
+
+    Unanchored, the codes matched INSIDE words: 'Toronto: $120,000' read as RON and 'Europe:
+    80,000 GBP' as EUR. That only made the target comparison abstain until a reading's currency
+    began to drive a conversion shown to the user (2026-10-08). A digit may still touch the token
+    ('CAD154,700'), and a symbol edge ('CA$', '€') needs no guard.
+    """
+    lead = r'(?<![^\W\d_])' if token[0].isalpha() else ''
+    trail = r'(?![^\W\d_])' if token[-1].isalpha() else ''
+    return f'{lead}{re.escape(token)}{trail}'
+
+
 _CURRENCY_RE = re.compile(
-    '|'.join(re.escape(token) for token in sorted(_CURRENCY_BY_TOKEN, key=len, reverse=True)),
+    '|'.join(_currency_token_pattern(token) for token in sorted(_CURRENCY_BY_TOKEN, key=len, reverse=True)),
     re.IGNORECASE,
 )
 
@@ -279,13 +299,20 @@ def parse_amount(raw: str, suffix: str = '') -> float | None:
     return value
 
 
+def currencies_named(text: str) -> tuple[str, ...]:
+    """Every distinct currency the text names, as ISO codes in order of first appearance.
+
+    More than one means the amounts are not all in one currency ('£60,000 or €70,000'), so a caller
+    converting the bounds cannot assume the first currency belongs to them.
+    """
+    codes = (_CURRENCY_BY_FOLDED_TOKEN[m.group(0).casefold()] for m in _CURRENCY_RE.finditer(str(text or '')))
+    return tuple(dict.fromkeys(codes))
+
+
 def detect_currency(text: str) -> str:
-    """The currency the text names, or '' when it names none or only a bare '$'."""
-    match = _CURRENCY_RE.search(str(text or ''))
-    if not match:
-        return ''
-    token = match.group(0)
-    return _CURRENCY_BY_TOKEN.get(token, _CURRENCY_BY_TOKEN.get(token.upper(), ''))
+    """The currency the text names, or '' when it names none or only a bare '$' or 'kr'."""
+    named = currencies_named(text)
+    return named[0] if named else ''
 
 
 def detect_period(text: str) -> str:
@@ -401,7 +428,7 @@ def _coerce(raw: dict, text: str) -> dict[str, Any]:
     period = str(raw.get('period') or '').strip().lower()
     period = period if period in SALARY_PERIODS else ''
     currency = str(raw.get('currency') or '').strip().upper()
-    currency = currency if currency in set(_CURRENCY_BY_TOKEN.values()) else ''
+    currency = currency if currency in SALARY_CURRENCIES else ''
 
     def number(key: str) -> float | None:
         value = raw.get(key)

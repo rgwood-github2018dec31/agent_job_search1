@@ -75,6 +75,10 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     'compensation': {
         'base_target': None,  # annual amount, e.g. 150000
         'currency': '',       # ISO 4217 code the target is quoted in, e.g. 'EUR'
+        # Display only. A salary quoted in a currency outside `keep_currencies` is shown with its
+        # equivalent in `convert_to`; empty = nothing is converted.
+        'convert_to': '',
+        'keep_currencies': [],
     },
     'companies': {
         # [{'name': ..., 'reason': ..., 'added': 'YYYY-MM-DD'}]; empty = no company is blocked
@@ -311,6 +315,38 @@ def salary_target() -> tuple[float, str] | None:
             f'got {raw_currency!r}'
         )
     return target, currency
+
+
+def salary_conversion() -> tuple[str, frozenset[str]] | None:
+    """(currency to convert into, currencies left as written) — or None when no conversion is set.
+
+    The kept set always includes the conversion currency itself. A malformed value raises rather
+    than reading as unset, for the same reason as `salary_target`: an ignored preference silently
+    switches the conversion off.
+    """
+    compensation = load_preferences()['compensation']
+    raw_convert_to, raw_keep = compensation.get('convert_to'), compensation.get('keep_currencies')
+    if not raw_convert_to:
+        return None
+    if raw_keep is None:
+        raw_keep = []
+    if not isinstance(raw_keep, list):
+        raise ValueError(
+            f'{PREFERENCES_PATH}: `compensation.keep_currencies` must be a list of ISO 4217 codes '
+            f'such as [EUR, USD], got {raw_keep!r} ({type(raw_keep).__name__})'
+        )
+    convert_to = str(raw_convert_to).strip().upper()
+    keep = {str(code).strip().upper() for code in raw_keep}
+    for key, code, raw in (
+        ('convert_to', convert_to, raw_convert_to),
+        *(('keep_currencies', code, raw_keep) for code in sorted(keep)),
+    ):
+        if not _ISO_CURRENCY_RE.fullmatch(code):
+            raise ValueError(
+                f'{PREFERENCES_PATH}: `compensation.{key}` must hold ISO 4217 codes such as EUR, '
+                f'got {raw!r}'
+            )
+    return convert_to, frozenset(keep | {convert_to})
 
 
 def _parse_added_date(raw: Any) -> date | None:

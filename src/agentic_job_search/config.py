@@ -327,6 +327,10 @@ MODEL_NAME_RATING = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 # tiers in salary.py answer all but a few strings, and this only sees what they could not read.
 # Flash tier for that reason, and cached per string so a phrase is parsed once, ever.
 MODEL_NAME_SALARY = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
+# Estimating a pay range for a posting that states none is a JUDGEMENT about the job, so the
+# intelligence tier. Reached only for a job about to be notified whose salary reading is `absent`,
+# once per job, then cached. It gates nothing: the answer is shown as a labelled estimate.
+MODEL_NAME_SALARY_ESTIMATE = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 # The extraction loop is a many-iteration tool-calling conversation, so it runs on the
 # shared agentic (flash-tier) default rather than the intelligence default — glm-5.2
 # measured agentic 45.7 vs 58.2 for glm-5.3-flash, at ~1/19th the per-token price.
@@ -477,6 +481,15 @@ PLAYWRIGHT_MCP_REGISTRY_URL = 'https://registry.npmjs.org/@playwright/mcp/latest
 # registry is ~0.25s. The call fails open, so a slow registry delays a run, never fails it.
 PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS = 3
 
+# Exchange rates for the converted figure on the 💰 line. Frankfurter is free and keyless; `base`
+# is passed as a query parameter and every row is `quote` units per one `base`. Fetched at most
+# once a day and once per run, and it fails open: no rate means no conversion is shown.
+FX_RATES_URL = 'https://api.frankfurter.dev/v2/rates'
+FX_RATES_FETCH_TIMEOUT_SECONDS = 5
+# How old a cached rate table may be and still be served when today's fetch fails. A week-old
+# rate is still a fair "≈"; older than this, showing nothing is more honest.
+FX_RATES_STALE_MAX_DAYS = 7
+
 # Text budgets. A cap on text is a decision, so each one is named here, and every cut goes through
 # text_budget.truncate_reported() so it is logged and marked rather than silent (2026-09-21: the
 # PDF categorizer read only the first 3000 raw chars, whitespace included, and said nothing).
@@ -544,6 +557,18 @@ NOTIFICATION_POSTED_MAX_CHARS = 80
 # Compensation sentences of the description handed to the salary classifier, and ONLY when the
 # deterministic tiers found no figure in the salary field itself.
 SALARY_CONTEXT_MAX_CHARS = 1500
+# A converted amount is an approximation at a daily rate, so it is rounded to this many significant
+# figures rather than to a fixed step: 148,312 a year and 112.9 an hour both stay readable.
+SALARY_CONVERSION_SIGNIFICANT_FIGURES = 3
+# The posting text handed to the pay estimator. Cut from the MIDDLE when it bites, since seniority
+# and benefits wording sits at both ends of a job page.
+SALARY_ESTIMATE_TEXT_MAX_CHARS = 12_000
+# The estimator's one-line reason, kept in the saved job file (never in the Telegram message).
+SALARY_ESTIMATE_BASIS_MAX_CHARS = 300
+# An estimate whose top is more than this many times its bottom says nothing, and is dropped.
+SALARY_ESTIMATE_MAX_SPREAD_RATIO = 3.0
+# Off switch for the pay estimate. The currency conversion is switched by a preference instead.
+SALARY_ESTIMATE_ENABLED = True
 # A retained raw posting. Generous: the whole point is to be able to check an extracted figure
 # against what the page said, and a capture that drops the compensation block answers nothing.
 RAW_POSTING_MAX_CHARS = 200_000

@@ -50,7 +50,7 @@ from utils_tools_n_agents_common.telegram_client import send_message as telegram
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search import location, location_review, scrape_openrouter
+from agentic_job_search import fx, location, location_review, scrape_openrouter
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
@@ -83,6 +83,7 @@ from agentic_job_search.config import (
     REFERENCE_JOB_PROMPT_MAX_CHARS,
     REFERENCE_SUMMARY_MAX_CHARS,
     REGION_OVERLAP_ALERT_THRESHOLD,
+    SALARY_ESTIMATE_ENABLED,
     SALARY_FIELD_DESCRIPTION,
     SATURATION_MIN_NEW_JOBS,
     SATURATION_MIN_NEW_RATIO,
@@ -115,6 +116,7 @@ from agentic_job_search.salary import (
     salary_digits_are_in_the_source,
     salary_facts_of,
 )
+from agentic_job_search.salary_estimate import estimate_salary
 from agentic_job_search.text_budget import (
     pages_to_prompt,
     snippet,
@@ -3265,19 +3267,112 @@ _SALARY_LINE_SUFFIX_BY_KIND = {
 }
 
 
+def format_amount_bounds(minimum: float | None, maximum: float | None) -> str:
+    """'148,000 - 176,000', or the one amount when only one bound exists or both are equal."""
+    amounts = [
+        f'{int(amount):,}' if float(amount).is_integer() else f'{amount:,}'
+        for amount in dict.fromkeys(a for a in (minimum, maximum) if a is not None)
+    ]
+    return ' - '.join(amounts)
+
+
+def format_salary_conversion(conversion: dict | None) -> str:
+    """'(≈ CAD 148,000 - 176,000)' for a code-computed conversion, or '' when there is none."""
+    if not conversion:
+        return ''
+    return f"(≈ {conversion['currency']} {format_amount_bounds(conversion['minimum'], conversion['maximum'])})"
+
+
+def format_salary_estimate(estimate: dict) -> str:
+    """'PLN 250,000 - 320,000 per year (≈ CAD 88,000 - 113,000)' — the model's estimate, in its
+    own currency, with the code-computed conversion appended when one applies."""
+    text = (
+        f"{estimate['currency']} {format_amount_bounds(estimate['minimum'], estimate['maximum'])} "
+        f"per {estimate['period']}"
+    )
+    if conversion := format_salary_conversion(estimate.get('conversion')):
+        text = f'{text} {conversion}'
+    return text
+
+
 def format_salary_line(extract: dict) -> str:
     """The 💰 line of a job-match message: the salary text as extracted, never a paraphrase.
 
     The message used to carry no salary field at all, so the only figure reaching the user was
     whatever the rater wrote into a bullet — for job 4470298356 that was '$208K–$274K' in one
     bullet (rounded up from 273,770) and the floor alone in another, with nothing to check either
-    against (2026-09-22). Omitted when there is no figure: the ⚠️ bullet already says so.
+    against (2026-09-22).
+
+    Two things may follow the posting's own text, and both say what they are (2026-10-08): a
+    conversion code computed from a published rate, marked '≈', and — only when the posting states
+    no figure — a pay range the estimator model proposed, marked 'model estimate'. Without either,
+    a posting with no figure has no line: the ⚠️ bullet already says so.
     """
     facts = salary_facts_of(extract)
     if facts['kind'] == 'absent' or not facts['text']:
+        if estimate := extract.get('salary_estimate'):
+            return f'💰 Not listed — model estimate: {format_salary_estimate(estimate)}'
         return ''
     text = snippet(facts['text'], NOTIFICATION_SALARY_MAX_CHARS)
+    if conversion := format_salary_conversion(extract.get('salary_conversion')):
+        text = f'{text} {conversion}'
     return f"💰 {text}{_SALARY_LINE_SUFFIX_BY_KIND.get(facts['kind'], '')}"
+
+
+def format_pay_lines(extract: dict) -> list[str]:
+    """The Saved Job's record of what the 💰 line added to the posting's own figure.
+
+    Carries what the message leaves out — the rate and its date, the estimating model and its
+    stated basis — so either figure can be checked later. Kept out of `format_extract_text`: that
+    text is what the rater reads, and neither figure may reach a rating.
+    """
+    lines = []
+    if conversion := extract.get('salary_conversion'):
+        lines.append(
+            f"Salary conversion: {format_salary_conversion(conversion).strip('()')} "
+            f"(1 {conversion['currency']} = {conversion['rate']} {conversion['from_currency']}, "
+            f"rate of {conversion['rate_date'] or 'unknown date'})"
+        )
+    if estimate := extract.get('salary_estimate'):
+        lines.append(
+            f"Estimated salary: {format_salary_estimate(estimate)} — model estimate by "
+            f"{estimate.get('model') or 'unknown model'}, not stated in the posting"
+            + (f"; basis: {estimate['basis']}" if estimate.get('basis') else '')
+        )
+    return lines
+
+
+async def resolve_pay_display(
+    candidate: dict, extract: dict, page: JobPage | None, stage_stats: dict
+) -> None:
+    """Resolve what the 💰 line adds to the posting's figure, and write it onto the extract.
+
+    `salary_conversion` is the stated salary in the user's conversion currency; `salary_estimate`
+    is a model's pay range for a posting that states none, with its own conversion. Display only,
+    and called AFTER rating for exactly that reason: neither can reach the rater, a cap, a gate or
+    a warning. An unverified reading is not converted — its amounts did not check out against the
+    page, and a second figure derived from them would lend them weight.
+    """
+    facts = salary_facts_of(extract)
+    conversion = None
+    if facts['source'] != 'unverified':
+        conversion = fx.convert_bounds(facts['minimum'], facts['maximum'], facts['currency'], facts['text'])
+    extract['salary_conversion'] = conversion
+    estimate = None
+    if SALARY_ESTIMATE_ENABLED and facts['kind'] == 'absent':
+        estimate = await estimate_salary(
+            candidate, extract, page.text if page is not None else '', stage_stats
+        )
+        if estimate:
+            estimate['conversion'] = fx.convert_bounds(
+                estimate['minimum'], estimate['maximum'], estimate['currency']
+            )
+    extract['salary_estimate'] = estimate
+    if conversion or estimate:
+        logger.info(
+            f"Pay display: {candidate['company']} — {candidate['title']} (job {candidate['job_id']}): "
+            f'conversion={conversion} estimate={estimate}'
+        )
 
 
 _ORDINAL_SUFFIX_BY_LAST_DIGIT = {1: 'st', 2: 'nd', 3: 'rd'}
@@ -3704,11 +3799,27 @@ async def evaluate_all_candidates(
                 [str(w) for w in (result.get('warnings') or [])],
                 salary_on_target=salary_meets_target(extract) is True,
             )
+            # What the 💰 line adds to the posting's own figure. Only for a job at the
+            # notification threshold (a suppressed repost included: its saved file is the one
+            # place it is seen), and only now, after rating. A failure here costs the extra figure,
+            # never the notification.
+            if should_notify_based_on_rating(rating):
+                estimate_stats = stage_stats['salary_estimate']
+                try:
+                    await resolve_pay_display(candidate, extract, page, estimate_stats)
+                except Exception as ex:
+                    logger.warning(
+                        f"Pay display failed for {candidate['company']} — {candidate['title']} "
+                        f"(job {candidate['job_id']}), notifying without a conversion or estimate: "
+                        f'{type(ex).__name__}: {ex}'
+                    )
+            pay_lines = format_pay_lines(extract)
             content = (
                 f"# {result['title']} at {result['company']} — rating {rating}/5\n\n"
                 + (f"⚠ rating capped from {result['rating']}: {cap_reason}\n\n" if cap_reason else '')
                 + (_bullet_block('## Good', pros) + '\n\n' if pros else '')
                 + (_bullet_block('## Warnings', warnings) + '\n\n' if warnings else '')
+                + ('\n'.join(pay_lines) + '\n\n' if pay_lines else '')
                 + f"Reasoning: {result['reasoning']}\n"
                 + (f"Triage score (local): {triage_result['score']}\n" if triage_result else '')
                 + f'\n{extract_text}'
@@ -4138,6 +4249,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._search_reports = []
     tools_module._ui_alerts = list(_startup_ui_alerts)
     location.reset_countries_seen()
+    fx.reset_run_state()
     reset_location_guesses()
     tools_module.prune_raw_postings()
     funnel: dict[str, int] = {}
@@ -4161,6 +4273,8 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         # $0.0000 on a run whose salary strings all parse deterministically — which is itself the
         # evidence the rules are doing the work, rather than a model quietly doing it for them.
         'salary': new_stage_stats(),
+        # One call per notified job that states no salary; $0.0000 on a run with none.
+        'salary_estimate': new_stage_stats(),
     }
     jobs_before = set(RUN_DIR.glob('saved_jobs-*/job_posting-*.md'))
 

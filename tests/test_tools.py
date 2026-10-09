@@ -16,11 +16,13 @@ from agentic_job_search import (
     agent,
     config,
     extract_openrouter,
+    fx,
     linkedin_page,
     location,
     location_review,
     preferences,
     salary,
+    salary_estimate,
     scrape_openrouter,
     text_budget,
     triage,
@@ -5102,7 +5104,7 @@ async def test_recruiter_repost_judgement_live():
 # --- the same thing end to end, through Stage 2 -----------------------------
 
 def _stage2_stats() -> dict:
-    return {k: agent.new_stage_stats() for k in ('extraction', 'rating', 'recruiter_repost', 'salary')}
+    return {k: agent.new_stage_stats() for k in ('extraction', 'rating', 'recruiter_repost', 'salary', 'salary_estimate')}
 
 
 def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, list]:
@@ -5131,7 +5133,11 @@ def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, li
     async def fake_notify(text):
         notifications.append(text)
 
+    async def fake_estimate(candidate, extract, page_text='', stage_stats=None):
+        return None
+
     _stub_read_page(monkeypatch)
+    monkeypatch.setattr(agent, 'estimate_salary', fake_estimate)
     monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_extract)
     monkeypatch.setattr(agent, 'triage_job_fit', fake_triage)
     monkeypatch.setattr(agent, 'rate_job', fake_rate)
@@ -5484,6 +5490,7 @@ def test_default_preferences_apply_no_personal_gates(neutral_preferences):
     assert preferences.search_regions() == []
     assert preferences.would_not_live_here() == ()
     assert preferences.would_not_live_here() == ()
+    assert preferences.salary_conversion() is None
 
 
 async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences, stub_location_classifier):
@@ -5556,6 +5563,8 @@ def test_example_preferences_file_is_neutral():
     assert loaded['sponsorship_required_in'] == []
     assert loaded['reject_required_degrees'] == []
     assert loaded['current_tax_residence'] == ''
+    assert loaded['compensation']['convert_to'] == ''
+    assert loaded['compensation']['keep_currencies'] == []
     for key in ('would_live_here', 'would_not_live_here', 'not_yet_bucketed', 'would_commute_here'):
         assert loaded['locations'][key] == [], key
     assert 'acceptable_locations' not in loaded['hybrid'], 'the example must use the new key names'
@@ -9128,3 +9137,548 @@ async def test_an_anthropic_tool_runs_the_same_code_on_the_current_query(monkeyp
     result = await captured['run_ui_contract'].handler({'region': 'Canada'})
     assert result == {'content': [{'type': 'text', 'text': 'ok'}]}
     assert seen == [('AI Architect', 'run_ui_contract', {'region': 'Canada'})]
+
+
+# ---------------------------------------------------------------------------
+# Pay display: currency conversion and the model's estimate (2026-10-08)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('text, currency', [
+    # A code inside a word is not a currency. Unanchored, these read as RON, EUR and CAD.
+    ('Toronto: $120,000 - $150,000 per year', ''),
+    ('Europe: 80,000 - 95,000 GBP', 'GBP'),
+    ('$150K - $180K (Academy bonus)', ''),
+    ('Krakow 20,000 - 28,000 PLN/month', 'PLN'),
+    # A bare 'kr' is SEK, NOK, DKK or ISK. Not guessed, exactly like a bare '$'.
+    ('450 000 - 550 000 kr per year (Oslo)', ''),
+    ('513,000 kr—684,000 kr SEK', 'SEK'),
+    # A digit may touch a code, and case is not currency.
+    ('CAD154,700 to CAD 204,700', 'CAD'),
+    ('90K EUR/yr - 110K EUR/yr', 'EUR'),
+    ('80k eur', 'EUR'),
+    ('zł392,000 – zł588,000', 'PLN'),
+])
+def test_detect_currency_does_not_read_a_code_inside_a_word(text, currency):
+    assert salary.detect_currency(text) == currency
+
+
+def test_a_bare_kr_still_marks_an_amount_as_money():
+    """Dropping the SEK guess must not turn a krona salary into 'not a pay figure'."""
+    facts = salary.classify_salary('450 000 - 550 000 kr per year')
+    assert facts['kind'] == 'range'
+    assert facts['currency'] == ''
+
+
+def test_currencies_named_lists_each_currency_once_in_order():
+    assert salary.currencies_named('£60,000 - £70,000 or €70,000 - €80,000 (GBP)') == ('GBP', 'EUR')
+    assert salary.currencies_named('$120,000 in Toronto') == ()
+
+
+TEST_CONVERT_TO = 'CAD'
+TEST_KEEP_CURRENCIES = ['EUR', 'USD']
+# Quote units per one CAD, the shape the service publishes. Round numbers, so an expected figure
+# in a test is arithmetic a reader can do, not a second implementation of the rounding.
+TEST_FX_RATES = {'GBP': 0.5, 'PLN': 2.5, 'EUR': 0.625}
+TEST_FX_RATE_DATE = '2026-10-08'
+
+
+@pytest.fixture
+def salary_conversion_set(monkeypatch):
+    merged = preferences._deep_merge(
+        preferences.load_preferences(),
+        {'compensation': {'convert_to': TEST_CONVERT_TO, 'keep_currencies': TEST_KEEP_CURRENCIES}},
+    )
+    monkeypatch.setattr(preferences, '_cache', merged)
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+
+
+class _FxResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+def _fx_rows(rates: dict = TEST_FX_RATES, base: str = TEST_CONVERT_TO) -> list[dict]:
+    return [{'date': TEST_FX_RATE_DATE, 'base': base, 'quote': quote, 'rate': rate} for quote, rate in rates.items()]
+
+
+def _fx_service(monkeypatch, response=None) -> list:
+    """Stand in for the rate service. Returns the list of (url, params) actually requested."""
+    calls: list = []
+
+    def _get(url, params):
+        calls.append((url, params))
+        if isinstance(response, Exception):
+            raise response
+        return response if response is not None else _FxResponse(_fx_rows())
+
+    monkeypatch.setattr(fx, '_http_get', _get)
+    return calls
+
+
+def test_salary_conversion_is_off_until_a_currency_is_chosen():
+    assert preferences.salary_conversion() is None
+
+
+def test_salary_conversion_keeps_its_own_target_currency(salary_conversion_set):
+    convert_to, keep = preferences.salary_conversion()
+    assert convert_to == TEST_CONVERT_TO
+    assert keep == frozenset({*TEST_KEEP_CURRENCIES, TEST_CONVERT_TO})
+
+
+@pytest.mark.parametrize('compensation', [
+    {'convert_to': 'Canadian dollars', 'keep_currencies': []},
+    {'convert_to': 'CAD', 'keep_currencies': 'EUR, USD'},
+    {'convert_to': 'CAD', 'keep_currencies': ['euros']},
+])
+def test_salary_conversion_rejects_a_malformed_preference(monkeypatch, compensation):
+    merged = preferences._deep_merge(preferences.load_preferences(), {'compensation': compensation})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    with pytest.raises(ValueError, match='compensation'):
+        preferences.salary_conversion()
+
+
+def test_parse_rates_reads_the_published_shape():
+    rates = fx.parse_rates(_fx_rows(), TEST_CONVERT_TO)
+    assert rates['GBP'] == {'rate': TEST_FX_RATES['GBP'], 'date': TEST_FX_RATE_DATE}
+
+
+@pytest.mark.parametrize('payload', [
+    {'base': 'CAD', 'date': '2026-10-08', 'rates': {'GBP': 0.5}},   # the retired v1 shape
+    {'status': 422, 'message': 'invalid currency: XXX'},
+    [],
+    [{'date': '2026-10-08', 'base': 'USD', 'quote': 'GBP', 'rate': 0.5}],   # another base's table
+    [{'date': '2026-10-08', 'base': 'CAD', 'quote': 'GBP', 'rate': 0}],
+    [{'date': '2026-10-08', 'base': 'CAD', 'quote': 'GBP', 'rate': True}],
+    [{'date': '2026-10-08', 'base': 'CAD', 'quote': 'GBP'}],
+])
+def test_parse_rates_rejects_any_other_shape(payload):
+    """A table that parsed loosely would put a wrong figure in a notification."""
+    with pytest.raises(ValueError, match='exchange-rate'):
+        fx.parse_rates(payload, TEST_CONVERT_TO)
+
+
+def test_rates_are_fetched_once_a_day(monkeypatch):
+    calls = _fx_service(monkeypatch)
+    assert fx.rates_for(TEST_CONVERT_TO)['GBP']['rate'] == TEST_FX_RATES['GBP']
+    assert calls == [(config.FX_RATES_URL, {'base': TEST_CONVERT_TO})]
+
+    fx.reset_run_state()   # a second run the same day: the table comes off disk
+    assert fx.rates_for(TEST_CONVERT_TO)['PLN']['rate'] == TEST_FX_RATES['PLN']
+    assert len(calls) == 1
+
+
+def test_rates_fall_back_to_a_recent_table_when_the_fetch_fails(monkeypatch, caplog):
+    _fx_service(monkeypatch)
+    fetched_on = date.today()
+    fx.rates_for(TEST_CONVERT_TO, today=fetched_on)
+
+    fx.reset_run_state()
+    calls = _fx_service(monkeypatch, ConnectionError('offline'))
+    later = fetched_on + timedelta(days=config.FX_RATES_STALE_MAX_DAYS)
+    assert fx.rates_for(TEST_CONVERT_TO, today=later)['GBP']['rate'] == TEST_FX_RATES['GBP']
+    assert fx.rates_for(TEST_CONVERT_TO, today=later) is not None
+    assert len(calls) == 1, 'a service that is down must be tried once per run, not once per job'
+    assert any('Exchange-rate fetch' in r.message and fetched_on.isoformat() in r.message
+               and r.levelname == 'WARNING' for r in caplog.records)
+
+
+def test_rates_older_than_the_stale_limit_are_not_served(monkeypatch):
+    _fx_service(monkeypatch)
+    fetched_on = date.today()
+    fx.rates_for(TEST_CONVERT_TO, today=fetched_on)
+
+    fx.reset_run_state()
+    _fx_service(monkeypatch, ConnectionError('offline'))
+    too_late = fetched_on + timedelta(days=config.FX_RATES_STALE_MAX_DAYS + 1)
+    assert fx.rates_for(TEST_CONVERT_TO, today=too_late) is None
+
+
+@pytest.mark.parametrize('response', [
+    _FxResponse({'status': 422, 'message': 'invalid currency'}, status_code=422),
+    _FxResponse({'unexpected': 'shape'}),
+    TimeoutError('rate service timed out'),
+])
+def test_rates_fail_open_without_a_cached_table(monkeypatch, caplog, response):
+    _fx_service(monkeypatch, response)
+    assert fx.rates_for(TEST_CONVERT_TO) is None
+    assert any('Exchange-rate fetch' in r.message and r.levelname == 'WARNING' for r in caplog.records)
+
+
+def test_convert_bounds_converts_at_the_published_rate(monkeypatch, salary_conversion_set):
+    _fx_service(monkeypatch)
+    conversion = fx.convert_bounds(80_000.0, 95_000.0, 'GBP', '£80,000 - £95,000 per year')
+    assert conversion == {
+        'currency': TEST_CONVERT_TO, 'from_currency': 'GBP', 'minimum': 160_000.0, 'maximum': 190_000.0,
+        'rate': TEST_FX_RATES['GBP'], 'rate_date': TEST_FX_RATE_DATE,
+    }
+
+
+def test_convert_bounds_keeps_the_period_and_rounds_to_significant_figures(monkeypatch, salary_conversion_set):
+    """An hourly rate rounded to the nearest thousand would be zero."""
+    _fx_service(monkeypatch, _FxResponse(_fx_rows({'GBP': 0.53})))
+    conversion = fx.convert_bounds(None, 60.0, 'GBP', 'Up to £60/hr')
+    assert conversion['minimum'] is None
+    assert conversion['maximum'] == 113.0   # 60 / 0.53 = 113.2...
+
+
+@pytest.mark.parametrize('minimum, maximum, currency, text', [
+    (80_000.0, 95_000.0, 'EUR', '€80,000 - €95,000'),            # a currency the user keeps
+    (80_000.0, 95_000.0, 'CAD', 'CA$80,000 - CA$95,000'),        # already the conversion currency
+    (190_000.0, 300_000.0, '', '$190K/yr - $300K/yr'),           # a bare '$' is not guessed
+    (None, None, 'GBP', 'competitive, paid in GBP'),             # nothing to convert
+    (95_000.0, 80_000.0, 'GBP', '£95,000 - £80,000'),            # inverted bounds are not a range
+    (60_000.0, 70_000.0, 'GBP', '£60,000 - £70,000 (regions); £65,000 - £80,000 (London)'),
+    (60_000.0, 70_000.0, 'GBP', '£60,000 - £70,000 or the EUR equivalent'),
+    (60_000.0, 70_000.0, 'CHF', 'CHF 60,000 - 70,000'),          # no rate published for it here
+])
+def test_convert_bounds_shows_nothing_rather_than_guess(monkeypatch, salary_conversion_set, minimum, maximum, currency, text):
+    _fx_service(monkeypatch)
+    assert fx.convert_bounds(minimum, maximum, currency, text) is None
+
+
+def test_convert_bounds_does_nothing_without_the_preference(monkeypatch):
+    calls = _fx_service(monkeypatch)
+    assert fx.convert_bounds(80_000.0, 95_000.0, 'GBP', '£80,000 - £95,000') is None
+    assert calls == [], 'no conversion configured, so no rate may be fetched'
+
+
+def test_convert_bounds_reports_a_missing_rate_once(monkeypatch, salary_conversion_set, caplog):
+    _fx_service(monkeypatch)
+    for _ in range(3):
+        assert fx.convert_bounds(60_000.0, 70_000.0, 'CHF', 'CHF 60,000 - 70,000') is None
+    assert sum('No exchange rate from CHF' in r.message for r in caplog.records) == 1
+
+
+# --- the estimate -----------------------------------------------------------
+
+TEST_ESTIMATE_JSON = (
+    '{"can_estimate": true, "minimum": 250000, "maximum": 320000, "currency": "PLN", '
+    '"period": "year", "basis": "Staff-level AI engineering at a Warsaw scale-up"}'
+)
+TEST_ESTIMATE_COST = 0.00042
+
+
+def _estimator_llm(monkeypatch, answer=TEST_ESTIMATE_JSON) -> list:
+    """Stand in for the estimator model. Returns the list of prompts actually sent."""
+    prompts: list = []
+
+    async def _fake(prompt, model=None):
+        prompts.append(prompt)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer, TEST_ESTIMATE_COST
+
+    monkeypatch.setattr(salary_estimate, 'chat_openrouter', _fake)
+    return prompts
+
+
+async def test_estimate_salary_reads_the_page_and_is_cached_per_job(monkeypatch):
+    prompts = _estimator_llm(monkeypatch)
+    candidate, extract = _make_candidate(title='Staff AI Engineer'), _make_extract(location='Warsaw, Poland')
+    stats = agent.new_stage_stats()
+
+    estimate = await salary_estimate.estimate_salary(candidate, extract, 'THE FULL PAGE TEXT', stats)
+    assert (estimate['minimum'], estimate['maximum']) == (250_000.0, 320_000.0)
+    assert (estimate['currency'], estimate['period']) == ('PLN', 'year')
+    assert estimate['source'] == 'llm'
+    assert estimate['model'] == config.MODEL_NAME_SALARY_ESTIMATE
+    assert stats['cost'] == pytest.approx(TEST_ESTIMATE_COST)
+    assert 'THE FULL PAGE TEXT' in prompts[0]
+    assert 'Staff AI Engineer' in prompts[0] and 'Warsaw, Poland' in prompts[0]
+
+    again = await salary_estimate.estimate_salary(candidate, extract, 'the page, re-read, differs', stats)
+    assert again['source'] == 'cache'
+    assert again['maximum'] == 320_000.0
+    assert len(prompts) == 1, 'a job already estimated must not be estimated again'
+
+
+async def test_estimate_salary_falls_back_to_the_description_without_a_page(monkeypatch):
+    prompts = _estimator_llm(monkeypatch)
+    await salary_estimate.estimate_salary(_make_candidate(), _make_extract(description='Build agents in Krakow.'))
+    assert 'Build agents in Krakow.' in prompts[0]
+
+
+@pytest.mark.parametrize('salary_text', ['CAD 200,000 - 240,000 per year', 'Up to €50k', 'six figures'])
+async def test_estimate_salary_is_only_for_a_posting_that_states_no_figure(monkeypatch, salary_text):
+    """A stated, partial or unreadable salary is the posting's own; it is never estimated over."""
+    prompts = _estimator_llm(monkeypatch)
+    assert await salary_estimate.estimate_salary(_make_candidate(), _make_extract(salary=salary_text), 'page') is None
+    assert prompts == []
+
+
+async def test_estimate_salary_caches_a_cannot_estimate_answer(monkeypatch):
+    prompts = _estimator_llm(monkeypatch, '{"can_estimate": false, "minimum": null, "maximum": null}')
+    for _ in range(2):
+        assert await salary_estimate.estimate_salary(_make_candidate(), _make_extract(), 'page') is None
+    assert len(prompts) == 1, '"cannot estimate" is an answer, and is not asked for twice'
+
+
+async def test_estimate_salary_shows_nothing_when_the_server_is_down(monkeypatch, caplog):
+    prompts = _estimator_llm(monkeypatch, RuntimeError('tools_llm_remote_openrouter is not running'))
+    for _ in range(2):
+        assert await salary_estimate.estimate_salary(_make_candidate(), _make_extract(), 'page') is None
+    assert len(prompts) == 2, 'a failure is not an answer and must not be cached'
+    assert any('Salary estimate failed' in r.message and r.levelname == 'WARNING' for r in caplog.records)
+
+
+@pytest.mark.parametrize('answer', [
+    {'can_estimate': 'yes', 'minimum': 90_000, 'maximum': 110_000, 'currency': 'EUR', 'period': 'year'},
+    {'can_estimate': True, 'minimum': 90_000, 'maximum': None, 'currency': 'EUR', 'period': 'year'},
+    {'can_estimate': True, 'minimum': True, 'maximum': 110_000, 'currency': 'EUR', 'period': 'year'},
+    {'can_estimate': True, 'minimum': 110_000, 'maximum': 90_000, 'currency': 'EUR', 'period': 'year'},
+    {'can_estimate': True, 'minimum': 0, 'maximum': 90_000, 'currency': 'EUR', 'period': 'year'},
+    {'can_estimate': True, 'minimum': 90_000, 'maximum': 110_000, 'currency': 'euros', 'period': 'year'},
+    {'can_estimate': True, 'minimum': 90_000, 'maximum': 110_000, 'currency': 'EUR', 'period': 'fortnight'},
+    {'can_estimate': True, 'minimum': 30_000, 'maximum': 30_000 * config.SALARY_ESTIMATE_MAX_SPREAD_RATIO + 1,
+     'currency': 'EUR', 'period': 'year'},
+])
+def test_an_estimate_that_does_not_validate_is_dropped_not_repaired(answer):
+    assert salary_estimate._coerce(answer) is None
+
+
+def test_an_estimate_at_the_spread_limit_is_kept():
+    """The control for the over-wide case above: the limit itself is inside the vocabulary."""
+    estimate = salary_estimate._coerce({
+        'can_estimate': True, 'minimum': 30_000, 'maximum': 30_000 * config.SALARY_ESTIMATE_MAX_SPREAD_RATIO,
+        'currency': 'eur', 'period': 'Year', 'basis': '  mid-level\n role  ',
+    })
+    assert (estimate['currency'], estimate['period'], estimate['basis']) == ('EUR', 'year', 'mid-level role')
+
+
+async def test_estimate_salary_reports_a_page_cut_to_fit(monkeypatch, caplog):
+    prompts = _estimator_llm(monkeypatch)
+    page_text = 'HEAD-OF-PAGE ' + 'x' * config.SALARY_ESTIMATE_TEXT_MAX_CHARS + ' TAIL-OF-PAGE'
+    await salary_estimate.estimate_salary(_make_candidate(), _make_extract(), page_text)
+    assert 'HEAD-OF-PAGE' in prompts[0] and 'TAIL-OF-PAGE' in prompts[0], 'cut from the middle, both ends kept'
+    assert '[truncated:' in prompts[0], 'the model must be told its input is partial'
+    assert any('Truncating salary estimate input' in r.message and r.levelname == 'WARNING' for r in caplog.records)
+
+
+# --- rendering --------------------------------------------------------------
+
+TEST_GBP_CONVERSION = {
+    'currency': 'CAD', 'from_currency': 'GBP', 'minimum': 160_000.0, 'maximum': 190_000.0,
+    'rate': 0.5, 'rate_date': TEST_FX_RATE_DATE,
+}
+TEST_PLN_ESTIMATE = {
+    'minimum': 250_000.0, 'maximum': 320_000.0, 'currency': 'PLN', 'period': 'year',
+    'basis': 'Staff-level AI engineering at a Warsaw scale-up', 'model': 'test/estimator', 'source': 'llm',
+    'conversion': {'currency': 'CAD', 'from_currency': 'PLN', 'minimum': 100_000.0, 'maximum': 128_000.0,
+                   'rate': 2.5, 'rate_date': TEST_FX_RATE_DATE},
+}
+
+
+def test_the_salary_line_appends_the_conversion_to_the_postings_own_text():
+    extract = _make_extract(salary='£80,000 - £95,000 per year', salary_conversion=TEST_GBP_CONVERSION)
+    message = agent.format_job_notification(_make_candidate(), extract, 4, [], [])
+    assert '💰 £80,000 - £95,000 per year (≈ CAD 160,000 - 190,000)\n' in message
+
+
+def test_the_salary_line_puts_the_conversion_before_the_partial_gloss():
+    conversion = dict(TEST_GBP_CONVERSION, minimum=130_000.0, maximum=None)
+    extract = _make_extract(salary='Minimum £65,000', salary_conversion=conversion)
+    message = agent.format_job_notification(_make_candidate(), extract, 4, [], [])
+    assert '💰 Minimum £65,000 (≈ CAD 130,000) (lower bound only)' in message
+
+
+def test_the_salary_line_shows_a_single_figure_conversion_once():
+    conversion = dict(TEST_GBP_CONVERSION, minimum=113.0, maximum=113.0)
+    extract = _make_extract(salary='£60/hr', salary_conversion=conversion)
+    message = agent.format_job_notification(_make_candidate(), extract, 4, [], [])
+    assert '💰 £60/hr (≈ CAD 113) (single figure, no range)' in message
+
+
+def test_the_salary_line_labels_an_estimate_as_the_models():
+    extract = _make_extract(salary='Competitive salary', salary_estimate=TEST_PLN_ESTIMATE)
+    message = agent.format_job_notification(_make_candidate(), extract, 4, [], ['No salary listed'])
+    assert '💰 Not listed — model estimate: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000)\n' in message
+    assert '• No salary listed' in message, 'the estimate does not replace the warning'
+    assert TEST_PLN_ESTIMATE['basis'] not in message, 'model free text stays out of the message'
+
+
+def test_the_salary_line_shows_an_estimate_in_a_kept_currency_unconverted():
+    estimate = dict(TEST_PLN_ESTIMATE, currency='EUR', minimum=90_000.0, maximum=110_000.0, conversion=None)
+    message = agent.format_job_notification(_make_candidate(), _make_extract(salary_estimate=estimate), 4, [], [])
+    assert '💰 Not listed — model estimate: EUR 90,000 - 110,000 per year\n' in message
+
+
+def test_an_estimate_never_displaces_a_figure_the_posting_states():
+    extract = _make_extract(salary='€110,000', salary_estimate=TEST_PLN_ESTIMATE)
+    message = agent.format_job_notification(_make_candidate(), extract, 4, [], [])
+    assert '💰 €110,000 (single figure, no range)' in message
+    assert 'model estimate' not in message
+
+
+def test_the_saved_job_records_the_rate_and_the_estimating_model():
+    lines = agent.format_pay_lines(_make_extract(salary_conversion=TEST_GBP_CONVERSION, salary_estimate=TEST_PLN_ESTIMATE))
+    assert lines == [
+        f'Salary conversion: ≈ CAD 160,000 - 190,000 (1 CAD = 0.5 GBP, rate of {TEST_FX_RATE_DATE})',
+        'Estimated salary: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000) — model estimate by '
+        'test/estimator, not stated in the posting; basis: Staff-level AI engineering at a Warsaw scale-up',
+    ]
+    assert agent.format_pay_lines(_make_extract()) == []
+
+
+def test_neither_figure_reaches_the_text_the_rater_reads():
+    """Both are display only. The rater's input is built from the extract, so guard the formatter."""
+    extract = _make_extract(salary_conversion=TEST_GBP_CONVERSION, salary_estimate=TEST_PLN_ESTIMATE)
+    text = agent.format_extract_text(_make_candidate(), extract)
+    assert '250,000' not in text and '160,000' not in text and 'stimate' not in text
+
+
+async def test_an_unverified_salary_is_not_converted(monkeypatch, salary_conversion_set):
+    """Amounts that did not check out against the page get no second figure derived from them."""
+    _fx_service(monkeypatch)
+    extract = _make_extract(salary='£80,000 - £95,000 per year')
+    extract['salary_facts'] = dict(salary.classify_salary(extract['salary']), source='unverified')
+    await agent.resolve_pay_display(_make_candidate(), extract, None, agent.new_stage_stats())
+    assert extract['salary_conversion'] is None
+
+    extract['salary_facts']['source'] = 'deterministic'
+    await agent.resolve_pay_display(_make_candidate(), extract, None, agent.new_stage_stats())
+    assert extract['salary_conversion']['maximum'] == 190_000.0, 'the control: the same salary, verified'
+
+
+# --- end to end, through Stage 2 ---------------------------------------------
+
+def _stage2_estimator(monkeypatch, estimate: dict | None = None) -> list:
+    """Replace the estimator Stage 2 calls. Returns the page texts it was handed."""
+    page_texts: list = []
+
+    async def fake_estimate(candidate, extract, page_text='', stage_stats=None):
+        page_texts.append(page_text)
+        return dict(estimate) if estimate is not None else None
+
+    monkeypatch.setattr(agent, 'estimate_salary', fake_estimate)
+    return page_texts
+
+
+def _stage2_rater_inputs(monkeypatch, extract: dict, rating: int = 5) -> list:
+    """Re-stub the rater to record the extract text it is given."""
+    rater_inputs: list = []
+
+    async def fake_rate(evaluator_prompt, extract_text, stats):
+        rater_inputs.append(extract_text)
+        return {
+            'rating': rating, 'reasoning': 'strong fit', 'summary': 'strong fit',
+            'title': extract['title'], 'company': extract['company'], 'pros': [], 'warnings': [],
+        }
+
+    monkeypatch.setattr(agent, 'rate_job', fake_rate)
+    return rater_inputs
+
+
+async def test_stage_2_estimates_pay_for_a_notified_job_with_no_salary(monkeypatch, salary_conversion_set):
+    _fx_service(monkeypatch)
+    extract = _make_extract(salary='')
+    notifications, saved = _stage2_stubs(monkeypatch, extract)
+    estimate = {k: v for k, v in TEST_PLN_ESTIMATE.items() if k != 'conversion'}
+    page_texts = _stage2_estimator(monkeypatch, estimate)
+    rater_inputs = _stage2_rater_inputs(monkeypatch, extract)
+
+    await _run_stage2(_make_candidate(), {})
+
+    assert page_texts == ['Staff Engineer\nAbout the job\nBuild agents.'], 'the estimator reads the full page'
+    assert len(notifications) == 1
+    assert '💰 Not listed — model estimate: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000)' in notifications[0]
+    assert '• No salary listed' in notifications[0]
+    assert 'Estimated salary: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000) — model estimate by' in saved[0]['content']
+    assert len(rater_inputs) == 1 and '250,000' not in rater_inputs[0], 'the estimate must not reach the rater'
+
+
+async def test_stage_2_converts_a_stated_salary_for_a_notified_job(monkeypatch, salary_conversion_set):
+    _fx_service(monkeypatch)
+    notifications, saved = _stage2_stubs(monkeypatch, _make_extract(salary='£80,000 - £95,000 per year'))
+    page_texts = _stage2_estimator(monkeypatch, TEST_PLN_ESTIMATE)
+
+    await _run_stage2(_make_candidate(), {})
+
+    assert page_texts == [], 'a posting that states a salary is never estimated'
+    assert '💰 £80,000 - £95,000 per year (≈ CAD 160,000 - 190,000)' in notifications[0]
+    assert 'Salary conversion: ≈ CAD 160,000 - 190,000 (1 CAD = 0.5 GBP' in saved[0]['content']
+
+
+async def test_stage_2_pays_for_no_estimate_below_the_notification_threshold(monkeypatch, salary_conversion_set):
+    calls = _fx_service(monkeypatch)
+    notifications, saved = _stage2_stubs(
+        monkeypatch, _make_extract(salary=''), rating=config.RATING_NOTIFICATION_THRESHOLD - 1)
+    page_texts = _stage2_estimator(monkeypatch, TEST_PLN_ESTIMATE)
+
+    await _run_stage2(_make_candidate(), {})
+
+    assert notifications == []
+    assert page_texts == [] and calls == []
+    assert saved and 'Estimated salary' not in saved[0]['content']
+
+
+async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repost(monkeypatch):
+    """The message is withheld; the saved file is the one place the role is still seen."""
+    _repost_llm(monkeypatch, '4464637425')
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract(salary=''))
+    notifications, saved = _stage2_stubs(monkeypatch, _agency_extract(salary=''))
+    _stage2_estimator(monkeypatch, dict(TEST_PLN_ESTIMATE, conversion=None))
+
+    await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), {})
+
+    assert notifications == []
+    assert 'Estimated salary: PLN 250,000 - 320,000 per year' in saved[0]['content']
+
+
+async def test_stage_2_still_notifies_when_the_pay_display_fails(monkeypatch, caplog):
+    """An extra figure is a nicety. Losing it must never cost the notification itself."""
+    notifications, _saved = _stage2_stubs(monkeypatch, _make_extract(salary=''))
+
+    async def broken_estimate(candidate, extract, page_text='', stage_stats=None):
+        raise RuntimeError('estimator blew up')
+
+    monkeypatch.setattr(agent, 'estimate_salary', broken_estimate)
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(), funnel)
+
+    assert len(notifications) == 1 and '💰' not in notifications[0]
+    assert 'eval_error' not in funnel
+    assert any('Pay display failed' in r.message and r.levelname == 'WARNING' for r in caplog.records)
+
+
+@pytest.mark.network
+def test_the_rate_service_still_publishes_what_parse_rates_reads():
+    """Does the real service still answer in the shape fx.parse_rates() accepts?
+
+    Fetches and parses directly instead of calling fx.rates_for(), which fails open and would make
+    any assertion around it a tautology (see test_npm_registry_still_reports_a_semver_version).
+    Self-skips on a connection error only; a changed shape or a missing currency is a failure.
+    """
+    base = 'EUR'
+    try:
+        response = requests.get(config.FX_RATES_URL, params={'base': base}, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as ex:
+        pytest.skip(f'exchange-rate service unreachable: {type(ex).__name__}: {ex}')
+
+    rates = fx.parse_rates(response.json(), base)
+    missing = salary.SALARY_CURRENCIES - {base} - set(rates)
+    assert not missing, f'no rate published for currencies a salary can be read in: {sorted(missing)}'
+
+
+@pytest.mark.live
+async def test_estimate_salary_live(monkeypatch):
+    """The real estimator against the real server. The cache is already isolated by conftest."""
+    _require_llm_server(8006)
+    monkeypatch.setattr(salary_estimate, 'chat_openrouter', triage.chat_openrouter)
+    extract = _make_extract(
+        location='Warsaw, Poland (Remote)',
+        description='Staff AI Engineer, 8+ years. Lead the design of agentic LLM systems in Python at a 300-person scale-up.',
+    )
+    estimate = await salary_estimate.estimate_salary(_make_candidate(), extract)
+    cached = salary_estimate._load_cache().get(salary_estimate.cache_key(_make_candidate()))
+    assert cached is not None, 'the call failed (see the WARNING): a failure caches nothing'
+    assert cached['model'] == config.MODEL_NAME_SALARY_ESTIMATE
+    if estimate is not None:
+        assert estimate['currency'] in salary_estimate.ESTIMATE_CURRENCIES
+        assert 0 < estimate['minimum'] <= estimate['maximum']
