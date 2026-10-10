@@ -7939,6 +7939,105 @@ async def test_record_listings_returns_counts_not_job_data(monkeypatch, tmp_path
     assert len(out) < 400, 'the summary must stay short — it is re-read every iteration'
 
 
+def _fresh_listing_state(monkeypatch, tmp_path, processed=()):
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path)
+    for name, value in (('_processed_jobs', set(processed)), ('_listing_records', {}),
+                        ('_check_status_counts', {}), ('_distinct_listing_ids', set()),
+                        ('_search_ids', {}), ('_candidates', []), ('_candidates_per_query', {}),
+                        ('_queue_skipped_counts', {}), ('_applied_companies', {})):
+        monkeypatch.setattr(tools, name, value)
+
+
+def _info_messages(caplog):
+    return [r.message for r in caplog.records if r.levelno == logging.INFO]
+
+
+@pytest.mark.asyncio
+async def test_record_listings_logs_already_processed_on_one_line(monkeypatch, tmp_path, caplog):
+    '''A saturated search logged one line per listing it had seen before; now one line names them all.'''
+    _fresh_listing_state(monkeypatch, tmp_path, processed={('linkedin', '111'), ('linkedin', '333')})
+    jobs = [*json.loads(_two_jobs())['jobs'],
+            {'id': '333', 'title': 'Staff AI Engineer', 'company': 'Initech', 'posted': '4 days ago'}]
+    with caplog.at_level(logging.DEBUG, logger=tools.logger.name):
+        await tools.do_record_listings(jobs, query='Staff AI Engineer')
+    info = _info_messages(caplog)
+    assert [m for m in info if m.startswith('already_processed:')] == ['already_processed: 2/3 linkedin=111,333']
+    per_listing = [m for m in info if m.startswith('check_and_record_job:')]
+    assert len(per_listing) == 1 and 'new' in per_listing[0] and 'linkedin/222' in per_listing[0], per_listing
+    debug = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+    assert sum('check_and_record_job: already_processed' in m for m in debug) == 2, 'DEBUG keeps each listing'
+
+
+@pytest.mark.asyncio
+async def test_record_listings_logs_no_already_processed_line_when_all_are_new(monkeypatch, tmp_path, caplog):
+    _fresh_listing_state(monkeypatch, tmp_path)
+    with caplog.at_level(logging.INFO, logger=tools.logger.name):
+        await tools.do_record_listings(json.loads(_two_jobs())['jobs'], query='Staff AI Engineer')
+    assert not [m for m in _info_messages(caplog) if m.startswith('already_processed:')]
+
+
+@pytest.mark.asyncio
+async def test_record_listings_logs_already_applied_on_one_line(monkeypatch, tmp_path, caplog):
+    _fresh_listing_state(monkeypatch, tmp_path, processed={('linkedin', '333')})
+
+    async def applied(company):
+        return '2026-01-01-acme.pdf' if company == 'Acme' else None
+    monkeypatch.setattr(tools, 'company_matches_applied', applied)
+    jobs = [*json.loads(_two_jobs())['jobs'],
+            {'id': '333', 'title': 'Staff AI Engineer', 'company': 'Initech', 'posted': '4 days ago'}]
+    with caplog.at_level(logging.INFO, logger=tools.logger.name):
+        await tools.do_record_listings(jobs, query='Staff AI Engineer')
+    info = _info_messages(caplog)
+    assert 'already_applied: 1/3 linkedin=111' in info
+    assert 'already_processed: 1/3 linkedin=333' in info
+    per_listing = [m for m in info if m.startswith('check_and_record_job:')]
+    assert len(per_listing) == 1 and 'linkedin/222' in per_listing[0], per_listing
+
+
+@pytest.mark.asyncio
+async def test_a_direct_check_still_logs_an_already_processed_listing(monkeypatch, tmp_path, caplog):
+    '''Only record_listings has a summary line to carry the id; a direct call must keep its own.'''
+    _fresh_listing_state(monkeypatch, tmp_path, processed={('linkedin', '111')})
+    with caplog.at_level(logging.INFO, logger=tools.logger.name):
+        await tools.do_check_and_record_job('linkedin', '111', 'Acme', 'Staff AI Engineer')
+    assert any('check_and_record_job: already_processed' in m and 'linkedin/111' in m
+               for m in _info_messages(caplog))
+
+
+@pytest.mark.asyncio
+async def test_a_harvest_logs_one_progress_line(monkeypatch, caplog):
+    '''From the provider pin to the first listing the run log was silent for minutes (2026-10-10).'''
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    session = _session('### Result\n' + _two_jobs() + _CODE_ECHO)
+    session.region = 'Canada'
+    session.iterations = 14
+    monkeypatch.setattr(scrape_openrouter.time, 'monotonic', lambda: session._started_at + 112)
+    with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
+        await session.dispatch_local('harvest_listings', {})
+    assert _info_messages(caplog) == [
+        'Stage 1b: "Staff AI Engineer" / Canada — harvested 2 listing(s) (iteration 14, 1m52s into the query)']
+
+
+@pytest.mark.asyncio
+async def test_a_harvest_on_the_anthropic_path_omits_the_iteration(monkeypatch, caplog):
+    '''That path's one long-lived session never counts iterations, so its elapsed time means nothing.'''
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    session = _session('### Result\n' + _two_jobs() + _CODE_ECHO)
+    session.region = 'Canada'
+    with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
+        await session.dispatch_local('harvest_listings', {})
+    assert _info_messages(caplog) == ['Stage 1b: "Staff AI Engineer" / Canada — harvested 2 listing(s)']
+
+
+@pytest.mark.asyncio
+async def test_an_empty_harvest_logs_no_progress_line(monkeypatch, caplog):
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    session = _session('### Result\n{"count": 0, "jobs": []}' + _CODE_ECHO)
+    with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
+        await session.dispatch_local('harvest_listings', {})
+    assert not [m for m in _info_messages(caplog) if 'harvested' in m]
+
+
 def test_browser_tool_defs_drop_disallowed_and_keep_required():
     def _t(name):
         return {'name': name, 'description': 'd', 'inputSchema': {'type': 'object'}}

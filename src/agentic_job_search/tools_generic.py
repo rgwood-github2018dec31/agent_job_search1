@@ -1822,10 +1822,17 @@ def parse_posting_date(date_posted: str | None) -> date | None:
     )
 
 
+# Outcomes record_listings reports on one line per search, carrying every job id, instead of one
+# line per listing: both mean "seen before, nothing to decide", and on a saturated search they
+# are most of the page.
+RECORD_LISTINGS_FOLDED_STATUSES = ('already_processed', 'already_applied')
+
+
 async def do_check_and_record_job(
     site: str, job_id: str, company: str, description: str,
     date_posted: str | None = None,
-    url: str | None = None, content: str | None = None
+    url: str | None = None, content: str | None = None,
+    log_folded_statuses: bool = True,
 ) -> dict:
     def _result(status: str) -> dict:
         _check_status_counts[status] = _check_status_counts.get(status, 0) + 1
@@ -1840,8 +1847,11 @@ async def do_check_and_record_job(
             'url': url or job_url(site, job_id),
             'queued': False, 'outcome': status, 'rating': None, 'summary': '',
         }
-        logger.info(f'check_and_record_job: {status} — {company} — {description} '
-                    f'[{site}/{job_id}, date_posted={date_posted!r}]')
+        # record_listings reports a search's folded outcomes on one line each of its own.
+        quiet = status in RECORD_LISTINGS_FOLDED_STATUSES and not log_folded_statuses
+        logger.log(logging.DEBUG if quiet else logging.INFO,
+                   f'check_and_record_job: {status} — {company} — {description} '
+                   f'[{site}/{job_id}, date_posted={date_posted!r}]')
         return {'content': [{'type': 'text', 'text': status}]}
 
     key = (site, job_id)
@@ -1981,15 +1991,19 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
     capped = usable[:SCRAPER_MAX_LISTINGS_PER_SEARCH]
     before_skips = sum(_queue_skipped_counts.values())
     tally: dict[str, int] = {}
+    folded_ids: dict[str, list[str]] = {}
     queued = 0
     for job in capped:
         job_id = str(job.get('id'))
         status_result = await do_check_and_record_job(
             'linkedin', job_id, str(job.get('company') or ''), str(job.get('title') or ''),
             date_posted=str(job.get('posted') or '') or None,
+            log_folded_statuses=False,
         )
         status = status_result['content'][0]['text'].strip()
         tally[status] = tally.get(status, 0) + 1
+        if status in RECORD_LISTINGS_FOLDED_STATUSES:
+            folded_ids.setdefault(status, []).append(job_id)
         if status == 'new':
             await do_queue_candidate(
                 'linkedin', job_id, job_url('linkedin', job_id), str(job.get('title') or ''),
@@ -2000,6 +2014,10 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
     skipped = sum(_queue_skipped_counts.values()) - before_skips
     cap_note = f' (capped from {len(usable)})' if len(usable) > len(capped) else ''
     parts = ', '.join(f'{count} {status}' for status, count in sorted(tally.items()))
+    for status in RECORD_LISTINGS_FOLDED_STATUSES:
+        if (ids := folded_ids.get(status)):
+            # Every id, never a sample: this line is what tells seen-but-deduped from never-seen.
+            logger.info(f'{status}: {len(ids)}/{len(capped)} linkedin={",".join(ids)}')
     logger.info(f'record_listings: {len(capped)}{cap_note} recorded — {parts}; '
                 f'{queued} queued, {skipped} skipped by title')
     return (f'recorded {len(capped)}{cap_note}: {parts}. {queued} queued, '

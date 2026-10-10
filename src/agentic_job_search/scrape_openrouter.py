@@ -16,6 +16,7 @@ Two design rules hold this file together, both learned the hard way (see AGENTS.
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -41,6 +42,7 @@ from agentic_job_search.config import (
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     SCRAPER_VERBOSE_MIN_ITERATIONS,
     SCRAPER_WHAT_HAPPENED_MAX_CHARS,
+    SECONDS_PER_MINUTE,
     UI_BLOCK_SIGNATURES,
 )
 from agentic_job_search.snapshot_prune import drop_job_detail_pane
@@ -376,6 +378,17 @@ class ScrapeSession:
         self.iterations = 0
         self.cost = 0.0
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
+        self._started_at = time.monotonic()
+
+    def _progress(self) -> str:
+        '''Where the query is, for the harvest line: ' (iteration 14, 1m52s into the query)'.
+
+        Empty on the Anthropic path, whose one long-lived session never counts iterations.
+        '''
+        if not self.iterations:
+            return ''
+        minutes, seconds = divmod(int(time.monotonic() - self._started_at), SECONDS_PER_MINUTE)
+        return f' (iteration {self.iterations}, {minutes}m{seconds:02d}s into the query)'
 
     async def _evaluate(self, js: str) -> dict | None:
         return parse_evaluate_result(await self._browser('browser_evaluate', {'function': js}))
@@ -421,7 +434,10 @@ class ScrapeSession:
                     'detail': 'harvest returned zero listings'})
                 return ('harvested 0 listings. If the page visibly shows results then the markup has '
                         'changed — call report_problem and stop. Do NOT invent listings.')
-            logger.debug(f'Stage 1b: harvested {len(jobs)} listing(s) for "{self.query}" / {self.region}')
+            # The one line a healthy search logs before its listings are recorded: without it the
+            # run log was silent from the provider pin to the first listing (2026-10-10).
+            logger.info(f'Stage 1b: "{self.query}" / {self.region} — harvested {len(jobs)} listing(s)'
+                        f'{self._progress()}')
             return f'harvested {len(jobs)} listing(s); the system is holding them. Call record_listings next.'
 
         if name == 'record_listings':
