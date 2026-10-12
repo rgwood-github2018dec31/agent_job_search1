@@ -1132,6 +1132,7 @@ class _WarningCounter(logging.Handler):
         super().__init__(level=logging.WARNING)
         self._narration_length = narration_length
         self.positions: list[int] = []
+        self.messages: list[str] = []
         self.errors = 0
 
     @property
@@ -1140,6 +1141,7 @@ class _WarningCounter(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.positions.append(self._narration_length())
+        self.messages.append(f'{record.levelname} {record.getMessage()}')
         if record.levelno >= logging.ERROR:
             self.errors += 1
 
@@ -1184,6 +1186,7 @@ class QueryNarration:
         _active_narration = None
         _PACKAGE_LOGGER.removeHandler(self._counter)
         warning_positions, errors_logged = self._counter.positions, self._counter.errors
+        warning_messages = self._counter.messages
         alerts_raised = len(tools_module._ui_alerts) - self._alerts_before
         query, lines = self.query, self._lines
         self.query, self._lines, self._counter = None, [], None
@@ -1208,15 +1211,24 @@ class QueryNarration:
             logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration near '
                         f'{len(warning_positions)} warning(s) follows ({len(shown)} of {len(lines)} line(s); '
                         f'LOG_LEVEL=DEBUG shows all)')
+        # A warning fell after the first `position` narration lines; it is printed where it fell, so
+        # the narration reads against the thing that triggered it.
+        warnings_at: dict[int, list[str]] = {}
+        for position, message in zip(warning_positions, warning_messages):
+            warnings_at.setdefault(position, []).append(message)
         previous = -1
         for index in shown:
             if (gap := index - previous - 1):
                 logger.info(f'{SCRAPER_NARRATION_STAGE} narration: … {gap} line(s) withheld …')
+            for message in warnings_at.pop(index, []):
+                logger.info(f'{SCRAPER_NARRATION_STAGE} narration: ▶ warning logged here: {message}')
             stamp, line = lines[index]
             logger.info(f'{SCRAPER_NARRATION_STAGE} narration [{stamp}]: {line}')
             previous = index
         if (gap := len(lines) - previous - 1):
             logger.info(f'{SCRAPER_NARRATION_STAGE} narration: … {gap} line(s) withheld …')
+        for message in warnings_at.pop(len(lines), []):
+            logger.info(f'{SCRAPER_NARRATION_STAGE} narration: ▶ warning logged here (after the last line): {message}')
 
 
 _active_narration: QueryNarration | None = None
@@ -2529,8 +2541,7 @@ def check_salary_provenance(candidate: dict, extract: dict) -> bool:
     if salary_digits_are_in_the_source(facts['text'], raw_text):
         return True
     logger.warning(
-        f"Salary provenance: {candidate['company']} — {candidate['title']} "
-        f"(job {candidate.get('job_id')}): extracted salary {facts['text']!r} contains figures "
+        f"Salary provenance: job {candidate.get('job_id')}: extracted salary {facts['text']!r} contains figures "
         f'that do not appear in the retained page {path.name} — treat the figure as unverified.'
     )
     facts['source'] = 'unverified'
@@ -3490,8 +3501,9 @@ async def resolve_pay_display(
     extract['salary_estimate'] = estimate
     if conversion or estimate:
         logger.info(
-            f"Pay display: {candidate['company']} — {candidate['title']} (job {candidate['job_id']}): "
-            f'conversion={conversion} estimate={estimate}'
+            f"Pay display: job {candidate['job_id']}: "
+            + (f"conversion {format_salary_conversion(conversion).strip('()')}" if conversion else '')
+            + (f"estimate {format_salary_estimate(estimate)} by {estimate.get('model')}" if estimate else '')
         )
 
 
@@ -3646,7 +3658,7 @@ EXTRACT_SIGNAL_FIELDS = (
     'date_posted', 'location', 'closed', 'language_requirement', 'posting_language',
     'likely_working_language', 'stated_working_language', 'relocation',
 )
-EXTRACT_SIGNAL_FIELDS_AFTER_RESIDENCY = ('place_names', 'education_requirement')
+EXTRACT_SIGNAL_FIELDS_AFTER_RESIDENCY = ('education_requirement',)
 
 
 def format_extract_signal(extract: dict, raw_residency_scope: str) -> str:
@@ -3849,9 +3861,10 @@ async def evaluate_all_candidates(
             check_salary_provenance(candidate, extract)
             extract_text = format_extract_text(candidate, extract)
             logger.info(
-                f"Extract signal: {candidate['company']} — {candidate['title']}: "
+                f"Extract signal: job {candidate['job_id']}: "
                 f'{format_extract_signal(extract, raw_residency_scope)}'
             )
+            logger.debug(f"Place names: job {candidate['job_id']}: {extract.get('place_names')}")
 
             # Already-applied, checked against the END CLIENT only.
             #
@@ -3893,7 +3906,7 @@ async def evaluate_all_candidates(
             hard_rule_reason = await apply_hard_rules(candidate, extract)
             if hard_rule_reason:
                 bump(_hard_rule_category(hard_rule_reason))
-                logger.info(f"Hard rule: {candidate['company']} — {candidate['title']}: rated 1 ({hard_rule_reason})")
+                logger.info(f"Hard rule: job {candidate['job_id']}: rated 1 ({hard_rule_reason})")
                 await _save_and_notify(
                     candidate, rating=RATING_AUTO_REJECT, summary=f'auto rejected {hard_rule_reason}',
                     content=f'# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}', notify=False,
@@ -4020,8 +4033,7 @@ async def evaluate_all_candidates(
             else:
                 notify_note = 'notified' if sent else 'notification FAILED'
             logger.info(
-                f"Rating [{index}/{len(candidates)}]: {candidate['company']} — {candidate['title']} "
-                f"(job {candidate['job_id']}): {rating}/5 via {rated_by}"
+                f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: {rating}/5 via {rated_by}"
                 + (f' (fallback: {MODEL_NAME_RATING} failed)' if rated_by != MODEL_NAME_RATING else '')
                 + f'{triage_note}, {rating_seconds:.0f}s — saved, {notify_note}'
             )

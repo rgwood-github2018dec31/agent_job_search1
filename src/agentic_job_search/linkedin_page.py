@@ -583,7 +583,9 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         unusual += f'; JS {js_counts}'
     if any(asset_counts.get(key) for key in _UNUSUAL_ASSET_KEYS):
         unusual += f'; assets {asset_counts}'
-    logger.info(
+    # Routine success is DEBUG: the Extract line already gives page chars → condensed chars.
+    logger.log(
+        logging.INFO if unusual or not removed else logging.DEBUG,
         f"Job page {job_id}: DOM {len(capture['html']):,} chars → {len(text):,} chars of text; "
         f"removed {len(removed)} block(s) ({sum(r['chars'] for r in removed):,} chars){unusual}"
     )

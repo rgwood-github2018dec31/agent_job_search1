@@ -226,7 +226,9 @@ async def estimate_salary(
         'input_source': input_source,
     }
     _write_cache()
-    logger.info(
+    # The figure and its conversion are logged once, on the `Pay display:` line; the basis prose is
+    # in the Saved Job. Cost is in cost_log.jsonl.
+    logger.debug(
         f"Salary estimated for job {key} ({candidate.get('company')} — {candidate.get('title')}) "
         f'from the {input_source}: {result if result is not None else "cannot estimate"} (${cost_usd:.6f})'
     )

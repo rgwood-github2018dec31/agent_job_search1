@@ -18,6 +18,7 @@ from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
+    LOG_TITLE_MAX_CHARS,
     MODEL_NAME_EXTRACTOR,
     SALARY_FIELD_DESCRIPTION,
     STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
@@ -224,7 +225,8 @@ async def extract_job_page_openrouter(
                 continue
             extract = _extract_from_submit_args(args)
             logger.info(
-                f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
+                f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: "
                 f"{len(page_text)} page chars → {len(extract['description'])} chars condensed in "
                 f'{time.monotonic() - started:.0f}s'
                 + (f' over {iteration + 1} iterations' if iteration else '')

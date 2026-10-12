@@ -1848,7 +1848,8 @@ async def do_check_and_record_job(
             'queued': False, 'outcome': status, 'rating': None, 'summary': '',
         }
         # record_listings reports a search's folded outcomes on one line each of its own.
-        quiet = status in RECORD_LISTINGS_FOLDED_STATUSES and not log_folded_statuses
+        # A 'new' listing is queued straight after, and queue_candidate logs the same job with its query.
+        quiet = (status in RECORD_LISTINGS_FOLDED_STATUSES or status == 'new') and not log_folded_statuses
         logger.log(logging.DEBUG if quiet else logging.INFO,
                    f'check_and_record_job: {status} — {company} — {description} '
                    f'[{site}/{job_id}, date_posted={date_posted!r}]')
@@ -1860,7 +1861,7 @@ async def do_check_and_record_job(
 
     matched_pdf = await company_matches_applied(company)
     if matched_pdf is not None:
-        console.print(f'[dim]Skipping {company} — already applied ({matched_pdf}).[/dim]')
+        logger.debug(f'Skipping {company} [{site}/{job_id}] — already applied ({matched_pdf})')
         return _result('already_applied')
 
     try:
@@ -1963,7 +1964,7 @@ async def do_queue_candidate(
         record['url'] = url or record['url']
         record['snippet'] = snippet
         record['outcome'] = 'queued'
-    logger.info(f'queue_candidate: {company} — {title} [{site}/{job_id}, query={query!r}]')
+    logger.debug(f'queue_candidate: {company} — {title} [{site}/{job_id}, query={query!r}]')
     return {'content': [{'type': 'text', 'text': f'Queued: {company} — {title}'}]}
 
 
@@ -1992,6 +1993,8 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
     before_skips = sum(_queue_skipped_counts.values())
     tally: dict[str, int] = {}
     folded_ids: dict[str, list[str]] = {}
+    applied_companies: list[str] = []
+    queued_ids: list[str] = []
     queued = 0
     for job in capped:
         job_id = str(job.get('id'))
@@ -2004,6 +2007,8 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
         tally[status] = tally.get(status, 0) + 1
         if status in RECORD_LISTINGS_FOLDED_STATUSES:
             folded_ids.setdefault(status, []).append(job_id)
+        if status == 'already_applied':
+            applied_companies.append(str(job.get('company') or ''))
         if status == 'new':
             await do_queue_candidate(
                 'linkedin', job_id, job_url('linkedin', job_id), str(job.get('title') or ''),
@@ -2011,15 +2016,18 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
                 date_posted=str(job.get('posted') or '') or None, query=query,
             )
             queued += 1
+            queued_ids.append(job_id)
     skipped = sum(_queue_skipped_counts.values()) - before_skips
     cap_note = f' (capped from {len(usable)})' if len(usable) > len(capped) else ''
     parts = ', '.join(f'{count} {status}' for status, count in sorted(tally.items()))
     for status in RECORD_LISTINGS_FOLDED_STATUSES:
         if (ids := folded_ids.get(status)):
             # Every id, never a sample: this line is what tells seen-but-deduped from never-seen.
-            logger.info(f'{status}: {len(ids)}/{len(capped)} linkedin={",".join(ids)}')
+            company_note = f' companies={"; ".join(applied_companies)}' if status == 'already_applied' else ''
+            logger.info(f'{status}: {len(ids)}/{len(capped)} linkedin={",".join(ids)}{company_note}')
+    queued_note = f' linkedin={",".join(queued_ids)}' if queued_ids else ''
     logger.info(f'record_listings: {len(capped)}{cap_note} recorded — {parts}; '
-                f'{queued} queued, {skipped} skipped by title')
+                f'{queued} queued{queued_note}, {skipped} skipped by title')
     return (f'recorded {len(capped)}{cap_note}: {parts}. {queued} queued, '
             f'{skipped} skipped by title. Continue with the next search.')
 

@@ -7962,8 +7962,10 @@ async def test_record_listings_logs_already_processed_on_one_line(monkeypatch, t
         await tools.do_record_listings(jobs, query='Staff AI Engineer')
     info = _info_messages(caplog)
     assert [m for m in info if m.startswith('already_processed:')] == ['already_processed: 2/3 linkedin=111,333']
-    per_listing = [m for m in info if m.startswith('check_and_record_job:')]
-    assert len(per_listing) == 1 and 'new' in per_listing[0] and 'linkedin/222' in per_listing[0], per_listing
+    assert not [m for m in info if m.startswith('check_and_record_job:')]
+    assert not [m for m in info if m.startswith('queue_candidate:')]
+    summary = [m for m in info if m.startswith('record_listings:')]
+    assert len(summary) == 1 and '1 queued linkedin=222' in summary[0], summary
     debug = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
     assert sum('check_and_record_job: already_processed' in m for m in debug) == 2, 'DEBUG keeps each listing'
 
@@ -7988,10 +7990,12 @@ async def test_record_listings_logs_already_applied_on_one_line(monkeypatch, tmp
     with caplog.at_level(logging.INFO, logger=tools.logger.name):
         await tools.do_record_listings(jobs, query='Staff AI Engineer')
     info = _info_messages(caplog)
-    assert 'already_applied: 1/3 linkedin=111' in info
+    assert 'already_applied: 1/3 linkedin=111 companies=Acme' in info
     assert 'already_processed: 1/3 linkedin=333' in info
-    per_listing = [m for m in info if m.startswith('check_and_record_job:')]
-    assert len(per_listing) == 1 and 'linkedin/222' in per_listing[0], per_listing
+    assert not [m for m in info if m.startswith('check_and_record_job:')]
+    assert not [m for m in info if m.startswith('queue_candidate:')]
+    summary = [m for m in info if m.startswith('record_listings:')]
+    assert len(summary) == 1 and '1 queued linkedin=222' in summary[0], summary
 
 
 @pytest.mark.asyncio
@@ -9860,6 +9864,14 @@ def test_a_warning_releases_only_the_narration_around_it(monkeypatch, caplog):
         at - context, NARRATION_LINES_IN_A_LONG_QUERY - at - context], 'both gaps are counted, in order'
 
 
+def test_the_warning_is_printed_in_the_narration_where_it_fell(monkeypatch, caplog):
+    at = 20
+    messages = _narrate_long_query(monkeypatch, caplog, {at: lambda: tools.logger.warning('Truncating browser_find')})
+    marker = [i for i, m in enumerate(messages) if 'warning logged here: WARNING Truncating browser_find' in m]
+    assert len(marker) == 1
+    assert 'step 19' in messages[marker[0] - 1] and 'step 20' in messages[marker[0] + 1]
+
+
 def test_warnings_close_together_write_each_line_once(monkeypatch, caplog):
     context = config.NARRATION_WARNING_CONTEXT_LINES
 
@@ -9929,7 +9941,8 @@ def test_extract_signal_omits_empty_fields():
          'is_agency': True, 'end_client': 'Acme', 'salary': '$100 CAD per year',
          'salary_facts': {'kind': 'single', 'currency': 'CAD', 'period': 'year', 'source': 'deterministic'}},
         '')
-    assert 'closed=True' in full and "place_names=['Canada']" in full and "end_client='Acme'" in full
+    assert 'closed=True' in full and "end_client='Acme'" in full
+    assert 'place_names' not in full, 'place_names is logged at DEBUG, not on the INFO signal line'
     assert "residency_scope=''->'country_only'" in full, 'raw and derived shown when they differ'
     assert "salary='$100 CAD per year'->kind=single currency='CAD' period='year'" in full
 
@@ -9950,7 +9963,9 @@ async def test_stage_2_rating_line_says_notified_and_carries_no_reasoning(monkey
     messages = _stage2_messages(caplog)
     rating_lines = [m for m in messages if m.startswith('Rating [1/1]: ')]
     assert len(rating_lines) == 1
-    assert '(job 222): 5/5 via ' in rating_lines[0] and rating_lines[0].endswith('— saved, notified')
+    assert rating_lines[0].startswith('Rating [1/1]: job 222: 5/5 via ')
+    assert 'Acme' not in rating_lines[0], 'the title and company appear once, on the Extract line'
+    assert rating_lines[0].endswith('— saved, notified')
     assert 'strong fit' not in rating_lines[0], 'the reasoning lives in the saved job and the audit log'
     assert any(m == 'Stage 2: evaluating 1 candidate(s)' for m in messages)
     assert any(m.startswith('Stage 2 complete: 1 of 1 job(s) in ') for m in messages)

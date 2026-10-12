@@ -19,6 +19,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
@@ -32,6 +33,7 @@ from agentic_job_search.config import (
     SCRAPER_CACHED_PROMPT_SHARE,
     SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
+    FIND_CAPTURE_MAX_FILES,
     SCRAPER_FIND_RESULT_MAX_CHARS,
     SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION,
     SCRAPER_MIN_BITS_PER_WEIGHT,
@@ -45,6 +47,7 @@ from agentic_job_search.config import (
     SECONDS_PER_MINUTE,
     UI_BLOCK_SIGNATURES,
 )
+from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.snapshot_prune import drop_job_detail_pane
 from agentic_job_search.text_budget import snippet, truncate_reported
 from agentic_job_search.triage import http_status_of, provider_error
@@ -54,6 +57,19 @@ logger = logging.getLogger(__name__)
 _FIND_TOOL_NAME = 'browser_find'
 _SNAPSHOT_TOOL_NAME = 'browser_snapshot'
 _FILENAME_ARG = 'filename'
+FIND_CAPTURE_DIR = RUN_DIR / 'find_captures'
+
+
+def _capture_oversized_find(out: str, query: str | None) -> None:
+    """TEMPORARY: save a large raw browser_find result for inspection (see FIND_CAPTURE_MAX_FILES)."""
+    if len(out) <= SCRAPER_TOOL_RESULT_MAX_CHARS:
+        return
+    FIND_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    if len(list(FIND_CAPTURE_DIR.glob('*.txt'))) >= FIND_CAPTURE_MAX_FILES:
+        return
+    path = FIND_CAPTURE_DIR / f'{datetime.now():%Y-%m-%d_%H%M%S}.txt'
+    path.write_text(out, encoding='utf-8')
+    logger.info(f'Stage 1b: saved a {len(out):,}-char browser_find result for query {query!r} to {path}')
 _FINISH_REASON_STOP = 'stop'
 
 
@@ -618,7 +634,9 @@ class ScrapeSession:
                         )
                         out = f'ERROR calling {name}: {ex}'
                     else:
-                        if name == _SNAPSHOT_TOOL_NAME:
+                        if name == _FIND_TOOL_NAME:
+                            _capture_oversized_find(out, self.query)
+                        if name in (_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME):
                             out = drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
                 messages.append({'role': 'tool', 'tool_call_id': call.get('id', ''),
                                  'content': truncate_reported(out, _result_cap(name),

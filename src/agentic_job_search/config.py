@@ -408,8 +408,14 @@ SCRAPER_COST_ALERT_FACTOR = 3
 SCRAPER_TOOL_RESULT_MAX_CHARS = 30_000
 # browser_find, split out from the cap above (2026-09-24). Unlike a full snapshot it returns only
 # the matches the model asked for, so what it cut was signal: it went over the shared cap 13 times
-# across all logged runs, by a few hundred chars up to ~26K. Sized above the largest one measured.
-SCRAPER_FIND_RESULT_MAX_CHARS = 60_000
+# across all logged runs, by a few hundred chars up to ~26K. Sized above the largest one measured
+# (70,129 on 2026-10-12, the first find after the location chip opens; the job detail pane is
+# dropped from it as from a snapshot).
+SCRAPER_FIND_RESULT_MAX_CHARS = 75_000
+# TEMPORARY diagnostic (2026-10-12): a browser_find result over SCRAPER_TOOL_RESULT_MAX_CHARS is
+# saved raw to run_dir/find_captures/ so we can see what fills a 70K result. Stops after this many
+# files. Remove it, and the directory, once the bulk is identified and pruned.
+FIND_CAPTURE_MAX_FILES = 4
 # browser_snapshot, split out from the shared cap (2026-09-30). A search-page snapshot is sent with
 # the job detail pane removed (snapshot_prune.drop_job_detail_pane); what is left is the chip row
 # and the full result-card list. Across 351 saved snapshots that measured ~51K median and ~56K max,
@@ -570,6 +576,9 @@ OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS = 1024
 SCRAPER_WHAT_HAPPENED_MAX_CHARS = 500
 # Diagnostic excerpts of a response, error or command in log lines and exception messages.
 LOG_SNIPPET_MAX_CHARS = 300
+# A job's title appears once per job in the run log, on its Extract line, cut to this; later lines
+# for the job name it by id. LinkedIn titles run to 150+ chars of keyword stuffing.
+LOG_TITLE_MAX_CHARS = 80
 # The salary text shown on the 💰 line of a Telegram job-match message.
 NOTIFICATION_SALARY_MAX_CHARS = 200
 # An unparseable posting date shown verbatim on the 🗓 line of a Telegram job-match message.
