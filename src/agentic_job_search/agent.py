@@ -13,7 +13,7 @@ import statistics
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import aclosing
 from datetime import date, datetime
 from pathlib import Path
@@ -88,6 +88,7 @@ from agentic_job_search.config import (
     SALARY_FIELD_DESCRIPTION,
     SATURATION_MIN_NEW_JOBS,
     SATURATION_MIN_NEW_RATIO,
+    NARRATION_WARNING_CONTEXT_LINES,
     SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
     SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD,
     SCRAPER_COST_ALERT_FACTOR,
@@ -1124,14 +1125,23 @@ _PACKAGE_LOGGER = logging.getLogger(__name__.rpartition('.')[0])
 
 
 class _WarningCounter(logging.Handler):
-    """Counts WARNING-and-above records, so a query can tell whether anything went wrong in it."""
+    """Notes each WARNING-and-above record of a query: where in its narration it fell, and whether
+    any was an ERROR."""
 
-    def __init__(self) -> None:
+    def __init__(self, narration_length: Callable[[], int]) -> None:
         super().__init__(level=logging.WARNING)
-        self.count = 0
+        self._narration_length = narration_length
+        self.positions: list[int] = []
+        self.errors = 0
+
+    @property
+    def count(self) -> int:
+        return len(self.positions)
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.count += 1
+        self.positions.append(self._narration_length())
+        if record.levelno >= logging.ERROR:
+            self.errors += 1
 
 
 class QueryNarration:
@@ -1139,9 +1149,11 @@ class QueryNarration:
 
     Most of it is "Let me take a snapshot" — 356 lines of a 1,125-line log on 2026-10-08. What
     the mirroring exists for (see log_agent_text) is the model's account of a query that went
-    wrong, so each query's lines are held and written at INFO only when that query logged a
-    WARNING or above, raised a ui_alert, or did not finish. Every line still goes to DEBUG as
-    it arrives.
+    wrong, so each query's lines are held. All of them are written at INFO when the query logged
+    an ERROR or above, raised a ui_alert, or did not finish. A query that only logged WARNINGs
+    writes the NARRATION_WARNING_CONTEXT_LINES lines on each side of each one: a warning the
+    scraper recovered from released 58-104 lines per query on 2026-10-10. Every line still goes
+    to DEBUG as it arrives.
     """
 
     def __init__(self) -> None:
@@ -1155,7 +1167,7 @@ class QueryNarration:
         self.close()
         self.query = query
         self._lines = []
-        self._counter = _WarningCounter()
+        self._counter = _WarningCounter(lambda: len(self._lines))
         _PACKAGE_LOGGER.addHandler(self._counter)
         self._alerts_before = len(tools_module._ui_alerts)
         _active_narration = self
@@ -1165,27 +1177,46 @@ class QueryNarration:
         self._lines.append((datetime.now().strftime(NARRATION_TIME_FORMAT), line))
 
     def close(self, unfinished: bool = False) -> None:
-        """End the current query: write its narration if it had trouble, else say how much was withheld."""
+        """End the current query: write the narration its trouble calls for, else say how much was withheld."""
         global _active_narration
         if self.query is None:
             return
         _active_narration = None
         _PACKAGE_LOGGER.removeHandler(self._counter)
-        warnings_logged = self._counter.count
+        warning_positions, errors_logged = self._counter.positions, self._counter.errors
         alerts_raised = len(tools_module._ui_alerts) - self._alerts_before
         query, lines = self.query, self._lines
         self.query, self._lines, self._counter = None, [], None
         if not lines:
             return
-        if not (unfinished or warnings_logged or alerts_raised > 0):
+        if not (unfinished or warning_positions or alerts_raised > 0):
             logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration withheld — {len(lines)} '
                         f'line(s), no warnings or alerts (LOG_LEVEL=DEBUG shows it)')
             return
-        why = ('the query did not finish' if unfinished
-               else f'{warnings_logged} warning(s), {max(alerts_raised, 0)} alert(s)')
-        logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration follows ({len(lines)} line(s); {why})')
-        for stamp, line in lines:
+        if unfinished or errors_logged or alerts_raised > 0:
+            why = ('the query did not finish' if unfinished
+                   else f'{len(warning_positions)} warning(s), {errors_logged} of them error(s), '
+                        f'{max(alerts_raised, 0)} alert(s)')
+            logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration follows ({len(lines)} line(s); {why})')
+            shown = range(len(lines))
+        else:
+            shown = sorted({
+                index for position in warning_positions
+                for index in range(max(position - NARRATION_WARNING_CONTEXT_LINES, 0),
+                                   min(position + NARRATION_WARNING_CONTEXT_LINES, len(lines)))
+            })
+            logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration near '
+                        f'{len(warning_positions)} warning(s) follows ({len(shown)} of {len(lines)} line(s); '
+                        f'LOG_LEVEL=DEBUG shows all)')
+        previous = -1
+        for index in shown:
+            if (gap := index - previous - 1):
+                logger.info(f'{SCRAPER_NARRATION_STAGE} narration: … {gap} line(s) withheld …')
+            stamp, line = lines[index]
             logger.info(f'{SCRAPER_NARRATION_STAGE} narration [{stamp}]: {line}')
+            previous = index
+        if (gap := len(lines) - previous - 1):
+            logger.info(f'{SCRAPER_NARRATION_STAGE} narration: … {gap} line(s) withheld …')
 
 
 _active_narration: QueryNarration | None = None

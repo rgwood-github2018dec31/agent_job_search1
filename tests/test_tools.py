@@ -9815,15 +9815,77 @@ def test_narration_of_a_clean_query_is_withheld(monkeypatch, caplog):
 @pytest.mark.parametrize('trouble', [
     lambda: agent.logger.warning('Stage 1b: something failed'),
     lambda: tools.logger.warning('Stage 1b filters not applied'),
+    lambda: agent.logger.error('Stage 1b: something broke'),
     lambda: tools._ui_alerts.append({'kind': 'low_listings'}),
     lambda: True,   # the query did not finish
-], ids=['warning', 'warning_in_another_module', 'ui_alert', 'unfinished'])
+], ids=['warning', 'warning_in_another_module', 'error', 'ui_alert', 'unfinished'])
 def test_narration_is_written_when_the_query_had_trouble(monkeypatch, caplog, trouble):
     monkeypatch.setattr(tools, '_ui_alerts', [])
     with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
         _narrate_one_query(trouble)
     narrated = [r.getMessage() for r in caplog.records if NARRATION_LINE in r.getMessage()]
     assert len(narrated) == 1 and r'narration [' in narrated[0], 'written once, with its original time'
+
+
+NARRATION_LINES_IN_A_LONG_QUERY = 40
+
+
+def _narrate_long_query(monkeypatch, caplog, trouble_at: dict, unfinished: bool = False) -> list[str]:
+    """Narrate numbered lines, running trouble_at[i] before line i; return the INFO messages."""
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        narration = agent.QueryNarration()
+        narration.begin('Staff AI Engineer')
+        for index in range(NARRATION_LINES_IN_A_LONG_QUERY):
+            if index in trouble_at:
+                trouble_at[index]()
+            agent.log_agent_text('Stage 1b', f'step {index:02d}')
+        narration.close(unfinished=unfinished)
+    return [r.getMessage() for r in caplog.records if r.name == 'agentic_job_search.agent']
+
+
+def _narrated_steps(messages: list[str]) -> list[int]:
+    return [int(m.rpartition('step ')[2]) for m in messages if 'narration [' in m]
+
+
+def test_a_warning_releases_only_the_narration_around_it(monkeypatch, caplog):
+    context, at = config.NARRATION_WARNING_CONTEXT_LINES, 20
+    messages = _narrate_long_query(monkeypatch, caplog, {at: lambda: tools.logger.warning('Truncating browser_find')})
+    assert _narrated_steps(messages) == list(range(at - context, at + context))
+    shown = 2 * context
+    assert any(f'narration near 1 warning(s) follows ({shown} of {NARRATION_LINES_IN_A_LONG_QUERY} line(s)' in m
+               for m in messages)
+    gaps = [m for m in messages if 'line(s) withheld …' in m]
+    assert [int(m.split('… ')[1].split()[0]) for m in gaps] == [
+        at - context, NARRATION_LINES_IN_A_LONG_QUERY - at - context], 'both gaps are counted, in order'
+
+
+def test_warnings_close_together_write_each_line_once(monkeypatch, caplog):
+    context = config.NARRATION_WARNING_CONTEXT_LINES
+
+    def warn():
+        tools.logger.warning('Truncating browser_find')
+
+    messages = _narrate_long_query(monkeypatch, caplog, {20: warn, 21: warn})
+    assert _narrated_steps(messages) == list(range(20 - context, 21 + context))
+    assert any('narration near 2 warning(s)' in m for m in messages)
+
+
+def test_a_warning_at_the_start_of_a_query_has_no_leading_gap(monkeypatch, caplog):
+    messages = _narrate_long_query(monkeypatch, caplog, {0: lambda: tools.logger.warning('pinned endpoint failed')})
+    assert _narrated_steps(messages) == list(range(config.NARRATION_WARNING_CONTEXT_LINES))
+    assert len([m for m in messages if 'line(s) withheld …' in m]) == 1
+
+
+@pytest.mark.parametrize('trouble_at, unfinished', [
+    ({20: lambda: agent.logger.error('Stage 1b: something broke')}, False),
+    ({20: lambda: tools._ui_alerts.append({'kind': 'low_listings'})}, False),
+    ({20: lambda: tools.logger.warning('Truncating browser_find')}, True),
+], ids=['error', 'ui_alert', 'warning_then_unfinished'])
+def test_real_trouble_still_writes_the_whole_narration(monkeypatch, caplog, trouble_at, unfinished):
+    messages = _narrate_long_query(monkeypatch, caplog, trouble_at, unfinished)
+    assert _narrated_steps(messages) == list(range(NARRATION_LINES_IN_A_LONG_QUERY))
+    assert not any('line(s) withheld' in m for m in messages)
 
 
 def test_narration_always_reaches_debug(monkeypatch, caplog):

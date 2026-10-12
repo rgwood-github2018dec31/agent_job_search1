@@ -174,6 +174,13 @@ SCRAPER_MIN_LISTINGS_PER_QUERY = 6
 # rescued, and an alert that fires on success trains the reader to ignore it.
 SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY = SCRAPER_MIN_LISTINGS_PER_QUERY // 2
 
+# Stage 1b narration lines written before and after each WARNING a query logged (QueryNarration).
+# One warning used to release the query's whole narration: on 2026-10-10 four of six queries wrote
+# 58-104 lines each for 1-3 warnings the scraper had already recovered from (a find truncation, a
+# dropped filename argument, one 502 retry), and on 2026-10-11 two truncations wrote 71 of the
+# log's 101 lines.
+NARRATION_WARNING_CONTEXT_LINES = 3
+
 # Date-posted filter applied via the "Date posted" chip. LinkedIn expresses the choice as
 # f_TPR=r<seconds>; we never navigate to that parameter ourselves (see the chip rationale above),
 # but we DO read it back off the URL to confirm the click actually applied. r604800 = past week,
