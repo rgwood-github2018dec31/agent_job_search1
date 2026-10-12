@@ -10205,3 +10205,17 @@ def test_log_run_cost_puts_elapsed_and_cost_in_the_run_log(tmp_path, caplog):
         }, tmp_path / 'cost_log.jsonl')
     assert [r.getMessage() for r in caplog.records] == [
         'Run complete (ok): 12.3 min, $0.1234 total (scraping $0.1000, rating $0.0234)']
+
+
+def test_a_silent_search_logs_a_step_line_after_the_progress_interval(caplog):
+    session = scrape_openrouter.ScrapeSession(lambda *a, **k: None, 'Staff AI Engineer')
+    session.region = 'Canada'
+    with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
+        session._log_step('browser_click', {'element': 'Date posted'})
+        assert not caplog.records, 'inside the interval nothing is logged'
+        session._last_info_at -= config.SCRAPER_PROGRESS_LOG_SECONDS
+        session._log_step('browser_click', {'element': 'Date posted'})
+        session._log_step('browser_click', {'element': 'Past week'})
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1, 'the line resets the interval'
+    assert 'Staff AI Engineer' in messages[0] and 'Canada' in messages[0] and 'browser_click Date posted' in messages[0]

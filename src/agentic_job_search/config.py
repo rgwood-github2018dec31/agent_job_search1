@@ -145,6 +145,11 @@ SCRAPER_NO_TOOL_NUDGES = 1
 SCRAPER_INTER_ACTION_DELAY_SECONDS = (0.8, 2.6)    # between individual chip/filter interactions
 SCRAPER_INTER_SEARCH_DELAY_SECONDS = (2.5, 6.0)    # between searches within one query
 SCRAPER_INTER_QUERY_DELAY_SECONDS = (8.0, 18.0)    # between queries (code-enforced, not prompted)
+# Stage 1b writes a step line when this long has passed since its last INFO line (a harvest line
+# resets it), so a search that takes minutes to set up never leaves the run log silent.
+SCRAPER_PROGRESS_LOG_SECONDS = 30
+# Longest tool-argument excerpt shown on a step line.
+SCRAPER_STEP_ARG_MAX_CHARS = 60
 
 # Listings recorded per search. Now that harvesting is a single read-only call rather than N
 # clicks, taking the whole first page costs nothing extra in account exposure — the cap is just a

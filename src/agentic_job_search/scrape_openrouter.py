@@ -39,8 +39,10 @@ from agentic_job_search.config import (
     SCRAPER_MIN_BITS_PER_WEIGHT,
     SCRAPER_NO_TOOL_NUDGES,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
+    SCRAPER_PROGRESS_LOG_SECONDS,
     SCRAPER_PROVIDER_MAX_SWITCHES,
     SCRAPER_SNAPSHOT_RESULT_MAX_CHARS,
+    SCRAPER_STEP_ARG_MAX_CHARS,
     SCRAPER_TOOL_RESULT_MAX_CHARS,
     SCRAPER_VERBOSE_MIN_ITERATIONS,
     SCRAPER_WHAT_HAPPENED_MAX_CHARS,
@@ -395,6 +397,17 @@ class ScrapeSession:
         self.cost = 0.0
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
         self._started_at = time.monotonic()
+        self._last_info_at = self._started_at
+
+    def _log_step(self, name: str, args: dict) -> None:
+        '''One INFO line naming the step just taken, if SCRAPER_PROGRESS_LOG_SECONDS passed in silence.'''
+        if time.monotonic() - self._last_info_at < SCRAPER_PROGRESS_LOG_SECONDS:
+            return
+        detail = next((str(args[key]) for key in ('element', 'url', 'text', 'query') if args.get(key)), '')
+        shown = snippet(detail, SCRAPER_STEP_ARG_MAX_CHARS) if detail else ''
+        logger.info(f'Stage 1b: "{self.query}" / {self.region or "?"} — {name} {shown}'.rstrip()
+                    + self._progress())
+        self._last_info_at = time.monotonic()
 
     def _progress(self) -> str:
         '''Where the query is, for the harvest line: ' (iteration 14, 1m52s into the query)'.
@@ -454,6 +467,7 @@ class ScrapeSession:
             # run log was silent from the provider pin to the first listing (2026-10-10).
             logger.info(f'Stage 1b: "{self.query}" / {self.region} — harvested {len(jobs)} listing(s)'
                         f'{self._progress()}')
+            self._last_info_at = time.monotonic()
             return f'harvested {len(jobs)} listing(s); the system is holding them. Call record_listings next.'
 
         if name == 'record_listings':
@@ -638,6 +652,7 @@ class ScrapeSession:
                             _capture_oversized_find(out, self.query)
                         if name in (_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME):
                             out = drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
+                self._log_step(name, args)
                 messages.append({'role': 'tool', 'tool_call_id': call.get('id', ''),
                                  'content': truncate_reported(out, _result_cap(name),
                                                               f'{name} result for query {self.query!r}')})
