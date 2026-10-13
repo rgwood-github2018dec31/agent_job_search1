@@ -145,8 +145,10 @@ SCRAPER_NO_TOOL_NUDGES = 1
 SCRAPER_INTER_ACTION_DELAY_SECONDS = (0.8, 2.6)    # between individual chip/filter interactions
 SCRAPER_INTER_SEARCH_DELAY_SECONDS = (2.5, 6.0)    # between searches within one query
 SCRAPER_INTER_QUERY_DELAY_SECONDS = (8.0, 18.0)    # between queries (code-enforced, not prompted)
-# Stage 1b writes a step line when this long has passed since its last INFO line (a harvest line
-# resets it), so a search that takes minutes to set up never leaves the run log silent.
+# Stage 1b writes a DEBUG step line when this long has passed since its last progress line (a
+# harvest line resets it). At the default level a search that takes minutes to set up leaves the run
+# log silent — accepted 2026-10-13, since at INFO this was ~60 lines a run saying a filter was being
+# clicked; LOG_LEVEL=DEBUG restores it when a stuck query has to be diagnosed.
 SCRAPER_PROGRESS_LOG_SECONDS = 30
 # Longest tool-argument excerpt shown on a step line.
 SCRAPER_STEP_ARG_MAX_CHARS = 60
@@ -478,7 +480,16 @@ TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (c
 EVAL_ERROR_MAX_RELEASES = 2
 # The Rating log line carries triage's reason only when the two scores differ by at least this.
 TRIAGE_DISAGREEMENT_LOG_MIN = 2
+# What the reference-summary prompt ASKS the model for. A model given a length instruction
+# routinely ignores it — ask for n and ~1.5n comes back — so this is the ask, not the enforcement.
 REFERENCE_SUMMARY_MAX_CHARS = 2500
+# The result is accepted as written up to here — 2n, the observed overshoot ceiling. Nothing is
+# ever CUT: see build_reference_summary(). A silently shortened profile calibrates every rating in
+# the run against a profile that lost its last section (2026-10-13: the tail cut took out the
+# location and compensation sections the prompt had explicitly asked for).
+REFERENCE_SUMMARY_LIMIT_CHARS = 2 * REFERENCE_SUMMARY_MAX_CHARS
+# Share of an over-long response the model is asked to re-summarize itself down to.
+REFERENCE_SUMMARY_RETRY_SHARE = 0.4
 # No output-token cap is set anywhere, deliberately. There used to be LLM_JSON_MAX_TOKENS = 3000,
 # which no call site ever chose — all eight inherited it as a default argument — against models
 # that allow 131,072 completion tokens (glm-5.3-flash) with no server-side clamp. Every one of the

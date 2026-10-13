@@ -958,7 +958,7 @@ async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
     uncategorized = [p for p in directory.glob('*.pdf') if not p.name.startswith('cat-')]
     if not uncategorized:
         return
-    console.print(f'[dim]Categorizing {len(uncategorized)} uncategorized PDF(s) in {directory}...[/dim]')
+    logger.info(f'Categorizing {len(uncategorized)} uncategorized PDF(s) in {directory}...')
     for index, pdf in enumerate(uncategorized):
         try:
             pages = read_pdf_pages(pdf)
@@ -966,7 +966,6 @@ async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
             logger.warning(f'Could not read {pdf}, leaving uncategorized: {type(ex).__name__}: {ex}')
             console.print(f'[yellow]Warning: could not read {pdf.name}: {ex}[/yellow]')
             continue
-        console.print(f'[dim]  Categorizing {pdf.name}...[/dim]')
         prompt_text = pages_to_prompt(pages, f'PDF {pdf.name} (categorization)', PDF_PROMPT_MAX_CHARS)
         if sum(len(p) for p in pages) > PDF_PROMPT_MAX_CHARS:
             console.print(f'[yellow]Warning: {pdf.name} is over PDF_PROMPT_MAX_CHARS; see the log for sizes[/yellow]')
@@ -993,8 +992,7 @@ async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
         if category is None:
             continue
         new_name = f'cat-{category}-{pdf.name}'
-        logger.info(f'Categorized {pdf.name} -> {new_name}')
-        console.print(f'[dim]  → {new_name}[/dim]')
+        logger.info(f'Categorized {new_name!r}')
         pdf.rename(pdf.parent / new_name)
 
 
@@ -1106,12 +1104,12 @@ async def ingest_save_dir_applied_pdfs(
             logger.warning(f'Could not move {pdf} to {destination}: {type(ex).__name__}: {ex}')
             console.print(f'[yellow]Warning: could not move {pdf.name}: {ex}[/yellow]')
             continue
-        logger.info(f'Ingested applied job: {pdf.name} → {destination.name}')
+        logger.info(f'Ingested applied job: {destination.name}')
         moved += 1
 
     if moved:
         verb = 'would ingest' if dry_run else 'Ingested'
-        console.print(f'[dim]{verb} {moved} applied-job PDF(s) into {applied_to_dir}.[/dim]')
+        logger.info(f'{verb} {moved} applied-job PDF(s) into {applied_to_dir}.')
     return moved
 
 
@@ -1207,11 +1205,10 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     # without a YYYY-MM-DD prefix sorts arbitrarily.
     _reference_job_pages = [pages for _date, pages in sorted(texts, key=lambda pair: pair[0], reverse=True)]
     _applied_jobs = jobs
-    console.print(
-        f'[dim]Loaded {len(jobs)} applied job(s) within {APPLIED_JOBS_HORIZON_DAYS} days '
-        f'({len(companies)} blocklisted companies); {aged_out} of {total} beyond the horizon.[/dim]'
+    logger.info(
+        f'Loaded {len(jobs)} applied job(s) within {APPLIED_JOBS_HORIZON_DAYS} days '
+        f'({len(companies)} blocklisted companies); {aged_out} of {total} beyond the horizon.'
     )
-    logger.info(f'Applied jobs: {len(jobs)} in horizon, {aged_out} aged out, {total} on disk')
 
 
 def applied_jobs_summary() -> str:
@@ -1637,7 +1634,7 @@ def load_processed_jobs() -> None:
             console.print(f'[yellow]Warning: could not read {f}: {ex}[/yellow]')
 
     _processed_jobs = ids
-    console.print(f'[dim]Loaded {len(_processed_jobs)} previously processed job(s).[/dim]')
+    logger.info(f'Loaded {len(_processed_jobs)} previously processed job(s).')
 
 
 def forget_processed_job(site: str, job_id: str) -> int:

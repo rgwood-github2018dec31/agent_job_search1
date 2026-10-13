@@ -449,9 +449,23 @@ async def test_load_processed_jobs_combines_both(tmp_path, monkeypatch):
 # build_system_prompt
 # ---------------------------------------------------------------------------
 
-def test_build_system_prompt_includes_resume(tmp_path, monkeypatch):
+def _resume_env(tmp_path, monkeypatch) -> Path:
+    """Point BOTH resume directories at tmp_path; returns the empty save directory.
+
+    The save directory has to be redirected, not just run_dir: load_resume() reads the real
+    `save_dir` preference by default, so a test that only patched RUN_DIR would silently pick up a
+    resume out of the developer's own ~/Downloads and pass or fail by what is in it.
+    """
+    downloads = tmp_path / 'downloads'
+    downloads.mkdir()
     monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
     monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'JOB_REQUIREMENTS.md')
+    monkeypatch.setattr(preferences, 'save_dir', lambda: downloads)
+    return downloads
+
+
+def test_build_system_prompt_includes_resume(tmp_path, monkeypatch):
+    _resume_env(tmp_path, monkeypatch)
 
     (tmp_path / 'R_Garth_Wood-resume-2026Apr08v1.md').write_text('# Garth Wood\n\nExperienced engineer.')
 
@@ -461,9 +475,8 @@ def test_build_system_prompt_includes_resume(tmp_path, monkeypatch):
 
 
 def test_build_system_prompt_includes_job_requirements(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    _resume_env(tmp_path, monkeypatch)
     req_path = tmp_path / 'JOB_REQUIREMENTS.md'
-    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', req_path)
 
     req_path.write_text('# Requirements\n\n- Remote only')
 
@@ -473,12 +486,108 @@ def test_build_system_prompt_includes_job_requirements(tmp_path, monkeypatch):
 
 
 def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
-    monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', tmp_path / 'JOB_REQUIREMENTS.md')
+    _resume_env(tmp_path, monkeypatch)
 
     agent.build_system_prompt(interactive=True)
 
     assert 'Warning' in capsys.readouterr().out
+
+
+def test_print_thinking_skips_an_empty_block(capsys):
+    """A block with no text must print nothing: the bare label was ~40 lines of one query."""
+    agent.print_thinking('')
+    agent.print_thinking('   \n\t ', to_console=True)
+
+    assert 'Thinking' not in capsys.readouterr().out
+
+
+def test_print_thinking_is_log_only_unless_console_is_asked_for(capsys, caplog):
+    """The scraping and Stage 2 paths are log-only; interactive mode passes to_console=True."""
+    with caplog.at_level(logging.DEBUG, logger=agent.logger.name):
+        agent.print_thinking('Weighing the two filters')
+
+    assert 'Thinking' not in capsys.readouterr().out
+    assert [r.getMessage() for r in caplog.records if r.name == agent.logger.name] == [
+        'Thinking: Weighing the two filters']
+
+    agent.print_thinking('x' * (config.THINKING_MAX_CHARS + 25), to_console=True)
+
+    assert '25 more chars' in capsys.readouterr().out
+
+
+def test_load_resume_prefers_the_newest_across_save_dir_and_run_dir(tmp_path, monkeypatch):
+    """A resume dropped in the save directory supersedes the markdown kept in run_dir."""
+    downloads = _resume_env(tmp_path, monkeypatch)
+    stale = tmp_path / 'R_Garth_Wood-resume-2026Apr08v1.md'
+    stale.write_text('OLD MARKDOWN RESUME')
+    os.utime(stale, (1_600_000_000, 1_600_000_000))          # 2020, so the save-dir file wins
+    (downloads / 'cat-resume-R_Garth_Wood_Resume-2026oct8v2.docx.pdf').write_text('x')
+    monkeypatch.setattr(agent.tools_module, 'read_pdf_pages', lambda _path: ['NEW', 'RESUME'])
+
+    assert agent.load_resume() == 'NEW\n\nRESUME'
+
+
+def test_load_resume_reads_a_pdf_from_the_save_dir(tmp_path, monkeypatch):
+    """A docx->PDF export puts every word in its own text-showing op; the loader must reflow it."""
+    downloads = _resume_env(tmp_path, monkeypatch)
+    (downloads / 'cat-resume-Garth_Wood_AI_Engineer_Resume.docx.pdf').write_text('x')
+    monkeypatch.setattr(
+        agent.tools_module, 'read_pdf_pages', lambda _path: ['Garth\n \nWood\n \nAI Engineer']
+    )
+
+    assert agent.load_resume() == 'Garth Wood AI Engineer'
+
+
+def test_load_resume_reads_a_pdf_kept_in_run_dir(tmp_path, monkeypatch):
+    """run_dir takes a PDF too, so a resume can be pinned there instead of left in Downloads."""
+    _resume_env(tmp_path, monkeypatch)
+    (tmp_path / 'cat-resume-R_Garth_Wood_AI_Engineer_Resume-2026oct8v2.docx.pdf').write_text('x')
+    monkeypatch.setattr(agent.tools_module, 'read_pdf_pages', lambda _path: ['PDF IN RUN DIR'])
+
+    assert agent.load_resume() == 'PDF IN RUN DIR'
+
+
+def test_load_resume_counts_a_resume_matching_several_patterns_once(tmp_path, monkeypatch, caplog):
+    """`cat-resume-..._Resume-...pdf` matches two of run_dir's globs; the count must not double."""
+    _resume_env(tmp_path, monkeypatch)
+    (tmp_path / 'cat-resume-R_Garth_Wood_Resume-2026oct8v2.docx.pdf').write_text('x')
+    monkeypatch.setattr(agent.tools_module, 'read_pdf_pages', lambda _path: ['RESUME'])
+
+    with caplog.at_level(logging.INFO, logger=agent.logger.name):
+        assert agent.load_resume() == 'RESUME'
+    assert '(1 found)' in caplog.text
+
+
+def test_load_resume_falls_back_to_run_dir_when_the_save_dir_has_none(tmp_path, monkeypatch):
+    _resume_env(tmp_path, monkeypatch)
+    (tmp_path / 'R_Garth_Wood-resume-2026Apr08v1.md').write_text('MARKDOWN RESUME')
+
+    assert agent.load_resume() == 'MARKDOWN RESUME'
+
+
+def test_load_resume_returns_none_when_there_is_no_resume_anywhere(tmp_path, monkeypatch):
+    _resume_env(tmp_path, monkeypatch)
+
+    assert agent.load_resume() is None
+
+
+def test_load_resume_ignores_non_resume_files_in_the_save_dir(tmp_path, monkeypatch):
+    """Only the categorizer's `cat-resume-` label counts; a job posting in Downloads must not be it."""
+    downloads = _resume_env(tmp_path, monkeypatch)
+    (downloads / 'cat-saved_jd-Senior AI Engineer _ Acme _ LinkedIn.pdf').write_text('x')
+
+    assert agent.load_resume() is None
+
+
+def test_load_resume_warns_about_a_resume_it_cannot_read(tmp_path, monkeypatch, caplog):
+    """An unreadable resume must be reported, not silently skipped — it looks like 'no resume'."""
+    downloads = _resume_env(tmp_path, monkeypatch)
+    (downloads / 'cat-resume-Garth_Wood_Resume.docx').write_text('x')
+
+    assert agent.load_resume() is None
+    assert any(
+        'cannot read' in r.getMessage() and r.levelname == 'WARNING' for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1626,6 +1735,141 @@ async def test_build_reference_summary_cache_hit_skips_llm(tmp_path, monkeypatch
 async def test_build_reference_summary_empty_without_texts(monkeypatch):
     monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [])
     assert await agent.build_reference_summary() == ''
+
+
+def _over_limit(n: int = agent.REFERENCE_SUMMARY_LIMIT_CHARS + 500) -> str:
+    """A summary that overruns the limit, with the sections the prompt asked for at the END."""
+    return 'x' * (n - 40) + '\n\n**Location/remote:** fully remote EU or Canada.\n**Pay:** €120k.'
+
+
+async def test_reference_summary_within_the_limit_is_never_cut(tmp_path, monkeypatch):
+    """2n is accepted exactly as written — no marker, no truncation."""
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    body = 'y' * agent.REFERENCE_SUMMARY_LIMIT_CHARS
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        return body, 0.001
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    block = await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert body in block
+    assert '[truncated' not in block
+
+
+async def test_reference_summary_over_the_limit_is_re_summarized_by_the_same_provider(tmp_path, monkeypatch):
+    """Above 2n the model is asked again for 40% of what it produced, not cut."""
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    long_summary = _over_limit()
+    prompts: list[str] = []
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        prompts.append(prompt)
+        return (long_summary, 0.001) if len(prompts) == 1 else ('SHORT PROFILE', 0.001)
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    block = await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert len(prompts) == 2, 'exactly one re-summarize pass'
+    target = int(len(long_summary) * agent.REFERENCE_SUMMARY_RETRY_SHARE)
+    assert f'at most {target} characters' in prompts[1]
+    assert 'SHORT PROFILE' in block
+
+
+async def test_reference_summary_stops_the_run_when_re_summarizing_fails(tmp_path, monkeypatch):
+    """A profile that will not fit must stop the run with a Telegram message, never be cut."""
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    calls = 0
+    sent: list[str] = []
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _over_limit(), 0.001
+        raise RuntimeError('provider died mid-retry')
+
+    async def fake_notify(text):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    monkeypatch.setattr(agent, '_send_pipeline_notification', fake_notify)
+
+    with pytest.raises(agent.ReferenceSummaryTooLongError):
+        await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert sent and 'FAILED' in sent[0] and 'Nothing was truncated' in sent[0]
+    assert not (tmp_path / 'ref_cache.yaml').exists(), 'nothing may be cached from a failed run'
+
+
+async def test_reference_summary_stops_when_the_retry_is_still_over_the_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    sent: list[str] = []
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        return _over_limit(), 0.001
+
+    async def fake_notify(text):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    monkeypatch.setattr(agent, '_send_pipeline_notification', fake_notify)
+
+    with pytest.raises(agent.ReferenceSummaryTooLongError):
+        await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert sent and 'still over the limit' in sent[0]
+
+
+async def test_reference_summary_stops_when_the_retry_returns_nothing(tmp_path, monkeypatch):
+    """A blank retry must stop the run, not be cached as the profile."""
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
+    calls = 0
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        nonlocal calls
+        calls += 1
+        return (_over_limit(), 0.001) if calls == 1 else ('   \n  ', 0.001)
+
+    async def fake_notify(text):
+        return True
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    monkeypatch.setattr(agent, '_send_pipeline_notification', fake_notify)
+
+    with pytest.raises(agent.ReferenceSummaryTooLongError):
+        await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert not (tmp_path / 'ref_cache.yaml').exists()
+
+
+async def test_reference_summary_cache_over_the_limit_is_regenerated(tmp_path, monkeypatch):
+    """A cache written by the old truncating build must not be rated against."""
+    monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
+    cache_path = tmp_path / 'ref_cache.yaml'
+    monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', cache_path)
+    cache_path.write_text(yaml.dump({'hash': agent.hashlib.md5(
+        '[Reference Job 1]\nGreat AI job at Acme.'.encode('utf-8')).hexdigest(),
+        'provider': 'openrouter', 'summary': _over_limit()}), encoding='utf-8')
+    calls = 0
+
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+        nonlocal calls
+        calls += 1
+        return 'FRESH PROFILE', 0.001
+
+    monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
+    block = await agent.build_reference_summary(agent.new_stage_stats())
+
+    assert calls == 1, 'the over-long cache entry must be regenerated, not used'
+    assert 'FRESH PROFILE' in block
 
 
 # ---------------------------------------------------------------------------
@@ -8008,6 +8252,26 @@ async def test_a_direct_check_still_logs_an_already_processed_listing(monkeypatc
                for m in _info_messages(caplog))
 
 
+def test_an_oversized_find_capture_names_its_file_relative_to_the_project(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(scrape_openrouter, 'RUN_DIR', tmp_path / 'run_dir')
+    monkeypatch.setattr(scrape_openrouter, 'FIND_CAPTURE_DIR', tmp_path / 'run_dir' / 'find_captures')
+    with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
+        scrape_openrouter._capture_oversized_find('x' * 48_356, 'Principal AI Engineer')
+
+    assert any("saved a 48k char query: 'Principal AI Engineer' to run_dir/find_captures/" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_an_oversized_find_capture_survives_a_relocated_capture_dir(tmp_path, monkeypatch, caplog):
+    """A path outside the project must not raise — this runs uncaught inside the tool-call loop."""
+    monkeypatch.setattr(scrape_openrouter, 'RUN_DIR', tmp_path / 'somewhere' / 'else')
+    monkeypatch.setattr(scrape_openrouter, 'FIND_CAPTURE_DIR', tmp_path / 'captures')
+    with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
+        scrape_openrouter._capture_oversized_find('x' * 48_356, 'Principal AI Engineer')
+
+    assert any('saved a 48k char query' in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_a_harvest_logs_one_progress_line(monkeypatch, caplog):
     '''From the provider pin to the first listing the run log was silent for minutes (2026-10-10).'''
@@ -10210,7 +10474,7 @@ def test_log_run_cost_puts_elapsed_and_cost_in_the_run_log(tmp_path, caplog):
 def test_a_silent_search_logs_a_step_line_after_the_progress_interval(caplog):
     session = scrape_openrouter.ScrapeSession(lambda *a, **k: None, 'Staff AI Engineer')
     session.region = 'Canada'
-    with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=scrape_openrouter.logger.name):
         session._log_step('browser_click', {'element': 'Date posted'})
         assert not caplog.records, 'inside the interval nothing is logged'
         session._last_info_at -= config.SCRAPER_PROGRESS_LOG_SECONDS

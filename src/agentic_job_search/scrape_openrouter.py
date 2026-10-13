@@ -71,7 +71,11 @@ def _capture_oversized_find(out: str, query: str | None) -> None:
         return
     path = FIND_CAPTURE_DIR / f'{datetime.now():%Y-%m-%d_%H%M%S}.txt'
     path.write_text(out, encoding='utf-8')
-    logger.info(f'Stage 1b: saved a {len(out):,}-char browser_find result for query {query!r} to {path}')
+    try:
+        shown = path.relative_to(RUN_DIR.parent)     # run_dir/find_captures/…, not the absolute path
+    except ValueError:
+        shown = path                                 # only if the capture dir was relocated
+    logger.info(f'Stage 1b: saved a {round(len(out) / 1000)}k char query: {query!r} to {shown}')
 _FINISH_REASON_STOP = 'stop'
 
 
@@ -400,13 +404,20 @@ class ScrapeSession:
         self._last_info_at = self._started_at
 
     def _log_step(self, name: str, args: dict) -> None:
-        '''One INFO line naming the step just taken, if SCRAPER_PROGRESS_LOG_SECONDS passed in silence.'''
+        '''One DEBUG line naming the step just taken, if SCRAPER_PROGRESS_LOG_SECONDS passed in silence.
+
+        DEBUG, not INFO (2026-10-13): at a 30-second interval this was ~10 lines per query and ~60 a
+        run, every one of them saying a filter was being clicked — routine success, which this
+        project logs briefly or at DEBUG. `LOG_LEVEL=DEBUG` brings it back, which is when a query
+        that has stopped moving needs it. The default run log is therefore silent while a search
+        sets its filters, the state this line was added to fix on 2026-10-12.
+        '''
         if time.monotonic() - self._last_info_at < SCRAPER_PROGRESS_LOG_SECONDS:
             return
         detail = next((str(args[key]) for key in ('element', 'url', 'text', 'query') if args.get(key)), '')
         shown = snippet(detail, SCRAPER_STEP_ARG_MAX_CHARS) if detail else ''
-        logger.info(f'Stage 1b: "{self.query}" / {self.region or "?"} — {name} {shown}'.rstrip()
-                    + self._progress())
+        logger.debug(f'Stage 1b: "{self.query}" / {self.region or "?"} — {name} {shown}'.rstrip()
+                     + self._progress())
         self._last_info_at = time.monotonic()
 
     def _progress(self) -> str:

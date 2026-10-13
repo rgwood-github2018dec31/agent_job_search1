@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from contextlib import aclosing
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import quote_plus
 
 import requests
@@ -82,7 +82,9 @@ from agentic_job_search.config import (
     PLAYWRIGHT_STOP_TIMEOUT_SECONDS,
     RATING_AUTO_REJECT,
     REFERENCE_JOB_PROMPT_MAX_CHARS,
+    REFERENCE_SUMMARY_LIMIT_CHARS,
     REFERENCE_SUMMARY_MAX_CHARS,
+    REFERENCE_SUMMARY_RETRY_SHARE,
     REGION_OVERLAP_ALERT_THRESHOLD,
     SALARY_ESTIMATE_ENABLED,
     SALARY_FIELD_DESCRIPTION,
@@ -124,7 +126,6 @@ from agentic_job_search.salary_estimate import estimate_salary
 from agentic_job_search.text_budget import (
     pages_to_prompt,
     snippet,
-    truncate_reported,
 )
 from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
@@ -770,20 +771,77 @@ RATING_OUTPUT_SCHEMA = {
 }
 
 
-def load_resume() -> str | None:
-    """Newest `*-resume-*.md` in run_dir, or None.
+# Resume discovery. Both directories are searched, but with different patterns. The save directory
+# (preferences `save_dir`, default ~/Downloads) is where a new resume is actually dropped, and
+# categorize_save_dir_pdfs() labels it `cat-resume-` at startup, before load_resume() runs — so only
+# that precise label is trusted there, where a looser match would risk a downloaded article or a job
+# posting with "resume" in its title. run_dir is where a resume is kept deliberately, either under
+# the same label or hand-named `*-resume-*`. Either directory may hold a `.pdf` or a `.md`.
+RESUME_SAVE_DIR_GLOBS = ('*cat-resume-*',)
+RESUME_RUN_DIR_GLOBS = ('*cat-resume-*', '*-resume-*', '*-Resume-*')
+RESUME_READABLE_SUFFIXES = ('.pdf', '.md')
 
-    Markdown only — a PDF resume is not read. The applied-job corpus is the dominant signal for
-    query generation and the ideal-role profile, so converting the PDF has never been worth it.
+
+def _read_resume(path: Path) -> str:
+    """Text of a resume: a PDF through pypdf, markdown as written.
+
+    A docx->PDF export writes every word in its own text-showing operation, so pypdf hands back
+    `word\\n word\\n word` rather than lines. Whitespace is collapsed per page and pages are joined
+    by a blank line: that restores readable prose without inventing structure the PDF does not
+    carry. Measured 2026-10-13 on a 3-page resume: 8190 raw chars -> 6322 collapsed, against 6606
+    for the equivalent markdown conversion, with every section and keyword intact.
     """
-    matches = list(RUN_DIR.glob('*-resume-*.md'))
-    matches += list(RUN_DIR.glob('*-Resume-*.md'))
-    if not matches:
+    if path.suffix.lower() != '.pdf':
+        return path.read_text(encoding='utf-8')
+    pages = [' '.join(page.split()) for page in tools_module.read_pdf_pages(path)]
+    return '\n\n'.join(page for page in pages if page)
+
+
+def _resume_files() -> list[Path]:
+    """Every resume-named file in the save directory and run_dir, deduplicated.
+
+    One file can match several patterns — `cat-resume-R_Garth_Wood_Resume-2026oct8v2.docx.pdf`
+    matches two of them — and a duplicate would double-count in the "N found" line.
+    """
+    found: dict[Path, None] = {}
+    for directory, patterns in (
+        (preferences.save_dir(), RESUME_SAVE_DIR_GLOBS),
+        (RUN_DIR, RESUME_RUN_DIR_GLOBS),
+    ):
+        for pattern in patterns:
+            for path in directory.glob(pattern):
+                found[path] = None
+    return list(found)
+
+
+def load_resume() -> str | None:
+    """Newest resume in the save directory or run_dir, or None.
+
+    Newest by mtime ACROSS both directories, so dropping a fresh resume in Downloads supersedes one
+    kept in run_dir. A `.pdf` or a `.md` is read; any other format is reported at WARNING rather
+    than skipped silently, because a resume the loader cannot read is indistinguishable from there
+    being no resume at all. Until 2026-10-13 only run_dir was searched and only markdown was read,
+    so a resume revised in Downloads was invisible: the agent rated against a four-month-old copy
+    while the current one sat unread.
+    """
+    files = _resume_files()
+    candidates = [p for p in files if p.suffix.lower() in RESUME_READABLE_SUFFIXES]
+    unreadable = [p for p in files if p.suffix.lower() not in RESUME_READABLE_SUFFIXES]
+    if unreadable:
+        logger.warning(
+            f'Ignoring {len(unreadable)} resume file(s) in a format this loader cannot read '
+            f'(only {" or ".join(RESUME_READABLE_SUFFIXES)}): '
+            + ', '.join(sorted(str(p) for p in unreadable))
+        )
+    if not candidates:
         return None
-    latest = max(matches, key=lambda p: p.stat().st_mtime)
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
     mtime = datetime.fromtimestamp(latest.stat().st_mtime).strftime('%Y-%m-%d')
-    console.print(f'[dim]Loaded resume ({len(matches)} found): {latest.name} (modified {mtime})[/dim]')
-    return latest.read_text(encoding='utf-8')
+    logger.info(
+        f'Loaded resume ({len(candidates)} found): {latest.parent.name}/{latest.name} '
+        f'(modified {mtime})'
+    )
+    return _read_resume(latest)
 
 
 def build_system_prompt(interactive: bool) -> str:
@@ -796,7 +854,12 @@ def build_system_prompt(interactive: bool) -> str:
         if resume:
             parts.append(f'--- RESUME ---\n{resume}\n--- END RESUME ---')
         else:
-            console.print('[yellow]Warning: no resume file found matching *-resume-*.md[/yellow]')
+            message = (
+                f'no resume found in {preferences.save_dir()} ({" or ".join(RESUME_SAVE_DIR_GLOBS)}) '
+                f'or {RUN_DIR} ({" or ".join(RESUME_RUN_DIR_GLOBS)})'
+            )
+            logger.warning(f'No resume loaded: {message}')
+            console.print(f'[yellow]Warning: {message}[/yellow]')
 
     if JOB_REQUIREMENTS_PATH.exists():
         requirements = JOB_REQUIREMENTS_PATH.read_text(encoding='utf-8')
@@ -948,7 +1011,10 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
     if len(captured) > MAX_SEARCH_QUERIES:
         logger.info(f'Stage 1a: trimming {len(captured)} queries to the {MAX_SEARCH_QUERIES} cap: dropped {captured[MAX_SEARCH_QUERIES:]}')
         captured = captured[:MAX_SEARCH_QUERIES]
-    logger.info(f'Stage 1a: generated {len(captured)} search queries via {provider}: {captured}')
+    used_model = MODEL_NAME_QUERY if provider == 'openrouter' else ANTHROPIC_MODEL_NAME_MEDIUM
+    logger.info(
+        f'Stage 1a: generated {len(captured)} search queries via {provider}/{used_model}:\n  {captured}'
+    )
     return captured
 
 
@@ -1023,11 +1089,77 @@ async def _summarize_references_anthropic(prompt: str, stage_stats: dict | None)
     raise RuntimeError('Anthropic reference summarization returned no structured output')
 
 
+class ReferenceSummaryTooLongError(RuntimeError):
+    """The ideal-role profile would not fit, and cutting it is not permitted.
+
+    Raised to STOP the run: the profile calibrates every rating in it, so rating against a
+    truncated one is worse than not rating at all.
+    """
+
+
+async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict | None) -> str:
+    """One provider's answer to `prompt`. Raises whatever the provider raised."""
+    if provider == 'openrouter':
+        content, cost_usd = await chat_openrouter(prompt)
+        if stage_stats is not None:
+            stage_stats['cost'] += cost_usd
+        return content
+    if provider == 'ollama':
+        return await generate_local(prompt)
+    return await _summarize_references_anthropic(prompt, stage_stats)
+
+
+async def _ask_reference_providers(prompt: str, stage_stats: dict | None) -> tuple[str, str]:
+    """(summary, provider) from the first provider that answers; ('', '') when all three fail.
+
+    Provider chain: OpenRouter MCP -> local Ollama MCP -> Anthropic Haiku. Kept as a chain rather
+    than a loop so the retry below can re-ask the SAME provider that produced the over-long answer.
+    """
+    last: Exception | None = None
+    for provider in ('openrouter', 'ollama', 'anthropic'):
+        try:
+            return await _reference_summary_from(provider, prompt, stage_stats), provider
+        except Exception as ex:
+            last = ex
+            logger.warning(f'Reference summary via {provider} failed: {ex}')
+    logger.error(f'Reference summary failed on all providers, using full reference block: {last}')
+    return '', ''
+
+
+async def _stop_over_long_reference_summary(length: int, provider: str, reason: str) -> NoReturn:
+    """Report and abort: a profile that will not fit must not be cut down to fit."""
+    detail = (
+        f'Reference summary is {length} chars, over the {REFERENCE_SUMMARY_LIMIT_CHARS}-char limit, '
+        f'and re-summarizing it via {provider} {reason}'
+    )
+    logger.error(
+        f'{detail}. STOPPING: this block calibrates every rating in the run, so a cut profile '
+        f'would silently mis-rate everything after it — the sections at its end are the ones lost.'
+    )
+    await _send_pipeline_notification(
+        f'Job search run FAILED\n'
+        f'• {detail}\n'
+        f'• Nothing was truncated. The run stopped rather than rate against a cut profile.'
+    )
+    raise ReferenceSummaryTooLongError(detail)
+
+
 async def build_reference_summary(stage_stats: dict | None = None) -> str:
     """Distill the reference jobs into a compact profile block, once per corpus (cached).
 
     Provider chain: OpenRouter MCP -> local Ollama MCP -> Anthropic Haiku; each failure
     logs and falls through. Falls back to the full reference block if all three fail.
+
+    **Length is enforced by asking, never by cutting.** A model handed "at most n characters"
+    routinely returns ~1.5n, so the prompt asks for `REFERENCE_SUMMARY_MAX_CHARS` and anything up to
+    `REFERENCE_SUMMARY_LIMIT_CHARS` (2n) is accepted exactly as written. Over that, the SAME
+    provider is asked once to re-summarize what it produced down to
+    `REFERENCE_SUMMARY_RETRY_SHARE` of its length; if that call fails or still comes back over the
+    limit, the run stops with a Telegram message and nothing is stored. Truncating instead is not an
+    option — this block is the rater's 5/5 calibration for every job in the run, so a cut profile
+    mis-rates everything after it, and the cut is always the tail: measured 2026-10-13, dropping
+    806 chars removed the location/remote and compensation sections the prompt had explicitly asked
+    for, leaving the profile ending mid-heading at `**Location/`.
     """
     texts = _reference_job_texts()
     if not texts:
@@ -1041,9 +1173,17 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
             cache = yaml.safe_load(REFERENCE_SUMMARY_CACHE_PATH.read_text(encoding='utf-8')) or {}
         except Exception as ex:
             logger.warning(f'Could not read reference summary cache {REFERENCE_SUMMARY_CACHE_PATH}: {ex}')
-    if cache.get('hash') == corpus_hash_md5 and cache.get('summary'):
-        logger.info(f'Reference summary: cache hit ({len(combined)} chars → {len(cache["summary"])} chars, provider={cache.get("provider", "?")})')
-        return _wrap_reference_summary(cache['summary'], len(texts))
+    cached = str(cache.get('summary') or '')
+    if cache.get('hash') == corpus_hash_md5 and cached:
+        if len(cached) > REFERENCE_SUMMARY_LIMIT_CHARS:
+            # Written by an older build that truncated. Regenerate rather than rate against it.
+            logger.warning(
+                f'Reference summary cache holds {len(cached)} chars, over the '
+                f'{REFERENCE_SUMMARY_LIMIT_CHARS}-char limit — regenerating it'
+            )
+        else:
+            logger.info(f'Reference summary: cache hit ({len(combined)} chars → {len(cached)} chars, provider={cache.get("provider", "?")})')
+            return _wrap_reference_summary(cached, len(texts))
 
     prompt = (
         f'{combined}\n\n'
@@ -1057,25 +1197,37 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
         f'not as prose about each individual job.'
     )
 
-    summary, provider = '', ''
-    try:
-        content, cost_usd = await chat_openrouter(prompt)
-        summary, provider = content, 'openrouter'
-        if stage_stats is not None:
-            stage_stats['cost'] += cost_usd
-    except Exception as ex:
-        logger.warning(f'Reference summary via OpenRouter failed, trying local LLM: {ex}')
-        try:
-            summary, provider = await generate_local(prompt), 'ollama'
-        except Exception as ex2:
-            logger.warning(f'Reference summary via local LLM failed, trying Anthropic: {ex2}')
-            try:
-                summary, provider = await _summarize_references_anthropic(prompt, stage_stats), 'anthropic'
-            except Exception as ex3:
-                logger.error(f'Reference summary failed on all providers, using full reference block: {ex3}')
-                return build_reference_block()
+    summary, provider = await _ask_reference_providers(prompt, stage_stats)
+    summary = summary.strip()
+    if not summary:
+        return build_reference_block()
 
-    summary = truncate_reported(summary.strip(), REFERENCE_SUMMARY_MAX_CHARS, f'reference summary from {provider}')
+    if len(summary) > REFERENCE_SUMMARY_LIMIT_CHARS:
+        target = min(int(len(summary) * REFERENCE_SUMMARY_RETRY_SHARE), REFERENCE_SUMMARY_LIMIT_CHARS)
+        logger.warning(
+            f'Reference summary via {provider} returned {len(summary)} chars, over the '
+            f'{REFERENCE_SUMMARY_LIMIT_CHARS}-char limit ({REFERENCE_SUMMARY_MAX_CHARS} was asked '
+            f'for) — asking {provider} to re-summarize it to {target} chars'
+        )
+        retry_prompt = (
+            f'{summary}\n\n'
+            f'Rewrite the profile above in at most {target} characters. Keep every section and the '
+            f'same density; in particular keep the recurring titles/seniority, domains, tech stack, '
+            f'responsibilities, locations/remote patterns and compensation ranges. Output the '
+            f'rewritten profile only, with no preamble.'
+        )
+        try:
+            shorter = (await _reference_summary_from(provider, retry_prompt, stage_stats)).strip()
+        except Exception as ex:
+            await _stop_over_long_reference_summary(
+                len(summary), provider, f'failed ({type(ex).__name__}: {unwrap_exception(ex)})')
+        if not shorter:
+            await _stop_over_long_reference_summary(len(summary), provider, 'returned nothing')
+        if len(shorter) > REFERENCE_SUMMARY_LIMIT_CHARS:
+            await _stop_over_long_reference_summary(
+                len(shorter), provider, f'returned {len(shorter)} chars, still over the limit')
+        summary = shorter
+
     logger.info(f'Reference summary: {len(combined)} chars → {len(summary)} chars via {provider}')
     REFERENCE_SUMMARY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     REFERENCE_SUMMARY_CACHE_PATH.write_text(
@@ -1095,9 +1247,20 @@ def _wrap_reference_summary(summary: str, num_jobs: int) -> str:
 
 # --- Runner ---
 
-def print_thinking(text: str) -> None:
+def print_thinking(text: str, *, to_console: bool = False) -> None:
+    """Show a thinking block at DEBUG; `to_console` adds the live console copy.
+
+    Only interactive mode asks for the console copy — it is a live chat UI. On the scraping and
+    Stage 2 paths the narration belongs in the run log, and a block with no text prints nothing
+    either way, because a model configured to omit thinking content still emits the block and the
+    bare label was ~40 empty `Thinking:` lines in one query (2026-10-13).
+    """
+    if not text.strip():
+        return
     display = text if len(text) <= THINKING_MAX_CHARS else text[:THINKING_MAX_CHARS] + f'\n… ({len(text) - THINKING_MAX_CHARS} more chars)'
-    console.print(f'\n[dim italic]Thinking: {display}[/dim italic]\n')
+    logger.debug(f'Thinking: {display}')
+    if to_console:
+        console.print(f'\n[dim italic]Thinking: {display}[/dim italic]\n')
 
 
 def log_agent_text(stage: str, text: str) -> None:
@@ -1359,7 +1522,7 @@ async def run_interactive(client: ClaudeSDKClient) -> None:
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, ThinkingBlock):
-                        print_thinking(block.thinking)
+                        print_thinking(block.thinking, to_console=True)
                     elif isinstance(block, TextBlock):
                         print(block.text, flush=True)
                         log_agent_text('Interactive', block.text)
@@ -1703,7 +1866,6 @@ def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict, max_cost_usd
                     if isinstance(block, ThinkingBlock):
                         print_thinking(block.thinking)
                     elif isinstance(block, TextBlock):
-                        print(block.text, flush=True)
                         log_agent_text('Stage 1b', block.text)
             elif isinstance(msg, ResultMessage):
                 cost_delta = accumulate_stage_stats(stage_stats, msg)
@@ -1872,7 +2034,7 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
 async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNarration) -> None:
     """The per-query loop of `run_scraper`, which owns the narration's lifetime."""
     for i, query in enumerate(queries, 1):
-        console.print(f'[cyan]Stage 1b: query {i}/{len(queries)} — "{query}"[/cyan]')
+        logger.debug(f'Stage 1b: query {i}/{len(queries)} — "{query}"')
         narration.begin(query)
         if i > 1:
             await _human_pause(SCRAPER_INTER_QUERY_DELAY_SECONDS, f'query {i}/{len(queries)}')
@@ -2111,7 +2273,6 @@ async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: d
                     if isinstance(block, ThinkingBlock):
                         print_thinking(block.thinking)
                     elif isinstance(block, TextBlock):
-                        print(block.text, flush=True)
                         log_agent_text('Stage 2a', block.text)
             elif isinstance(msg, ResultMessage):
                 cost_delta = accumulate_stage_stats(stage_stats, msg)
@@ -3809,7 +3970,7 @@ async def evaluate_all_candidates(
             break
         candidate = candidates[index]
         index += 1
-        console.print(f"[dim]Evaluating: {candidate['company']} — {candidate['title']}[/dim]")
+        logger.debug(f"Evaluating: {candidate['company']} — {candidate['title']}")
         try:
             page: JobPage | None = None
             if route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
@@ -4524,7 +4685,6 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 'elapsed_minutes': (time.time() - start_time) / SECONDS_PER_MINUTE,
             })
             return
-        console.print(f'[dim]Queries: {queries}[/dim]\n')
 
         console.print('[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n')
         await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats['scraping'])
@@ -4685,7 +4845,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         'scrape_per_query': dict(tools_module._scrape_per_query),
         **funnel,
     }
-    logger.info(f'Run funnel: {json.dumps(funnel_summary)}')
+    logger.debug(f'Run funnel: {json.dumps(funnel_summary)}')
 
     # Discovery-health alerts. A run that finds nothing because the page changed, because a region
     # collapsed, or because the pool is exhausted must not look the same as a healthy quiet run.
