@@ -110,6 +110,7 @@ from agentic_job_search.config import (
     THINKING_MAX_CHARS,
     TRIAGE_DISAGREEMENT_LOG_MIN,
     TRIAGE_ENABLED,
+    WORKING_LANGUAGE_MIN_KNOWN_MASS,
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
 )
@@ -2784,9 +2785,9 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     if extract.get('stated_working_language'):
         lines.append(f"Stated working language: {extract['stated_working_language']}")
     # The location's guess is shown only when the posting is silent on language: the JD wins.
-    if extract.get('likely_working_language') and not posting_states_working_language(extract):
+    if (shares := extract.get('likely_spoken_languages')) and not posting_states_working_language(extract):
         marginal = ' (marginal: remote across a multilingual area)' if working_language_is_marginal(extract) else ''
-        lines.append(f"Likely working language: {extract['likely_working_language']}{marginal}")
+        lines.append(f'Likely spoken languages: {language_share_text(shares)}{marginal}')
     # A requirement the user already meets is told to the rater as met, not dropped: the JD still
     # says 'remote within Canada', and the rater does not otherwise know where the user lives.
     if relocation_already_met(extract.get('relocation', '')):
@@ -2871,9 +2872,11 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
 def _unsupported_language(value: str) -> str:
     """The language named, if it is one the user does not work in; '' otherwise.
 
-    Returns '' when the field is unset and when no languages are configured, so every rule built
-    on this is inert under neutral defaults. Matching is by substring in the same direction as the
-    `language_requirement` gate, so 'english (uk)' counts as english.
+    For the two SCALAR language fields (`posting_language`, `stated_working_language`), which name
+    one language and are not distributions. Returns '' when the field is unset and when no
+    languages are configured, so every rule built on this is inert under neutral defaults. Matching
+    is by substring in the same direction as the `language_requirement` gate, so 'english (uk)'
+    counts as english.
     """
     known = preferences.languages()
     text = str(value or '').strip().lower()
@@ -2887,9 +2890,50 @@ def foreign_posting_language(extract: dict) -> str:
     return _unsupported_language(extract.get('posting_language', ''))
 
 
-def foreign_likely_working_language(extract: dict) -> str:
-    """The language implied by the job's location, when it is not one the user speaks."""
-    return _unsupported_language(extract.get('likely_working_language', ''))
+def _language_is_known(language: str, known: tuple[str, ...]) -> bool:
+    """True when `language` is one the user works in, matched either direction.
+
+    Substring both ways: a configured 'english' matches the classifier's key 'english (uk)', and a
+    configured 'english (uk)' matches the key 'english'. The keys are short lowercase names from a
+    controlled vocabulary, while a preference may be qualified. An empty name is never a language:
+    `'' in lang` is True for every lang, so without this a malformed key would silently count as one
+    the user works in and quieten the warning.
+    """
+    if not language:
+        return False
+    return any(lang in language or language in lang for lang in known)
+
+
+def known_language_mass(shares: dict[str, float]) -> float:
+    """How much of a location's spoken languages the user actually works in.
+
+    1.0 when nothing is configured or nothing was answered, so every rule built on this is inert
+    under neutral defaults -- the same fail-open shape as `_unsupported_language`.
+    """
+    known = preferences.languages()
+    if not known or not shares:
+        return 1.0
+    return sum(fraction for language, fraction in shares.items() if _language_is_known(language, known))
+
+
+def language_share_text(shares: dict[str, float]) -> str:
+    """'german 60%, english 40%' -- integer percentages, largest share first, adding to 100.
+
+    Integer percentages, not the raw fractions: the shares are exact multiples of 1e-4, and a
+    bullet reading 'german 0.6000000000000001' is a measurement shown as noise. The remainder lost
+    to flooring goes to the largest fractional parts, so the displayed percentages add to 100.
+    """
+    ordered = sorted(shares.items(), key=lambda kv: (-kv[1], kv[0]))
+    if not ordered:
+        return ''
+    floors = [(name, int(fraction * 100)) for name, fraction in ordered]
+    leftover = 100 - sum(value for _, value in floors)
+    by_fraction = sorted(
+        range(len(ordered)), key=lambda i: (-(ordered[i][1] * 100 - floors[i][1]), i)
+    )
+    for index in by_fraction[:leftover]:
+        floors[index] = (floors[index][0], floors[index][1] + 1)
+    return ', '.join(f'{name} {value}%' for name, value in floors)
 
 
 def posting_states_working_language(extract: dict) -> bool:
@@ -2916,34 +2960,40 @@ def working_language_is_marginal(extract: dict) -> bool:
 
 
 def working_language_warnings(extract: dict) -> list[str]:
-    """The working-language bullets, in precedence order (Detect Likely Working Language).
+    """The working-language bullets, in precedence order (Detect Likely Spoken Languages).
 
     1. The posting states a working language or a required one -> it wins. A stated language the
        user does not speak gets its own bullet; the location's guess is never shown.
-    2. Otherwise the location's likely working language, when the user does not speak it --
-       marked marginal for a remote role across a multi-country area.
+    2. Otherwise the location's likely spoken languages, when the user's own languages hold less
+       than WORKING_LANGUAGE_MIN_KNOWN_MASS of the distribution -- marked marginal for a remote
+       role across a multi-country area.
     """
     if posting_states_working_language(extract):
         if stated := _unsupported_language(extract.get('stated_working_language', '')):
             return [f'Working language: {stated.title()} (stated in posting)']
         return []
-    if not (language := foreign_likely_working_language(extract)):
+    shares = extract.get('likely_spoken_languages') or {}
+    if not shares or known_language_mass(shares) >= WORKING_LANGUAGE_MIN_KNOWN_MASS:
         return []
     location = extract.get('location') or 'location not stated'
+    spoken = language_share_text(shares)
     if working_language_is_marginal(extract):
-        return [f'Likely working language (marginal — remote across a multilingual area): '
-                f'{language.title()} — {location}']
-    return [f'Likely working language: {language.title()} — {location}']
+        return [f'Likely spoken languages (marginal — remote across a multilingual area): '
+                f'{spoken} — {location}']
+    return [f'Likely spoken languages: {spoken} — {location}']
 
 
-async def derive_likely_working_language(extract: dict) -> str:
-    """The language a professional team at the job's location most likely works in. NO gate reads this.
+async def derive_likely_spoken_languages(extract: dict) -> dict[str, float]:
+    """The languages a professional team at the job's location likely works in. NO gate reads this.
 
-    A place implies a working language -- Paris implies French, Montreal French, Toronto English --
-    and that is world knowledge about a location, not a judgement about the posting. It is the
-    language business is actually done in, not the national one: Luxembourg answered
-    `luxembourgish` under the old national-language question (2026-09-29). So the cached classifier is the only source:
-    it cannot answer two Berlin jobs differently, within a run or across runs.
+    A place implies languages -- Paris implies French, Montreal French, Toronto English -- and that
+    is world knowledge about a location, not a judgement about the posting. It is the language
+    business is actually done in, not the national one: Luxembourg answered `luxembourgish` under
+    the old national-language question (2026-09-29). The answer is a DISTRIBUTION (2026-10-14),
+    because a single language forced a coin flip on an ambiguous place -- "Berlin, Germany (Remote
+    across Europe)" came back `english` or `german` depending on the sample -- and a split says what
+    one word cannot. So the cached classifier is the only source: it cannot answer two Berlin jobs
+    differently, within a run or across runs.
 
     The extractor used to supply this too, under a rule where its foreign finding won over the
     classifier's. That bought one thing -- a language named only in the body, like Valtech's
@@ -2953,7 +3003,8 @@ async def derive_likely_working_language(extract: dict) -> str:
     fact about the page and stays a model judgement for that reason.
     """
     facts = await classify_location(extract.get('location', ''))
-    return str(facts.get('likely_working_language') or '').strip().lower()
+    shares = facts.get('likely_spoken_languages')
+    return dict(shares) if isinstance(shares, dict) else {}
 
 
 def commute_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
@@ -3081,7 +3132,7 @@ async def rejected_location(text: str, *, residency_spare: str = 'none') -> str:
     "non-English AND not on the acceptable list", which got the right answers for the wrong reason
     and would have excluded a French-language remote role in Canada — the exempt list named
     Vancouver and British Columbia but not Canada itself. What language is spoken somewhere is a
-    separate fact (`likely_working_language`), it warns only, and must never be folded back in here.
+    separate fact (`likely_spoken_languages`), it warns only, and must never be folded back in here.
 
     In order, cheapest first:
       1. unconfigured (`would_live_here` and `would_not_live_here` both empty) -> '', and no
@@ -3821,7 +3872,7 @@ async def _save_and_notify(
 
 EXTRACT_SIGNAL_FIELDS = (
     'date_posted', 'location', 'closed', 'language_requirement', 'posting_language',
-    'likely_working_language', 'stated_working_language', 'relocation',
+    'likely_spoken_languages', 'stated_working_language', 'relocation',
 )
 EXTRACT_SIGNAL_FIELDS_AFTER_RESIDENCY = ('education_requirement',)
 
@@ -3999,11 +4050,11 @@ async def evaluate_all_candidates(
                 logger.warning(f"Extract failed (both paths): {candidate['company']} — {candidate['title']}")
                 continue
             bump('extract_ok')
-            # Resolve the likely working language ONCE, here, and write it back — so
+            # Resolve the likely spoken languages ONCE, here, and write it back — so
             # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
             # field. Cosmetic only: no gate reads it, by design. `broad_area` rides along from the
             # same cached answer, for the marginal-warning rule.
-            extract['likely_working_language'] = await derive_likely_working_language(extract)
+            extract['likely_spoken_languages'] = await derive_likely_spoken_languages(extract)
             extract['location_broad_area'] = bool(
                 (await classify_location(extract.get('location', ''))).get('broad_area'))
             # Same treatment for residency_scope, and for the same reason: resolve once here so
@@ -4012,7 +4063,7 @@ async def evaluate_all_candidates(
             raw_residency_scope = str(extract.get('residency_scope') or '')
             extract['residency_scope'] = derive_residency_scope(extract)
             # Every other name this place goes by, resolved ONCE (the classifier answer is already
-            # cached from derive_likely_working_language above, which now calls it unconditionally,
+            # cached from derive_likely_spoken_languages above, which now calls it unconditionally,
             # so this is always free) and written back, so the sync consumers below read a plain
             # field instead of each needing to be async.
             extract['place_names'] = (

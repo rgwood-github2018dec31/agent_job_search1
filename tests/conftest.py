@@ -174,9 +174,9 @@ def fake_classify(text):
     names = [_GEO_KEYS[match.group(1).casefold()] for match in _GEO_RE.finditer(haystack)]
     countries, regions, language = [], [], ''
     for name in names:
-        country, region, likely_working_language = FAKE_GEOGRAPHY[name]
+        country, region, place_language = FAKE_GEOGRAPHY[name]
         if not language:
-            language = likely_working_language
+            language = place_language
         if country in countries:
             continue
         countries.append(country)
@@ -196,7 +196,10 @@ def fake_classify(text):
         place_names += FAKE_EXONYMS.get(name, [])
     return {
         'countries': countries, 'regions': regions, 'broad_area': broad,
-        'likely_working_language': language, 'place_names': list(dict.fromkeys(place_names)),
+        # The stub answers with a CERTAIN distribution. The split is exercised where it belongs --
+        # against `_language_shares` and the warning threshold -- not by faking one here.
+        'likely_spoken_languages': {language: 1.0} if language else {},
+        'place_names': list(dict.fromkeys(place_names)),
         'source': 'stub',
     }
 

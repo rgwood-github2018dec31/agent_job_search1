@@ -9,6 +9,14 @@ JOB_MAX_AGE_DAYS = 21
 JOB_STALE_AGE_DAYS = 30  # hard rule: postings older than this are auto-rated RATING_AUTO_REJECT
 MAX_REFERENCE_JOBS = 20
 THINKING_MAX_CHARS = 1000
+# A location's spoken languages are a distribution (`likely_spoken_languages`), and the warning
+# fires when the languages the user works in hold less than this share of it. A threshold rather
+# than "the top language", because a single answer to an ambiguous place is a coin flip:
+# "Berlin, Germany (Remote across Europe)" is a role open across a continent, and
+# {german: 0.6, english: 0.4} should still warn for an English-only user (0.4 < 0.5) while a
+# certain answer in a language they speak (mass 1.0) never does. 0.5 reads as "more likely than
+# not that the office works in a language you do not" — see Detect Likely Spoken Languages.
+WORKING_LANGUAGE_MIN_KNOWN_MASS = 0.5
 # Applied-job corpus: only records applied to within this window feed query generation,
 # the ideal-role profile, and the already-applied company blocklist. Older PDFs are kept
 # on disk but never read. An applied-to company must stay blocked long enough to cover a
@@ -474,7 +482,7 @@ SALARY_FIELD_DESCRIPTION = (
     'Put bonus/equity wording after the amounts. Leave empty ONLY when the page states no pay at all.'
 )
 # Shared by every extract schema, like SALARY_FIELD_DESCRIPTION. A language the posting SAYS the
-# work is done in beats the one the location implies (Detect Likely Working Language).
+# work is done in beats the one the location implies (Detect Likely Spoken Languages).
 STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION = (
     'The language(s) the posting SAYS the team or company works in, lowercase, e.g. "english" for '
     '"our working language is English" or "international English-speaking team". Leave empty '

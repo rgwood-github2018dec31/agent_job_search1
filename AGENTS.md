@@ -160,7 +160,7 @@ run_dir/
   processed_jobs/                 # Per-job YAML records for deduplication
   audit_logs/                     # Per-run audit trace (audit-{date}-{time}.md)
   reference_summary_cache.yaml    # Cached distilled ideal-role profile (md5-keyed)
-  location_cache.yaml             # Cached geography per location string (country/region/language)
+  location_cache.yaml             # Cached geography per location string (country/region/languages)
   salary_cache.yaml               # Cached salary reading per salary string (kind/bounds/currency/period)
   fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)

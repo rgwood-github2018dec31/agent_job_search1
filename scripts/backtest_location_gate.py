@@ -51,8 +51,9 @@ FIELD_RE = {
     'relocation': re.compile(r'^Relocation required:[ \t]*(\S.*)$', re.MULTILINE),
     # Every label the field has carried: postings saved before each rename keep the old one, and
     # a backtest that silently parsed nothing from them would look exactly like a clean run.
-    'likely_working_language': re.compile(
-        r'^(?:Likely working language|Implied local language|Local working language):[ \t]*(\S.*)$',
+    'likely_spoken_languages': re.compile(
+        r'^(?:Likely spoken languages|Likely working language|Implied local language'
+        r'|Local working language):[ \t]*(\S.*)$',
         re.MULTILINE),
     'posting_language': re.compile(r'^Posting written in:[ \t]*(\S.*)$', re.MULTILINE),
     'workplace': re.compile(r'^Workplace:[ \t]*(\S.*)$', re.MULTILINE),

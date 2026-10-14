@@ -1363,7 +1363,7 @@ def _make_extract(**overrides) -> dict:
         'location': 'Canada (Remote)', 'date_posted': '3 days ago',
         'closed': False, 'salary': '', 'sponsorship_note': '',
         'language_requirement': '', 'relocation': '', 'education_requirement': '',
-        'posting_language': '', 'likely_working_language': '', 'residency_scope': '',
+        'posting_language': '', 'likely_spoken_languages': {}, 'residency_scope': '',
     }
     extract.update(overrides)
     return extract
@@ -2358,7 +2358,13 @@ async def test_classify_location_live(monkeypatch, tmp_path):
     # that answers 'germany' fails here rather than being quietly normalised into agreement.
     assert facts['countries'] == ['Germany']
     assert facts['regions'] == ['western_europe']
-    assert facts['likely_working_language'] == 'german'
+    # A DISTRIBUTION, and the assertion deliberately stops short of pinning which language wins. A
+    # scalar made this a coin flip -- the model answered `english` about as often as `german` for a
+    # posting that says "Remote across Europe" -- and the split is the honest answer, so what is
+    # checked is that it IS a distribution adding to 1 with the anchor country's language in it.
+    shares = facts['likely_spoken_languages']
+    assert sum(shares.values()) == pytest.approx(1.0, abs=1e-6), shares
+    assert shares.get('german', 0) >= 0.25, f'Berlin is a German-speaking office; got {shares}'
 
     # The distinction the whole gate rests on: a Mediterranean location is a different region,
     # regardless of the language spoken there.
@@ -4884,15 +4890,56 @@ def test_foreign_posting_language(value, expected):
     assert agent.foreign_posting_language(_make_extract(posting_language=value)) == expected
 
 
-@pytest.mark.parametrize('value,expected', [
-    ('french', 'french'),
-    ('spanish', 'spanish'),
-    ('english', ''),
-    ('', ''),
+@pytest.mark.parametrize('shares,expected', [
+    ({'french': 1.0}, 0.0),
+    ({'spanish': 1.0}, 0.0),
+    ({'english': 1.0}, 1.0),
+    ({'german': 0.6, 'english': 0.4}, 0.4),
+    ({}, 1.0),
+    ({'': 1.0}, 0.0),  # a malformed key is not a language, and must not read as one you work in
 ])
-def test_foreign_likely_working_language(value, expected):
-    assert agent.foreign_likely_working_language(
-        _make_extract(likely_working_language=value)) == expected
+def test_known_language_mass(shares, expected):
+    """The share of a location's languages the user works in.
+
+    1.0 is INERT (nothing to warn about), not "every language is known" -- so an unconfigured or
+    unanswered field leaves every rule built on it switched off.
+    """
+    assert agent.known_language_mass(shares) == pytest.approx(expected)
+
+
+def test_a_split_distribution_warns_on_the_mass_the_user_cannot_speak():
+    """The point of the distribution: 'Berlin, Germany (Remote across Europe)' is not a coin flip.
+
+    An English-only user holds 0.4 of {german: 0.6, english: 0.4}, below
+    WORKING_LANGUAGE_MIN_KNOWN_MASS, so it warns -- and the bullet states the split rather than
+    picking a winner, which is what the scalar field could never do.
+    """
+    extract = _make_extract(
+        location='Berlin, Germany (Remote across Europe)',
+        likely_spoken_languages={'german': 0.6, 'english': 0.4},
+    )
+    assert _language_bullets(extract) == [
+        'Likely spoken languages: german 60%, english 40% — Berlin, Germany (Remote across Europe)']
+
+
+def test_a_split_the_user_holds_half_of_does_not_warn():
+    '''At exactly the threshold the user is not more likely than not outside it, so it stays quiet.'''
+    extract = _make_extract(
+        location='Montreal, Canada', likely_spoken_languages={'french': 0.5, 'english': 0.5})
+    assert _language_bullets(extract) == []
+
+
+def test_a_certain_foreign_language_still_warns():
+    extract = _make_extract(location='Paris, France', likely_spoken_languages={'french': 1.0})
+    assert _language_bullets(extract) == ['Likely spoken languages: french 100% — Paris, France']
+
+
+def test_language_share_text_percentages_add_to_100():
+    '''Integer percentages, largest first. 0.33+0.33+0.33 would be a lie about a distribution.'''
+    assert agent.language_share_text({'a': 0.3334, 'b': 0.3333, 'c': 0.3333}) == 'a 34%, b 33%, c 33%'
+    assert agent.language_share_text({'german': 0.6, 'english': 0.4}) == 'german 60%, english 40%'
+    assert agent.language_share_text({'english': 1.0}) == 'english 100%'
+    assert agent.language_share_text({}) == ''
 
 
 def test_apply_rating_caps_caps_foreign_language_posting():
@@ -4910,9 +4957,9 @@ def test_apply_rating_caps_foreign_language_does_not_raise_a_low_rating():
     assert agent.apply_rating_caps(_make_extract(posting_language='french'), 2) == (2, '')
 
 
-def test_apply_rating_caps_likely_working_language_alone_never_caps():
+def test_apply_rating_caps_likely_spoken_languages_alone_never_cap():
     """A non-English workplace is a warning, not a ceiling — only the JD's own language caps."""
-    assert agent.apply_rating_caps(_make_extract(likely_working_language='french'), 5) == (5, '')
+    assert agent.apply_rating_caps(_make_extract(likely_spoken_languages={'french': 1.0}), 5) == (5, '')
 
 
 def test_apply_rating_caps_applies_lowest_cap_and_reports_every_reason(monkeypatch):
@@ -4932,18 +4979,19 @@ def test_build_deterministic_warnings_flags_foreign_posting_language():
     assert any('Posting written in French' in w for w in warnings)
 
 
-def test_build_deterministic_warnings_flags_non_english_likely_working_language():
-    '''Reads the RESOLVED field; `derive_likely_working_language` is what puts it there.'''
+def test_build_deterministic_warnings_flags_a_foreign_likely_spoken_language():
+    '''Reads the RESOLVED field; `derive_likely_spoken_languages` is what puts it there.'''
     extract = _make_extract(
-        likely_working_language='french', location='Montreal, Canada', salary='CAD 200,000 - 240,000 per year',
+        likely_spoken_languages={'french': 1.0}, location='Montreal, Canada',
+        salary='CAD 200,000 - 240,000 per year',
     )
     warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
-    assert any('Likely working language: French' in w and 'Montreal, Canada' in w for w in warnings)
+    assert any('Likely spoken languages: french 100%' in w and 'Montreal, Canada' in w for w in warnings)
 
 
 @pytest.mark.parametrize('overrides', [
-    {'posting_language': 'english', 'likely_working_language': 'english'},
-    {'posting_language': '', 'likely_working_language': ''},
+    {'posting_language': 'english', 'likely_spoken_languages': {'english': 1.0}},
+    {'posting_language': '', 'likely_spoken_languages': {}},
 ])
 def test_build_deterministic_warnings_quiet_for_english_language_fields(overrides):
     extract = _make_extract(salary='CAD 200,000 - 240,000 per year', **overrides)
@@ -4952,16 +5000,16 @@ def test_build_deterministic_warnings_quiet_for_english_language_fields(override
 
 def test_format_extract_text_includes_language_fields():
     text = agent.format_extract_text(
-        _make_candidate(), _make_extract(posting_language='french', likely_working_language='french'),
+        _make_candidate(), _make_extract(posting_language='french', likely_spoken_languages={'french': 1.0}),
     )
     assert 'Posting written in: french' in text
-    assert 'Likely working language: french' in text
+    assert 'Likely spoken languages: french 100%' in text
 
 
 def test_format_extract_text_omits_empty_language_fields():
     text = agent.format_extract_text(_make_candidate(), _make_extract())
     assert 'Posting written in:' not in text
-    assert 'Likely working language:' not in text
+    assert 'Likely spoken languages:' not in text
 
 
 def test_valtech_regression_french_posting_is_capped_and_warned():
@@ -4986,7 +5034,7 @@ def test_valtech_regression_french_posting_is_capped_and_warned():
     # was one sentence in the body ('colleagues outside Quebec'); `Canada (Remote)` implies English,
     # and the implied local language is now a fact about the place alone. The outcome is unchanged
     # — `posting_language` is a fact about the PAGE, still a model judgement, and still caps here.
-    assert not any('Likely working language' in w for w in warnings)
+    assert not any('Likely spoken languages' in w for w in warnings)
 
 
 def _language_bullets(extract: dict) -> list[str]:
@@ -4999,20 +5047,20 @@ def test_luxembourg_work_from_anywhere_regression_is_marginal():
     sat in a Luxembourg office; if the location's language is foreign at all, it is marginal."""
     extract = _make_extract(
         location='Luxembourg (Remote — "Remote-First, work from anywhere")', workplace_type='remote',
-        description=_NEUTRAL_DESCRIPTION, likely_working_language='french',
+        description=_NEUTRAL_DESCRIPTION, likely_spoken_languages={'french': 1.0},
         salary='EUR 120,000 - 150,000 per year',
     )
     extract['residency_scope'] = agent.derive_residency_scope(extract)
     assert extract['residency_scope'] == 'area_wide'
     bullets = _language_bullets(extract)
     assert len(bullets) == 1
-    assert bullets[0].startswith('Likely working language (marginal — remote across a multilingual area): French')
+    assert bullets[0].startswith('Likely spoken languages (marginal — remote across a multilingual area): french 100%')
 
 
 def test_remote_in_a_broad_area_is_marginal():
     extract = _make_extract(
         location='European Union (Remote)', workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
-        likely_working_language='german', location_broad_area=True,
+        likely_spoken_languages={'german': 1.0}, location_broad_area=True,
     )
     assert 'marginal' in _language_bullets(extract)[0]
 
@@ -5021,26 +5069,26 @@ def test_hybrid_in_an_area_wide_posting_is_not_marginal():
     """Marginal needs the holder to be remote: a hybrid role sits in the office's language."""
     extract = _make_extract(
         location='Madrid, Spain (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
-        likely_working_language='spanish', residency_scope='area_wide',
+        likely_spoken_languages={'spanish': 1.0}, residency_scope='area_wide',
     )
-    assert _language_bullets(extract) == ['Likely working language: Spanish — Madrid, Spain (Hybrid)']
+    assert _language_bullets(extract) == ['Likely spoken languages: spanish 100% — Madrid, Spain (Hybrid)']
 
 
 def test_a_stated_english_working_language_silences_the_location_guess():
     extract = _make_extract(
         location='Berlin, Germany (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
-        likely_working_language='german', stated_working_language='english',
+        likely_spoken_languages={'german': 1.0}, stated_working_language='english',
     )
     assert _language_bullets(extract) == []
     text = agent.format_extract_text(_make_candidate(), extract)
     assert 'Stated working language: english' in text
-    assert 'Likely working language:' not in text
+    assert 'Likely spoken languages:' not in text
 
 
 def test_a_stated_foreign_working_language_gets_its_own_bullet():
     extract = _make_extract(
         location='Toronto, Canada (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
-        likely_working_language='english', stated_working_language='german',
+        likely_spoken_languages={'english': 1.0}, stated_working_language='german',
     )
     assert _language_bullets(extract) == ['Working language: German (stated in posting)']
 
@@ -5050,7 +5098,7 @@ def test_a_language_requirement_silences_the_location_guess():
     names only languages the user speaks -- and it is the posting speaking, which wins.'''
     extract = _make_extract(
         location='Paris, France (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
-        likely_working_language='french', language_requirement='english',
+        likely_spoken_languages={'french': 1.0}, language_requirement='english',
     )
     assert _language_bullets(extract) == []
 
@@ -5058,10 +5106,10 @@ def test_a_language_requirement_silences_the_location_guess():
 def test_format_extract_text_marks_a_marginal_working_language():
     extract = _make_extract(
         location='European Union (Remote)', workplace_type='remote', description=_NEUTRAL_DESCRIPTION,
-        likely_working_language='german', location_broad_area=True,
+        likely_spoken_languages={'german': 1.0}, location_broad_area=True,
     )
     text = agent.format_extract_text(_make_candidate(), extract)
-    assert 'Likely working language: german (marginal: remote across a multilingual area)' in text
+    assert 'Likely spoken languages: german 100% (marginal: remote across a multilingual area)' in text
 
 
 # ---------------------------------------------------------------------------
@@ -5781,10 +5829,10 @@ async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences
 def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences):
     '''With no languages configured there is nothing to be foreign to — no cap, no warning.'''
     extract = _make_extract(
-        posting_language='french', likely_working_language='french', salary='CAD 200,000 - 240,000 per year',
+        posting_language='french', likely_spoken_languages={'french': 1.0}, salary='CAD 200,000 - 240,000 per year',
     )
     assert agent.foreign_posting_language(extract) == ''
-    assert agent.foreign_likely_working_language(extract) == ''
+    assert agent.known_language_mass(extract['likely_spoken_languages']) == 1.0
     assert agent.apply_rating_caps(extract, 5) == (5, '')
     assert agent.build_deterministic_warnings(_make_candidate(), extract) == []
 
@@ -5951,7 +5999,7 @@ async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatc
     assert facts['source'] == 'stale'
     assert facts['regions'] == ['western_europe'], 'the region gate still works from the old answer'
     assert facts['place_names'] == [], 'but no aliases until it can actually be upgraded'
-    assert facts['likely_working_language'] == 'german', (
+    assert facts['likely_spoken_languages'] == {'german': 1.0}, (
         'the pre-rename key still reads: this is the one path that serves an un-upgraded entry'
     )
 
@@ -5967,7 +6015,7 @@ async def test_an_entry_from_the_national_language_question_is_re_asked(monkeypa
     async def fake_chat(prompt, **kwargs):
         calls.append(prompt)
         return ('{"countries": ["Luxembourg"], "regions": ["western_europe"], "broad_area": false, '
-                '"likely_working_language": "english", "place_names": ["Luxembourg"]}'), 0.0
+                '"likely_spoken_languages": {"english": 1.0}, "place_names": ["Luxembourg"]}'), 0.0
 
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {
@@ -5979,7 +6027,34 @@ async def test_an_entry_from_the_national_language_question_is_re_asked(monkeypa
 
     facts = await location.classify_location('Luxembourg (Remote)')
     assert len(calls) == 1 and facts['source'] == 'llm'
-    assert facts['likely_working_language'] == 'english'
+    assert facts['likely_spoken_languages'] == {'english': 1.0}
+
+
+async def test_a_scalar_language_entry_is_re_asked(monkeypatch, tmp_path):
+    '''The 2026-10-14 rename is itself the cache invalidation.
+
+    A scalar answer cannot express a split, and serving one would freeze a coin flip for that
+    location forever, so an entry carrying only `likely_working_language` is a miss and is re-asked.
+    '''
+    calls = []
+
+    async def fake_chat(prompt, **kwargs):
+        calls.append(prompt)
+        return ('{"countries": ["Germany"], "regions": ["western_europe"], "broad_area": false, '
+                '"likely_spoken_languages": {"german": 0.6, "english": 0.4}, '
+                '"place_names": ["Berlin"]}'), 0.0
+
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {
+        'berlin, germany': {'countries': ['Germany'], 'regions': ['western_europe'],
+                            'broad_area': False, 'likely_working_language': 'german',
+                            'place_names': ['Berlin']},
+    })
+    monkeypatch.setattr(location, 'chat_openrouter', fake_chat)
+
+    facts = await location.classify_location('Berlin, Germany')
+    assert len(calls) == 1 and facts['source'] == 'llm', 'the scalar entry must not be served'
+    assert facts['likely_spoken_languages'] == {'german': 0.6, 'english': 0.4}
 
 
 async def test_a_failed_re_ask_serves_the_old_language_answer(monkeypatch, tmp_path):
@@ -5994,7 +6069,7 @@ async def test_a_failed_re_ask_serves_the_old_language_answer(monkeypatch, tmp_p
 
     facts = await location.classify_location('Berlin, Germany')
     assert facts['source'] == 'stale'
-    assert facts['likely_working_language'] == 'german'
+    assert facts['likely_spoken_languages'] == {'german': 1.0}
     assert facts['place_names'] == ['Berlin']
 
 
@@ -6077,14 +6152,44 @@ def test_substring_collisions_ignores_a_whole_word_entry(monkeypatch):
 
 
 def test_classifier_keeps_country_names_proper():
-    '''`_coerce` must not fold a name. Regions and languages ARE folded — they are vocabularies.'''
+    '''`_coerce` must not fold a name. Regions and language KEYS ARE folded — they are vocabularies.'''
     coerced = location._coerce({
         'countries': ['Spain', '  United  Kingdom '], 'regions': ['Southern_Europe', 'WESTERN_EUROPE'],
-        'likely_working_language': 'Spanish',
+        'likely_spoken_languages': {'Spanish': 1},
     })
     assert coerced['countries'] == ['Spain', 'United Kingdom']
     assert coerced['regions'] == ['southern_europe', 'western_europe']
-    assert coerced['likely_working_language'] == 'spanish'
+    assert coerced['likely_spoken_languages'] == {'spanish': 1.0}
+
+
+def test_language_shares_normalise_to_exactly_one():
+    '''Fractions or percentages, three ways or one, the stored distribution adds to 1.
+
+    A model answering 60/40 and one answering 0.6/0.4 must give the same answer, and a split of
+    thirds must not read 0.33+0.33+0.33 -- a distribution that does not add up is the kind of quiet
+    wrongness this field exists to remove.
+    '''
+    assert location._language_shares({'german': 60, 'english': 40}) == {'german': 0.6, 'english': 0.4}
+    assert location._language_shares({'german': 0.6, 'english': 0.4}) == {'german': 0.6, 'english': 0.4}
+    assert location._language_shares({'german': 3, 'english': 1}) == {'german': 0.75, 'english': 0.25}
+    assert sum(location._language_shares({'a': 1, 'b': 1, 'c': 1}).values()) == 1.0
+
+
+def test_language_shares_drop_noise_cap_the_count_and_keep_the_total():
+    '''A share below LANGUAGE_SHARE_MIN is noise, at most LANGUAGE_SHARE_MAX survive largest first.
+
+    What is dropped is handed to what remains: 0.97 + a dropped 0.02 must still be 1.0, not 0.97.
+    '''
+    assert location._language_shares({'a': 0.97, 'b': 0.02, 'c': 0.01}) == {'a': 1.0}
+    top = location._language_shares({'a': 0.4, 'b': 0.3, 'c': 0.2, 'd': 0.06, 'e': 0.04})
+    assert list(top) == ['a', 'b', 'c', 'd'], 'largest first, e (0.04) dropped as noise'
+    assert sum(top.values()) == 1.0
+
+
+def test_language_shares_reject_junk():
+    '''Anything that is not a positive number, or names nothing, is dropped.'''
+    for junk in ([], 'german', None, 1.0, {'german': 'lots'}, {'german': 0}, {'': 1}):
+        assert location._language_shares(junk) == {}, junk
 
 
 async def test_review_skips_rather_than_rebuilds_a_corrupt_file(monkeypatch):
@@ -6643,7 +6748,7 @@ def test_eu_constants_are_written_as_proper_names():
 #
 # Purely geographic. These tests exist as much to pin what the rule must NOT look at as what it
 # does: it reads no language field, because a "non-English" conjunct would exclude a
-# French-language remote role in Canada. See test_location_gate_ignores_likely_working_language.
+# French-language remote role in Canada. See test_location_gate_ignores_likely_spoken_languages.
 # ---------------------------------------------------------------------------
 
 async def test_rejected_location_flags_a_country_in_a_rejected_region():
@@ -6809,7 +6914,7 @@ def test_hard_rule_category_order_is_stable():
 # the four language/location facts stay independent
 # ---------------------------------------------------------------------------
 
-async def test_location_gate_ignores_likely_working_language():
+async def test_location_gate_ignores_likely_spoken_languages():
     '''A Spanish-speaking location is acceptable; the gate is geographic, not linguistic.
 
     This is the pin for the design error that nearly shipped: "non-English AND not on the
@@ -6820,15 +6925,15 @@ async def test_location_gate_ignores_likely_working_language():
     # `agent.classify_location`, which is the stub. Calling `location.classify_location` here made
     # this test pass only on a machine whose real cache happened to hold 'spain (remote)' — on a
     # clean checkout it would have made a live, paid call, or failed open and asserted on that.
-    assert (await agent.classify_location('Spain (Remote)'))['likely_working_language'] == 'spanish'
+    assert (await agent.classify_location('Spain (Remote)'))['likely_spoken_languages'] == {'spanish': 1.0}
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
-async def test_likely_working_language_alone_never_rejects_or_caps():
+async def test_likely_spoken_languages_alone_never_reject_or_cap():
     '''French-speaking Quebec: warned about, never gated. The Valtech mechanism, restated.'''
     extract = _make_extract(location='Montreal, Canada (Remote)')
-    extract['likely_working_language'] = await agent.derive_likely_working_language(extract)
-    assert extract['likely_working_language'] == 'french'
+    extract['likely_spoken_languages'] = await agent.derive_likely_spoken_languages(extract)
+    assert extract['likely_spoken_languages'] == {'french': 1.0}
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
     assert agent.apply_rating_caps(extract, 5) == (5, '')
 
@@ -6872,34 +6977,34 @@ async def test_september_2026_regression_is_superseded_for_silent_remote_posting
 
 
 # ---------------------------------------------------------------------------
-# derive_likely_working_language  (cosmetic: no gate reads it)
+# derive_likely_spoken_languages  (cosmetic: no gate reads it)
 #
 # The location is the ONLY source. The extractor no longer supplies a claim, so there is no
 # precedence rule left to test -- which is the point: a fact about a place cannot be decided
 # differently for two jobs in the same place.
 # ---------------------------------------------------------------------------
 
-async def test_derive_likely_working_language_comes_from_the_location():
-    assert await agent.derive_likely_working_language(
+async def test_derive_likely_spoken_languages_comes_from_the_location():
+    assert await agent.derive_likely_spoken_languages(
         _make_extract(location='Berlin, Germany (Remote)')
-    ) == 'german'
+    ) == {'german': 1.0}
 
 
-async def test_derive_likely_working_language_ignores_a_stale_field_on_the_extract():
+async def test_derive_likely_spoken_languages_ignores_a_stale_field_on_the_extract():
     """team.blue's Berlin posting once came back 'english' while Finom's came back 'german'.
 
     Nothing populates this field before resolution any more, but if anything ever did, the
     classifier still decides -- two Berlin jobs cannot disagree.
     """
-    assert await agent.derive_likely_working_language(
-        _make_extract(location='Berlin, Germany (Remote)', likely_working_language='english')
-    ) == 'german'
+    assert await agent.derive_likely_spoken_languages(
+        _make_extract(location='Berlin, Germany (Remote)', likely_spoken_languages={'english': 1.0})
+    ) == {'german': 1.0}
 
 
-async def test_derive_likely_working_language_empty_for_an_unnamed_location():
-    assert await agent.derive_likely_working_language(
+async def test_derive_likely_spoken_languages_empty_for_an_unnamed_location():
+    assert await agent.derive_likely_spoken_languages(
         _make_extract(location='Remote (Anywhere)')
-    ) == ''
+    ) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -6938,7 +7043,7 @@ def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_th
     """An out-of-vocabulary region must read as 'I could not tell', not as 'acceptable'."""
     from agentic_job_search import location
     coerced = location._coerce(
-        {'countries': ['Germany'], 'regions': ['middle_earth'], 'likely_working_language': 'german'})
+        {'countries': ['Germany'], 'regions': ['middle_earth'], 'likely_spoken_languages': {'german': 1.0}})
     assert coerced['regions'] == ['unknown']
 
 
@@ -6951,7 +7056,7 @@ async def test_location_classification_is_cached(monkeypatch, tmp_path):
     async def fake_chat(prompt, **kwargs):
         calls.append(prompt)
         return ('{"countries": ["germany"], "regions": ["western_europe"], '
-                '"likely_working_language": "german"}'), 0.0
+                '"likely_spoken_languages": {"german": 1.0}}'), 0.0
 
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {})

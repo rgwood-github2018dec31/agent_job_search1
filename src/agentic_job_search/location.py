@@ -150,7 +150,7 @@ Return ONLY a JSON object, no prose and no code fence:
 {{"countries": ["<country in English, properly capitalised>", ...],
   "regions": ["<one region per country, same order>", ...],
   "broad_area": <true|false>,
-  "likely_working_language": "<language a professional office team there most likely works in, lowercase English name>",
+  "likely_spoken_languages": {{"<language, lowercase English name>": <fraction 0-1>, ...}},
   "place_names": ["<every place this text refers to, English and local spellings>", ...]}}
 
 Rules:
@@ -166,12 +166,16 @@ Rules:
 - southern_europe means the Mediterranean and Iberia, including SOUTHERN France (Nice, Marseille,
   Montpellier, Toulouse). Northern France, including Paris, is western_europe.
 - A city implies its country: "Berlin" -> Germany, "Barcelona" -> Spain.
-- `likely_working_language` is the language a professional, office-based team at the FIRST place
-  named most likely works in day to day. Judge it at the most specific level named -- the city or
-  province when one is given, else the country -- because a country can be split: "Montreal, QC,
-  Canada" is french, "Toronto, Canada" is english. Answer the language business is actually done
-  in, not a national or heritage language that is not the working one, and answer english where
-  that is the realistic working language even in a non-English country.
+- `likely_spoken_languages` is how a professional, office-based team at the FIRST place named
+  actually communicates day to day, as FRACTIONS THAT ADD TO 1. Judge it at the most specific
+  level named -- the city or province when one is given, else the country -- because a country can
+  be split: "Montreal, QC, Canada" is mostly french, "Toronto, Canada" is mostly english. Give the
+  language business is actually done in, not a national or heritage language that is not the
+  working one, and give english a share wherever it is realistically used even in a non-English
+  country. One language is a complete answer when the place is unambiguous: {{"italian": 1}}.
+  Report the uncertainty honestly rather than picking a side: "Berlin, Germany (Remote across
+  Europe)" is a role open across a continent, so {{"german": 0.6, "english": 0.4}} says more than
+  either language alone. Every fraction must be above 0 and they must sum to 1; at most 4.
 - `countries` are proper names, like `place_names` below: write "Germany", never
   "germany". Code folds case where it needs to; it cannot restore a name you folded.
 - `place_names` lists every place the text refers to at EVERY level -- city, region/state, country
@@ -275,9 +279,59 @@ def cache_key(text: str) -> str:
 def _empty(reason: str) -> dict[str, Any]:
     '''The fail-open answer: no country named, so no policy can reject.'''
     return {
-        'countries': [], 'regions': [], 'broad_area': False, 'likely_working_language': '',
+        'countries': [], 'regions': [], 'broad_area': False, 'likely_spoken_languages': {},
         'place_names': [], 'source': reason,
     }
+
+
+# The spoken-language distribution is stored as exact multiples of 1/SHARE_SCALE, so the fractions
+# sum to exactly 1 rather than to 0.9999. Shares below SHARE_MIN are noise and at most SHARE_MAX
+# survive; both are applied AFTER normalising, so a model answering in percentages (60/40) yields
+# the same distribution as one answering in fractions (0.6/0.4).
+LANGUAGE_SHARE_SCALE = 10_000
+LANGUAGE_SHARE_MIN = 0.05
+LANGUAGE_SHARE_MAX = 4
+
+
+def _language_shares(raw: Any) -> dict[str, float]:
+    """The model's spoken-language distribution, normalised to fractions that add to exactly 1.
+
+    Anything that is not a positive number is dropped and keys are folded to lowercase -- they are
+    a vocabulary, like `regions`, and the user's `languages` list is lowercase too. An empty or
+    unusable answer gives {}, which no rule can warn on.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    shares: dict[str, float] = {}
+    for name, fraction in raw.items():
+        key = ' '.join(str(name or '').split()).lower()
+        try:
+            value = float(fraction)
+        except (TypeError, ValueError):
+            continue
+        if key and value > 0:
+            shares[key] = shares.get(key, 0.0) + value
+    total = sum(shares.values())
+    if not total:
+        return {}
+    shares = {k: v / total for k, v in shares.items()}
+    shares = {k: v for k, v in shares.items() if v >= LANGUAGE_SHARE_MIN}
+    top = sorted(shares.items(), key=lambda kv: (-kv[1], kv[0]))[:LANGUAGE_SHARE_MAX]
+    kept = sum(v for _, v in top)
+    if not kept:
+        return {}
+    # Renormalise over what survived, so the flooring below still reaches 1: dropping a 2% share
+    # must hand its 2% to the others, not shorten the distribution.
+    scaled = {k: v / kept * LANGUAGE_SHARE_SCALE for k, v in top}
+    units = {k: int(v) for k, v in scaled.items()}
+    # Hand the units lost to flooring to the largest fractional parts, so the fractions sum to
+    # exactly 1. A distribution that does not add up is the kind of quiet wrongness the rest of
+    # this file refuses to accept.
+    remainder = LANGUAGE_SHARE_SCALE - sum(units.values())
+    by_fraction = sorted(top, key=lambda kv: (-(scaled[kv[0]] - units[kv[0]]), kv[0]))
+    for key, _ in by_fraction[:remainder]:
+        units[key] += 1
+    return {key: units[key] / LANGUAGE_SHARE_SCALE for key, _ in top}
 
 
 def _coerce(raw: dict) -> dict[str, Any]:
@@ -299,7 +353,7 @@ def _coerce(raw: dict) -> dict[str, Any]:
         'countries': countries,
         'regions': regions,
         'broad_area': bool(raw.get('broad_area')),
-        'likely_working_language': str(raw.get('likely_working_language') or '').strip().lower(),
+        'likely_spoken_languages': _language_shares(raw.get('likely_spoken_languages')),
         # Proper names, deliberately NOT lowercased: they are matched case-sensitively against the
         # user's lists. Deduped preserving order so the cache file stays stable.
         'place_names': list(dict.fromkeys(
@@ -311,7 +365,7 @@ def _coerce(raw: dict) -> dict[str, Any]:
 
 
 async def classify_location(text: str) -> dict[str, Any]:
-    '''Geographic facts about `text`: {countries, regions, likely_working_language}.
+    '''Geographic facts about `text`: {countries, regions, likely_spoken_languages}.
 
     Cached on disk by normalized location string, so a repeated location costs nothing and — more
     importantly — cannot be answered two different ways. Every failure returns the empty answer,
@@ -326,11 +380,14 @@ async def classify_location(text: str) -> dict[str, Any]:
     # would silently disable alias matching for that location forever, which is the same shape as
     # the dead `malaga` entry this field exists to fix -- a mechanism that reports success while
     # doing nothing. One-off cost: ~81 entries at the flash-tier rate.
-    # Likewise an entry predating `likely_working_language` (2026-09-29): the old question asked
-    # for the national language of the first COUNTRY, which answered Luxembourg `luxembourgish`
-    # and Montreal `english`. Keeping those answers would keep the wrong warnings, so every such
-    # entry is re-asked the next time its location is seen.
-    if key in cache and 'place_names' in cache[key] and 'likely_working_language' in cache[key]:
+    # Likewise an entry predating `likely_spoken_languages` (2026-10-14), the scalar
+    # `likely_working_language` before it (2026-09-29), and the national-language question before
+    # that: the scalar could not express a split -- "Berlin, Germany (Remote across Europe)"
+    # answered `english` or `german` depending on the sample -- and the oldest asked for the
+    # national language of the first COUNTRY, which answered Luxembourg `luxembourgish` and
+    # Montreal `english`. Keeping any of them would keep the wrong warnings, so every such entry is
+    # re-asked the next time its location is seen.
+    if key in cache and 'place_names' in cache[key] and 'likely_spoken_languages' in cache[key]:
         entry = dict(cache[key])
         entry['source'] = 'cache'
         _record_countries(entry)
@@ -349,13 +406,16 @@ async def classify_location(text: str) -> dict[str, Any]:
             # this, one outage silently disables the region gate for every location ever cached.
             entry = dict(stale)
             entry.setdefault('place_names', [])
-            # Same for the pre-rename language keys, newest first. This is the one path that
+            # Same for the pre-rename language keys, newest first: a scalar answer becomes a
+            # certain distribution, which is exactly what it meant. This is the one path that
             # serves an entry the guard above would otherwise have reclassified, so it is the only
             # place an old name can still reach a consumer.
-            entry.setdefault(
-                'likely_working_language',
-                stale.get('implied_local_language', stale.get('local_language', '')),
-            )
+            if 'likely_spoken_languages' not in entry:
+                legacy = (stale.get('likely_working_language') or stale.get('implied_local_language')
+                          or stale.get('local_language') or '')
+                entry['likely_spoken_languages'] = (
+                    {str(legacy).strip().lower(): 1.0} if str(legacy).strip() else {}
+                )
             entry['source'] = 'stale'
             _record_countries(entry)
             return entry
@@ -367,7 +427,7 @@ async def classify_location(text: str) -> dict[str, Any]:
     _write_cache()
     logger.info(
         f'Location classified: {text!r} -> countries={result["countries"]} '
-        f'regions={result["regions"]} likely_working_language={result["likely_working_language"]!r} (${cost:.6f})'
+        f'regions={result["regions"]} likely_spoken_languages={result["likely_spoken_languages"]!r} (${cost:.6f})'
     )
     entry = dict(result)
     entry['source'] = 'llm'
