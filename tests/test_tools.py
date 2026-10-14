@@ -1593,7 +1593,7 @@ def test_hard_rule_category_buckets_education():
 # ---------------------------------------------------------------------------
 
 async def test_triage_job_fit_parses_score(monkeypatch):
-    async def fake_generate_local(prompt, system='', model='', max_tokens=0):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
         return 'Sure! {"score": 2, "reason": "wrong domain"}'
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
@@ -1602,7 +1602,7 @@ async def test_triage_job_fit_parses_score(monkeypatch):
 
 
 async def test_triage_job_fit_fails_open_when_server_down(monkeypatch):
-    async def fake_generate_local(prompt, system='', model='', max_tokens=0):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
         raise RuntimeError('connection refused')
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
@@ -1610,7 +1610,7 @@ async def test_triage_job_fit_fails_open_when_server_down(monkeypatch):
 
 
 async def test_triage_job_fit_fails_open_on_garbage(monkeypatch):
-    async def fake_generate_local(prompt, system='', model='', max_tokens=0):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
         return 'I cannot help with that.'
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
@@ -1661,7 +1661,7 @@ async def test_build_reference_summary_falls_back_to_local(tmp_path, monkeypatch
         calls.append('openrouter')
         raise RuntimeError('server down')
 
-    async def fake_local(prompt, system='', model='', max_tokens=0):
+    async def fake_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
         calls.append('ollama')
         return 'Local summary of ideal role.'
 
@@ -1682,7 +1682,7 @@ async def test_build_reference_summary_falls_back_to_anthropic(tmp_path, monkeyp
         calls.append('openrouter')
         raise RuntimeError('server down')
 
-    async def fake_local(prompt, system='', model='', max_tokens=0):
+    async def fake_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
         calls.append('ollama')
         raise RuntimeError('server down too')
 
@@ -2231,11 +2231,38 @@ async def test_generate_local_names_installed_models_when_model_missing(monkeypa
     _patch_mcp(monkeypatch, generate=missing, list_models=_INSTALLED)
 
     with pytest.raises(triage.LocalModelMissingError) as excinfo:
-        await triage.generate_local('hi', model='gone:latest')
+        await triage.generate_local('hi', model='gone:latest', purpose_slug='test')
 
     message = str(excinfo.value)
     assert 'gone:latest' in message
     assert 'granite4.1:3b' in message and 'gemma4:26b' in message
+
+
+async def test_generate_local_sends_caller_identity_to_the_server(monkeypatch):
+    """tools_llm_local requires service_name + purpose_slug on every generate call."""
+    seen = {}
+
+    async def fake_call(url, tool_name, args, timeout_seconds=None):
+        seen.update(args)
+        return json.dumps({'response': 'ok'})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    await triage.generate_local('hi', purpose_slug=config.LLM_LOCAL_PURPOSE_TRIAGE)
+    assert seen['service_name'] == config.LLM_LOCAL_SERVICE_NAME
+    assert seen['purpose_slug'] == config.LLM_LOCAL_PURPOSE_TRIAGE
+
+
+async def test_each_local_call_site_passes_its_own_purpose(monkeypatch):
+    purposes = []
+
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
+        purposes.append(purpose_slug)
+        return '{"score": 3, "reason": "x", "rating": 3, "reasoning": "x"}'
+
+    monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
+    await triage.triage_job_fit('job', 'profile')
+    await triage.rate_with_ollama('sys', 'user')
+    assert purposes == [config.LLM_LOCAL_PURPOSE_TRIAGE, config.LLM_LOCAL_PURPOSE_RATING]
 
 
 async def test_generate_local_reraises_other_failures(monkeypatch):
@@ -2243,7 +2270,7 @@ async def test_generate_local_reraises_other_failures(monkeypatch):
     _patch_mcp(monkeypatch, generate=ConnectionRefusedError('connection refused'), list_models=_INSTALLED)
 
     with pytest.raises(Exception) as excinfo:
-        await triage.generate_local('hi', model='granite4.1:3b')
+        await triage.generate_local('hi', model='granite4.1:3b', purpose_slug='test')
 
     assert not isinstance(excinfo.value, triage.LocalModelMissingError)
 
@@ -2302,7 +2329,7 @@ async def test_generate_local_live():
     _require_llm_server(8002)
     # config.OLLAMA_MODEL_NAME_TRIAGE, never a hardcoded copy: this test's whole job is to catch that tag
     # going stale, and a test carrying its own duplicate of the value tracks nothing.
-    response = await triage.generate_local('Reply with exactly: OK', model=config.OLLAMA_MODEL_NAME_TRIAGE, max_tokens=500)
+    response = await triage.generate_local('Reply with exactly: OK', model=config.OLLAMA_MODEL_NAME_TRIAGE, max_tokens=500, purpose_slug='test-live')
     assert response.strip() != ''
 
 
@@ -10357,7 +10384,7 @@ async def test_rate_with_openrouter_names_a_malformed_reply_and_does_not_repair_
 
 
 async def test_rate_with_ollama_names_a_reply_without_a_rating(monkeypatch):
-    async def fake_generate(prompt, system='', model=''):
+    async def fake_generate(prompt, system='', model='', purpose_slug=''):
         return '{"reasoning": "no rating key"}'
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate)

@@ -61,6 +61,7 @@ from agentic_job_search.config import (
     FAILED_QUERIES_NAMED_MAX,
     JOB_STALE_AGE_DAYS,
     LISTING_ESTIMATE_HISTORY_RUNS,
+    LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY,
     LOCATION_GUESS_REASON_MAX_CHARS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
@@ -1105,7 +1106,7 @@ async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict 
             stage_stats['cost'] += cost_usd
         return content
     if provider == 'ollama':
-        return await generate_local(prompt)
+        return await generate_local(prompt, purpose_slug=LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY)
     return await _summarize_references_anthropic(prompt, stage_stats)
 
 

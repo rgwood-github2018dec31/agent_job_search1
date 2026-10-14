@@ -55,6 +55,7 @@ All model constants are defined once in the shared `utils_tools_n_agents_common.
 - `MODEL_NAME_SALARY_ESTIMATE` — the pay range for a notified posting that states no salary. A judgement about the job, so the intelligence tier (`OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE`); one call per such job, no fallback provider (a failure shows no estimate)
 - `OLLAMA_MODEL_NAME_TRIAGE` — machine-local Ollama tag for Stage 2c triage (the one model constant defined in this repo, not the library — it is machine-local and can vanish on a re-pull, which `preflight_local_model()` catches)
 - Non-Anthropic models are reached via the LLM MCP tool servers (`LLM_OPENROUTER_MCP_URL` :8006, `LLM_LOCAL_MCP_URL` :8002) using `call_mcp_tool()` in `triage.py`. **Always route OpenRouter/Ollama inference through these servers, never the raw HTTP APIs** — that is where keys, config, and per-call `cost_usd` tracking live. Note the local Ollama `generate` tool has **no default model configured**, so always pass `model` explicitly
+- Calls to the local server (`generate_local()` in `triage.py`) must carry a caller identity: `LLM_LOCAL_SERVICE_NAME` plus a per-call-site `LLM_LOCAL_PURPOSE_*` slug from `config.py`. tools_llm_local rejects a call without them and logs each one in its `run_dir/call_log.jsonl` — that log is how a model loading in Ollama gets traced back to this repo and the stage that asked.
 
 ### Resume (`load_resume()` in `agent.py`)
 

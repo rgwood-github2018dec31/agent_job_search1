@@ -74,6 +74,13 @@ def is_mid_rated(rating: int) -> bool:
 # Local/remote LLM MCP tool servers (started via their scripts/start-tool-server.sh)
 LLM_LOCAL_MCP_URL = 'http://127.0.0.1:8002/mcp'
 LLM_OPENROUTER_MCP_URL = 'http://127.0.0.1:8006/mcp'
+# Caller identity tools_llm_local requires on every model-touching call (its run_dir/call_log.jsonl
+# is how "what keeps loading granite?" gets answered — Ollama's own log only says 127.0.0.1).
+# service_name names THIS program; each purpose slug names why one call is made.
+LLM_LOCAL_SERVICE_NAME = 'agent-job-search1'
+LLM_LOCAL_PURPOSE_TRIAGE = 'job-triage'
+LLM_LOCAL_PURPOSE_RATING = 'job-rating'
+LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY = 'reference-summary'
 # Wall-clock cap for one LLM call (chat/generate) through the shared MCP client. Its own default
 # (30s) is sized for quick sends like Telegram, and silently applied to every LLM call when this
 # repo moved onto it: a Stage 1b scraper round resending a conversation full of 30k-char snapshots

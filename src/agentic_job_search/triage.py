@@ -19,6 +19,9 @@ from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INT
 
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
+    LLM_LOCAL_PURPOSE_RATING,
+    LLM_LOCAL_PURPOSE_TRIAGE,
+    LLM_LOCAL_SERVICE_NAME,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     LOCAL_LLM_TEMPERATURE,
@@ -207,16 +210,28 @@ async def _describe_missing_model(model: str) -> str:
 
 
 async def generate_local(
-    prompt: str, system: str = '', model: str = OLLAMA_MODEL_NAME_TRIAGE, max_tokens: int | None = None
+    prompt: str,
+    system: str = '',
+    model: str = OLLAMA_MODEL_NAME_TRIAGE,
+    max_tokens: int | None = None,
+    *,
+    purpose_slug: str,
 ) -> str:
     """One completion via the local Ollama MCP server. Returns the response text.
+
+    `purpose_slug` (why this call is made — one of the LLM_LOCAL_PURPOSE_* constants) is required,
+    and is sent with LLM_LOCAL_SERVICE_NAME so the server's call log can trace a model loading in
+    Ollama back to this program and this call site.
 
     Raises LocalModelMissingError - naming the installed models - when the tag is gone, so a
     misconfiguration is distinguishable from the server being down. Every other failure is
     re-raised untouched: a down server must keep reading as a down server.
     """
     try:
-        args = {'prompt': prompt, 'system': system, 'model': model, 'temperature': LOCAL_LLM_TEMPERATURE}
+        args = {
+            'prompt': prompt, 'system': system, 'model': model, 'temperature': LOCAL_LLM_TEMPERATURE,
+            'service_name': LLM_LOCAL_SERVICE_NAME, 'purpose_slug': purpose_slug,
+        }
         if max_tokens is not None:
             args['max_tokens'] = max_tokens
         raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'generate', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
@@ -265,7 +280,7 @@ async def triage_job_fit(job_text: str, profile_block: str) -> dict | None:
     or None if the local server is unavailable or the response is unusable (fail open)."""
     prompt = f'{profile_block}\n\n--- JOB POSTING ---\n{job_text}\n--- END JOB POSTING ---'
     try:
-        response = await generate_local(prompt, system=TRIAGE_INSTRUCTIONS)
+        response = await generate_local(prompt, system=TRIAGE_INSTRUCTIONS, purpose_slug=LLM_LOCAL_PURPOSE_TRIAGE)
         result = extract_json_object(response)
         score = int(result['score'])
     except Exception as ex:
@@ -333,6 +348,7 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
 async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OLLAMA_MODEL_NAME_TRIAGE) -> dict:
     """Rate a job via the local Ollama server. Returns the rating dict (cost is zero)."""
     response = await generate_local(
-        f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}', system=system_prompt, model=model
+        f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}', system=system_prompt, model=model,
+        purpose_slug=LLM_LOCAL_PURPOSE_RATING,
     )
     return parse_rating_reply(response)
