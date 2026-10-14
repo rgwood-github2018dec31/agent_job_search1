@@ -29,9 +29,9 @@ import math
 from datetime import date
 from typing import Any
 
-import yaml
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
+from agentic_job_search import cache_io
 from agentic_job_search.config import (
     MODEL_NAME_SALARY_ESTIMATE,
     SALARY_ESTIMATE_BASIS_MAX_CHARS,
@@ -97,39 +97,14 @@ _cache: dict[str, Any] | None = None
 def _load_cache() -> dict[str, Any]:
     '''Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal.'''
     global _cache
-    if _cache is not None:
-        return _cache
-    _cache = {}
-    if SALARY_ESTIMATE_CACHE_PATH.exists():
-        try:
-            loaded = yaml.safe_load(SALARY_ESTIMATE_CACHE_PATH.read_text(encoding='utf-8'))
-            if isinstance(loaded, dict):
-                _cache = loaded
-            elif loaded is not None:
-                logger.warning(
-                    f'Salary estimate cache {SALARY_ESTIMATE_CACHE_PATH} is not a mapping '
-                    f'({type(loaded).__name__}) — rebuilding it.'
-                )
-        except Exception as ex:
-            logger.warning(
-                f'Could not read salary estimate cache {SALARY_ESTIMATE_CACHE_PATH}: '
-                f'{type(ex).__name__}: {ex} — rebuilding it.'
-            )
+    if _cache is None:
+        _cache = cache_io.load(SALARY_ESTIMATE_CACHE_PATH, 'salary estimate cache')
     return _cache
 
 
 def _write_cache() -> None:
     '''Persist the cache. A cache that cannot be written costs money, not correctness.'''
-    try:
-        SALARY_ESTIMATE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SALARY_ESTIMATE_CACHE_PATH.write_text(
-            yaml.safe_dump(_load_cache(), sort_keys=True, allow_unicode=True), encoding='utf-8'
-        )
-    except Exception as ex:
-        logger.warning(
-            f'Could not write salary estimate cache {SALARY_ESTIMATE_CACHE_PATH}: '
-            f'{type(ex).__name__}: {ex} — continuing.'
-        )
+    cache_io.save(SALARY_ESTIMATE_CACHE_PATH, _load_cache(), 'salary estimate cache')
 
 
 def cache_key(candidate: dict) -> str:

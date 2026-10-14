@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID=<your chat ID>
 
 The agent uses a persistent browser profile at `~/.linkedin-agent-profile/` so your LinkedIn session is remembered between runs. Log in on first launch when the browser opens.
 
-Place your resume in `run_dir/` as Markdown, matching the pattern `*-resume-*.md`. The most recently modified match is used. A PDF resume is not read — convert it to Markdown.
+Place your resume in `run_dir/`, named `*-resume-*.md` or `*-resume-*.pdf`. A resume labelled `cat-resume-*` in your downloads folder (the `save_dir` preference) is picked up as well. Whichever readable file (`.pdf` or `.md`) was modified most recently is the one used; a resume in any other format is ignored with a warning.
 
 ## Usage
 
@@ -32,17 +32,17 @@ The agent reads your resume and `run_dir/JOB_REQUIREMENTS.md`, then searches Lin
 
 ### Non-interactive mode
 
-Designed for scheduled/cron runs. The agent searches LinkedIn autonomously, rates all jobs, and sends Telegram notifications for jobs rated 4 or 5. `JOB_REQUIREMENTS.md` is read but never modified.
+Designed for scheduled/cron runs. The agent searches LinkedIn autonomously, rates all jobs, and sends Telegram notifications for jobs rated at or above `RATING_NOTIFICATION_THRESHOLD` (`config.py`). `JOB_REQUIREMENTS.md` is read but never modified.
 
 ## How it works
 
 **Non-interactive pipeline:**
 
-1. **Query generation** (Sonnet) — derives 2–6 LinkedIn search queries from your resume and job requirements
-2. **Scraping** (Haiku) — runs the queries, records candidates from search result listings without visiting individual job pages
-3. **Evaluation** (Sonnet) — one fresh agent session per candidate: navigates to the job page, reads the full description, rates 1–5, saves to `run_dir/saved_jobs-{date}/`, and sends a Telegram notification for ratings ≥ 4
+1. **Query generation** (OpenRouter; Anthropic as fallback) — derives up to `MAX_SEARCH_QUERIES` LinkedIn search queries from your resume and job requirements
+2. **Scraping** (`MODEL_NAME_SCRAPER`) — runs the queries, records candidates from search result listings without visiting individual job pages
+3. **Evaluation** (`MODEL_NAME_RATING`) — one fresh agent session per candidate: code navigates to the job page and captures it, the extractor condenses that text (it gets no browser of its own), rates 1–5, saves to `run_dir/saved_jobs-{date}/`, and sends a Telegram notification when the rating clears the notification threshold
 
-**Job deduplication:** `check_and_record_job` is called before any job is processed. It returns `already_processed`, `too_old` (posted > 21 days ago), or `new`, and records each new job to `run_dir/processed_jobs/*.yaml`.
+**Job deduplication:** `check_and_record_job` is called before any job is processed. It returns `already_processed`, `too_old` (posted more than `JOB_MAX_AGE_DAYS` ago), or `new`, and records each new job to `run_dir/processed_jobs/*.yaml`.
 
 ## Tests
 

@@ -36,10 +36,10 @@ import re
 from datetime import date
 from typing import Any
 
-import yaml
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
+from agentic_job_search import cache_io
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.triage import chat_openrouter, extract_json_object
 
@@ -257,33 +257,14 @@ def reset_countries_seen() -> None:
 def _load_cache() -> dict[str, Any]:
     '''Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal.'''
     global _cache
-    if _cache is not None:
-        return _cache
-    _cache = {}
-    if LOCATION_CACHE_PATH.exists():
-        try:
-            loaded = yaml.safe_load(LOCATION_CACHE_PATH.read_text(encoding='utf-8')) or {}
-            if isinstance(loaded, dict):
-                _cache = loaded
-            else:
-                logger.warning(
-                    f'Location cache {LOCATION_CACHE_PATH} is not a mapping '
-                    f'(got {type(loaded).__name__}) — rebuilding it.'
-                )
-        except (yaml.YAMLError, OSError) as ex:
-            logger.warning(f'Could not read location cache {LOCATION_CACHE_PATH}: {ex} — rebuilding it.')
+    if _cache is None:
+        _cache = cache_io.load(LOCATION_CACHE_PATH, 'location cache')
     return _cache
 
 
 def _write_cache() -> None:
-    try:
-        LOCATION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LOCATION_CACHE_PATH.write_text(
-            yaml.safe_dump(_load_cache(), sort_keys=True, allow_unicode=True), encoding='utf-8'
-        )
-    except OSError as ex:
-        # A cache that cannot be persisted costs money, not correctness — the run continues.
-        logger.warning(f'Could not write location cache {LOCATION_CACHE_PATH}: {ex}')
+    # A cache that cannot be persisted costs money, not correctness — cache_io.save warns.
+    cache_io.save(LOCATION_CACHE_PATH, _load_cache(), 'location cache')
 
 
 def cache_key(text: str) -> str:

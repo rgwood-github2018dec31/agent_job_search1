@@ -20,9 +20,9 @@ from http import HTTPStatus
 from typing import Any
 
 import requests
-import yaml
 
 import agentic_job_search.preferences as preferences
+from agentic_job_search import cache_io
 from agentic_job_search.config import (
     FX_RATES_FETCH_TIMEOUT_SECONDS,
     FX_RATES_STALE_MAX_DAYS,
@@ -101,37 +101,14 @@ def fetch_rates(base: str) -> dict[str, dict[str, Any]]:
 def _load_table() -> dict[str, Any]:
     '''Read the on-disk rate table. A missing or corrupt file is refetched, never fatal.'''
     global _table
-    if _table is not None:
-        return _table
-    _table = {}
-    if FX_RATES_CACHE_PATH.exists():
-        try:
-            loaded = yaml.safe_load(FX_RATES_CACHE_PATH.read_text(encoding='utf-8'))
-            if isinstance(loaded, dict):
-                _table = loaded
-            elif loaded is not None:
-                logger.warning(
-                    f'Exchange-rate cache {FX_RATES_CACHE_PATH} is not a mapping '
-                    f'({type(loaded).__name__}) — refetching.'
-                )
-        except Exception as ex:
-            logger.warning(
-                f'Could not read exchange-rate cache {FX_RATES_CACHE_PATH}: {type(ex).__name__}: {ex} — refetching.'
-            )
+    if _table is None:
+        _table = cache_io.load(FX_RATES_CACHE_PATH, 'exchange-rate cache')
     return _table
 
 
 def _write_table() -> None:
     '''Persist the table. A table that cannot be written costs a fetch next run, not correctness.'''
-    try:
-        FX_RATES_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FX_RATES_CACHE_PATH.write_text(
-            yaml.safe_dump(_load_table(), sort_keys=True, allow_unicode=True), encoding='utf-8'
-        )
-    except Exception as ex:
-        logger.warning(
-            f'Could not write exchange-rate cache {FX_RATES_CACHE_PATH}: {type(ex).__name__}: {ex} — continuing.'
-        )
+    cache_io.save(FX_RATES_CACHE_PATH, _load_table(), 'exchange-rate cache')
 
 
 def _table_age_days(table: dict[str, Any], base: str, today: date) -> int | None:
