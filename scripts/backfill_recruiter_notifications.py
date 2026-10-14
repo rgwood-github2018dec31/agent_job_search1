@@ -1,4 +1,4 @@
-"""Seed run_dir/recruiter_notifications.yaml from saved jobs already notified.
+'''Seed run_dir/recruiter_notifications.yaml from saved jobs already notified.
 
 The repost check can only suppress a second notification for a role it has seen a FIRST
 notification for. Without this, the agency reposts already in flight — Archer Recruitment
@@ -11,7 +11,7 @@ RECRUITER_REPOST_WINDOW_DAYS. Dry-run by default; writes only with --apply.
 
     uv run python scripts/backfill_recruiter_notifications.py
     uv run python scripts/backfill_recruiter_notifications.py --apply
-"""
+'''
 
 import argparse
 import logging
@@ -31,7 +31,7 @@ _FIELD_RE = re.compile(r'^(?P<name>[A-Z][A-Za-z -]{1,30}): (?P<value>.*)$')
 
 
 def _saved_dir_date(directory: Path) -> date:
-    """The run date encoded in a `saved_jobs-2026Sep09` directory name; raises ValueError otherwise."""
+    '''The run date encoded in a `saved_jobs-2026Sep09` directory name; raises ValueError otherwise.'''
     try:
         return datetime.strptime(directory.name.removeprefix('saved_jobs-'), '%Y%b%d').date()
     except ValueError as ex:
@@ -39,7 +39,7 @@ def _saved_dir_date(directory: Path) -> date:
 
 
 def _parse_saved_job(path: Path) -> tuple[dict, str] | None:
-    """The extract-shaped fields and the description body of one saved job, or None."""
+    '''The extract-shaped fields and the description body of one saved job, or None.'''
     text = path.read_text(encoding='utf-8')
     if _AGENCY_WARNING not in text:
         return None
@@ -56,7 +56,7 @@ def _parse_saved_job(path: Path) -> tuple[dict, str] | None:
 
 
 def collect(run_dir: Path, today: date | None = None) -> list[dict]:
-    """One record per notified agency posting inside the window, oldest first."""
+    '''One record per notified agency posting inside the window, oldest first.'''
     cutoff = (today or date.today()) - timedelta(days=RECRUITER_REPOST_WINDOW_DAYS)
     records: list[dict] = []
 

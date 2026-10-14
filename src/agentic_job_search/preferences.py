@@ -116,11 +116,11 @@ _warned_blacklist_entries: set[str] = set()
 
 
 def load_preferences(force_reload: bool = False) -> dict[str, Any]:
-    """Read run_dir/preferences.yaml over the neutral defaults, cached for the process.
+    '''Read run_dir/preferences.yaml over the neutral defaults, cached for the process.
 
     A missing file is not an error — the agent still runs, just without any personal gate. It is
     logged at WARNING because an unconfigured run silently rates very differently.
-    """
+    '''
     global _cache
     if _cache is not None and not force_reload:
         return _cache
@@ -154,7 +154,7 @@ def load_preferences(force_reload: bool = False) -> dict[str, Any]:
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Recursive dict merge; override wins. Nested dicts merge, scalars and lists replace."""
+    '''Recursive dict merge; override wins. Nested dicts merge, scalars and lists replace.'''
     merged = dict(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -165,12 +165,12 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def save_dir() -> Path:
-    """Directory where saved job-posting PDFs land, before categorization and ingest.
+    '''Directory where saved job-posting PDFs land, before categorization and ingest.
 
     This is the SOURCE only — an external, user-controlled folder the agent moves files out of.
     It is never the applied-jobs corpus, which lives at tools_generic.APPLIED_JOBS_DIR
     (run_dir/applied_jobs/) and is deliberately not configurable.
-    """
+    '''
     return Path(str(load_preferences()['save_dir'])).expanduser()
 
 
@@ -190,36 +190,36 @@ def search_regions() -> list[dict[str, str]]:
 
 
 def _places(key: str) -> tuple[str, ...]:
-    """One of the `locations` place lists, as written, blank entries dropped."""
+    '''One of the `locations` place lists, as written, blank entries dropped.'''
     return tuple(
         str(place).strip() for place in load_preferences()['locations'][key] if str(place).strip()
     )
 
 
 def sponsorship_required_in() -> tuple[str, ...]:
-    """Place names where the user would need visa sponsorship, as written.
+    '''Place names where the user would need visa sponsorship, as written.
 
     Returned unfolded like the other place-name lists. This rule still compares by SUBSTRING and
     case-insensitively at its call site, unlike the two geographic lists -- but the folding happens
     there, where it is a comparison, rather than here, where it would be a lossy store.
-    """
+    '''
     return tuple(
         str(loc).strip() for loc in load_preferences()['sponsorship_required_in'] if str(loc).strip()
     )
 
 
 def would_live_here() -> tuple[str, ...]:
-    """Places the user has said they would live. Exempts a posting from the geographic gate.
+    '''Places the user has said they would live. Exempts a posting from the geographic gate.
 
     Returned **as written**, like the company blacklist and unlike the vocabulary lists: these are
     proper names, matched case-sensitively and accent-exactly. Lowercasing them is what made
     `malaga` an entry that could never match `Málaga`.
-    """
+    '''
     return _places('would_live_here')
 
 
 def would_not_live_here() -> tuple[str, ...]:
-    """Places the user has said they would NOT live. Rejects outright, ahead of any guess."""
+    '''Places the user has said they would NOT live. Rejects outright, ahead of any guess.'''
     return _places('would_not_live_here')
 
 
@@ -234,21 +234,21 @@ def not_yet_bucketed() -> tuple[str, ...]:
 
 
 def would_commute_here() -> tuple[str, ...]:
-    """Places the user would travel to an OFFICE. A different question from would_live_here.
+    '''Places the user would travel to an OFFICE. A different question from would_live_here.
 
     Drives the hybrid/on-site rating cap only. Living somewhere does not imply commuting across it
     -- `Spain` on the live list once meant an on-site role in any Spanish town was uncapped.
-    """
+    '''
     return _places('would_commute_here')
 
 
 def languages() -> tuple[str, ...]:
-    """Lowercase languages the user works in; a posting requiring any other language is rejected."""
+    '''Lowercase languages the user works in; a posting requiring any other language is rejected.'''
     return tuple(str(lang).lower() for lang in load_preferences()['languages'])
 
 
 def foreign_language_rating_cap() -> int:
-    """Highest rating a posting written in a language outside `languages` can receive."""
+    '''Highest rating a posting written in a language outside `languages` can receive.'''
     return int(load_preferences()['foreign_language_rating_cap'])
 
 
@@ -292,11 +292,11 @@ def current_tax_residence() -> str:
 
 
 def salary_target() -> tuple[float, str] | None:
-    """(annual base target, ISO currency) — or None when either is unset.
+    '''(annual base target, ISO currency) — or None when either is unset.
 
     A malformed value raises rather than reading as unset: an ignored target silently switches the
     below-target comparison off and hands it back to the rater.
-    """
+    '''
     compensation = load_preferences()['compensation']
     raw_target, raw_currency = compensation.get('base_target'), compensation.get('currency')
     if raw_target in (None, '') or not raw_currency:
@@ -318,12 +318,12 @@ def salary_target() -> tuple[float, str] | None:
 
 
 def salary_conversion() -> tuple[str, frozenset[str]] | None:
-    """(currency to convert into, currencies left as written) — or None when no conversion is set.
+    '''(currency to convert into, currencies left as written) — or None when no conversion is set.
 
     The kept set always includes the conversion currency itself. A malformed value raises rather
     than reading as unset, for the same reason as `salary_target`: an ignored preference silently
     switches the conversion off.
-    """
+    '''
     compensation = load_preferences()['compensation']
     raw_convert_to, raw_keep = compensation.get('convert_to'), compensation.get('keep_currencies')
     if not raw_convert_to:
@@ -364,7 +364,7 @@ def _parse_added_date(raw: Any) -> date | None:
 
 
 def _blacklist_entries() -> list[tuple[str, str, date | None, str]]:
-    """Normalize the raw blacklist into (name, reason, added_date, date_problem) tuples.
+    '''Normalize the raw blacklist into (name, reason, added_date, date_problem) tuples.
 
     `date_problem` is empty, or says why `added` could not be read; the caller that owns the
     once-per-entry warning reports it.
@@ -372,7 +372,7 @@ def _blacklist_entries() -> list[tuple[str, str, date | None, str]]:
     Accepts either a mapping per entry or a bare string (a name with no reason and no date), so a
     hand-edited list of plain names still works. Names are returned **as written** — the match is
     case-sensitive, unlike every other preference accessor here.
-    """
+    '''
     entries: list[tuple[str, str, date | None, str]] = []
     for raw in load_preferences()['companies']['blacklist']:
         date_problem = ''
@@ -391,12 +391,12 @@ def _blacklist_entries() -> list[tuple[str, str, date | None, str]]:
 
 
 def blacklisted_companies() -> tuple[tuple[str, str], ...]:
-    """(name, reason) pairs for unexpired blacklist entries. Empty means no blacklist gate.
+    '''(name, reason) pairs for unexpired blacklist entries. Empty means no blacklist gate.
 
     An entry with a missing or unparseable `added` date stays **active** and is warned about. An
     auto-reject is unappealable, so a typo in a date must not silently switch the rule off; the
     warning is how the typo gets noticed.
-    """
+    '''
     active: list[tuple[str, str]] = []
     for name, reason, added, date_problem in _blacklist_entries():
         if added is None:
@@ -424,7 +424,7 @@ def blacklisted_companies() -> tuple[tuple[str, str], ...]:
 
 
 def expired_blacklist_entries() -> tuple[tuple[str, str], ...]:
-    """(name, added-date) pairs past COMPANY_BLACKLIST_EXPIRY_DAYS. Reported, never enforced."""
+    '''(name, added-date) pairs past COMPANY_BLACKLIST_EXPIRY_DAYS. Reported, never enforced.'''
     return tuple(
         (name, added.isoformat())
         for name, _reason, added, _date_problem in _blacklist_entries()
@@ -443,7 +443,7 @@ _BUCKET_HEADER = (
 
 
 def append_not_yet_bucketed(entries: list[tuple[str, str, str]]) -> bool:
-    """Append `(place, guess, reason)` rows under `locations.not_yet_bucketed`. True if written.
+    '''Append `(place, guess, reason)` rows under `locations.not_yet_bucketed`. True if written.
 
     A TEXTUAL append, not a re-serialization: the file is hand-written and commented, and this
     project has pyyaml only, whose `safe_dump` would delete every comment in it.
@@ -452,7 +452,7 @@ def append_not_yet_bucketed(entries: list[tuple[str, str, str]]) -> bool:
     unexpected leaves the file untouched and logs. This is the only list the agent may write, and
     it is allowed *because* `not_yet_bucketed` cannot reject a job; the agent never appends to a
     list that gates anything.
-    """
+    '''
     if not entries:
         return False
     try:
@@ -500,10 +500,10 @@ def append_not_yet_bucketed(entries: list[tuple[str, str, str]]) -> bool:
 
 
 def _bucket_insertion_point(lines: list[str]) -> int | None:
-    """Index to insert at: after the last `not_yet_bucketed` item, or the key is created.
+    '''Index to insert at: after the last `not_yet_bucketed` item, or the key is created.
 
     Returns None when there is no `locations:` block to attach to.
-    """
+    '''
     locations_at = next((i for i, ln in enumerate(lines) if ln.rstrip('\n') == 'locations:'), None)
     if locations_at is None:
         return None

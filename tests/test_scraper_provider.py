@@ -48,7 +48,7 @@ NO_CACHE_PRICE = _endpoint('mancer/fp8', 5e-8, None, 1.6e-7)
 # --- ranking ---------------------------------------------------------------------------------------
 
 def test_ranking_is_by_the_scrapers_token_mix_not_the_prompt_price():
-    """NO_CACHE_PRICE has the lowest prompt price, but at 94% cache reads it is the dearest."""
+    '''NO_CACHE_PRICE has the lowest prompt price, but at 94% cache reads it is the dearest.'''
     ranked = [e['tag'] for _, e in so.rank_endpoints(_listing(COREWEAVE, NO_CACHE_PRICE, DEEPINFRA, STREAMLAKE), [], MIN_BITS)]
     assert ranked == ['streamlake/fp8', 'deepinfra/fp8', 'mancer/fp8', 'coreweave/fp8']
 
@@ -78,7 +78,7 @@ def test_unusable_endpoints_are_never_chosen_however_cheap(unusable):
 
 
 def test_a_precision_above_the_servers_default_is_still_a_candidate():
-    """2026-09-27: the default became bf16 and every fp8 endpoint vanished from the list."""
+    '''2026-09-27: the default became bf16 and every fp8 endpoint vanished from the list.'''
     bf16 = _endpoint('morph/bf16', 1.4e-7, 3.6e-8, 4e-7, quantization='bf16', bits=16)
     listing = {**_listing(bf16, DEEPINFRA, STREAMLAKE), 'default_quantization': 'bf16'}
     assert [e['tag'] for _, e in so.rank_endpoints(listing, [], MIN_BITS)] == \
@@ -107,7 +107,7 @@ def test_failed_endpoints_are_excluded():
 # --- choosing --------------------------------------------------------------------------------------
 
 def _wire(monkeypatch, listing, chat_responses=None, sent=None):
-    """Route call_mcp_tool: list_endpoints -> the listing; chat -> the next canned response."""
+    '''Route call_mcp_tool: list_endpoints -> the listing; chat -> the next canned response.'''
     chat_responses = list(chat_responses or [])
 
     async def fake_call(url, tool, args, timeout_seconds=None):

@@ -1,10 +1,10 @@
-"""linkedin_page: capture, archive and de-clutter a LinkedIn job page.
+'''linkedin_page: capture, archive and de-clutter a LinkedIn job page.
 
 The fixture mirrors the structure measured on three real pages (2026-09-24): hashed class names
 (never used), stable `JobDetails_<Section>_<jobId>` ids, a top card around the company logo, and
 the clutter sections the user listed. It also carries two sections nobody has classified: one
 harmless, one that mentions pay.
-"""
+'''
 import json
 import logging
 
@@ -24,7 +24,7 @@ JOB_ID = '4415518989'
 LOGO_URL = 'https://media.licdn.com/dms/image/logo-acme.png'
 CSS_URL = 'https://static.licdn.com/aero-v1/sc/h/site.css'
 
-PAGE = f"""<!DOCTYPE html><html><head>
+PAGE = f'''<!DOCTYPE html><html><head>
 <link rel="stylesheet" href="{CSS_URL}"><link rel="modulepreload" href="https://static.licdn.com/m.js">
 <script>window.track()</script></head>
 <body><header><a href="/feed">Home</a> My Network</header>
@@ -55,7 +55,7 @@ PAGE = f"""<!DOCTYPE html><html><head>
   </div></div></div>
   <div class="d71e55ac"><h2>More jobs</h2><p>Other Co — Principal Engineer — $300K/yr</p><img src="https://media.licdn.com/other.png" alt=""></div>
 </div></main>
-<footer><p>Looking for talent?</p><p>Nederlands (Dutch)</p></footer></body></html>"""
+<footer><p>Looking for talent?</p><p>Nederlands (Dutch)</p></footer></body></html>'''
 
 HARMLESS_TEXT = 'New from LinkedIn: see who else viewed this job'
 PAY_SECTION = 'Salary insights for this role'
@@ -89,7 +89,7 @@ def _candidate(**overrides) -> dict:
 # --- read-only capture -----------------------------------------------------------------------------
 
 def test_capture_js_only_reads_the_page():
-    """JavaScript may read the page, never drive it (Account safety)."""
+    '''JavaScript may read the page, never drive it (Account safety).'''
     assert _guard_call('browser_evaluate', {'function': LINKEDIN_PAGE_CAPTURE_JS}) is None
     for driving in ('.click(', 'dispatchEvent', '.remove(', 'innerHTML =', 'outerHTML =', 'appendChild', 'setAttribute'):
         assert driving not in LINKEDIN_PAGE_CAPTURE_JS
@@ -171,7 +171,7 @@ def test_known_clutter_is_removed_and_the_facts_survive():
 
 
 def test_every_listed_phrase_is_matched_as_written():
-    """A phrase that stops matching fails silently permissive — the section just comes back."""
+    '''A phrase that stops matching fails silently permissive — the section just comes back.'''
     soup = _soup()
     lp.strip_js(soup)
     main_html = str(soup.find('main'))  # the footer's phrase goes out with the footer
@@ -197,7 +197,7 @@ def test_only_unclassified_sections_are_unknown():
 
 
 def test_with_no_known_list_every_clutter_section_is_detected(monkeypatch):
-    """What makes automatic removal possible: a section LinkedIn adds shows up here unasked."""
+    '''What makes automatic removal possible: a section LinkedIn adds shows up here unasked.'''
     soup = _soup()
     lp.strip_js(soup)
     for tag in soup.find_all(['header', 'footer', 'nav']):

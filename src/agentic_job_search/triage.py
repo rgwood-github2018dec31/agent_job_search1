@@ -1,4 +1,4 @@
-"""Cheap-LLM helpers for Stage 2: local triage, and non-Anthropic rating calls.
+'''Cheap-LLM helpers for Stage 2: local triage, and non-Anthropic rating calls.
 
 OpenRouter and local Ollama models are reached through the pre-existing FastMCP
 HTTP tool servers (tools_llm_remote_openrouter on :8006, tools_llm_local on
@@ -8,7 +8,7 @@ callers treat that as a provider failure (fall through / fail open).
 The generic MCP client (`call_mcp_tool`, `mcp_session`, `unwrap_exception`)
 lives in utils_tools_n_agents_common.mcp_client, shared with agent_meta1 and
 agent_stock_trends1.
-"""
+'''
 
 import json
 import logging
@@ -45,7 +45,7 @@ _JSON_STATUS_RE = re.compile(r'"(?:code|status|status_code)"\s*:\s*(\d{3})\b')
 
 
 class ProviderUnavailableError(RuntimeError):
-    """The remote LLM provider itself is refusing every call - unpaid, unauthorised, or throttled.
+    '''The remote LLM provider itself is refusing every call - unpaid, unauthorised, or throttled.
 
     Distinct from a one-off failure, and the distinction decides control flow. A page that would
     not load breaks ONE query and the next should still run; a 402 breaks EVERY query, so retrying
@@ -57,7 +57,7 @@ class ProviderUnavailableError(RuntimeError):
 
     Same shape as `AgentApiError` in tools_generic (2026-08-24): a systemic API-level fault must
     abort the loop, while a per-item fault warns and continues.
-    """
+    '''
 
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
@@ -65,7 +65,7 @@ class ProviderUnavailableError(RuntimeError):
 
 
 class TruncatedResponseError(RuntimeError):
-    """The model hit its output ceiling mid-answer, so the body is incomplete.
+    '''The model hit its output ceiling mid-answer, so the body is incomplete.
 
     Distinct from a malformed response, and the distinction is the whole point: a truncated JSON
     body is not a parse bug to be worked around, it is a request that needs re-issuing with more
@@ -74,7 +74,7 @@ class TruncatedResponseError(RuntimeError):
     surfaced as "No JSON object found in LLM response" — which reads like a fence or a prose
     wrapper and sent the 2026-09 diagnosis down exactly that dead end. `finish_reason` was in the
     payload the entire time.
-    """
+    '''
 
     def __init__(self, message: str, max_tokens: int | None = None):
         super().__init__(message)
@@ -82,7 +82,7 @@ class TruncatedResponseError(RuntimeError):
 
 
 def http_status_of(error_text: str) -> int | None:
-    """The HTTP status named in a provider error string, or None if it names none."""
+    '''The HTTP status named in a provider error string, or None if it names none.'''
     for pattern in (_HTTP_STATUS_RE, _JSON_STATUS_RE):
         if match := pattern.search(error_text):
             return int(match.group(1))
@@ -90,10 +90,10 @@ def http_status_of(error_text: str) -> int | None:
 
 
 def provider_error(context: str, error_text: str) -> RuntimeError:
-    """Classify an OpenRouter MCP failure as systemic (provider) or one-off.
+    '''Classify an OpenRouter MCP failure as systemic (provider) or one-off.
 
     Returns the exception rather than raising it, so call sites keep their `raise` visible.
-    """
+    '''
     status = http_status_of(error_text)
     message = f'{context}: {error_text}'
     if status in PROVIDER_UNAVAILABLE_STATUSES:
@@ -102,15 +102,15 @@ def provider_error(context: str, error_text: str) -> RuntimeError:
 
 
 class LocalModelMissingError(RuntimeError):
-    """OLLAMA_MODEL_NAME_TRIAGE is not installed on the Ollama server behind the local MCP tool server.
+    '''OLLAMA_MODEL_NAME_TRIAGE is not installed on the Ollama server behind the local MCP tool server.
 
     Distinct from the server being down: that is the fail-open case this module is designed
     around, while this is a misconfiguration that silently disables triage on every job.
-    """
+    '''
 
 
 def extract_json_object(text: str) -> dict:
-    """Extract the first JSON object from text that may contain prose around it."""
+    '''Extract the first JSON object from text that may contain prose around it.'''
     decoder = json.JSONDecoder()
     start = text.find('{')
     # A '{' that does not start valid JSON is expected in prose; only the last failure matters,
@@ -178,7 +178,7 @@ async def chat_openrouter(
 
 
 async def list_local_models() -> list[str]:
-    """Names of the models actually installed on the local Ollama server."""
+    '''Names of the models actually installed on the local Ollama server.'''
     raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'list_models', {})
     data = json.loads(raw)
     return [m['name'] for m in data.get('models', ()) if m.get('name')]
@@ -247,12 +247,12 @@ async def generate_local(
 
 
 async def preflight_local_model(model: str = OLLAMA_MODEL_NAME_TRIAGE) -> str | None:
-    """None when `model` is installed, otherwise a message naming what IS installed.
+    '''None when `model` is installed, otherwise a message naming what IS installed.
 
     Also None when the server itself is unreachable - that is the already-handled fail-open
     case, not a misconfiguration, and reporting it here would cry wolf on every run made with
     the tool servers stopped.
-    """
+    '''
     try:
         installed = await list_local_models()
     except Exception as ex:
@@ -263,7 +263,7 @@ async def preflight_local_model(model: str = OLLAMA_MODEL_NAME_TRIAGE) -> str | 
     return await _describe_missing_model(model)
 
 
-TRIAGE_INSTRUCTIONS = """You are a fast job-fit triage filter. Score how well the job posting below fits the candidate profile on a 1-5 scale:
+TRIAGE_INSTRUCTIONS = '''You are a fast job-fit triage filter. Score how well the job posting below fits the candidate profile on a 1-5 scale:
 1 = clear non-fit (wrong field, wrong location, hard deal-breaker)
 2 = weak fit (major gaps or mismatches)
 3 = plausible fit (worth a closer look)
@@ -272,7 +272,7 @@ TRIAGE_INSTRUCTIONS = """You are a fast job-fit triage filter. Score how well th
 
 Be conservative: when unsure, score HIGHER so a stronger model takes a closer look. Only score 1-2 when the mismatch is obvious.
 
-Respond with ONLY a JSON object: {"score": <1-5>, "reason": "<one sentence>"}"""
+Respond with ONLY a JSON object: {"score": <1-5>, "reason": "<one sentence>"}'''
 
 
 async def triage_job_fit(job_text: str, profile_block: str) -> dict | None:
@@ -310,11 +310,11 @@ _TRUNCATION_RETRY_MAX_TOKENS = 32_000
 
 
 class MalformedRatingReplyError(ValueError):
-    """A rating reply that arrived whole but holds no JSON object with an integer `rating`."""
+    '''A rating reply that arrived whole but holds no JSON object with an integer `rating`.'''
 
 
 def parse_rating_reply(content: str) -> dict:
-    """The rating dict from a model reply; MalformedRatingReplyError names what was wrong with it."""
+    '''The rating dict from a model reply; MalformedRatingReplyError names what was wrong with it.'''
     try:
         result = extract_json_object(content)
         result['rating'] = int(result['rating'])
@@ -324,7 +324,7 @@ def parse_rating_reply(content: str) -> dict:
 
 
 async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE) -> tuple[dict, float]:
-    """Rate a job via OpenRouter. Returns (rating dict, cost_usd).
+    '''Rate a job via OpenRouter. Returns (rating dict, cost_usd).
 
     Retries once on truncation because losing this call is costly: the job was written to
     processed_jobs/ back in Stage 1b. A posting the model had scored 5 was lost that way on
@@ -333,7 +333,7 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
     A complete reply that is not a usable rating raises MalformedRatingReplyError and is never
     repaired; `rate_job` then asks MODEL_NAME_RATING_FALLBACKS. On 2026-10-08 a reply holding
     `"rating": 5` left its last array unclosed.
-    """
+    '''
     prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}'
     try:
         content, cost_usd = await chat_openrouter(prompt, system=system_prompt, model=model)
@@ -346,7 +346,7 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
 
 
 async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OLLAMA_MODEL_NAME_TRIAGE) -> dict:
-    """Rate a job via the local Ollama server. Returns the rating dict (cost is zero)."""
+    '''Rate a job via the local Ollama server. Returns the rating dict (cost is zero).'''
     response = await generate_local(
         f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}', system=system_prompt, model=model,
         purpose_slug=LLM_LOCAL_PURPOSE_RATING,

@@ -70,6 +70,7 @@ from agentic_job_search.config import (
     MODEL_NAME_RATING,
     MODEL_NAME_RATING_FALLBACKS,
     MODEL_NAME_SCRAPER,
+    NARRATION_WARNING_CONTEXT_LINES,
     NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_SALARY_MAX_CHARS,
     PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS,
@@ -91,7 +92,6 @@ from agentic_job_search.config import (
     SALARY_FIELD_DESCRIPTION,
     SATURATION_MIN_NEW_JOBS,
     SATURATION_MIN_NEW_RATIO,
-    NARRATION_WARNING_CONTEXT_LINES,
     SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
     SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD,
     SCRAPER_COST_ALERT_FACTOR,
@@ -175,7 +175,7 @@ REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
 
 
 async def _send_pipeline_notification(text: str) -> bool:
-    """Send one Telegram message. False (after a WARNING) when the send failed; never raises."""
+    '''Send one Telegram message. False (after a WARNING) when the send failed; never raises.'''
     try:
         await telegram_send_message(text)
     except Exception as ex:
@@ -190,7 +190,7 @@ async def _send_pipeline_notification(text: str) -> bool:
 
 # --- Prompt construction ---
 
-AGENT_INSTRUCTIONS_COMMON_TEMPLATE = """You are a personal job search agent.
+AGENT_INSTRUCTIONS_COMMON_TEMPLATE = '''You are a personal job search agent.
 
 Do not write files directly to disk. Use the save_job_posting tool to persist job data — it is the only way you should store anything.
 
@@ -211,9 +211,9 @@ Rate every job you evaluate on a 1–5 scale:
 - 3 — Decent fit (meets most requirements, worth considering)
 - 4 — Good fit (strong match on most criteria)
 - 5 — Excellent fit (matches nearly everything)
-"""
+'''
 
-AGENT_INSTRUCTIONS_INTERACTIVE_TEMPLATE = AGENT_INSTRUCTIONS_COMMON_TEMPLATE + """
+AGENT_INSTRUCTIONS_INTERACTIVE_TEMPLATE = AGENT_INSTRUCTIONS_COMMON_TEMPLATE + '''
 ## Interactive mode
 
 Your job is to:
@@ -223,7 +223,7 @@ Your job is to:
 4. Eventually help draft cover letters and apply to approved jobs (email, web forms, or LinkedIn)
 
 Present each job clearly, then ask the user if it's a good fit and why.
-"""
+'''
 
 
 def _sponsorship_prompt_section() -> str:
@@ -246,7 +246,7 @@ def _sponsorship_prompt_section() -> str:
 
 
 def build_interactive_instructions() -> str:
-    """Interactive-mode system prompt with the configured sponsorship rule injected."""
+    '''Interactive-mode system prompt with the configured sponsorship rule injected.'''
     return AGENT_INSTRUCTIONS_INTERACTIVE_TEMPLATE.format(
         sponsorship_section=_sponsorship_prompt_section()
     )
@@ -260,7 +260,7 @@ def build_interactive_instructions() -> str:
 # and must not, since the only real <button> in a row is Dismiss. Cards appear twice in the DOM,
 # hence the dedupe; each label is rendered twice (a visually-hidden copy carrying "(Verified job)"
 # plus the visible one), hence `clean`.
-SCRAPER_HARVEST_JS = r"""() => {
+SCRAPER_HARVEST_JS = r'''() => {
   const box = document.querySelector('div[componentkey="SearchResultsMainContent"]');
   if (!box) return {error: 'results container not found'};
   const seen = new Set(), out = [];
@@ -281,14 +281,14 @@ SCRAPER_HARVEST_JS = r"""() => {
         .replace(/^Posted\s*/i, '').replace(/(.+?)\1$/, '$1')});
   }
   return {count: out.length, jobs: out};
-}"""
+}'''
 
 # Structural report on the search page, run once per search and handed to `report_search`, which
 # does the JUDGING in code. The model is not asked whether the page "looks right": that is exactly
 # the discretion that let a dead EU region and a silently-restructured results list run for days.
 #
 # Read-only, like SCRAPER_HARVEST_JS. It reports what exists, never acts on it.
-SCRAPER_UI_CONTRACT_JS = r"""() => {
+SCRAPER_UI_CONTRACT_JS = r'''() => {
   const box = document.querySelector('div[componentkey="SearchResultsMainContent"]');
   const txt = el => ((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
 
@@ -340,9 +340,9 @@ SCRAPER_UI_CONTRACT_JS = r"""() => {
     result_count_text: resultCountEl ? txt(resultCountEl) : '',
     body_sample: txt(document.body).slice(0, 1500).toLowerCase(),
   };
-}"""
+}'''
 
-SCRAPER_INSTRUCTIONS_TEMPLATE = """You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation
+SCRAPER_INSTRUCTIONS_TEMPLATE = '''You are a job listing scraper. Your job is to find new job postings on LinkedIn and add them to the internal evaluation
 queue.
 
 You are fully authorized to call all available tools. Call them directly — do not ask for permission.
@@ -513,10 +513,10 @@ If a search returns zero results, wait, then re-run it once before concluding th
 
 Only pass information directly visible on the card. Do not infer or fabricate missing fields —
 Stage 2 will fill in the details from the job page.
-"""
+'''
 
 # What to capture and how, shared by both extractor prompts below.
-EXTRACT_FIELD_GUIDANCE = """Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack,
+EXTRACT_FIELD_GUIDANCE = '''Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack,
 seniority, and any visa/work-authorization or "no longer accepting applications" statements. In the location field, always include the workplace type shown on
 the page (Remote / Hybrid / On-site), e.g. "Bucharest, Romania (Remote within country)". Strip navigation chrome, footers, "similar jobs" lists, and marketing
 boilerplate.
@@ -541,10 +541,10 @@ advertised: "Romania (Remote)" on its own says nothing here.
 Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
 - education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD
 is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a
-plus", "Bachelor's or Master's"), or when only a Bachelor's is required."""
+plus", "Bachelor's or Master's"), or when only a Bachelor's is required.'''
 
 # The Anthropic agentic path (the non-default route) still browses for itself.
-EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. Navigate to the job URL provided and capture a condensed extract of the posting.
+EXTRACTOR_INSTRUCTIONS = '''You are a job page extractor. Navigate to the job URL provided and capture a condensed extract of the posting.
 
 Follow EXACTLY this sequence — you have a hard turn budget, and calling submit_job_extract is the only thing that counts as success:
 1. browser_navigate to the URL.
@@ -557,24 +557,24 @@ not verify anything else. A partial description is acceptable — submitting som
 If you have a title, company, and any description text, calling submit_job_extract is ALWAYS your next action. Never end a turn without having either taken
 your one snapshot or submitted the extract.
 
-""" + EXTRACT_FIELD_GUIDANCE + """
+''' + EXTRACT_FIELD_GUIDANCE + '''
 
 Do not rate the job. Do not browse other pages. Extract this one posting, submit it, then stop.
-"""
+'''
 
 # The default path: code has already read the page (linkedin_page.read_job_page), so the model
 # has the text and one tool, and no browser.
-PAGE_EXTRACTOR_INSTRUCTIONS = """You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code — you
+PAGE_EXTRACTOR_INSTRUCTIONS = '''You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code — you
 have no browser and need none.
 
 Call submit_job_extract exactly once, with what the page text says. Never invent a field the text does not support; leave it empty instead.
 
-""" + EXTRACT_FIELD_GUIDANCE + """
+''' + EXTRACT_FIELD_GUIDANCE + '''
 
 Do not rate the job. Extract this one posting, submit it, then stop.
-"""
+'''
 
-EVALUATOR_INSTRUCTIONS_TEMPLATE = """You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not
+EVALUATOR_INSTRUCTIONS_TEMPLATE = '''You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not
 need to browse anywhere.
 {sponsorship_section}{relocation_section}
 ## Workplace type
@@ -622,7 +622,7 @@ Judging the pay itself is still yours: if the figure (or its absence)
 makes you think the pay is likely below target, say that in one bullet. A range whose upper bound reaches the target is on target, because the band is
 negotiable: never warn about its midpoint, its lower half or its floor. Warn only when the whole range, converted if it is in another currency, sits below the
 target. When a `Salary vs target:` line is present, that comparison has already been made for you: do not write a bullet about it.
-"""
+'''
 
 
 def build_scraper_instructions() -> str:
@@ -682,7 +682,7 @@ def build_scraper_instructions() -> str:
 
 
 def build_evaluator_instructions() -> str:
-    """Evaluator prompt with the configured sponsorship, relocation, and hybrid rules injected."""
+    '''Evaluator prompt with the configured sponsorship, relocation, and hybrid rules injected.'''
     sponsorship_section = _sponsorship_prompt_section()
     note = preferences.relocation_note()
     relocation_section = f'\n## Relocation (applies to REMOTE roles only)\n{note}\n' if note else ''
@@ -784,14 +784,14 @@ RESUME_READABLE_SUFFIXES = ('.pdf', '.md')
 
 
 def _read_resume(path: Path) -> str:
-    """Text of a resume: a PDF through pypdf, markdown as written.
+    '''Text of a resume: a PDF through pypdf, markdown as written.
 
     A docx->PDF export writes every word in its own text-showing operation, so pypdf hands back
     `word\\n word\\n word` rather than lines. Whitespace is collapsed per page and pages are joined
     by a blank line: that restores readable prose without inventing structure the PDF does not
     carry. Measured 2026-10-13 on a 3-page resume: 8190 raw chars -> 6322 collapsed, against 6606
     for the equivalent markdown conversion, with every section and keyword intact.
-    """
+    '''
     if path.suffix.lower() != '.pdf':
         return path.read_text(encoding='utf-8')
     pages = [' '.join(page.split()) for page in tools_module.read_pdf_pages(path)]
@@ -799,11 +799,11 @@ def _read_resume(path: Path) -> str:
 
 
 def _resume_files() -> list[Path]:
-    """Every resume-named file in the save directory and run_dir, deduplicated.
+    '''Every resume-named file in the save directory and run_dir, deduplicated.
 
     One file can match several patterns — `cat-resume-R_Garth_Wood_Resume-2026oct8v2.docx.pdf`
     matches two of them — and a duplicate would double-count in the "N found" line.
-    """
+    '''
     found: dict[Path, None] = {}
     for directory, patterns in (
         (preferences.save_dir(), RESUME_SAVE_DIR_GLOBS),
@@ -816,7 +816,7 @@ def _resume_files() -> list[Path]:
 
 
 def load_resume() -> str | None:
-    """Newest resume in the save directory or run_dir, or None.
+    '''Newest resume in the save directory or run_dir, or None.
 
     Newest by mtime ACROSS both directories, so dropping a fresh resume in Downloads supersedes one
     kept in run_dir. A `.pdf` or a `.md` is read; any other format is reported at WARNING rather
@@ -824,7 +824,7 @@ def load_resume() -> str | None:
     being no resume at all. Until 2026-10-13 only run_dir was searched and only markdown was read,
     so a resume revised in Downloads was invisible: the agent rated against a four-month-old copy
     while the current one sat unread.
-    """
+    '''
     files = _resume_files()
     candidates = [p for p in files if p.suffix.lower() in RESUME_READABLE_SUFFIXES]
     unreadable = [p for p in files if p.suffix.lower() not in RESUME_READABLE_SUFFIXES]
@@ -882,7 +882,7 @@ def build_scraper_prompt() -> str:
 
 
 def build_query_generation_instructions() -> str:
-    """Query-generation prompt with the configured title preferences injected."""
+    '''Query-generation prompt with the configured title preferences injected.'''
     lines = [
         'Generate short LinkedIn job search queries (2–6 words each, like a job title).',
         f'Return AT MOST {MAX_SEARCH_QUERIES} queries — each one costs two live LinkedIn searches, '
@@ -912,7 +912,7 @@ QUERY_JSON_INSTRUCTIONS = (
 
 
 async def _generate_queries_openrouter(prompt: str, stage_stats: dict | None) -> list[str]:
-    """Query generation via the OpenRouter MCP server. Raises on any failure."""
+    '''Query generation via the OpenRouter MCP server. Raises on any failure.'''
     content, cost_usd = await chat_openrouter(f'{prompt}\n\n{QUERY_JSON_INSTRUCTIONS}', model=MODEL_NAME_QUERY)
     if stage_stats is not None:
         stage_stats['cost'] += cost_usd
@@ -923,10 +923,10 @@ async def _generate_queries_openrouter(prompt: str, stage_stats: dict | None) ->
 
 
 async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
-    """Derive LinkedIn search queries from resume + requirements + applied jobs.
+    '''Derive LinkedIn search queries from resume + requirements + applied jobs.
 
     Provider chain: OpenRouter (glm) -> Anthropic tool-call. Capped at MAX_SEARCH_QUERIES.
-    """
+    '''
     parts = []
     resume = load_resume()
     if resume:
@@ -953,7 +953,10 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
                 'queries': {
                     'type': 'array',
                     'items': {'type': 'string'},
-                    'description': f'At most {MAX_SEARCH_QUERIES} LinkedIn search queries of 2–6 words each, e.g. ["Staff ML Engineer", "Principal AI Engineer"]',
+                    'description': (
+                        f'At most {MAX_SEARCH_QUERIES} LinkedIn search queries of 2–6 words '
+                        'each, e.g. ["Staff ML Engineer", "Principal AI Engineer"]'
+                    ),
                 },
             },
             'required': ['queries'],
@@ -1020,7 +1023,7 @@ async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
 
 
 def build_profile_block(reference_block: str = '') -> str:
-    """Requirements + reference profile, without rating instructions (shared by triage and rating)."""
+    '''Requirements + reference profile, without rating instructions (shared by triage and rating).'''
     parts = []
     if JOB_REQUIREMENTS_PATH.exists():
         requirements = JOB_REQUIREMENTS_PATH.read_text(encoding='utf-8')
@@ -1044,7 +1047,7 @@ def build_evaluator_prompt(reference_block: str = '') -> str:
 
 
 def _reference_job_texts() -> list[str]:
-    """The newest MAX_REFERENCE_JOBS applied jobs, LinkedIn UI stripped, each within REFERENCE_JOB_PROMPT_MAX_CHARS."""
+    '''The newest MAX_REFERENCE_JOBS applied jobs, LinkedIn UI stripped, each within REFERENCE_JOB_PROMPT_MAX_CHARS.'''
     return [
         pages_to_prompt(strip_saved_page_furniture(pages), f'reference job {i}', REFERENCE_JOB_PROMPT_MAX_CHARS)
         for i, pages in enumerate(tools_module._reference_job_pages[:MAX_REFERENCE_JOBS], 1)
@@ -1091,11 +1094,11 @@ async def _summarize_references_anthropic(prompt: str, stage_stats: dict | None)
 
 
 class ReferenceSummaryTooLongError(RuntimeError):
-    """The ideal-role profile would not fit, and cutting it is not permitted.
+    '''The ideal-role profile would not fit, and cutting it is not permitted.
 
     Raised to STOP the run: the profile calibrates every rating in it, so rating against a
     truncated one is worse than not rating at all.
-    """
+    '''
 
 
 async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict | None) -> str:
@@ -1128,7 +1131,7 @@ async def _ask_reference_providers(prompt: str, stage_stats: dict | None) -> tup
 
 
 async def _stop_over_long_reference_summary(length: int, provider: str, reason: str) -> NoReturn:
-    """Report and abort: a profile that will not fit must not be cut down to fit."""
+    '''Report and abort: a profile that will not fit must not be cut down to fit.'''
     detail = (
         f'Reference summary is {length} chars, over the {REFERENCE_SUMMARY_LIMIT_CHARS}-char limit, '
         f'and re-summarizing it via {provider} {reason}'
@@ -1249,13 +1252,13 @@ def _wrap_reference_summary(summary: str, num_jobs: int) -> str:
 # --- Runner ---
 
 def print_thinking(text: str, *, to_console: bool = False) -> None:
-    """Show a thinking block at DEBUG; `to_console` adds the live console copy.
+    '''Show a thinking block at DEBUG; `to_console` adds the live console copy.
 
     Only interactive mode asks for the console copy — it is a live chat UI. On the scraping and
     Stage 2 paths the narration belongs in the run log, and a block with no text prints nothing
     either way, because a model configured to omit thinking content still emits the block and the
     bare label was ~40 empty `Thinking:` lines in one query (2026-10-13).
-    """
+    '''
     if not text.strip():
         return
     display = text if len(text) <= THINKING_MAX_CHARS else text[:THINKING_MAX_CHARS] + f'\n… ({len(text) - THINKING_MAX_CHARS} more chars)'
@@ -1289,8 +1292,8 @@ _PACKAGE_LOGGER = logging.getLogger(__name__.rpartition('.')[0])
 
 
 class _WarningCounter(logging.Handler):
-    """Notes each WARNING-and-above record of a query: where in its narration it fell, and whether
-    any was an ERROR."""
+    '''Notes each WARNING-and-above record of a query: where in its narration it fell, and whether
+    any was an ERROR.'''
 
     def __init__(self, narration_length: Callable[[], int]) -> None:
         super().__init__(level=logging.WARNING)
@@ -1343,7 +1346,7 @@ class QueryNarration:
         self._lines.append((datetime.now().strftime(NARRATION_TIME_FORMAT), line))
 
     def close(self, unfinished: bool = False) -> None:
-        """End the current query: write the narration its trouble calls for, else say how much was withheld."""
+        '''End the current query: write the narration its trouble calls for, else say how much was withheld.'''
         global _active_narration
         if self.query is None:
             return
@@ -1378,7 +1381,7 @@ class QueryNarration:
         # A warning fell after the first `position` narration lines; it is printed where it fell, so
         # the narration reads against the thing that triggered it.
         warnings_at: dict[int, list[str]] = {}
-        for position, message in zip(warning_positions, warning_messages):
+        for position, message in zip(warning_positions, warning_messages, strict=True):
             warnings_at.setdefault(position, []).append(message)
         previous = -1
         for index in shown:
@@ -1457,7 +1460,7 @@ def new_stage_stats() -> dict:
 
 
 def public_stage_stats(stage_stats: dict) -> dict:
-    """Strip internal bookkeeping keys so cost_log.jsonl keeps its existing stage schema."""
+    '''Strip internal bookkeeping keys so cost_log.jsonl keeps its existing stage schema.'''
     return {
         stage: {k: v for k, v in stats.items() if k not in _PRIVATE_STAGE_STAT_KEYS}
         for stage, stats in stage_stats.items()
@@ -1543,7 +1546,7 @@ _RATING_RE = re.compile(r'-rating_(\d+)-')
 
 
 def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
-    """Return (num_evaluated, num_high_rated) for job files created since snapshot."""
+    '''Return (num_evaluated, num_high_rated) for job files created since snapshot.'''
     jobs_after = set(RUN_DIR.glob('saved_jobs-*/job_posting-*.md'))
     new_jobs = jobs_after - jobs_before
     num_evaluated = len(new_jobs)
@@ -1555,21 +1558,21 @@ def count_new_jobs(jobs_before: set[Path]) -> tuple[int, int]:
 
 
 def _listings_seen() -> int:
-    """Total job listings the scraper has inspected this run (any check_and_record_job outcome).
+    '''Total job listings the scraper has inspected this run (any check_and_record_job outcome).
 
     This counts CALLS. When two regions return the same cards it double-counts, which is exactly
     what made a collapsed region axis look like healthy coverage — see _listings_distinct.
-    """
+    '''
     return sum(tools_module._check_status_counts.values())
 
 
 def _listings_distinct() -> int:
-    """Distinct job listings inspected this run, regardless of how many searches surfaced them."""
+    '''Distinct job listings inspected this run, regardless of how many searches surfaced them.'''
     return len(tools_module._distinct_listing_ids)
 
 
 def _distinct_snapshot() -> set[str]:
-    """Copy of the distinct-id set, for before/after per-query diffing."""
+    '''Copy of the distinct-id set, for before/after per-query diffing.'''
     return set(tools_module._distinct_listing_ids)
 
 
@@ -1587,12 +1590,12 @@ async def _human_pause(delay_range: tuple[float, float], reason: str) -> None:
 
 
 def _check_status_snapshot() -> dict[str, int]:
-    """Copy of the global check_status counters, for before/after per-query diffing."""
+    '''Copy of the global check_status counters, for before/after per-query diffing.'''
     return dict(tools_module._check_status_counts)
 
 
 def _check_status_delta(before: dict[str, int]) -> dict[str, int]:
-    """Per-status counts accrued since `before`; zero-delta statuses are omitted."""
+    '''Per-status counts accrued since `before`; zero-delta statuses are omitted.'''
     return {
         status: count - before.get(status, 0)
         for status, count in tools_module._check_status_counts.items()
@@ -1601,11 +1604,11 @@ def _check_status_delta(before: dict[str, int]) -> dict[str, int]:
 
 
 def _same_query(reported: str, base: str) -> bool:
-    """True if a report_search record belongs to this base query.
+    '''True if a report_search record belongs to this base query.
 
     The model reports the full search text it typed ("Principal Data Scientist, remote"), not the
     base query, so an exact match silently never fires.
-    """
+    '''
     reported = (reported or '').strip().lower()
     base = (base or '').strip().lower()
     return bool(base) and (reported == base or reported.startswith(base))
@@ -1742,7 +1745,7 @@ def health_alert_block(alerts: list[str]) -> str:
 
 
 def _timestamp_date(timestamp: object) -> str:
-    """The YYYY-MM-DD date of an ISO timestamp from cost_log.jsonl. Raises ValueError if unparseable."""
+    '''The YYYY-MM-DD date of an ISO timestamp from cost_log.jsonl. Raises ValueError if unparseable.'''
     try:
         return datetime.fromisoformat(str(timestamp)).date().isoformat()
     except ValueError as ex:
@@ -1797,13 +1800,13 @@ def _median(values: list[int]) -> float:
 
 
 def expected_listings_per_query(query: str, limit: int = LISTING_ESTIMATE_HISTORY_RUNS) -> tuple[float | None, str]:
-    """How many listings `query` usually yields, read back from cost_log.jsonl, plus a label.
+    '''How many listings `query` usually yields, read back from cost_log.jsonl, plus a label.
 
     Median, not mean, so one bad day of zeros does not drag the expectation down. Prefers the
     distinct count (`listings_distinct_per_query`); runs before that field existed only have
     `check_status_per_query` call counts, a different unit, so the label says which one the number
     is. A query with no history falls back to the median over every query in the last `limit` runs.
-    """
+    '''
     path = RUN_DIR / 'cost_log.jsonl'
     if not path.exists():
         return None, 'no history yet'
@@ -1836,12 +1839,12 @@ def expected_listings_per_query(query: str, limit: int = LISTING_ESTIMATE_HISTOR
 
 
 class ScraperBudgetExceededError(ProviderUnavailableError):
-    """The Anthropic scraper fallback has spent its per-run budget.
+    '''The Anthropic scraper fallback has spent its per-run budget.
 
     A ProviderUnavailableError so `run_scraper` treats it the same way: abort the query loop and
     mark every unreached query as an error, rather than letting each remaining query pay for its
     own attempt.
-    """
+    '''
 
 
 def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict, max_cost_usd: float | None = None):
@@ -1878,14 +1881,14 @@ def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict, max_cost_usd
 
 
 def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per_query: dict,
-                         provider_pin: 'scrape_openrouter.ProviderPin | None' = None):
-    """One Stage 1b request through the OpenRouter function-calling loop.
+                         provider_pin: scrape_openrouter.ProviderPin | None = None):
+    '''One Stage 1b request through the OpenRouter function-calling loop.
 
     A FRESH conversation per request. On the Anthropic path all six queries share one transcript,
     so context per turn grew 41K -> 162K across a run and every later query paid for every earlier
     snapshot. Here the browser session persists (the page stays where it was) while the transcript
     does not, so each query starts at the floor.
-    """
+    '''
     async def run_pass(instruction: str) -> int | None:
         query = tools_module._current_query or ''
         session = scrape_openrouter.ScrapeSession(browser_call, query, provider_pin=provider_pin)
@@ -2234,7 +2237,7 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
 
 
 async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: dict) -> dict | None:
-    """Stage 2a: Haiku agentic session fetches the job page and submits a condensed extract."""
+    '''Stage 2a: Haiku agentic session fetches the job page and submits a condensed extract.'''
     options = ClaudeAgentOptions(
         setting_sources=[],
         strict_mcp_config=True,
@@ -2311,8 +2314,8 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
 async def extract_job_page_direct(
     candidate: dict, playwright_mcp_url: str, stage_stats: dict, page: JobPage | None = None
 ) -> dict | None:
-    """Fallback for a failed extract, and the audit path: condense the page text with one
-    non-agentic Haiku call. Reads the page itself when the caller has not already."""
+    '''Fallback for a failed extract, and the audit path: condense the page text with one
+    non-agentic Haiku call. Reads the page itself when the caller has not already.'''
     if page is None:
         page = await read_page(candidate, playwright_mcp_url, stage_stats)
         if page is None:
@@ -2679,7 +2682,7 @@ _SALARY_VS_TARGET_NOTE = {
 
 
 def check_salary_provenance(candidate: dict, extract: dict) -> bool:
-    """Warn when a reported salary figure is not in the page the extract was made from.
+    '''Warn when a reported salary figure is not in the page the extract was made from.
 
     `submit_job_extract` is generative, so a figure it hands back is only as good as the page it
     read — and until raw postings were retained there was nothing to check one against. This is
@@ -2688,7 +2691,7 @@ def check_salary_provenance(candidate: dict, extract: dict) -> bool:
     missed the compensation block is at least as likely as a model inventing a number.
 
     Returns True when the figures check out or there was nothing to check against.
-    """
+    '''
     facts = extract.get('salary_facts') or {}
     if not facts.get('text'):
         return True
@@ -2800,12 +2803,12 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
 
 
 async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
-    """Auto-reject rules; returns the reason, or None if the job survives.
+    '''Auto-reject rules; returns the reason, or None if the job survives.
 
     All rules but the first are deterministic and free. The blacklist runs first because it is
     the most decisive and short-circuits for free when the company name does not match; only an
     exact name hit costs a (cheap) confirmation call. See company_blacklist_reason().
-    """
+    '''
     full_text = format_extract_text(candidate, extract)
 
     # Both the poster and the end client: a recruiting agency can repost a blacklisted company's
@@ -2890,11 +2893,11 @@ def foreign_likely_working_language(extract: dict) -> str:
 
 
 def posting_states_working_language(extract: dict) -> bool:
-    """True when the JD itself says anything about the working language.
+    '''True when the JD itself says anything about the working language.
 
     What the posting says beats what the location implies, so a stated language (or an explicit
     language requirement) silences the location-derived line entirely.
-    """
+    '''
     return bool(
         str(extract.get('stated_working_language') or '').strip()
         or str(extract.get('language_requirement') or '').strip()
@@ -2990,7 +2993,7 @@ def location_is_allowed(location: str, place_names: Sequence[str] = ()) -> bool:
 # the run into one appended block and one Telegram, rather than a call and a message per posting.
 _location_guesses: dict[str, tuple[str, str]] = {}
 
-_GUESS_PROMPT = """Someone filters job postings by where the role is anchored. These are the places
+_GUESS_PROMPT = '''Someone filters job postings by where the role is anchored. These are the places
 they have told us about:
 
 - would live here: {live}
@@ -3001,7 +3004,7 @@ is it more like?
 
 Return ONLY a JSON object, no prose and no code fence:
 {{"guess": "<would_live|would_not_live>", "reason": "<one short sentence>"}}
-"""
+'''
 
 
 def _trim(text: str, limit: int) -> str:
@@ -3013,7 +3016,7 @@ def _trim(text: str, limit: int) -> str:
 
 
 def queue_location_guess(country: str) -> None:
-    """Note a country nothing on the lists names. Guessed once per run, resolved at run end."""
+    '''Note a country nothing on the lists names. Guessed once per run, resolved at run end.'''
     if country and country not in _location_guesses:
         _location_guesses[country] = ('', '')
 
@@ -3023,12 +3026,12 @@ def reset_location_guesses() -> None:
 
 
 async def resolve_location_guesses(stage_stats: dict | None = None) -> list[tuple[str, str, str]]:
-    """Ask about each queued country, record the answers, return (place, guess, reason) rows.
+    '''Ask about each queued country, record the answers, return (place, guess, reason) rows.
 
     Fails open and quietly: no guess, nothing appended, nothing reported, every posting already
     passed. Same stance as the location classifier, for the same reason -- nothing the user wrote
     down matched, so an outage must not begin rejecting.
-    """
+    '''
     pending = [c for c, (guess, _r) in _location_guesses.items() if not guess]
     if not pending:
         return []
@@ -3057,7 +3060,7 @@ async def resolve_location_guesses(stage_stats: dict | None = None) -> list[tupl
 
 
 def location_guess_notification(rows: list[tuple[str, str, str]]) -> str:
-    """The batched Telegram. One message per run, not one per posting."""
+    '''The batched Telegram. One message per run, not one per posting.'''
     lines = [f'\u2753 Location guesses needing your confirmation ({len(rows)})', '']
     for place, guess, reason in rows:
         lines.append(f'\u2022 {place} \u2192 {guess}')
@@ -3324,7 +3327,7 @@ def salary_meets_target(extract: dict) -> bool | None:
 
 
 def below_target_salary_warning(extract: dict) -> str | None:
-    """The code-emitted below-target line, or None unless code decided the range falls short."""
+    '''The code-emitted below-target line, or None unless code decided the range falls short.'''
     if salary_meets_target(extract) is not False:
         return None
     amount, currency = preferences.salary_target()
@@ -3335,7 +3338,7 @@ def below_target_salary_warning(extract: dict) -> str | None:
 
 
 def is_code_emitted_salary_warning(warning: str) -> bool:
-    """True for any salary line this module produced, whichever reading produced it."""
+    '''True for any salary line this module produced, whichever reading produced it.'''
     text = str(warning).strip()
     return (
         text == NO_SALARY_WARNING
@@ -3421,12 +3424,12 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
 
 
 def repost_warning(repost: dict) -> str:
-    """The warning naming the earlier posting a suppressed repost re-advertises.
+    '''The warning naming the earlier posting a suppressed repost re-advertises.
 
     Built in code, like every other deterministic warning, and written into the saved job as well as
     the audit log: a notification that never arrives is invisible, so the reason it did not has to
     be somewhere the user can find it later.
-    """
+    '''
     context = ', '.join(str(repost.get(k) or '').strip() for k in ('notified', 'location', 'salary') if repost.get(k))
     return (
         f"Likely repost of job {repost.get('job_id', '')}"
@@ -3710,8 +3713,8 @@ def format_posted_line(candidate: dict, extract: dict) -> str:
 def format_job_notification(
     candidate: dict, extract: dict, rating: int, pros: list[str], warnings: list[str]
 ) -> str:
-    """The Telegram job-match message. Plain text — _send_pipeline_notification sends no
-    parse_mode, so this uses bullets and emoji rather than Markdown."""
+    '''The Telegram job-match message. Plain text — _send_pipeline_notification sends no
+    parse_mode, so this uses bullets and emoji rather than Markdown.'''
     header = f"⭐ {rating}/5 — {candidate['company']} — {candidate['title']}"
     location = extract.get('location', '').strip()
     workplace_type = derive_workplace_type(extract)
@@ -3801,10 +3804,10 @@ async def _save_and_notify(
     candidate: dict, rating: int, summary: str, content: str, notify: bool = True,
     extract: dict | None = None, pros: list[str] | None = None, warnings: list[str] | None = None,
 ) -> bool | None:
-    """Save the job, and notify when asked and rated high enough.
+    '''Save the job, and notify when asked and rated high enough.
 
     Returns whether the notification was sent, or None when none was attempted.
-    """
+    '''
     await tools_module.do_save_job_posting(
         company=candidate['company'], description=summary, rating=rating,
         content=content, job_id=candidate['job_id'],
@@ -3853,7 +3856,7 @@ def format_extract_signal(extract: dict, raw_residency_scope: str) -> str:
 
 
 def _hard_rule_category(reason: str) -> str:
-    """Bucket a hard-rule reason string for the funnel summary."""
+    '''Bucket a hard-rule reason string for the funnel summary.'''
     if 'blacklisted' in reason:
         return 'hard_ruled_blacklisted'
     if 'closed' in reason:
@@ -3880,7 +3883,7 @@ async def evaluate_all_candidates(
     profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
     triage_enabled: bool = True, browser: BrowserServer | None = None,
 ) -> None:
-    """Stage 2: per candidate — Haiku extract, deterministic hard rules, local triage,
+    '''Stage 2: per candidate — Haiku extract, deterministic hard rules, local triage,
     then one configurable-model rating call. All sharing one browser.
 
     ``browser``, when given, is checked before each job and after each failure: a dead one is
@@ -3897,7 +3900,7 @@ async def evaluate_all_candidates(
     OLLAMA_MODEL_NAME_TRIAGE is reported ONCE and triage is skipped, rather than every job
     re-discovering the same misconfiguration and logging an identical warning (2026-08-25, 63 of
     them in one run).
-    """
+    '''
     if funnel is None:
         funnel = {}
 
@@ -3905,7 +3908,7 @@ async def evaluate_all_candidates(
         funnel[key] = funnel.get(key, 0) + 1
 
     async def audit_gate(candidate: dict, extract_text: str, gate_label: str, gate_detail: str) -> None:
-        """In audit mode, re-rate a gate-killed job with the strong rater and flag false negatives."""
+        '''In audit mode, re-rate a gate-killed job with the strong rater and flag false negatives.'''
         if not audit:
             return
         try:
@@ -3922,7 +3925,7 @@ async def evaluate_all_candidates(
             logger.warning(f"AUDIT rating failed for {candidate['company']} — {candidate['title']}: {ex}")
 
     async def browser_usable(remaining: list[dict]) -> bool:
-        """True when the browser is alive (restarting it if allowed); False once Stage 2 must stop."""
+        '''True when the browser is alive (restarting it if allowed); False once Stage 2 must stop.'''
         if browser is None or not browser.is_dead():
             return True
         if browser.restarts < PLAYWRIGHT_MAX_RESTARTS_PER_RUN:
@@ -4236,7 +4239,7 @@ async def evaluate_all_candidates(
 
 
 async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
-    """One non-agentic Opus rating call — the reference standard for audits only."""
+    '''One non-agentic Opus rating call — the reference standard for audits only.'''
     options = ClaudeAgentOptions(
         setting_sources=[],
         strict_mcp_config=True,
@@ -4277,12 +4280,12 @@ async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats:
 async def audit_unsurfaced_with_opus(
     playwright_mcp: dict, evaluator_prompt: str, stage_stats: dict, sample_size: int,
 ) -> list[dict]:
-    """Sample jobs the pipeline never surfaced and re-rate them with Opus.
+    '''Sample jobs the pipeline never surfaced and re-rate them with Opus.
 
     Three pools (filtered at Stage 1, seen but never queued, mid-rated per is_mid_rated). A high Opus
     rating on any of them is a FALSE NEGATIVE: a job the funnel should have delivered.
     Diagnostic only — nothing is saved or notified.
-    """
+    '''
     pools = tools_module.unsurfaced_pools()
     findings: list[dict] = []
 
@@ -4345,12 +4348,12 @@ def _parse_semver(version: str) -> tuple[int, ...] | None:
 
 
 def check_playwright_mcp_version() -> str | None:
-    """Return the published @playwright/mcp version if it is NEWER than the pin, else None.
+    '''Return the published @playwright/mcp version if it is NEWER than the pin, else None.
 
     Fails open on absolutely everything — offline, timeout, a registry outage, a body that does
     not parse. This runs before the run lock is taken and before the browser starts, so a network
     hiccup here must cost a log line, never a run.
-    """
+    '''
     try:
         response = requests.get(
             PLAYWRIGHT_MCP_REGISTRY_URL, timeout=PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
@@ -4384,7 +4387,7 @@ def _playwright_upgrade_instructions(published: str) -> str:
 
 
 def prompt_playwright_mcp_upgrade(interactive: bool) -> None:
-    """Offer the choice BEFORE the run lock, the job load, or npx — so exiting costs nothing.
+    '''Offer the choice BEFORE the run lock, the job load, or npx — so exiting costs nothing.
 
     Asks ONLY in interactive mode with a real TTY. Both conditions are load-bearing, and gating on
     the TTY alone was a bug: `-n` is the autonomous mode, run by cron *and* by hand from a terminal,
@@ -4392,7 +4395,7 @@ def prompt_playwright_mcp_upgrade(interactive: bool) -> None:
     failure this whole mechanism exists to prevent. `-n` means "do not ask me things".
 
     Anywhere it does not ask, it warns, raises a health alert, and continues on the pin.
-    """
+    '''
     published = check_playwright_mcp_version()
     if not published:
         return
@@ -4508,11 +4511,11 @@ class BrowserServer:
         return self.proc is not None and (self.proc.returncode is not None or self.unreachable)
 
     async def confirm_dead(self) -> bool:
-        """After a failed extract: is the server gone, rather than the page bad? Probes the port.
+        '''After a failed extract: is the server gone, rather than the page bad? Probes the port.
 
         is_dead() alone missed the 2026-09-28 death: the port closed and three jobs failed within
         43 ms, before the process exit was reaped, so each was written off as a bad page.
-        """
+        '''
         if self.is_dead():
             return True
         try:

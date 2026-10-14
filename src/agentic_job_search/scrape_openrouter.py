@@ -26,6 +26,7 @@ from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
+    FIND_CAPTURE_MAX_FILES,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_SCRAPER,
@@ -33,7 +34,6 @@ from agentic_job_search.config import (
     SCRAPER_CACHED_PROMPT_SHARE,
     SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
-    FIND_CAPTURE_MAX_FILES,
     SCRAPER_FIND_RESULT_MAX_CHARS,
     SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION,
     SCRAPER_MIN_BITS_PER_WEIGHT,
@@ -63,7 +63,7 @@ FIND_CAPTURE_DIR = RUN_DIR / 'find_captures'
 
 
 def _capture_oversized_find(out: str, query: str | None) -> None:
-    """TEMPORARY: save a large raw browser_find result for inspection (see FIND_CAPTURE_MAX_FILES)."""
+    '''TEMPORARY: save a large raw browser_find result for inspection (see FIND_CAPTURE_MAX_FILES).'''
     if len(out) <= SCRAPER_TOOL_RESULT_MAX_CHARS:
         return
     FIND_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -80,11 +80,11 @@ _FINISH_REASON_STOP = 'stop'
 
 
 def _result_cap(tool_name: str) -> int:
-    """The char budget for one tool result.
+    '''The char budget for one tool result.
 
     browser_find returns only matches, and a snapshot arrives with its job detail pane removed and
     must keep every result card, so both get more room than the shared cap.
-    """
+    '''
     if tool_name == _FIND_TOOL_NAME:
         return SCRAPER_FIND_RESULT_MAX_CHARS
     if tool_name == _SNAPSHOT_TOOL_NAME:
@@ -128,7 +128,7 @@ def effective_price_per_million(endpoint: dict) -> float | None:
 
 
 def min_bits_for(model: str) -> int:
-    """The lowest bits-per-weight the scraper accepts for this model. Raises when it has no entry."""
+    '''The lowest bits-per-weight the scraper accepts for this model. Raises when it has no entry.'''
     try:
         return SCRAPER_MIN_BITS_PER_WEIGHT[model]
     except KeyError as ex:
@@ -182,7 +182,7 @@ class ProviderPin:
     switches: int = 0
 
     async def choose(self) -> bool:
-        """Pin the cheapest usable endpoint not yet failed. Raises when the listing fails."""
+        '''Pin the cheapest usable endpoint not yet failed. Raises when the listing fails.'''
         raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'list_endpoints', {'model': self.model},
                                   timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
         listing = json.loads(raw)
@@ -203,7 +203,7 @@ class ProviderPin:
         return True
 
     async def switch(self, error: str, query: str) -> bool:
-        """After a failure on the pinned endpoint, move to the next-cheapest. False when none is left."""
+        '''After a failure on the pinned endpoint, move to the next-cheapest. False when none is left.'''
         if self.tag is None:
             return False
         failed_tag = self.tag
@@ -291,11 +291,11 @@ LOCAL_TOOL_NAMES = {t['function']['name'] for t in LOCAL_TOOL_DEFS}
 
 
 def _guard_call(name: str, args: dict) -> str | None:
-    """Refuse anything that would touch the job results list. Returns a refusal, or None to allow.
+    '''Refuse anything that would touch the job results list. Returns a refusal, or None to allow.
 
     Code-enforced rather than prompted: to the model a card and its Dismiss button are the same
     node, so wording cannot prevent this (AGENTS.md, Account safety).
-    """
+    '''
     if name in ('browser_click', 'browser_hover'):
         blob = ' '.join(str(args.get(k, '')) for k in ('target', 'element', 'ref', 'selector'))
         for bad in FORBIDDEN_CLICK_SUBSTRINGS:
@@ -332,14 +332,14 @@ def browser_tool_defs(mcp_tools: list[dict]) -> list[dict]:
 
 
 def parse_evaluate_result(raw: str) -> dict | None:
-    """Pull the object out of a browser_evaluate response.
+    '''Pull the object out of a browser_evaluate response.
 
     playwright-mcp answers with a `### Result` section followed by `### Ran Playwright code`, and
     that trailing block ECHOES THE SCRIPT, braces included. Scanning to the last `}` therefore runs
     past the JSON into the echoed source -- which silently returned None on every real harvest while
     passing against hand-written fixtures. Isolate the Result section, then take the outermost
     balanced object.
-    """
+    '''
     body = raw
     if '### Ran Playwright code' in body:
         body = body.split('### Ran Playwright code', 1)[0]
@@ -434,7 +434,7 @@ class ScrapeSession:
         return parse_evaluate_result(await self._browser('browser_evaluate', {'function': js}))
 
     async def dispatch_local(self, name: str, args: dict) -> str:
-        """Run one of our tools. Every branch obtains its own data."""
+        '''Run one of our tools. Every branch obtains its own data.'''
         from agentic_job_search.agent import SCRAPER_HARVEST_JS, SCRAPER_UI_CONTRACT_JS
 
         if name == 'run_ui_contract':
@@ -543,7 +543,7 @@ class ScrapeSession:
         await self.pin.switch(reason, self.query)
 
     async def run(self, system_prompt: str, user_prompt: str, tools: list[dict]) -> None:
-        """Drive the conversation until the model stops, it is blocked, or iterations run out."""
+        '''Drive the conversation until the model stops, it is blocked, or iterations run out.'''
         messages: list[dict[str, Any]] = [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt},

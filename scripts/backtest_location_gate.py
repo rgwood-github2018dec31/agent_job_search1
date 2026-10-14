@@ -63,7 +63,7 @@ DESCRIPTION_RE = re.compile(r'^URL:[ \t]*\S+[ \t]*$(.*)', re.MULTILINE | re.DOTA
 
 
 def load_postings(root: Path) -> list[dict]:
-    """Every saved posting, newest directory first."""
+    '''Every saved posting, newest directory first.'''
     postings = []
     for path in sorted(root.glob('saved_jobs-*/job_posting-*.md'), reverse=True):
         text = path.read_text(encoding='utf-8', errors='replace')
@@ -77,7 +77,7 @@ def load_postings(root: Path) -> list[dict]:
 
 
 def spread(postings: list[dict], limit: int) -> list[dict]:
-    """Pick a sample that actually exercises the gate rather than N postings from one country.
+    '''Pick a sample that actually exercises the gate rather than N postings from one country.
 
     Three things this must avoid, each of which produced a useless run while writing it:
       - newest-first, which is dominated by whatever the last run happened to surface;
@@ -85,7 +85,7 @@ def spread(postings: list[dict], limit: int) -> list[dict]:
       - random, which is not reproducible across the two runs the cache check needs.
     So: dedupe to one posting per distinct location (preferring the highest-rated, since a 5 the
     gate now rejects is the finding worth seeing), then take an even STRIDE through that list.
-    """
+    '''
     by_location: dict[str, dict] = {}
     for record in sorted(postings, key=lambda r: -r['rating']):
         key = record['location'].lower()[:LOCATION_DEDUPE_KEY_CHARS]

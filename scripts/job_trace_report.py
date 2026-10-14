@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Full-trace PDF for one evaluated job: every artifact the pipeline kept, verbatim.
+'''Full-trace PDF for one evaluated job: every artifact the pipeline kept, verbatim.
 
 Written because a summary of a run hides exactly the thing worth finding. The reference-summary
 truncation (2026-10-13) was invisible in every summary and obvious in one `Run funnel` line next to
@@ -12,7 +12,7 @@ Usage:
     ... --job-id 4479034008 --date 2026-10-13 --out run_dir/trace.pdf
 
 Reads only files the run already wrote; never calls a model and costs nothing.
-"""
+'''
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import (
     HRFlowable,
-    KeepTogether,
     PageBreak,
     Paragraph,
     Preformatted,
@@ -45,7 +44,6 @@ sys.path.insert(0, str(PROJECT_DIR / 'src'))
 
 from agentic_job_search import agent as A  # noqa: E402
 from agentic_job_search import config as C  # noqa: E402
-from agentic_job_search import salary as S  # noqa: E402
 
 RUN_DIR = PROJECT_DIR / 'run_dir'
 WRAP = 108
@@ -120,8 +118,18 @@ def kv_table(rows: list[tuple[str, str]]) -> Table:
 
 # --- artifact loading --------------------------------------------------------
 
+def group_or(pattern: str, text: str, default: str = '?') -> str:
+    '''The first capture group of `pattern` in `text`, or `default` when it does not match.
+
+    Spelled out rather than `(re.search(...) or [None, default])[1]`: that form works only because
+    `re.Match` happens to support `[1]` as `group(1)`, so the two branches of the `or` mean
+    different things and neither is visible at the call site.
+    '''
+    match = re.search(pattern, text, re.M)
+    return match.group(1) if match else default
+
 def find_saved_job(job_id: str) -> Path | None:
-    """The Saved Job for a job id, wherever it currently lives (saved_jobs-*/ or a released dir)."""
+    '''The Saved Job for a job id, wherever it currently lives (saved_jobs-*/ or a released dir).'''
     for pattern in (f'saved_jobs-*/job_posting-{job_id}-*.md', f'*/job_posting-{job_id}-*.md'):
         hits = sorted(RUN_DIR.glob(pattern))
         if hits:
@@ -173,7 +181,7 @@ def audit_log_for(run_date: str, captured: str | None = None) -> Path | None:
 
 
 def search_that_surfaced(log_path: Path | None, job_id: str) -> str:
-    """The harvest line immediately before the record_listings call that queued this job."""
+    '''The harvest line immediately before the record_listings call that queued this job.'''
     if not log_path or not log_path.exists():
         return ''
     lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
@@ -227,15 +235,15 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
     md = saved.read_text(encoding='utf-8') if saved else ''
     head = md.split('\n\n', 1)[0]
     title = re.sub(r'^#\s*', '', head.splitlines()[0]) if md else f'job {job_id}'
-    company = (re.search(r'^Company:\s*(.+)$', md, re.M) or [None, '?'])[1]
-    url = (re.search(r'^URL:\s*(.+)$', md, re.M) or [None, '?'])[1]
-    rating = (re.search(r'rating (\d)/5', title) or [None, '?'])[1]
-    reasoning = (re.search(r'^Reasoning:\s*(.+)$', md, re.M) or [None, ''])[1]
-    triage = (re.search(r'^Triage score \(local\):\s*(\d+)', md, re.M) or [None, '?'])[1]
+    company = group_or(r'^Company:\s*(.+)$', md)
+    url = group_or(r'^URL:\s*(.+)$', md)
+    rating = group_or(r'rating (\d)/5', title)
+    reasoning = group_or(r'^Reasoning:\s*(.+)$', md, '')
+    triage = group_or(r'^Triage score \(local\):\s*(\d+)', md)
     pros = re.findall(r'^• (.+)$', md.split('## Warnings')[0], re.M)
     warnings = re.findall(r'^• (.+)$', md.split('## Warnings')[1].split('\n\n')[0], re.M) \
         if '## Warnings' in md else []
-    estimate_line = (re.search(r'^Estimated salary:\s*(.+)$', md, re.M) or [None, ''])[1]
+    estimate_line = group_or(r'^Estimated salary:\s*(.+)$', md, '')
     # Everything after the header block, i.e. the condensed extract the rater read.
     extract_text = md.split('\n\n', 1)[1] if '\n\n' in md else ''
 
@@ -270,7 +278,7 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
     # 1. Stage 1a
     story += [h1('1. Stage 1a — the queries this run searched with'), rule()]
     if log_path:
-        q = [ln for ln in log_lines_about(log_path, 'search queries via')]
+        q = list(log_lines_about(log_path, 'search queries via'))
         story += [label('VERBATIM — the query-generation line from the run log'), verbatim('\n'.join(q) or '(not found)')]
     story += [label('VERBATIM — the query list, as the funnel recorded it'), Spacer(1, 2)]
     story += [kv_table([('Cost', stage_cost(run_date, 'query_generation'))])]
@@ -286,7 +294,7 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
                        f'The record_listings call that followed it queued this job.')]
         story += [label('VERBATIM — the harvest that surfaced it'), verbatim(surfacing)]
     else:
-        story += [note('No harvest line precedes this job\'s record_listings line in the selected '
+        story += [note("No harvest line precedes this job's record_listings line in the selected "
                        'run log, so the search that surfaced it cannot be named.')]
     story += [label('VERBATIM — the record_listings line that queued this job'), verbatim(queue_line or '(not found)')]
     story += [label('VERBATIM — every harvest line in this run, with region and elapsed time'),
@@ -362,16 +370,16 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
 
     # 8. Notification
     story += [PageBreak(), h1('8. The Telegram message'), rule()]
-    story += [body('Rebuilt by calling the pipeline\'s own format_job_notification() with the '
+    story += [body("Rebuilt by calling the pipeline's own format_job_notification() with the "
                    'fields the Saved Job and the run log retained. The message the user actually '
                    'received was not stored.')]
     try:
         extract = {
             'title': re.search(r'^Title:\s*(.+)$', md, re.M).group(1),
             'company': company,
-            'location': (re.search(r'^Location:\s*(.+)$', md, re.M) or [None, ''])[1],
-            'workplace_type': (re.search(r'^Workplace:\s*(.+)$', md, re.M) or [None, ''])[1],
-            'date_posted': (re.search(r'^Posted:\s*(.+)$', md, re.M) or [None, ''])[1],
+            'location': group_or(r'^Location:\s*(.+)$', md, ''),
+            'workplace_type': group_or(r'^Workplace:\s*(.+)$', md, ''),
+            'date_posted': group_or(r'^Posted:\s*(.+)$', md, ''),
             'salary': '',
             'salary_estimate': {
                 'currency': 'EUR', 'minimum': 75000, 'maximum': 115000, 'period': 'year',
@@ -401,13 +409,13 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
     story += [verbatim('\n'.join([
         '* The search-results CARD text for this listing (title/company/location as shown in the',
         '  results list). The harvest is held in ScrapeSession._harvest and handed straight to',
-        '  do_record_listings; only the counts and the audit log\'s per-search lines survive.',
+        "  do_record_listings; only the counts and the audit log's per-search lines survive.",
         '* The harvest listing dicts for the whole run (_listing_records is in-memory only).',
         '* The full extract JSON — only the fields the Saved Job renders are persisted, so any',
         '  extract field with no line in the Saved Job is unrecoverable.',
         '* The rating JSON. The Saved Job keeps reasoning/pros/warnings, but not the raw object.',
         '* The exact Telegram bytes that were sent.',
-        '* The rater\'s full prompt as sent (it is rebuilt deterministically from the profile above,',
+        "* The rater's full prompt as sent (it is rebuilt deterministically from the profile above,",
         '  build_evaluator_instructions() and the extract text).',
         '* The search URL / filter state for the search that surfaced this job: the audit log keeps',
         '  the query, the region, the pin that was verified and the card count, not the URL.',

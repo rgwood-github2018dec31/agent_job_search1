@@ -85,7 +85,7 @@ def _write(doc: dict[str, Any]) -> None:
 
 
 def substring_collisions(countries: dict[str, str]) -> list[dict[str, str]]:
-    """List entries that sit inside a place they do not mean. Deterministic and free.
+    '''List entries that sit inside a place they do not mean. Deterministic and free.
 
     This is the check that catches `Roma` inside `Romania` -- the entry that exempted every
     Romanian posting before the deny list, the classifier and the region policy were consulted. It
@@ -97,7 +97,7 @@ def substring_collisions(countries: dict[str, str]) -> list[dict[str, str]]:
     1 real one. Across lists it is the dangerous case and is always reported -- allow beats deny, so
     `Roma` on `would_live_here` sitting inside `Romania` on `would_not_live_here` is exactly how a
     whole country gets silently exempted.
-    """
+    '''
     listed = _all_listed_places()
     own_list: dict[str, set[str]] = {}
     for list_name, token in listed:
@@ -128,7 +128,7 @@ def substring_collisions(countries: dict[str, str]) -> list[dict[str, str]]:
 
 
 def _all_listed_places() -> list[tuple[str, str]]:
-    """(list name, entry) for every user-authored place list, for the hygiene checks."""
+    '''(list name, entry) for every user-authored place list, for the hygiene checks.'''
     return [
         (f'locations.{name}', token)
         for name, getter in (
@@ -148,13 +148,13 @@ def _fold(text: str) -> str:
 
 
 def dead_entries(place_names: set[str]) -> list[dict[str, str]]:
-    """List entries that match nothing seen, but WOULD if case or accents were fixed.
+    '''List entries that match nothing seen, but WOULD if case or accents were fixed.
 
     Deterministic and free, like the collision check. This is how `malaga` gets caught: LinkedIn
     writes `Málaga`, matching is accent-exact, and the entry had therefore never matched anything
     in the corpus -- while looking exactly like an entry that simply had not come up yet. That is
     the distinction this check makes and a plain "never matched" count cannot.
-    """
+    '''
     listed = _all_listed_places()
     findings: list[dict[str, str]] = []
     for list_name, token in listed:

@@ -199,7 +199,7 @@ def title_rejection_reason(title: str) -> str | None:
 
 
 class AgentApiError(Exception):
-    """An Anthropic API call failed at the HTTP level (401 / 429 / 500 / 529 ...).
+    '''An Anthropic API call failed at the HTTP level (401 / 429 / 500 / 529 ...).
 
     The SDK reports this as a ResultMessage with is_error=True and subtype=="success", putting the
     real status in api_error_status. Its own fallback text renders that as the self-contradictory
@@ -209,7 +209,7 @@ class AgentApiError(Exception):
 
     Unlike a corrupt PDF, this is systemic: it fails every call the same way, so callers abort
     rather than retrying per file.
-    """
+    '''
 
     def __init__(self, detail: str, api_error_status: int | None = None):
         super().__init__(detail)
@@ -328,7 +328,7 @@ _COMPANY_NOISE_WORDS = {
 
 
 async def _company_matches_openrouter(candidate: str, companies_list: str) -> dict:
-    """Fuzzy company match via the OpenRouter MCP server. Raises on any failure."""
+    '''Fuzzy company match via the OpenRouter MCP server. Raises on any failure.'''
     content, _cost = await chat_openrouter(
         f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
         f'{companies_list}\n\n'
@@ -340,12 +340,12 @@ async def _company_matches_openrouter(candidate: str, companies_list: str) -> di
 
 
 async def company_matches_applied(candidate: str) -> str | None:
-    """Return the source PDF filename if candidate matches a previously applied-to company, else None.
+    '''Return the source PDF filename if candidate matches a previously applied-to company, else None.
 
     Tries an exact normalized string match first — that resolves the overwhelming majority of
     listings for free and, more importantly, without a per-listing network round-trip that would
     otherwise dominate Stage 1b wall-clock. The LLM is only consulted for genuine ambiguity.
-    """
+    '''
     if not _applied_companies:
         return None
 
@@ -417,13 +417,13 @@ def _blacklist_confirm_prompt(company: str, entry_name: str, reason: str, contex
 
 
 async def _blacklist_confirms_openrouter(prompt: str) -> dict:
-    """Confirm a blacklist name hit via the OpenRouter MCP server. Raises on any failure."""
+    '''Confirm a blacklist name hit via the OpenRouter MCP server. Raises on any failure.'''
     content, _cost = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
     return extract_json_object(content)
 
 
 async def company_blacklist_reason(company: str, context: str = '', description: str = '') -> str | None:
-    """Return the blacklist reason if this posting is from a blacklisted company, else None.
+    '''Return the blacklist reason if this posting is from a blacklisted company, else None.
 
     Deliberately does NOT reuse ``company_matches_applied``: that one matches on a normalized,
     lowercased name and fuzzy-matches by default, both of which are wrong for a standing
@@ -439,7 +439,7 @@ async def company_blacklist_reason(company: str, context: str = '', description:
     `description` is budgeted only after a name hit, because only then does anything read it.
     Budgeting it up front logged a truncation for every job on every run (20 on 2026-09-24) for
     text that was then thrown away unread.
-    """
+    '''
     entries = preferences.blacklisted_companies()
     if not entries or not company or not company.strip():
         return None
@@ -550,11 +550,11 @@ def raw_posting_path(candidate: dict, captured_on: date | None = None) -> Path:
 
 
 def save_raw_posting(candidate: dict, text: str, source: str, chars_sent_to_model: int) -> Path | None:
-    """Keep the page an extract was made from, so its figures can be checked against it later.
+    '''Keep the page an extract was made from, so its figures can be checked against it later.
 
     Returns the path written, or None when it could not be. A retention failure is not a run
     failure: this directory feeds nothing, and losing a capture costs a later audit, not a job.
-    """
+    '''
     path = raw_posting_path(candidate)
     header = yaml.safe_dump({
         'url': str(candidate.get('url') or ''),
@@ -636,7 +636,7 @@ _RECRUITER_NOTIFICATIONS_HEADER = (
 
 
 def _parse_iso_date(raw: Any) -> date:
-    """A `date` from an ISO string; raises ValueError otherwise. PyYAML already parses an unquoted date."""
+    '''A `date` from an ISO string; raises ValueError otherwise. PyYAML already parses an unquoted date.'''
     if isinstance(raw, datetime):
         return raw.date()
     if isinstance(raw, date):
@@ -648,13 +648,13 @@ def _parse_iso_date(raw: Any) -> date:
 
 
 def load_recruiter_notifications(today: date | None = None) -> list[dict]:
-    """Notified agency postings still inside the repost window, newest first.
+    '''Notified agency postings still inside the repost window, newest first.
 
     Fails open to an empty list on anything unreadable. Deliberately NOT the "skip, never rebuild"
     treatment `location_recommendations.yaml` gets: that file holds decisions the user made by hand,
     this one is rebuilt by the next notification — and an unreadable file must never be able to
     suppress a notification.
-    """
+    '''
     if not RECRUITER_NOTIFICATIONS_PATH.exists():
         return []
     try:
@@ -693,11 +693,11 @@ def load_recruiter_notifications(today: date | None = None) -> list[dict]:
 
 
 def record_recruiter_notification(candidate: dict, extract: dict, today: date | None = None) -> dict:
-    """Record one notified agency posting so a later repost of it can be recognised.
+    '''Record one notified agency posting so a later repost of it can be recognised.
 
     Only postings actually NOTIFIED are recorded. A role first rated 3 was never sent to the user,
     so a later repost that rates 4 must still notify.
-    """
+    '''
     agency = str(extract.get('company') or candidate.get('company') or '').strip()
     job_id = str(candidate.get('job_id') or '')
     entry = {
@@ -768,7 +768,7 @@ def _repost_match_prompt(new_posting: dict, priors: list[dict]) -> str:
 
 
 async def _repost_match_openrouter(prompt: str, stage_stats: dict | None) -> dict:
-    """Judge a repost via the OpenRouter MCP server. Raises on any failure."""
+    '''Judge a repost via the OpenRouter MCP server. Raises on any failure.'''
     content, cost_usd = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
     if stage_stats is not None:
         stage_stats['cost'] += cost_usd
@@ -778,7 +778,7 @@ async def _repost_match_openrouter(prompt: str, stage_stats: dict | None) -> dic
 async def recruiter_repost_of(
     candidate: dict, extract: dict, stage_stats: dict | None = None,
 ) -> dict | None:
-    """The already-notified posting this one re-advertises, or None to notify normally.
+    '''The already-notified posting this one re-advertises, or None to notify normally.
 
     Two steps, and the first is free: unless this agency already had a posting notified inside the
     window, no LLM call is made at all — which is every job on essentially every run.
@@ -791,7 +791,7 @@ async def recruiter_repost_of(
     user wrote down already matched, so an outage must not readmit it; here nothing has been
     established except that the same agency posted before, and an outage must not silence a real
     role.
-    """
+    '''
     agency = str(extract.get('company') or candidate.get('company') or '').strip()
     if not agency:
         return None
@@ -894,18 +894,18 @@ async def recruiter_repost_of(
 
 
 def read_pdf_pages(pdf: Path) -> list[str]:
-    """Extracted text of each page of a PDF, null bytes stripped.
+    '''Extracted text of each page of a PDF, null bytes stripped.
 
     Pages stay separate until a prompt serializes them (text_budget.pages_to_prompt), so size per
     page can be reported and a cap applied after whitespace normalization rather than to raw text.
     Null bytes are stripped because they make text unusable as a CLI subprocess argument.
-    """
+    '''
     reader = pypdf.PdfReader(pdf)
     return [(page.extract_text() or '').replace('\x00', '') for page in reader.pages]
 
 
 async def _categorize_pdf_text(text: str, filename: str) -> str | None:
-    """Use agent SDK to assign a category label to a PDF. Returns a snake_case string."""
+    '''Use agent SDK to assign a category label to a PDF. Returns a snake_case string.'''
     options = ClaudeAgentOptions(
         model=ANTHROPIC_MODEL_NAME_LOW,
         tools=[],
@@ -997,7 +997,7 @@ async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
 
 
 def _read_yaml_mapping(path: Path) -> dict:
-    """Read a YAML file into a dict, warning and returning {} if it is missing or unreadable."""
+    '''Read a YAML file into a dict, warning and returning {} if it is missing or unreadable.'''
     if not path.exists():
         return {}
     try:
@@ -1009,11 +1009,11 @@ def _read_yaml_mapping(path: Path) -> dict:
 
 
 def _resolve_applied_date(pdf: Path, index: dict, legacy_cache: dict) -> date:
-    """Determine the date a job was applied to, most durable source first.
+    '''Determine the date a job was applied to, most durable source first.
 
     mtime is the least trustworthy carrier — a move, copy, or backup restore rewrites it — so
     the filename prefix and the index take precedence over it.
-    """
+    '''
     prefix_match = _DATE_PREFIX_RE.match(pdf.name)
     if prefix_match:
         try:
@@ -1114,7 +1114,7 @@ async def ingest_save_dir_applied_pdfs(
 
 
 async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path | None = None) -> None:
-    """Load the applied-jobs corpus, populating the in-horizon globals.
+    '''Load the applied-jobs corpus, populating the in-horizon globals.
 
     Reads the DESTINATION directory only (run_dir/applied_jobs/) — the save directory is not
     involved here, and an un-ingested PDF still sitting in it is invisible to this function.
@@ -1122,7 +1122,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     index.yaml caches the extracted text and metadata per filename, keyed on mtime, so the
     metadata LLM call only runs for new or changed PDFs. Records applied to longer ago than
     APPLIED_JOBS_HORIZON_DAYS stay on disk but are not read into any global.
-    """
+    '''
     global _applied_companies, _reference_job_pages, _applied_jobs
 
     applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
@@ -1212,7 +1212,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
 
 
 def applied_jobs_summary() -> str:
-    """One line per in-horizon applied job, for injection into the query-generation prompt."""
+    '''One line per in-horizon applied job, for injection into the query-generation prompt.'''
     lines = []
     for job in sorted(_applied_jobs, key=lambda j: j['applied_date'], reverse=True):
         title = job['job_title'] or '(unknown title)'
@@ -1228,7 +1228,7 @@ RUN_LOCK_PATH = RUN_DIR / '.run_lock.json'
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if a process with this PID exists. Signal 0 checks liveness without touching it."""
+    '''True if a process with this PID exists. Signal 0 checks liveness without touching it.'''
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1259,13 +1259,13 @@ def read_run_lock(lock_path: Path | None = None) -> dict | None:
 
 
 def acquire_run_lock(mode: str, force: bool = False, lock_path: Path | None = None) -> dict | None:
-    """Claim the run lock. Returns the CONFLICTING record if a run is already active, else None.
+    '''Claim the run lock. Returns the CONFLICTING record if a run is already active, else None.
 
     Concurrent runs share processed_jobs/ and one Playwright browser profile: whichever run
     reaches a listing first marks it processed, so the other silently dedups it away and the
     jobs are never evaluated by either. That is invisible in the logs, which is why this is
     enforced rather than merely warned about.
-    """
+    '''
     path = lock_path or RUN_LOCK_PATH
     active = read_run_lock(path)
     if active and not force:
@@ -1371,8 +1371,8 @@ def describe_run_status(lock_path: Path | None = None) -> str:
 
 
 def job_url(site: str, job_id: str) -> str:
-    """Reconstruct a canonical job URL, so audit records always have one even when the
-    scraper recorded a listing without passing the URL through."""
+    '''Reconstruct a canonical job URL, so audit records always have one even when the
+    scraper recorded a listing without passing the URL through.'''
     if site == 'linkedin':
         return f'https://www.linkedin.com/jobs/view/{job_id}/'
     return f'({site} job {job_id})'
@@ -1398,11 +1398,11 @@ def write_run_audit_log(
     run_dir: Path | None = None,
     timestamp: datetime | None = None,
 ) -> Path:
-    """Write a per-run, human-readable trace of what the pipeline actually did.
+    '''Write a per-run, human-readable trace of what the pipeline actually did.
 
     Answers, for one run: how many applied jobs fed it, which queries ran, how many jobs each
     query surfaced, and what happened to every individual job (with URL and summary).
-    """
+    '''
     audit_dir = (run_dir or RUN_DIR) / 'audit_logs'
     audit_dir.mkdir(parents=True, exist_ok=True)
     stamp = (timestamp or datetime.now()).strftime('%Y%b%d-%H%M%S')
@@ -1609,7 +1609,7 @@ _SAVED_JOB_MD_RE = re.compile(r'^job_posting-(\d+|noid)(?:-rating_\d+)?-.+-\d+\.
 
 
 def load_processed_jobs() -> None:
-    """Populate _processed_jobs from both old MD filenames and new per-job YAML files."""
+    '''Populate _processed_jobs from both old MD filenames and new per-job YAML files.'''
     global _processed_jobs
     ids: set[tuple[str, str]] = set()
 
@@ -1638,12 +1638,12 @@ def load_processed_jobs() -> None:
 
 
 def forget_processed_job(site: str, job_id: str) -> int:
-    """Undo check_and_record_job for a job Stage 2 never evaluated, so the next run retries it.
+    '''Undo check_and_record_job for a job Stage 2 never evaluated, so the next run retries it.
 
     Stage 1 marks a job processed the moment it is queued. Without this, a job that Stage 2 could
     not reach (on 2026-09-21 a dead browser left 23 of them) is deduped away forever.
     Returns the number of record files removed; raises FileNotFoundError when there were none.
-    """
+    '''
     records = list(PROCESSED_JOBS_DIR.glob(f'job_posting-{site}-{job_id}-*.yaml'))
     if not records:
         raise FileNotFoundError(
@@ -1665,7 +1665,7 @@ _EVAL_ERROR_RELEASES_HEADER = (
 
 
 def release_errored_job(site: str, job_id: str) -> str:
-    """Release a job whose evaluation errored so the next run rates it; returns what was done, for the log.
+    '''Release a job whose evaluation errored so the next run rates it; returns what was done, for the log.
 
     Stage 1 marks a job processed when it is queued, so an error in Stage 2 used to end the job for
     good: a posting the rater had scored 5 was lost on 2026-09-03 and again on 2026-10-08. The
@@ -1674,7 +1674,7 @@ def release_errored_job(site: str, job_id: str) -> str:
 
     Raises when the count file cannot be read or written, or the job has no processed record: the
     caller is already reporting an error for this job and adds this one to it.
-    """
+    '''
     key = f'{site}/{job_id}'
     releases: dict = {}
     if EVAL_ERROR_RELEASES_PATH.exists():
@@ -1733,7 +1733,7 @@ COST_LOG_PATH = RUN_DIR / 'cost_log.jsonl'
 
 
 def log_run_cost(record: dict, log_path: Path | None = None) -> None:
-    """Append a per-run cost record as one JSON line to cost_log.jsonl."""
+    '''Append a per-run cost record as one JSON line to cost_log.jsonl.'''
     path = log_path if log_path is not None else COST_LOG_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a', encoding='utf-8') as f:
@@ -1772,7 +1772,7 @@ _AUTH_REQUIRED_PATTERNS = [
 
 
 def _requires_current_us_auth(text: str) -> bool:
-    """Return True if text indicates the job requires current US work authorization (no sponsorship)."""
+    '''Return True if text indicates the job requires current US work authorization (no sponsorship).'''
     return any(p.search(text) for p in _AUTH_REQUIRED_PATTERNS)
 
 
@@ -2233,7 +2233,7 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
 # --- MCP server factories ---
 
 def make_job_search_server(interactive: bool):
-    """MCP server for interactive mode."""
+    '''MCP server for interactive mode.'''
     tools = [check_and_record_job, save_job_posting]
     if interactive:
         tools.append(update_job_requirements)
@@ -2287,13 +2287,13 @@ def evaluate_ui_contract(report: dict) -> list[str]:
 
 
 def check_filters_applied(report: dict, region: dict) -> list[str]:
-    """Return reasons the requested filters do NOT look applied.
+    '''Return reasons the requested filters do NOT look applied.
 
     This is where the geoId/f_TPR discovery earns its keep. We never NAVIGATE to those parameters
     -- that is the bot-shaped move -- but once the chips are clicked LinkedIn puts them in the URL
     itself, so reading them back proves the clicks landed. Before this existed, a location filter
     that silently did nothing was invisible.
-    """
+    '''
     problems: list[str] = []
     url = str(report.get('url', ''))
     chips = [str(c).lower() for c in (report.get('chips') or [])]
@@ -2377,7 +2377,7 @@ def check_fingerprint_drift(report: dict) -> str:
     },
 )
 async def report_search(args: dict) -> dict:
-    """Record one search and judge whether the page is usable. Judgement lives here, not in the prompt."""
+    '''Record one search and judge whether the page is usable. Judgement lives here, not in the prompt.'''
     query = str(args.get('query') or _current_query or '')
     region_name = str(args.get('region') or '')
     report = args.get('report') or {}
@@ -2454,11 +2454,11 @@ async def report_search(args: dict) -> dict:
 
 
 def region_overlap_report() -> dict[str, float]:
-    """Jaccard overlap of harvested ids between regions, per query.
+    '''Jaccard overlap of harvested ids between regions, per query.
 
     A near-1.0 score means the location filter did nothing. On 2026-08-18 every query would have
     scored ~1.0 and nothing in the funnel could say so.
-    """
+    '''
     by_query: dict[str, list[set[str]]] = {}
     for (query, _region), ids in _search_ids.items():
         by_query.setdefault(query, []).append(ids)
@@ -2479,7 +2479,7 @@ def region_overlap_report() -> dict[str, float]:
 
 
 def make_evaluator_server():
-    """MCP server for stage 2: captures the condensed page extract from the Haiku extractor."""
+    '''MCP server for stage 2: captures the condensed page extract from the Haiku extractor.'''
     return create_sdk_mcp_server(
         name='job_evaluator', version='1.0.0',
         tools=[submit_job_extract],

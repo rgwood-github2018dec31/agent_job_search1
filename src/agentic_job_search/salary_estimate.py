@@ -58,7 +58,7 @@ ESTIMATE_CURRENCIES = SALARY_CURRENCIES | frozenset({
     'IDR', 'BGN', 'ISK', 'COP', 'CLP', 'ARS', 'PEN',
 })
 
-_PROMPT = """You are a compensation analyst. The job posting below states no salary. Estimate the
+_PROMPT = '''You are a compensation analyst. The job posting below states no salary. Estimate the
 gross BASE pay range an employer would typically offer for this role, from the seniority, scope,
 employer and location the posting describes.
 
@@ -89,13 +89,13 @@ Rules:
 - `can_estimate: false`, with null amounts, is a correct and expected answer when the posting does
   not say enough to place the role (no location, no seniority, a vague or multi-country
   opening). Use it freely: a missing estimate costs nothing, a baseless one misleads.
-"""
+'''
 
 _cache: dict[str, Any] | None = None
 
 
 def _load_cache() -> dict[str, Any]:
-    """Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal."""
+    '''Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal.'''
     global _cache
     if _cache is not None:
         return _cache
@@ -119,7 +119,7 @@ def _load_cache() -> dict[str, Any]:
 
 
 def _write_cache() -> None:
-    """Persist the cache. A cache that cannot be written costs money, not correctness."""
+    '''Persist the cache. A cache that cannot be written costs money, not correctness.'''
     try:
         SALARY_ESTIMATE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         SALARY_ESTIMATE_CACHE_PATH.write_text(
@@ -133,8 +133,8 @@ def _write_cache() -> None:
 
 
 def cache_key(candidate: dict) -> str:
-    """One entry per job. Not a hash of the text: a job page carries applicant counts and relative
-    dates, so its text never repeats, and a job id can be looked up against the saved posting."""
+    '''One entry per job. Not a hash of the text: a job page carries applicant counts and relative
+    dates, so its text never repeats, and a job id can be looked up against the saved posting.'''
     return f"{candidate.get('site')}:{candidate.get('job_id')}"
 
 
@@ -179,12 +179,12 @@ def _estimate_from_entry(entry: dict[str, Any], source: str) -> dict[str, Any] |
 async def estimate_salary(
     candidate: dict, extract: dict, page_text: str = '', stage_stats: dict | None = None
 ) -> dict[str, Any] | None:
-    """An estimated pay range for a posting that states none — or None.
+    '''An estimated pay range for a posting that states none — or None.
 
     None when the posting states any salary at all (the reading is not `absent`), when the model
     says it cannot estimate, when its answer does not validate, or when the call fails. `page_text`
     is the full page the extractor read; without it the condensed description is used.
-    """
+    '''
     if salary_facts_of(extract)['kind'] != 'absent':
         return None
 

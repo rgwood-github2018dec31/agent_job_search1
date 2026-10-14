@@ -142,7 +142,7 @@ def location_token_matches(token: str, text: str) -> bool:
     return _token_pattern(token).search(' '.join(str(text or '').split())) is not None
 
 
-_PROMPT = """You are a geography reference. Answer ONLY about the PLACE named below.
+_PROMPT = '''You are a geography reference. Answer ONLY about the PLACE named below.
 
 Location text: "{text}"
 
@@ -183,7 +183,7 @@ Rules:
   This is administrative containment, a checkable fact -- never proximity, which is a
   judgement. Omit workplace words ("Remote", "Hybrid"), and return an empty list when the
   text names no place.
-"""
+'''
 
 _cache: dict[str, Any] | None = None
 
@@ -199,12 +199,12 @@ _place_names_seen_this_run: set[str] = set()
 
 
 def _record_countries(result: dict[str, Any]) -> None:
-    """Note the countries in a classification. Called on BOTH return paths of classify_location.
+    '''Note the countries in a classification. Called on BOTH return paths of classify_location.
 
     The cache-hit path matters as much as the LLM path: in steady state almost every location is a
     hit, so recording only new classifications would report a country once, ever, and then never
     again.
-    """
+    '''
     regions = result.get('regions') or []
     for index, country in enumerate(result.get('countries') or []):
         region = regions[index] if index < len(regions) else 'unknown'
@@ -213,7 +213,7 @@ def _record_countries(result: dict[str, Any]) -> None:
 
 
 def countries_seen_this_run() -> dict[str, str]:
-    """Countries encountered this run, country -> its MOST COMMON region this run."""
+    '''Countries encountered this run, country -> its MOST COMMON region this run.'''
     return {
         country: counts.most_common(1)[0][0]
         for country, counts in _countries_seen_this_run.items() if counts
@@ -221,14 +221,14 @@ def countries_seen_this_run() -> dict[str, str]:
 
 
 def region_disagreements() -> dict[str, dict[str, int]]:
-    """Countries the CACHE places in more than one region, country -> {region: times}.
+    '''Countries the CACHE places in more than one region, country -> {region: times}.
 
     Deterministic, free, and reads the whole cache rather than one run. A country is in exactly one
     region -- that is what makes it world knowledge -- so two answers means at least one is wrong,
     and the cache has frozen it. Measured on the real cache: 5 of 40 countries, three of them clear
     outliers (Ireland 17:1, United Kingdom 10:1, Austria 6:1) and two genuinely split 1:1, which is
     the phrasing sensitivity at the margins already documented for this classifier.
-    """
+    '''
     tally: dict[str, collections.Counter] = {}
     for entry in _load_cache().values():
         regions = entry.get('regions') or []
@@ -249,13 +249,13 @@ def place_names_seen_this_run() -> set[str]:
 
 
 def reset_countries_seen() -> None:
-    """Clear the run-scoped accumulators. Called once at the start of a run."""
+    '''Clear the run-scoped accumulators. Called once at the start of a run.'''
     _countries_seen_this_run.clear()
     _place_names_seen_this_run.clear()
 
 
 def _load_cache() -> dict[str, Any]:
-    """Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal."""
+    '''Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal.'''
     global _cache
     if _cache is not None:
         return _cache
@@ -287,12 +287,12 @@ def _write_cache() -> None:
 
 
 def cache_key(text: str) -> str:
-    """Normalized cache key. Whitespace and case are not geography."""
+    '''Normalized cache key. Whitespace and case are not geography.'''
     return ' '.join(str(text or '').split()).lower()
 
 
 def _empty(reason: str) -> dict[str, Any]:
-    """The fail-open answer: no country named, so no policy can reject."""
+    '''The fail-open answer: no country named, so no policy can reject.'''
     return {
         'countries': [], 'regions': [], 'broad_area': False, 'likely_working_language': '',
         'place_names': [], 'source': reason,
@@ -330,12 +330,12 @@ def _coerce(raw: dict) -> dict[str, Any]:
 
 
 async def classify_location(text: str) -> dict[str, Any]:
-    """Geographic facts about `text`: {countries, regions, likely_working_language}.
+    '''Geographic facts about `text`: {countries, regions, likely_working_language}.
 
     Cached on disk by normalized location string, so a repeated location costs nothing and — more
     importantly — cannot be answered two different ways. Every failure returns the empty answer,
     which no policy can reject.
-    """
+    '''
     key = cache_key(text)
     if not key:
         return _empty('empty')

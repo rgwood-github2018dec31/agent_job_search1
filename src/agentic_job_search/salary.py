@@ -193,7 +193,7 @@ _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|\n+')
 # 11 times across 2026-09-24..28.
 _ZERO_PRICE_RE = re.compile(rf'(?:{_CURRENCY_RE.pattern}|\$)\s?0(?![\d.,]*\d)', re.IGNORECASE)
 
-_PROMPT = """You are a compensation-string parser. Read ONLY the text below and report what
+_PROMPT = '''You are a compensation-string parser. Read ONLY the text below and report what
 amounts it states. Do not estimate, do not infer a market rate, do not judge whether the pay is
 good.
 
@@ -218,13 +218,13 @@ Rules:
 - Write amounts at full magnitude: "75K" is 75000, "€1.2M" is 1200000.
 - A bare "$" is ambiguous. Leave `currency` empty unless the text names one.
 - `period` is the pay period the amounts are quoted per, empty when the text does not say.
-"""
+'''
 
 _cache: dict[str, Any] | None = None
 
 
 def _load_cache() -> dict[str, Any]:
-    """Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal."""
+    '''Read the on-disk cache. A missing or corrupt file is rebuilt, never fatal.'''
     global _cache
     if _cache is not None:
         return _cache
@@ -245,7 +245,7 @@ def _load_cache() -> dict[str, Any]:
 
 
 def _write_cache() -> None:
-    """Persist the cache. A cache that cannot be written costs money, not correctness."""
+    '''Persist the cache. A cache that cannot be written costs money, not correctness.'''
     try:
         SALARY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         SALARY_CACHE_PATH.write_text(
@@ -256,11 +256,11 @@ def _write_cache() -> None:
 
 
 def cache_key(text: str, context: str = '') -> str:
-    """Normalized cache key. Whitespace and case are not compensation.
+    '''Normalized cache key. Whitespace and case are not compensation.
 
     With a context excerpt the key is a hash of both, since the same empty-looking salary field can
     sit beside different descriptions — the `reference_summary_cache.yaml` shape.
-    """
+    '''
     normalized = ' '.join(str(text or '').split()).lower()
     if not context:
         return normalized
@@ -325,12 +325,12 @@ def detect_period(text: str) -> str:
 
 
 def classify_salary(text: str) -> dict[str, Any]:
-    """Read a compensation string with rules alone: sync, free, and never truncated.
+    '''Read a compensation string with rules alone: sync, free, and never truncated.
 
     Deterministic checks scan the whole string (see the text-budget module docstring). Returning a
     plain dict rather than a dataclass keeps it writable straight into the YAML cache and into the
     extract, and keeps every consumer — warnings, notification, extract text — sync.
-    """
+    '''
     raw = str(text or '')
     stripped = raw.strip()
     if not stripped:
@@ -392,12 +392,12 @@ def count_ranges(text: str) -> int:
 
 
 def compensation_context(description: str) -> str:
-    """Sentences of the description that mention money, for the classifier to read.
+    '''Sentences of the description that mention money, for the classifier to read.
 
     Selected in code, so the model is handed evidence rather than asked to go looking. Only used
     when the salary field itself carries no figure — the case where the extractor may simply have
     missed a pay line that is sitting in the body.
-    """
+    '''
     sentences = [
         ' '.join(s.split()) for s in _SENTENCE_SPLIT_RE.split(str(description or ''))
         if _COMPENSATION_SENTENCE_RE.search(s)
@@ -447,12 +447,12 @@ def _coerce(raw: dict, text: str) -> dict[str, Any]:
 
 
 async def resolve_salary(extract: dict, stage_stats: dict | None = None) -> dict[str, Any]:
-    """The reading for one posting: rules first, the model only for what they could not read.
+    '''The reading for one posting: rules first, the model only for what they could not read.
 
     Cached on disk, so a compensation phrase is parsed once ever and — more importantly — cannot be
     answered two different ways. Every failure falls back to the deterministic reading, which for
     an escalated string is `unclassified`: a warning that the text could not be read, and no gate.
-    """
+    '''
     text = str(extract.get('salary') or '')
     deterministic = classify_salary(text)
     if deterministic['kind'] != 'unclassified':

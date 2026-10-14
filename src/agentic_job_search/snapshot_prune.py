@@ -27,7 +27,7 @@ def _indent(line: str) -> int:
 
 
 def _subtree_end(lines: list[str], start: int) -> int:
-    """Index one past the last line of the subtree rooted at lines[start]."""
+    '''Index one past the last line of the subtree rooted at lines[start].'''
     depth = _indent(lines[start])
     end = start + 1
     while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > depth):
@@ -36,7 +36,7 @@ def _subtree_end(lines: list[str], start: int) -> int:
 
 
 def _holds_search_ui(lines: list[str]) -> bool:
-    """True when these lines contain a result card or the results count -- never pane content."""
+    '''True when these lines contain a result card or the results count -- never pane content.'''
     return any(_RESULT_CARD_RE.match(line.strip()) or _RESULT_COUNT_RE.search(line) for line in lines)
 
 
@@ -62,13 +62,13 @@ def _pane_span(lines: list[str], heading_index: int) -> tuple[int, int] | None:
 
 
 def drop_job_detail_pane(text: str, what: str) -> str:
-    """Return the snapshot with the job detail pane replaced by a one-line marker.
+    '''Return the snapshot with the job detail pane replaced by a one-line marker.
 
     Stage 1b never reads a posting, and the pane (the posting, the company profile, its posts feed)
     was most of every oversized snapshot. Returns text unchanged when there is no pane, or when the
     pane cannot be separated from the search UI -- the size cap downstream then still applies and
     warns. `what` names the snapshot in the log line.
-    """
+    '''
     lines = text.split('\n')
     heading_index = next((i for i, line in enumerate(lines) if SNAPSHOT_DETAIL_PANE_HEADING in line), None)
     if heading_index is None:

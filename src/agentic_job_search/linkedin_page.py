@@ -92,7 +92,7 @@ _PAGE_SECTIONS_HEADER = (
 
 @dataclass
 class JobPage:
-    """What the extractor reads, and how it came to be."""
+    '''What the extractor reads, and how it came to be.'''
     text: str
     source: str  # 'dom' (de-cluttered page) or 'snapshot' (fallback: budgeted a11y snapshot)
     removed: list[dict] = field(default_factory=list)
@@ -113,7 +113,7 @@ def _contains(ancestor: Tag, el: Tag) -> bool:
 # --- JS-free archive -----------------------------------------------------------------------------
 
 def strip_js(soup: BeautifulSoup) -> dict:
-    """Remove every script, script preload, inline handler and javascript: URL. Returns counts."""
+    '''Remove every script, script preload, inline handler and javascript: URL. Returns counts.'''
     counts = {'scripts': 0, 'script_links': 0, 'handler_attrs': 0, 'js_urls': 0}
     for el in soup.find_all(['script', 'noscript']):
         el.decompose()
@@ -150,7 +150,7 @@ def _load_asset_index(directory: Path) -> dict:
 
 
 def _http_get(url: str) -> requests.Response:
-    """A plain GET with no cookies or session: page assets never go through the logged-in browser."""
+    '''A plain GET with no cookies or session: page assets never go through the logged-in browser.'''
     return requests.get(url, timeout=JOB_PAGE_ASSET_FETCH_TIMEOUT_SECONDS)
 
 
@@ -240,7 +240,7 @@ def raw_html_path(candidate: dict) -> Path:
 
 
 def save_raw_html(candidate: dict, soup: BeautifulSoup, meta: dict) -> Path | None:
-    """Write the JS-free page beside the raw posting. A failure is logged, never fatal."""
+    '''Write the JS-free page beside the raw posting. A failure is logged, never fatal.'''
     path = raw_html_path(candidate)
     header = yaml.safe_dump(meta, sort_keys=True, allow_unicode=True).replace('--', '- -')
     try:
@@ -262,7 +262,7 @@ def _is_protected(el: Tag, protected: list[Tag]) -> bool:
 
 
 def _section_root(el: Tag, protected: list[Tag]) -> Tag:
-    """Climb from a matched element to the largest ancestor that holds only its own section."""
+    '''Climb from a matched element to the largest ancestor that holds only its own section.'''
     node = el
     while node.parent is not None and node.parent.name not in ('main', 'body', '[document]'):
         parent = node.parent
@@ -364,7 +364,7 @@ def company_card_anchors(root: Tag) -> list[Tag]:
 
 
 def unknown_blocks(main: Tag) -> list[Tag]:
-    """Maximal subtrees of <main> holding no keep anchor and some visible text."""
+    '''Maximal subtrees of <main> holding no keep anchor and some visible text.'''
     anchors = keep_anchors(main)
     blocks: list[Tag] = []
 
@@ -382,7 +382,7 @@ def unknown_blocks(main: Tag) -> list[Tag]:
 
 
 def block_signature(block: Tag) -> str:
-    """A stable name for a block across jobs: its heading, else aria-label, else its first line."""
+    '''A stable name for a block across jobs: its heading, else aria-label, else its first line.'''
     heading = block.find(_HEADING_TAGS)
     text = (norm(heading.get_text(' ')) if heading is not None else '') or norm(block.get('aria-label', ''))
     if not text:
@@ -392,7 +392,7 @@ def block_signature(block: Tag) -> str:
 
 
 def load_section_decisions() -> dict | None:
-    """The cached verdicts, or None when the file is unreadable (then nothing may rewrite it)."""
+    '''The cached verdicts, or None when the file is unreadable (then nothing may rewrite it).'''
     if not PAGE_SECTIONS_PATH.exists():
         return {}
     try:
@@ -438,7 +438,7 @@ def _classify_prompt(candidate: dict, samples: list[tuple[str, str]]) -> str:
 
 
 async def decide_unknown_blocks(soup: BeautifulSoup, candidate: dict, stage_stats: dict | None) -> list[dict]:
-    """Remove unknown blocks that are cached, or newly judged, as clutter. Returns what was removed."""
+    '''Remove unknown blocks that are cached, or newly judged, as clutter. Returns what was removed.'''
     main = soup.find('main')
     if main is None:
         return []
@@ -504,7 +504,7 @@ async def decide_unknown_blocks(soup: BeautifulSoup, candidate: dict, stage_stat
 
 
 def page_text(soup: BeautifulSoup) -> str:
-    """The visible text of <main>, one non-empty line per line."""
+    '''The visible text of <main>, one non-empty line per line.'''
     root = soup.find('main') or soup.body or soup
     lines = (norm(line) for line in root.get_text('\n').splitlines())
     return '\n'.join(line for line in lines if line)
@@ -516,7 +516,7 @@ BrowserCall = Callable[[str, dict], Awaitable[str]]
 
 
 async def _capture_dom(call: BrowserCall, job_id: str) -> dict:
-    """One read-only serialization of the DOM. Raises with detail when the result is unusable."""
+    '''One read-only serialization of the DOM. Raises with detail when the result is unusable.'''
     raw = await call('browser_evaluate', {'function': LINKEDIN_PAGE_CAPTURE_JS})
     result = parse_evaluate_result(raw)
     if not result or not isinstance(result.get('html'), str):
@@ -530,7 +530,7 @@ async def _capture_dom(call: BrowserCall, job_id: str) -> dict:
 
 
 async def _read_snapshot(candidate: dict, call: BrowserCall, reason: str) -> JobPage:
-    """The pre-2026-09-24 path: the a11y snapshot, whitespace-collapsed, middle-cut to budget."""
+    '''The pre-2026-09-24 path: the a11y snapshot, whitespace-collapsed, middle-cut to budget.'''
     logger.warning(f"Job page {candidate.get('job_id')}: reading the accessibility snapshot instead — {reason}")
     snapshot = normalize_whitespace(await call('browser_snapshot', {}))
     budgeted = truncate_reported_middle(
@@ -540,11 +540,11 @@ async def _read_snapshot(candidate: dict, call: BrowserCall, reason: str) -> Job
 
 
 async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | None = None) -> JobPage:
-    """Navigate to the posting and return the text the extractor should read.
+    '''Navigate to the posting and return the text the extractor should read.
 
     Falls back to the snapshot path, with a WARNING, when the capture fails or the description
     is not on the page — a markup change must degrade to the old behaviour, never to no page.
-    """
+    '''
     job_id = str(candidate.get('job_id') or '')
     await call('browser_navigate', {'url': candidate['url']})
     capture: dict | None = None

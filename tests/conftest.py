@@ -169,7 +169,7 @@ FAKE_BROAD_AREAS = ('European Union', ' EU ', 'EMEA', 'anywhere', 'worldwide', '
 
 
 def fake_classify(text):
-    """Every COUNTRY named in `text`, first mention first, deduped. Unmatched text names none."""
+    '''Every COUNTRY named in `text`, first mention first, deduped. Unmatched text names none.'''
     haystack = ' '.join(str(text or '').split())
     names = [_GEO_KEYS[match.group(1).casefold()] for match in _GEO_RE.finditer(haystack)]
     countries, regions, language = [], [], ''
@@ -203,13 +203,13 @@ def fake_classify(text):
 
 @pytest.fixture(autouse=True)
 def stub_location_classifier(monkeypatch):
-    """Autouse: no unit test may reach the real classifier. Returns the call log for assertions.
+    '''Autouse: no unit test may reach the real classifier. Returns the call log for assertions.
 
     Patches the binding the production path actually uses (agent imported the name at module
     load), and separately blocks the network underneath the real classifier so a test that calls
     `location.classify_location` directly still cannot escape. Tests exercising the real
     classifier monkeypatch `chat_openrouter` themselves, which wins over this.
-    """
+    '''
     calls = []
 
     async def _fake(text):
@@ -229,13 +229,13 @@ _REAL_LOAD_PREFERENCES = preferences.load_preferences
 
 @pytest.fixture
 def real_load_preferences():
-    """The unpatched loader, for tests that exercise file loading itself."""
+    '''The unpatched loader, for tests that exercise file loading itself.'''
     return _REAL_LOAD_PREFERENCES
 
 
 @pytest.fixture(autouse=True)
 def _fixed_preferences(monkeypatch):
-    """Pin preferences for every test, and block reads of the real preferences file."""
+    '''Pin preferences for every test, and block reads of the real preferences file.'''
     merged = preferences._deep_merge(preferences.DEFAULT_PREFERENCES, TEST_PREFERENCES)
     monkeypatch.setattr(preferences, '_cache', merged)
     monkeypatch.setattr(
@@ -303,13 +303,13 @@ def _isolated_salary_cache(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def stub_salary_classifier(monkeypatch):
-    """Autouse: no unit test may escalate a salary string to the real model.
+    '''Autouse: no unit test may escalate a salary string to the real model.
 
     The classifier FAILS OPEN toward `unclassified`, so without this an unstubbed test would pass
     while making a live, paid call and nothing would look wrong — the same shape as the location
     stub below it. Tests exercising the escalation path patch `chat_openrouter` themselves, which
     wins over this.
-    """
+    '''
     async def _no_network(*args, **kwargs):
         raise AssertionError('a unit test tried to reach the OpenRouter MCP server')
 
@@ -335,12 +335,12 @@ def _isolated_salary_estimate_cache(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def stub_fx_fetch(monkeypatch):
-    """Autouse: no unit test may fetch exchange rates from the real service.
+    '''Autouse: no unit test may fetch exchange rates from the real service.
 
     A call COUNT checked at teardown rather than a raising stub, deliberately: `fx.rates_for`
     fails open, so a stub that raised would be caught, logged, and the test would pass anyway.
     Tests exercising the fetch patch `fx._http_get` themselves, which wins over this.
-    """
+    '''
     calls: list = []
 
     def _recorded(url, params):
@@ -354,12 +354,12 @@ def stub_fx_fetch(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stub_salary_estimator(monkeypatch):
-    """Autouse: no unit test may ask the real model for a pay estimate.
+    '''Autouse: no unit test may ask the real model for a pay estimate.
 
     Counted and checked at teardown for the same reason as `stub_fx_fetch`: `estimate_salary`
     fails open, so a raising stub alone cannot fail a test. Tests exercising the estimator patch
     `salary_estimate.chat_openrouter` (or `agent.estimate_salary`) themselves.
-    """
+    '''
     calls: list = []
 
     async def _recorded(prompt, *args, **kwargs):
@@ -382,8 +382,8 @@ def _isolated_raw_postings(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _unpinned_scraper_provider(monkeypatch):
-    """No test may reach the OpenRouter MCP server to choose a scraper endpoint: Stage 1b runs
-    unpinned. Tests of the pin itself build a ProviderPin and patch call_mcp_tool."""
+    '''No test may reach the OpenRouter MCP server to choose a scraper endpoint: Stage 1b runs
+    unpinned. Tests of the pin itself build a ProviderPin and patch call_mcp_tool.'''
     async def _unpinned(model):
         return scrape_openrouter.ProviderPin(model)
 
@@ -400,8 +400,8 @@ def _no_scraper_nudge(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_linkedin_page(monkeypatch, tmp_path):
-    """No test may write the real company_assets/ or linkedin_page_sections.yaml, or fetch an asset
-    or classify a page section over the network. Tests exercising those patch them themselves."""
+    '''No test may write the real company_assets/ or linkedin_page_sections.yaml, or fetch an asset
+    or classify a page section over the network. Tests exercising those patch them themselves.'''
     monkeypatch.setattr(linkedin_page, 'COMPANY_ASSETS_DIR', tmp_path / 'company_assets')
     monkeypatch.setattr(linkedin_page, 'PAGE_SECTIONS_PATH', tmp_path / 'linkedin_page_sections.yaml')
 
@@ -451,24 +451,24 @@ def _isolated_eval_error_releases(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _reset_scraper_run_state(monkeypatch):
-    """Clear Stage 1b module state that run_scraper writes, so tests cannot leak into each other.
+    '''Clear Stage 1b module state that run_scraper writes, so tests cannot leak into each other.
 
     run_scraper sets tools._current_query as it goes; a test that ran it left the last query set,
     and a later queue_candidate test then attributed its candidate to that stale value.
-    """
+    '''
     monkeypatch.setattr(tools, '_current_query', None)
     yield
 
 
 @functools.lru_cache(maxsize=1)
 def _claude_available() -> bool:
-    """Whether a live Claude call can actually be made.
+    '''Whether a live Claude call can actually be made.
 
     ANTHROPIC_API_KEY alone is the wrong question: the Agent SDK authenticates through the
     logged-in Claude Code CLI, so a developer machine with no API key at all can still make live
     calls — and gating on the env var silently skipped every live test there. Probe the CLI the
     SDK would actually spawn instead, and fall back to the env var for API-key setups (CI).
-    """
+    '''
     if os.environ.get('ANTHROPIC_API_KEY'):
         return True
     try:

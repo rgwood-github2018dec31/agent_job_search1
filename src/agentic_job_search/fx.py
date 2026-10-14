@@ -57,7 +57,7 @@ def reset_run_state() -> None:
 
 
 def _http_get(url: str, params: dict[str, str]) -> requests.Response:
-    """The one outbound call, kept thin so tests replace it."""
+    '''The one outbound call, kept thin so tests replace it.'''
     return requests.get(url, params=params, timeout=FX_RATES_FETCH_TIMEOUT_SECONDS)
 
 
@@ -99,7 +99,7 @@ def fetch_rates(base: str) -> dict[str, dict[str, Any]]:
 
 
 def _load_table() -> dict[str, Any]:
-    """Read the on-disk rate table. A missing or corrupt file is refetched, never fatal."""
+    '''Read the on-disk rate table. A missing or corrupt file is refetched, never fatal.'''
     global _table
     if _table is not None:
         return _table
@@ -122,7 +122,7 @@ def _load_table() -> dict[str, Any]:
 
 
 def _write_table() -> None:
-    """Persist the table. A table that cannot be written costs a fetch next run, not correctness."""
+    '''Persist the table. A table that cannot be written costs a fetch next run, not correctness.'''
     try:
         FX_RATES_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         FX_RATES_CACHE_PATH.write_text(
@@ -135,7 +135,7 @@ def _write_table() -> None:
 
 
 def _table_age_days(table: dict[str, Any], base: str, today: date) -> int | None:
-    """Days since the table was fetched, or None when it is not a usable table for `base`."""
+    '''Days since the table was fetched, or None when it is not a usable table for `base`.'''
     if table.get('schema') != CACHE_SCHEMA_VERSION or table.get('base') != base:
         return None
     if not isinstance(table.get('rates'), dict):
@@ -189,7 +189,7 @@ def rates_for(base: str, today: date | None = None) -> dict[str, dict[str, Any]]
 
 
 def round_significant(value: float, figures: int = SALARY_CONVERSION_SIGNIFICANT_FIGURES) -> float:
-    """148312.4 -> 148000.0 and 112.9 -> 113.0 at three figures: readable at any pay period."""
+    '''148312.4 -> 148000.0 and 112.9 -> 113.0 at three figures: readable at any pay period.'''
     if value == 0:
         return 0.0
     return round(value, figures - 1 - math.floor(math.log10(abs(value))))

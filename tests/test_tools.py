@@ -1,4 +1,4 @@
-"""Tests for the job search agent."""
+'''Tests for the job search agent.'''
 
 import asyncio
 import json
@@ -214,7 +214,7 @@ def test_new_stage_stats_zeroed():
 
 
 def test_accumulate_stage_stats_sums_usage_and_cost():
-    """Two independent requests (separate sessions) sum in both usage and cost."""
+    '''Two independent requests (separate sessions) sum in both usage and cost.'''
     usage = {
         'input_tokens': 100,
         'output_tokens': 50,
@@ -494,7 +494,7 @@ def test_build_system_prompt_warns_when_no_resume(tmp_path, monkeypatch, capsys)
 
 
 def test_print_thinking_skips_an_empty_block(capsys):
-    """A block with no text must print nothing: the bare label was ~40 lines of one query."""
+    '''A block with no text must print nothing: the bare label was ~40 lines of one query.'''
     agent.print_thinking('')
     agent.print_thinking('   \n\t ', to_console=True)
 
@@ -502,7 +502,7 @@ def test_print_thinking_skips_an_empty_block(capsys):
 
 
 def test_print_thinking_is_log_only_unless_console_is_asked_for(capsys, caplog):
-    """The scraping and Stage 2 paths are log-only; interactive mode passes to_console=True."""
+    '''The scraping and Stage 2 paths are log-only; interactive mode passes to_console=True.'''
     with caplog.at_level(logging.DEBUG, logger=agent.logger.name):
         agent.print_thinking('Weighing the two filters')
 
@@ -516,7 +516,7 @@ def test_print_thinking_is_log_only_unless_console_is_asked_for(capsys, caplog):
 
 
 def test_load_resume_prefers_the_newest_across_save_dir_and_run_dir(tmp_path, monkeypatch):
-    """A resume dropped in the save directory supersedes the markdown kept in run_dir."""
+    '''A resume dropped in the save directory supersedes the markdown kept in run_dir.'''
     downloads = _resume_env(tmp_path, monkeypatch)
     stale = tmp_path / 'R_Garth_Wood-resume-2026Apr08v1.md'
     stale.write_text('OLD MARKDOWN RESUME')
@@ -528,7 +528,7 @@ def test_load_resume_prefers_the_newest_across_save_dir_and_run_dir(tmp_path, mo
 
 
 def test_load_resume_reads_a_pdf_from_the_save_dir(tmp_path, monkeypatch):
-    """A docx->PDF export puts every word in its own text-showing op; the loader must reflow it."""
+    '''A docx->PDF export puts every word in its own text-showing op; the loader must reflow it.'''
     downloads = _resume_env(tmp_path, monkeypatch)
     (downloads / 'cat-resume-Garth_Wood_AI_Engineer_Resume.docx.pdf').write_text('x')
     monkeypatch.setattr(
@@ -539,7 +539,7 @@ def test_load_resume_reads_a_pdf_from_the_save_dir(tmp_path, monkeypatch):
 
 
 def test_load_resume_reads_a_pdf_kept_in_run_dir(tmp_path, monkeypatch):
-    """run_dir takes a PDF too, so a resume can be pinned there instead of left in Downloads."""
+    '''run_dir takes a PDF too, so a resume can be pinned there instead of left in Downloads.'''
     _resume_env(tmp_path, monkeypatch)
     (tmp_path / 'cat-resume-R_Garth_Wood_AI_Engineer_Resume-2026oct8v2.docx.pdf').write_text('x')
     monkeypatch.setattr(agent.tools_module, 'read_pdf_pages', lambda _path: ['PDF IN RUN DIR'])
@@ -596,7 +596,7 @@ def test_load_resume_warns_about_a_resume_it_cannot_read(tmp_path, monkeypatch, 
 
 @pytest.mark.live_agent_claude
 async def test_live_agent_calls_save_job_posting(tmp_path, monkeypatch):
-    """Agent uses the save_job_posting tool when instructed to save a job."""
+    '''Agent uses the save_job_posting tool when instructed to save a job.'''
     monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
 
     from claude_agent_sdk import ClaudeAgentOptions, query
@@ -656,7 +656,7 @@ async def test_company_matches_applied_empty_dict_skips_llm(monkeypatch):
 
 
 def _make_sdk_mock(monkeypatch, structured_output: dict):
-    """Patch sdk_query so it yields a ResultMessage with structured_output."""
+    '''Patch sdk_query so it yields a ResultMessage with structured_output.'''
     from claude_agent_sdk import ResultMessage
 
     async def fake_sdk_query(**kwargs):
@@ -709,7 +709,7 @@ async def test_check_and_record_job_skips_applied_company(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 def _write_pdf(path: Path, mtime_date: date | None = None) -> Path:
-    """Create a placeholder PDF, optionally stamping its mtime to a given date."""
+    '''Create a placeholder PDF, optionally stamping its mtime to a given date.'''
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b'%PDF-1.4 fake')
     if mtime_date is not None:
@@ -759,7 +759,7 @@ async def test_ingest_date_prefixes_from_mtime_and_preserves_it(tmp_path, monkey
 
 
 async def test_ingest_rolls_back_partial_move(tmp_path, monkeypatch):
-    """A copy that succeeds but whose source unlink fails must not leave a duplicate behind."""
+    '''A copy that succeeds but whose source unlink fails must not leave a duplicate behind.'''
     _no_legacy_cache(monkeypatch, tmp_path)
     save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
@@ -810,7 +810,7 @@ async def test_ingest_is_idempotent_for_already_prefixed_file(tmp_path, monkeypa
 
 
 async def test_ingest_prefers_index_date_over_clobbered_mtime(tmp_path, monkeypatch):
-    """The whole point of the manifest: a rewritten mtime must not rewrite the applied date."""
+    '''The whole point of the manifest: a rewritten mtime must not rewrite the applied date.'''
     import yaml as yaml_mod
     _no_legacy_cache(monkeypatch, tmp_path)
     save_dir = tmp_path / 'saved_pdfs'
@@ -870,12 +870,12 @@ async def test_load_applied_jobs_uses_index_without_llm_call(tmp_path, monkeypat
 
 
 async def test_load_applied_jobs_ignores_the_save_dir(tmp_path, monkeypatch):
-    """The corpus and the save directory are separate: an un-ingested PDF is invisible here.
+    '''The corpus and the save directory are separate: an un-ingested PDF is invisible here.
 
     Pins the split — if load_applied_jobs ever fell back to the save directory, a PDF the user
     merely saved (but never applied to) would silently join the reference corpus and the
     already-applied blocklist.
-    """
+    '''
     _no_legacy_cache(monkeypatch, tmp_path)
     save_dir = tmp_path / 'saved_pdfs'
     applied = tmp_path / 'applied_jobs'
@@ -1132,7 +1132,7 @@ def test_save_dir_preference_expands_home(monkeypatch):
 
 
 async def test_categorize_save_dir_pdfs_defaults_to_preference(tmp_path, monkeypatch):
-    """With no argument the save directory comes from preferences, not a hardcoded ~/Downloads."""
+    '''With no argument the save directory comes from preferences, not a hardcoded ~/Downloads.'''
     pdf = tmp_path / 'report.pdf'
     pdf.write_bytes(b'%PDF fake')
 
@@ -1234,8 +1234,8 @@ async def test_run_scraper_sets_the_current_query(monkeypatch):
 
 
 def test_min_turns_floor_is_absolute_not_a_budget_fraction():
-    """A fraction of the (worst-case) budget fired on every healthy query once harvesting replaced
-    click-to-reveal, and a warning that fires on success gets ignored."""
+    '''A fraction of the (worst-case) budget fired on every healthy query once harvesting replaced
+    click-to-reveal, and a warning that fires on success gets ignored.'''
     assert config.SCRAPER_MIN_TURNS_PER_QUERY >= 1
     assert config.SCRAPER_MIN_TURNS_PER_QUERY < config.SCRAPER_MAX_TURNS_PER_QUERY // 3, \
         "must sit below a healthy query's turn count, not scale with the budget"
@@ -1336,11 +1336,11 @@ async def test_submit_job_extract_normalizes_stated_working_language(monkeypatch
 
 
 async def test_submit_job_extract_rejects_a_local_language_argument():
-    """The implied local language is a fact about a PLACE, resolved by the cached classifier.
+    '''The implied local language is a fact about a PLACE, resolved by the cached classifier.
 
     Pinned as a signature check rather than prose: re-adding the parameter would otherwise be
     accepted and silently ignored, which is the shape this repo keeps catching.
-    """
+    '''
     with pytest.raises(TypeError):
         await tools.do_submit_job_extract('t', 'c', 'desc', local_language='french')
 
@@ -1738,12 +1738,12 @@ async def test_build_reference_summary_empty_without_texts(monkeypatch):
 
 
 def _over_limit(n: int = agent.REFERENCE_SUMMARY_LIMIT_CHARS + 500) -> str:
-    """A summary that overruns the limit, with the sections the prompt asked for at the END."""
+    '''A summary that overruns the limit, with the sections the prompt asked for at the END.'''
     return 'x' * (n - 40) + '\n\n**Location/remote:** fully remote EU or Canada.\n**Pay:** €120k.'
 
 
 async def test_reference_summary_within_the_limit_is_never_cut(tmp_path, monkeypatch):
-    """2n is accepted exactly as written — no marker, no truncation."""
+    '''2n is accepted exactly as written — no marker, no truncation.'''
     monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     body = 'y' * agent.REFERENCE_SUMMARY_LIMIT_CHARS
@@ -1759,7 +1759,7 @@ async def test_reference_summary_within_the_limit_is_never_cut(tmp_path, monkeyp
 
 
 async def test_reference_summary_over_the_limit_is_re_summarized_by_the_same_provider(tmp_path, monkeypatch):
-    """Above 2n the model is asked again for 40% of what it produced, not cut."""
+    '''Above 2n the model is asked again for 40% of what it produced, not cut.'''
     monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     long_summary = _over_limit()
@@ -1779,7 +1779,7 @@ async def test_reference_summary_over_the_limit_is_re_summarized_by_the_same_pro
 
 
 async def test_reference_summary_stops_the_run_when_re_summarizing_fails(tmp_path, monkeypatch):
-    """A profile that will not fit must stop the run with a Telegram message, never be cut."""
+    '''A profile that will not fit must stop the run with a Telegram message, never be cut.'''
     monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = 0
@@ -1828,7 +1828,7 @@ async def test_reference_summary_stops_when_the_retry_is_still_over_the_limit(tm
 
 
 async def test_reference_summary_stops_when_the_retry_returns_nothing(tmp_path, monkeypatch):
-    """A blank retry must stop the run, not be cached as the profile."""
+    '''A blank retry must stop the run, not be cached as the profile.'''
     monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = 0
@@ -1851,12 +1851,12 @@ async def test_reference_summary_stops_when_the_retry_returns_nothing(tmp_path, 
 
 
 async def test_reference_summary_cache_over_the_limit_is_regenerated(tmp_path, monkeypatch):
-    """A cache written by the old truncating build must not be rated against."""
+    '''A cache written by the old truncating build must not be rated against.'''
     monkeypatch.setattr(agent.tools_module, '_reference_job_pages', [['Great AI job at Acme.']])
     cache_path = tmp_path / 'ref_cache.yaml'
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', cache_path)
     cache_path.write_text(yaml.dump({'hash': agent.hashlib.md5(
-        '[Reference Job 1]\nGreat AI job at Acme.'.encode('utf-8')).hexdigest(),
+        b'[Reference Job 1]\nGreat AI job at Acme.').hexdigest(),
         'provider': 'openrouter', 'summary': _over_limit()}), encoding='utf-8')
     calls = 0
 
@@ -1934,7 +1934,7 @@ def _make_agent_sdk_mock(monkeypatch, structured_output: dict, prompts: list | N
 
 
 def _stub_read_page(monkeypatch, page=None, calls: list | None = None):
-    """Replace the code-side page read; records (job_id, url) per read."""
+    '''Replace the code-side page read; records (job_id, url) per read.'''
     page = page if page is not None else linkedin_page.JobPage(text='Staff Engineer\nAbout the job\nBuild agents.', source='dom')
 
     async def fake_read_page(candidate, url, stats):
@@ -2040,7 +2040,7 @@ async def _run_loop(page_text='About the job\nBuild agents.'):
 
 
 def test_extractor_model_has_no_browser_tools():
-    """Code reads the page; a model that can click could hit a Dismiss button (2026-09-24)."""
+    '''Code reads the page; a model that can click could hit a Dismiss button (2026-09-24).'''
     assert [t['function']['name'] for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS] == ['submit_job_extract']
 
 
@@ -2183,7 +2183,7 @@ def test_format_extract_text_falls_back_to_candidate_date():
 # ---------------------------------------------------------------------------
 
 def test_unwrap_exception_surfaces_root_cause():
-    """The message must survive ExceptionGroup nesting, which is how every MCP failure arrives."""
+    '''The message must survive ExceptionGroup nesting, which is how every MCP failure arrives.'''
     root = RuntimeError("model 'qwen3.6:latest' not found")
     inner = ExceptionGroup('unhandled errors in a TaskGroup', [root])
     outer = ExceptionGroup('unhandled errors in a TaskGroup', [inner])
@@ -2209,7 +2209,7 @@ def test_unwrap_exception_follows_cause_chain():
 
 
 def _patch_mcp(monkeypatch, generate=None, list_models=None):
-    """Stub call_mcp_tool, dispatching on tool name. Values may be strings or exceptions."""
+    '''Stub call_mcp_tool, dispatching on tool name. Values may be strings or exceptions.'''
     async def fake_call(url, tool_name, args, timeout_seconds=None):
         result = {'generate': generate, 'list_models': list_models}[tool_name]
         if isinstance(result, BaseException):
@@ -2223,7 +2223,7 @@ _INSTALLED = json.dumps({'models': [{'name': 'granite4.1:3b'}, {'name': 'gemma4:
 
 
 async def test_generate_local_names_installed_models_when_model_missing(monkeypatch):
-    """A missing tag must produce the fix, not a 404 the reader has to decode."""
+    '''A missing tag must produce the fix, not a 404 the reader has to decode.'''
     missing = ExceptionGroup('unhandled errors in a TaskGroup', [
         RuntimeError("MCP tool 'generate' returned an error: 404 Client Error: Not Found for url: "
                      "http://localhost:11434/api/generate model 'gone:latest' not found"),
@@ -2239,7 +2239,7 @@ async def test_generate_local_names_installed_models_when_model_missing(monkeypa
 
 
 async def test_generate_local_sends_caller_identity_to_the_server(monkeypatch):
-    """tools_llm_local requires service_name + purpose_slug on every generate call."""
+    '''tools_llm_local requires service_name + purpose_slug on every generate call.'''
     seen = {}
 
     async def fake_call(url, tool_name, args, timeout_seconds=None):
@@ -2266,7 +2266,7 @@ async def test_each_local_call_site_passes_its_own_purpose(monkeypatch):
 
 
 async def test_generate_local_reraises_other_failures(monkeypatch):
-    """A down server must keep reading as a down server, not as a misconfiguration."""
+    '''A down server must keep reading as a down server, not as a misconfiguration.'''
     _patch_mcp(monkeypatch, generate=ConnectionRefusedError('connection refused'), list_models=_INSTALLED)
 
     with pytest.raises(Exception) as excinfo:
@@ -2291,18 +2291,18 @@ async def test_preflight_local_model_reports_when_missing(monkeypatch):
 
 
 async def test_preflight_local_model_is_silent_when_server_is_down(monkeypatch):
-    """Fail open quietly: the servers are optional, and crying wolf every run trains it out."""
+    '''Fail open quietly: the servers are optional, and crying wolf every run trains it out.'''
     _patch_mcp(monkeypatch, list_models=ConnectionRefusedError('connection refused'))
     assert await triage.preflight_local_model('granite4.1:3b') is None
 
 
 async def test_configured_local_model_is_a_concrete_tag():
-    """`:latest` is the tag that vanished on a re-pull; pin a concrete one."""
+    '''`:latest` is the tag that vanished on a re-pull; pin a concrete one.'''
     assert not config.OLLAMA_MODEL_NAME_TRIAGE.endswith(':latest')
 
 
 def test_local_model_missing_alert_reaches_run_health():
-    """The preflight is worthless if its finding stops at the run log."""
+    '''The preflight is worthless if its finding stops at the run log.'''
     alerts = agent.assess_run_health({'ui_alerts': [
         {'kind': 'local_model_missing', 'query': '(all)', 'region': '(all)',
          'detail': "Local model 'gone:latest' is not installed"},
@@ -2343,8 +2343,8 @@ async def test_chat_openrouter_live():
 
 @pytest.mark.live
 async def test_classify_location_live(monkeypatch, tmp_path):
-    """The real classifier against the real server. Uses a throwaway cache so a stale entry can
-    never make this pass — the point is that the model still answers geography correctly."""
+    '''The real classifier against the real server. Uses a throwaway cache so a stale entry can
+    never make this pass — the point is that the model still answers geography correctly.'''
     _require_llm_server(8006)
     from agentic_job_search import location
 
@@ -2387,19 +2387,19 @@ async def test_triage_job_fit_live():
 
 @pytest.mark.live_agent_claude
 async def test_extract_applied_job_metadata_live():
-    """Successor to test_extract_company_from_text_live.
+    '''Successor to test_extract_company_from_text_live.
 
     `_extract_company_from_text(text) -> str` was replaced by
     `_extract_applied_job_metadata(text, filename) -> dict` in commit 96bd708, but the old test
     stayed behind calling the deleted name. It never failed, because the live gate skipped it.
-    """
-    text = """
+    '''
+    text = '''
     Software Engineer — Remote
     Shopify
     We are looking for an experienced software engineer to join our team.
     You will work on our e-commerce platform serving millions of merchants.
     Requirements: 5+ years Python, strong distributed systems knowledge.
-    """
+    '''
     metadata = await tools._extract_applied_job_metadata(text, 'shopify_swe.pdf')
 
     assert 'shopify' in metadata['company'].lower(), metadata
@@ -2410,14 +2410,14 @@ async def test_extract_applied_job_metadata_live():
 
 @pytest.mark.live_agent_claude
 async def test_extract_applied_job_metadata_live_flags_agency():
-    """The agency/end-client split is the field that keeps a staffing firm off the blocklist."""
-    text = """
+    '''The agency/end-client split is the field that keeps a staffing firm off the blocklist.'''
+    text = '''
     Staff Machine Learning Engineer
     Posted by TalentBridge Recruiting — a specialist technology staffing agency.
     Our client, a global payments company called Northwind Payments, is looking for a
     Staff Machine Learning Engineer to join their fraud detection team.
     Requirements: 8+ years Python, production ML systems.
-    """
+    '''
     metadata = await tools._extract_applied_job_metadata(text, 'talentbridge_mle.pdf')
 
     assert metadata['is_agency'] is True, metadata
@@ -2426,7 +2426,7 @@ async def test_extract_applied_job_metadata_live_flags_agency():
 
 @pytest.mark.live_agent_claude
 async def test_categorize_pdf_text_live_saved_jd():
-    text = """
+    text = '''
     Principal AI Engineer — Remote Canada
     Dayforce
     We are hiring a Principal AI Engineer to lead our machine learning platform.
@@ -2434,7 +2434,7 @@ async def test_categorize_pdf_text_live_saved_jd():
     build RAG pipelines and LLM evaluation frameworks.
     Requirements: 10+ years experience, Python, deep learning expertise.
     Salary: CAD $220,000 base + equity.
-    """
+    '''
     category = await tools._categorize_pdf_text(text, 'Principal AI Engineer _ Dayforce Jobs.pdf')
     assert category is not None, 'tool was not called'
     assert category == 'saved_jd', f'expected saved_jd, got {category!r}'
@@ -2442,13 +2442,13 @@ async def test_categorize_pdf_text_live_saved_jd():
 
 @pytest.mark.live_agent_claude
 async def test_categorize_pdf_text_live_other():
-    text = """
+    text = '''
     Your Airbnb booking confirmation
     Check-in: June 12, 2026
     Check-out: June 15, 2026
     Property: Cozy cabin in Whistler
     Total: $450 CAD
-    """
+    '''
     category = await tools._categorize_pdf_text(text, 'Your trip overview – Airbnb.pdf')
     assert category is not None, 'tool was not called'
     assert category != 'saved_jd', f'expected non-jd category, got {category!r}'
@@ -2472,7 +2472,7 @@ def test_normalize_company_strips_suffixes_and_punctuation():
 
 
 async def test_company_matches_applied_exact_match_skips_llm(monkeypatch):
-    """The per-listing LLM round trip is the Stage 1b bottleneck; exact matches must not pay it."""
+    '''The per-listing LLM round trip is the Stage 1b bottleneck; exact matches must not pay it.'''
     monkeypatch.setattr(tools, '_applied_companies', {'Datadog': 'datadog.pdf'})
     called = []
 
@@ -2757,7 +2757,7 @@ def _scrape(client, queries, stats=None):
 
 
 class _FakeScraperClient:
-    """Records each query() call so we can assert on request boundaries."""
+    '''Records each query() call so we can assert on request boundaries.'''
 
     def __init__(self, listings_per_query=None):
         self.requests = []
@@ -2783,8 +2783,8 @@ class _FakeScraperClient:
 
 
 def test_scraper_browser_find_and_snapshot_get_their_own_larger_caps():
-    """browser_find returns only matches, so cutting it at the shared cap cut signal (2026-09-24);
-    a pane-less snapshot must keep every result card (2026-09-30)."""
+    '''browser_find returns only matches, so cutting it at the shared cap cut signal (2026-09-24);
+    a pane-less snapshot must keep every result card (2026-09-30).'''
     assert scrape_openrouter._result_cap('browser_find') == config.SCRAPER_FIND_RESULT_MAX_CHARS
     assert scrape_openrouter._result_cap('browser_snapshot') == config.SCRAPER_SNAPSHOT_RESULT_MAX_CHARS
     assert scrape_openrouter._result_cap('browser_evaluate') == config.SCRAPER_TOOL_RESULT_MAX_CHARS
@@ -2793,7 +2793,7 @@ def test_scraper_browser_find_and_snapshot_get_their_own_larger_caps():
 
 
 async def test_run_scraper_sends_one_request_per_query(monkeypatch):
-    """Each query needs its own turn budget; a shared request starves the later ones."""
+    '''Each query needs its own turn budget; a shared request starves the later ones.'''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -2817,7 +2817,7 @@ async def test_run_scraper_sends_one_request_per_query(monkeypatch):
 
 
 async def test_run_scraper_retries_empty_query_then_continues(monkeypatch):
-    """A query that comes back empty gets one retry, and must not abort the remaining queries."""
+    '''A query that comes back empty gets one retry, and must not abort the remaining queries.'''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -2876,12 +2876,12 @@ async def test_no_scraper_prompt_ever_instructs_clicking_the_results_list(monkey
 
 
 async def test_run_scraper_retries_low_yield_query_keeping_filters(monkeypatch):
-    """A query returning a handful of listings is retried too, not just one returning zero.
+    '''A query returning a handful of listings is retried too, not just one returning zero.
 
     This is the 2026-08-11 signature: LinkedIn stopped honouring filter params in the search
     URL, every search resolved to the same page, and each query inspected exactly ONE listing.
     A `seen == 0` trigger sails straight past that and the run reports itself a success.
-    """
+    '''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -2915,7 +2915,7 @@ def _reset_scraper_state(monkeypatch):
 
 
 class _PerPassScraperClient:
-    """Yields a different number of NEW distinct listings on each pass of the one query."""
+    '''Yields a different number of NEW distinct listings on each pass of the one query.'''
 
     def __init__(self, query_name, per_pass):
         self.query_name = query_name
@@ -2941,7 +2941,7 @@ def _low_listing_alerts():
 
 
 async def test_low_listings_alert_not_raised_when_recovery_fixes_the_query(monkeypatch, tmp_path):
-    """First pass below the retry floor, recovery rescues it: retry yes, alert no."""
+    '''First pass below the retry floor, recovery rescues it: retry yes, alert no.'''
     _reset_scraper_state(monkeypatch)
     monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
     client = _PerPassScraperClient('Niche Query', [2, 20])
@@ -2987,7 +2987,7 @@ def test_expected_listings_prefers_distinct_counts(monkeypatch, tmp_path):
 
 
 def test_expected_listings_falls_back_to_checked_counts_and_labels_them(monkeypatch, tmp_path):
-    """Old runs only have call counts -- a different unit, so the label must say so."""
+    '''Old runs only have call counts -- a different unit, so the label must say so.'''
     monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
     _write_cost_log(tmp_path, [
         {'check_status_per_query': {'Q': {'new': 10, 'already_processed': 40}}},
@@ -3025,7 +3025,7 @@ def test_listings_distinct_per_query_leaves_out_failed_queries(monkeypatch):
 
 
 async def test_run_scraper_records_per_query_check_status(monkeypatch):
-    """Per-query dedup counts: a saturated query must be distinguishable from a starved one."""
+    '''Per-query dedup counts: a saturated query must be distinguishable from a starved one.'''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -3037,7 +3037,7 @@ async def test_run_scraper_records_per_query_check_status(monkeypatch):
     monkeypatch.setattr(tools, '_check_status_per_query', {})
 
     class _StatusClient:
-        """Records real check_and_record_job statuses rather than opaque unique keys."""
+        '''Records real check_and_record_job statuses rather than opaque unique keys.'''
 
         def __init__(self):
             self.requests = []
@@ -3091,13 +3091,13 @@ async def test_run_scraper_survives_a_failing_query(monkeypatch):
 
 
 async def test_stage_1b_falls_back_to_anthropic_when_the_provider_runs_out_of_credit(monkeypatch):
-    """THE test for the 2026-09-02 defect: the fallback must actually be reached.
+    '''THE test for the 2026-09-02 defect: the fallback must actually be reached.
 
     Everything else about that run was already covered by a test somewhere. What was not, and
     could not be while the dispatch was inline in run_non_interactive, is the only question that
     mattered: when OpenRouter returns 402 for every call, does the Anthropic scraper run? It did
     not, for the whole life of that code path.
-    """
+    '''
     monkeypatch.setattr(tools, '_ui_alerts', [])
     monkeypatch.setattr(tools, '_scrape_per_query', {})
     monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
@@ -3183,7 +3183,7 @@ async def test_stage_1b_reports_the_cause_through_an_exception_group(monkeypatch
 
 
 async def test_stage_1b_does_not_fall_back_when_the_provider_is_healthy(monkeypatch):
-    """The fallback is ~9x more expensive per search; it must not fire on a healthy run."""
+    '''The fallback is ~9x more expensive per search; it must not fire on a healthy run.'''
     monkeypatch.setattr(tools, '_ui_alerts', [])
     monkeypatch.setattr(tools, '_scrape_per_query', {})
     monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
@@ -3220,12 +3220,12 @@ async def test_stage_1b_does_not_fall_back_when_the_provider_is_healthy(monkeypa
 
 
 async def test_run_scraper_aborts_the_whole_loop_on_a_provider_failure(monkeypatch):
-    """A 402 breaks EVERY query, so the loop must abort and let the caller fall back.
+    '''A 402 breaks EVERY query, so the loop must abort and let the caller fall back.
 
     Regression for 2026-09-02: OpenRouter ran out of credit mid-run, the per-query handler
     swallowed all six 402s, run_scraper returned normally, `scraped = True` was set, and the
     Anthropic fallback that exists precisely for this never fired. The run reported 0 jobs.
-    """
+    '''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -3257,7 +3257,7 @@ async def test_run_scraper_aborts_the_whole_loop_on_a_provider_failure(monkeypat
 
 
 async def test_run_scraper_still_survives_a_single_query_failure(monkeypatch):
-    """The abort above must not regress per-query resilience: a one-off failure still continues."""
+    '''The abort above must not regress per-query resilience: a one-off failure still continues.'''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -3306,18 +3306,18 @@ def test_provider_error_reads_a_status_out_of_a_json_body():
 
 
 def test_provider_error_without_any_status_is_not_systemic():
-    """No status named means no evidence the PROVIDER is down - do not abort the whole run."""
+    '''No status named means no evidence the PROVIDER is down - do not abort the whole run.'''
     err = triage.provider_error('OpenRouter chat failed', 'connection reset by peer')
     assert type(err) is RuntimeError
 
 
 def test_assess_run_health_alerts_when_every_query_failed():
-    """The exact funnel of the 2026-09-02 run, which returned no alerts at all.
+    '''The exact funnel of the 2026-09-02 run, which returned no alerts at all.
 
     Saturation is guarded by `if distinct:`, so zero listings skipped every existing check and
     the audit log printed "No alerts: page structure sound, regions distinct, yield acceptable"
     while all six queries had died on a 402.
-    """
+    '''
     alerts = agent.assess_run_health({
         'queries_generated': 6,
         'listings_seen': 0,
@@ -3371,11 +3371,11 @@ def test_partial_query_failure_alert_caps_the_names_it_lists():
 
 
 async def test_failed_query_keeps_the_counts_it_recorded_before_failing(monkeypatch):
-    """Regression for 2026-09-10: a 502 at iteration 71 hit after the Canada search was recorded.
+    '''Regression for 2026-09-10: a 502 at iteration 71 hit after the Canada search was recorded.
 
     Those 25 listings (2 queued) were in the run-global counts but not the per-query ones, so
     audit section 3 read "error | 0 listings | ... | 2 queued".
-    """
+    '''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -3602,14 +3602,14 @@ def test_assess_run_health_stays_quiet_when_no_query_failed():
 
 
 def test_attach_run_health_records_alerts_on_the_funnel():
-    """Both exit paths go through this, so the zero-candidate branch cannot skip assessment."""
+    '''Both exit paths go through this, so the zero-candidate branch cannot skip assessment.'''
     funnel = {'queries_generated': 2, 'queries_failed': {'Q1': 'boom', 'Q2': 'boom'}}
     alerts = agent.attach_run_health(funnel)
     assert alerts and funnel['health_alerts'] == alerts
 
 
 def test_audit_log_does_not_claim_no_alerts_when_queries_failed(tmp_path, monkeypatch):
-    """Audit section 1b must name the failure instead of declaring the page structure sound."""
+    '''Audit section 1b must name the failure instead of declaring the page structure sound.'''
     monkeypatch.setattr(tools, '_queries_searched', {'Q1': 'error'})
     monkeypatch.setattr(tools, '_query_errors', {'Q1': '402 Client Error: Payment Required'})
     monkeypatch.setattr(tools, '_check_status_per_query', {})
@@ -3650,7 +3650,7 @@ def test_acquire_and_release_run_lock_roundtrip(tmp_path):
 
 
 def test_acquire_run_lock_reports_conflict(tmp_path, monkeypatch):
-    """A second run must be told who holds the lock, not silently proceed."""
+    '''A second run must be told who holds the lock, not silently proceed.'''
     lock = tmp_path / 'lock.json'
     lock.write_text(json.dumps({
         'pid': os.getpid(), 'started_at': '2026-07-28T21:05:00',
@@ -3664,7 +3664,7 @@ def test_acquire_run_lock_reports_conflict(tmp_path, monkeypatch):
 
 
 def test_stale_lock_from_dead_pid_is_ignored(tmp_path, monkeypatch):
-    """A crashed run must not block every future run with a leftover file."""
+    '''A crashed run must not block every future run with a leftover file.'''
     lock = tmp_path / 'lock.json'
     lock.write_text(json.dumps({
         'pid': 999999, 'started_at': '2026-07-28T10:00:00', 'mode': 'non-interactive', 'argv': 'old',
@@ -3712,7 +3712,7 @@ def test_describe_run_status_both_states(tmp_path, monkeypatch):
 
 
 def test_describe_run_status_falls_back_to_process_scan(tmp_path, monkeypatch):
-    """A run started before the lock existed still has to be reported as running."""
+    '''A run started before the lock existed still has to be reported as running.'''
     monkeypatch.setattr(tools, 'find_run_processes', lambda: [
         '13779  /path/.venv/bin/python3 /path/agent_job_search1/.venv/bin/job-search -n'
     ])
@@ -3722,7 +3722,7 @@ def test_describe_run_status_falls_back_to_process_scan(tmp_path, monkeypatch):
 
 
 def test_find_run_processes_requires_project_marker(monkeypatch):
-    """An unrelated main.py on the machine must not be mistaken for a job search run."""
+    '''An unrelated main.py on the machine must not be mistaken for a job search run.'''
     fake_ps = (
         '  111 /usr/bin/python3 /some/other/project/main.py\n'
         '  222 /path/agent_job_search1/.venv/bin/job-search -n\n'
@@ -3761,10 +3761,10 @@ def _result_msg(session_id: str, cost: float | None, **usage) -> ResultMessage:
 
 
 class _BillingScraperClient(_FakeScraperClient):
-    """One shared SDK session whose cumulative total_cost_usd rises by `cost_per_query` per request.
+    '''One shared SDK session whose cumulative total_cost_usd rises by `cost_per_query` per request.
 
     Each query yields a healthy listing count, so no low-yield retry adds requests of its own.
-    """
+    '''
 
     def __init__(self, cost_per_query: float, queries: list[str]):
         super().__init__(dict.fromkeys(queries, agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20))
@@ -3775,7 +3775,7 @@ class _BillingScraperClient(_FakeScraperClient):
 
 
 async def test_anthropic_fallback_stops_at_its_budget(monkeypatch):
-    """On 2026-09-28 the fallback billed ~$4.96 of a $5.30 run with nothing to stop it."""
+    '''On 2026-09-28 the fallback billed ~$4.96 of a $5.30 run with nothing to stop it.'''
     _reset_scraper_state(monkeypatch)
     monkeypatch.setattr(tools, '_query_errors', {})
     queries = ['Q1', 'Q2', 'Q3', 'Q4']
@@ -3820,8 +3820,8 @@ def test_fallback_and_budget_alerts_reach_run_health():
 
 
 def test_cost_charged_once_for_cumulative_session():
-    """Stage 1b sends one request per query on ONE shared session, and total_cost_usd is
-    cumulative for that session. Naive summation billed 1+2+3 instead of 3."""
+    '''Stage 1b sends one request per query on ONE shared session, and total_cost_usd is
+    cumulative for that session. Naive summation billed 1+2+3 instead of 3.'''
     stats = agent.new_stage_stats()
     for cumulative in (1.0, 2.5, 6.6):
         agent.accumulate_stage_stats(stats, _result_msg('sess-a', cumulative))
@@ -3854,7 +3854,7 @@ def test_accumulate_returns_charged_delta():
 
 
 def test_cost_decrease_within_session_charges_zero(caplog):
-    """Defensive: total_cost_usd is expected to be non-decreasing within a session."""
+    '''Defensive: total_cost_usd is expected to be non-decreasing within a session.'''
     stats = agent.new_stage_stats()
     agent.accumulate_stage_stats(stats, _result_msg('s', 5.0))
     with caplog.at_level('WARNING'):
@@ -3880,7 +3880,7 @@ def test_none_cost_is_a_noop():
 
 
 def test_usage_counters_still_summed_per_request():
-    """Usage is a per-request delta and must keep summing, unlike cost."""
+    '''Usage is a per-request delta and must keep summing, unlike cost.'''
     stats = agent.new_stage_stats()
     for _ in range(3):
         agent.accumulate_stage_stats(
@@ -3891,7 +3891,7 @@ def test_usage_counters_still_summed_per_request():
 
 
 def test_public_stage_stats_strips_bookkeeping_keys():
-    """cost_log.jsonl serializes stage_stats directly; its schema must not gain keys."""
+    '''cost_log.jsonl serializes stage_stats directly; its schema must not gain keys.'''
     stats = agent.new_stage_stats()
     agent.accumulate_stage_stats(stats, _result_msg('s', 1.0))
     public = agent.public_stage_stats({'scraping': stats})
@@ -3909,16 +3909,16 @@ def test_public_stage_stats_strips_bookkeeping_keys():
 # ---------------------------------------------------------------------------
 
 def test_required_browser_tools_are_never_disallowed():
-    """Measured on a live LinkedIn results page: browser_evaluate is the only working scroll
+    '''Measured on a live LinkedIn results page: browser_evaluate is the only working scroll
     (inner container lazy-loads 7 -> 10 listings) and browser_click drives pagination. Removing
-    either silently cuts discovery rather than raising, so guard the list."""
+    either silently cuts discovery rather than raising, so guard the list.'''
     overlap = set(config.SCRAPER_REQUIRED_BROWSER_TOOLS) & set(config.SCRAPER_DISALLOWED_BROWSER_TOOLS)
     assert not overlap, f'these are load-bearing for discovery: {sorted(overlap)}'
 
 
 def test_scraper_keeps_obstacle_handling_tools():
-    """Scraping is not a deterministic problem: pages change and add bot protection, so the
-    tools needed to get past a dialog, consent banner, or login form stay available."""
+    '''Scraping is not a deterministic problem: pages change and add bot protection, so the
+    tools needed to get past a dialog, consent banner, or login form stay available.'''
     obstacle_tools = (
         'fill_form', 'type', 'hover', 'select_option', 'handle_dialog', 'console_messages',
         # take_screenshot is the only way to SEE a block page / CAPTCHA / consent overlay that
@@ -3941,9 +3941,9 @@ def test_disallowed_browser_tools_are_well_formed():
 # ---------------------------------------------------------------------------
 
 def test_scraper_instructions_do_not_rely_on_url_filter_params():
-    """LinkedIn strips location/f_WT/f_E/sortBy from job-search URLs (2026-08-11), keeping only
+    '''LinkedIn strips location/f_WT/f_E/sortBy from job-search URLs (2026-08-11), keeping only
     `keywords`. Emitting them as URL params produced a search that looked right and silently
-    returned the wrong jobs, so the prompt must drive the filter chips instead."""
+    returned the wrong jobs, so the prompt must drive the filter chips instead.'''
     text = agent.build_scraper_instructions()
     for dead_param in ('f_WT=2', 'f_E=4%2C5%2C6', 'sortBy=DD', '&location='):
         assert dead_param not in text, f'{dead_param} is ignored by LinkedIn; set it via the UI'
@@ -3968,12 +3968,12 @@ def test_scraper_instructions_cover_every_configured_region_as_a_chip_click():
 
 
 def test_scraper_instructions_never_craft_filter_urls():
-    """Filters go in by clicking, never by hand-assembling the URL.
+    '''Filters go in by clicking, never by hand-assembling the URL.
 
     geoId/f_TPR demonstrably DO work when navigated to directly — that is exactly why this test
     exists. No human assembles filter parameters by hand, so doing it is a cheap fingerprint for
     anti-automation, and this drives a real logged-in account.
-    """
+    '''
     text = agent.build_scraper_instructions()
     for forbidden in ('&geoId=', '&f_TPR=', '&f_E=', '&f_WT='):
         assert forbidden not in text, 'filter params must never appear in a URL to navigate to'
@@ -3982,9 +3982,9 @@ def test_scraper_instructions_never_craft_filter_urls():
 
 
 def test_scraper_instructions_forbid_renavigating_after_filters_are_clicked():
-    """2026-09-10: LinkedIn re-appended its salary param after "Show results", the model
+    '''2026-09-10: LinkedIn re-appended its salary param after "Show results", the model
     re-navigated to strip it, and that silently dropped the location it had just clicked — the
-    sticky location chip kept showing "Canada", so the page looked filtered when it was not."""
+    sticky location chip kept showing "Canada", so the page looked filtered when it was not.'''
     text = agent.build_scraper_instructions()
     assert 'Do not navigate again to remove it' in text, 'the re-appearing f_SAL must be declared expected'
     assert 'do not navigate again during this search' in text
@@ -4024,11 +4024,11 @@ def test_scraper_instructions_require_the_ui_contract_before_harvesting():
 
 
 def test_scraper_tools_never_accept_page_or_job_data():
-    """The anti-fabrication invariant, asserted structurally.
+    '''The anti-fabrication invariant, asserted structurally.
 
     A model relaying a payload cannot distinguish copying from producing, so with no data it emits
     a plausible object rather than failing. Every argument it can send must be a DECISION.
-    """
+    '''
     allowed = {'region', 'what_happened'}
     for tool in scrape_openrouter.LOCAL_TOOL_DEFS:
         fn = tool['function']
@@ -4053,12 +4053,12 @@ def test_scraper_instructions_reject_identical_results_as_a_failure():
 
 
 def test_scraper_instructions_harvest_job_ids_from_componentkey():
-    """Job ids come off the DOM, not off the accessibility tree and not from clicking.
+    '''Job ids come off the DOM, not off the accessibility tree and not from clicking.
 
     Each card is div[componentkey="job-card-component-ref-<jobId>"], so one read-only evaluate
     yields every listing on the page. This replaced a click-to-reveal design that read ids from
     `currentJobId` after selecting each card.
-    """
+    '''
     # The selectors now live in the harvest JS, which CODE runs -- the model neither writes it nor
     # sees the listings, so it cannot retype it wrongly (it corrupted the contract JS this way on
     # 2026-08-21) nor invent ids.
@@ -4089,8 +4089,8 @@ def test_scraper_instructions_forbid_clicking_the_results_list():
 # ---------------------------------------------------------------------------
 
 def test_pacing_delays_are_ranges_not_constants():
-    """A fixed interval is itself a robotic signature, so every delay must be a (min, max)
-    range that _human_pause draws from uniformly."""
+    '''A fixed interval is itself a robotic signature, so every delay must be a (min, max)
+    range that _human_pause draws from uniformly.'''
     for name in (
         'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
         'SCRAPER_INTER_QUERY_DELAY_SECONDS',
@@ -4115,8 +4115,8 @@ async def test_human_pause_draws_from_the_range(monkeypatch):
 
 
 async def test_run_scraper_pauses_between_queries(monkeypatch):
-    """Inter-query pacing is enforced in CODE, not prompted: a model under turn pressure will
-    skip a prompted wait, and a flagged account ends the whole job search."""
+    '''Inter-query pacing is enforced in CODE, not prompted: a model under turn pressure will
+    skip a prompted wait, and a flagged account ends the whole job search.'''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -4156,13 +4156,13 @@ def test_scraper_instructions_forbid_pushing_through_blocks():
 
 
 def test_min_listings_threshold_keeps_the_recovery_pass_enabled():
-    """At 0 the low-yield retry silently never fires, which is the bug it exists to catch."""
+    '''At 0 the low-yield retry silently never fires, which is the bug it exists to catch.'''
     assert config.SCRAPER_MIN_LISTINGS_PER_QUERY >= 1
     assert config.SCRAPER_MIN_LISTINGS_PER_QUERY < config.SCRAPER_MAX_TURNS_PER_QUERY
 
 
 def test_low_listings_alert_threshold_is_half_the_retry_floor():
-    """The alert is checked after recovery, so it must sit below the retry trigger and above 0."""
+    '''The alert is checked after recovery, so it must sit below the retry trigger and above 0.'''
     assert config.SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY == config.SCRAPER_MIN_LISTINGS_PER_QUERY // 2
     assert 1 <= config.SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY < config.SCRAPER_MIN_LISTINGS_PER_QUERY
 
@@ -4192,8 +4192,8 @@ def test_title_rejection_reason(title, expect_skip):
 
 
 async def test_queue_candidate_skips_below_seniority_titles(monkeypatch):
-    """LinkedIn no longer enforces f_E server-side, so junk reaches the queue -- and each queued
-    job costs a Stage 2a extract plus a rating call. The skip is $0 and must be auditable."""
+    '''LinkedIn no longer enforces f_E server-side, so junk reaches the queue -- and each queued
+    job costs a Stage 2a extract plus a rating call. The skip is $0 and must be auditable.'''
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_candidates_per_query', {})
     monkeypatch.setattr(tools, '_queue_skipped_counts', {})
@@ -4249,8 +4249,8 @@ def test_derive_workplace_type_normalizes_explicit_variants():
 
 
 def test_derive_workplace_type_infers_hybrid_from_location():
-    """The extractors do not always fill workplace_type, but the wording has always leaked
-    into the free-text location string."""
+    '''The extractors do not always fill workplace_type, but the wording has always leaked
+    into the free-text location string.'''
     extract = _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
     assert agent.derive_workplace_type(extract) == 'hybrid'
 
@@ -4304,7 +4304,7 @@ def test_apply_rating_caps_leaves_remote_alone():
 
 
 def test_apply_rating_caps_does_not_raise_a_low_rating():
-    """A cap is a ceiling, never a floor — a 2 stays a 2."""
+    '''A cap is a ceiling, never a floor — a 2 stays a 2.'''
     extract = _make_extract(location='Netherlands (Hybrid - 2-3 days onsite)')
     assert agent.apply_rating_caps(extract, 2) == (2, '')
 
@@ -4424,7 +4424,7 @@ def test_classify_salary_reads_currency_and_period(text, currency, period):
 
 
 async def test_resolve_salary_does_not_call_the_model_for_a_readable_string(monkeypatch):
-    """The rules answer 862 of 911 figured postings in the corpus; none may cost a call."""
+    '''The rules answer 862 of 911 figured postings in the corpus; none may cost a call.'''
     async def _boom(*args, **kwargs):
         raise AssertionError('a readable salary string was escalated to the model')
 
@@ -4461,7 +4461,7 @@ async def test_resolve_salary_escalates_only_what_the_rules_cannot_read(monkeypa
 
 
 async def test_resolve_salary_fails_toward_saying_less_when_the_server_is_down(monkeypatch, caplog):
-    """A provider outage must never turn an unreadable string into a complete range."""
+    '''A provider outage must never turn an unreadable string into a complete range.'''
     async def _down(*args, **kwargs):
         raise RuntimeError('tools_llm_remote_openrouter is not running')
 
@@ -4474,7 +4474,7 @@ async def test_resolve_salary_fails_toward_saying_less_when_the_server_is_down(m
 
 
 async def test_resolve_salary_never_upgrades_a_partial_to_a_range(monkeypatch):
-    """A model that labels something `range` without two numbers is downgraded, not trusted."""
+    '''A model that labels something `range` without two numbers is downgraded, not trusted.'''
     async def _fake(prompt, model=None):
         return ('{"kind": "range", "minimum": 70000, "maximum": null, "currency": "EUR"}', 0.0)
 
@@ -4484,7 +4484,7 @@ async def test_resolve_salary_never_upgrades_a_partial_to_a_range(monkeypatch):
 
 
 async def test_resolve_salary_shows_the_model_the_compensation_lines_when_the_field_has_no_figure(monkeypatch):
-    """The excerpt is selected in code, so the model is handed evidence rather than sent looking."""
+    '''The excerpt is selected in code, so the model is handed evidence rather than sent looking.'''
     prompts = []
 
     async def _fake(prompt, model=None):
@@ -4537,7 +4537,7 @@ def test_merge_salary_warning_puts_the_code_line_before_the_raters_floor_first_b
 
 
 def test_merge_salary_warning_leaves_a_complete_range_to_the_rater():
-    """Below-target on a full range is the judgement the rater is asked for (requirements.md)."""
+    '''Below-target on a full range is the judgement the rater is asked for (requirements.md).'''
     llm = ['Pay is below the CAD $210K target across the whole band']
     assert agent.merge_warnings([], llm) == llm
 
@@ -4601,7 +4601,7 @@ def test_build_deterministic_warnings_flags_only_a_whole_range_below_target(sala
 
 
 def test_merge_warnings_drops_the_raters_salary_bullets_when_the_range_is_on_target():
-    """The incident: the top of the range clears the target, so a lower-half complaint is noise."""
+    '''The incident: the top of the range clears the target, so a lower-half complaint is noise.'''
     llm = [
         RXNT_RATER_BULLET,
         'Base midpoint sits below target unless negotiated into upper half',
@@ -4728,7 +4728,7 @@ def test_save_raw_posting_writes_the_page_with_its_provenance_header(tmp_path):
 
 
 def test_save_raw_posting_survives_an_unwritable_directory(monkeypatch, caplog):
-    """A retention failure is not a run failure: this directory feeds nothing."""
+    '''A retention failure is not a run failure: this directory feeds nothing.'''
     def _boom(*args, **kwargs):
         raise OSError('read-only file system')
 
@@ -4753,7 +4753,7 @@ def test_prune_raw_postings_removes_only_directories_past_the_window():
 
 
 def test_prune_raw_postings_leaves_anything_that_is_not_a_capture_directory(caplog):
-    """The only code in this repo that deletes user data deletes exactly one shape of thing."""
+    '''The only code in this repo that deletes user data deletes exactly one shape of thing.'''
     keep = tools.RAW_POSTINGS_DIR / 'notes-i-put-here-by-hand'
     keep.mkdir(parents=True)
     (keep / 'important.txt').write_text('mine', encoding='utf-8')
@@ -4796,7 +4796,7 @@ def test_check_salary_provenance_passes_when_the_page_backs_the_figure():
 
 @pytest.mark.live
 async def test_resolve_salary_live(monkeypatch, tmp_path):
-    """The real classifier against the real server, on a string the rules deliberately refuse."""
+    '''The real classifier against the real server, on a string the rules deliberately refuse.'''
     _require_llm_server(8006)
     monkeypatch.setattr(salary, 'SALARY_CACHE_PATH', tmp_path / 'salary_cache.yaml')
     monkeypatch.setattr(salary, '_cache', {})
@@ -4825,7 +4825,7 @@ def test_the_three_extract_schemas_share_one_salary_description():
 
 
 def test_the_extract_schemas_all_accept_stated_working_language():
-    """A field added to one extractor and not the others silently returns empty for that provider."""
+    '''A field added to one extractor and not the others silently returns empty for that provider.'''
     from agentic_job_search import extract_openrouter as extract_or
     from agentic_job_search import tools_generic
     from agentic_job_search.config import STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION
@@ -4933,7 +4933,7 @@ def test_build_deterministic_warnings_flags_foreign_posting_language():
 
 
 def test_build_deterministic_warnings_flags_non_english_likely_working_language():
-    """Reads the RESOLVED field; `derive_likely_working_language` is what puts it there."""
+    '''Reads the RESOLVED field; `derive_likely_working_language` is what puts it there.'''
     extract = _make_extract(
         likely_working_language='french', location='Montreal, Canada', salary='CAD 200,000 - 240,000 per year',
     )
@@ -5046,8 +5046,8 @@ def test_a_stated_foreign_working_language_gets_its_own_bullet():
 
 
 def test_a_language_requirement_silences_the_location_guess():
-    """A required language the user lacks is already a hard rejection, so a surviving requirement
-    names only languages the user speaks -- and it is the posting speaking, which wins."""
+    '''A required language the user lacks is already a hard rejection, so a surviving requirement
+    names only languages the user speaks -- and it is the posting speaking, which wins.'''
     extract = _make_extract(
         location='Paris, France (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
         likely_working_language='french', language_requirement='english',
@@ -5132,7 +5132,7 @@ def test_agency_status_never_changes_the_rating():
 
 
 async def test_agency_posting_is_not_hard_ruled():
-    """Agency status must never reject a job -- only warn. An auto-reject is unappealable."""
+    '''Agency status must never reject a job -- only warn. An auto-reject is unappealable.'''
     extract = _make_extract(company='Quik Hire Staffing', is_agency=True, end_client='',
                             description='Our client is a leading AI lab. Build agents in Python.')
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
@@ -5186,12 +5186,12 @@ def _agency_extract(**overrides) -> dict:
 
 
 def _repost_llm(monkeypatch, same_as_job_id: str, reason: str = 'same pharma programme') -> list:
-    """Patch both providers to answer the same way. Returns the list of prompts actually sent.
+    '''Patch both providers to answer the same way. Returns the list of prompts actually sent.
 
     A call COUNT rather than a raising stub, deliberately: `recruiter_repost_of` fails open, so a
     stub that raised would be swallowed and a test asserting "no call was made" would pass whether
     or not the call happened.
-    """
+    '''
     calls: list[str] = []
     answer = {'same_as_job_id': same_as_job_id, 'reason': reason}
 
@@ -5215,7 +5215,7 @@ async def test_recruiter_repost_check_is_free_when_that_agency_has_no_recent_pos
 
 
 async def test_recruiter_repost_matches_a_prior_posting_of_the_same_role(monkeypatch):
-    """The Archer case: one role, a new job id, a different country and a different day rate."""
+    '''The Archer case: one role, a new job id, a different country and a different day rate.'''
     _repost_llm(monkeypatch, '4464637425')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
     match = await tools.recruiter_repost_of(
@@ -5228,7 +5228,7 @@ async def test_recruiter_repost_matches_a_prior_posting_of_the_same_role(monkeyp
 
 
 async def test_recruiter_repost_ignores_a_job_id_it_was_never_shown(monkeypatch):
-    """Anti-fabrication: the model CHOOSES from a list, so an id outside that list is no match."""
+    '''Anti-fabrication: the model CHOOSES from a list, so an id outside that list is no match.'''
     _repost_llm(monkeypatch, '9999999999')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
     assert await tools.recruiter_repost_of(
@@ -5237,8 +5237,8 @@ async def test_recruiter_repost_ignores_a_job_id_it_was_never_shown(monkeypatch)
 
 
 async def test_recruiter_repost_fails_open_when_both_providers_fail(monkeypatch):
-    """Deliberately opposite to the blacklist: a duplicate ping costs a glance, a missed
-    notification costs a real role."""
+    '''Deliberately opposite to the blacklist: a duplicate ping costs a glance, a missed
+    notification costs a real role.'''
     async def boom_openrouter(prompt, stage_stats):
         raise RuntimeError('tool server down')
 
@@ -5264,7 +5264,7 @@ async def test_recruiter_repost_ignores_a_prior_outside_the_window(monkeypatch):
 
 
 async def test_recruiter_repost_matches_the_agency_across_name_variants(monkeypatch):
-    """Folding happens at the comparison; the stored name keeps the case it arrived with."""
+    '''Folding happens at the comparison; the stored name keeps the case it arrived with.'''
     _repost_llm(monkeypatch, '111')
     tools.record_recruiter_notification(
         _make_candidate(job_id='111'), _agency_extract(company='Archer Recruitment Ltd.')
@@ -5277,7 +5277,7 @@ async def test_recruiter_repost_matches_the_agency_across_name_variants(monkeypa
 
 
 async def test_recruiter_repost_compares_only_the_most_recent_priors(monkeypatch):
-    """An agency that posts daily would otherwise grow the prompt without bound."""
+    '''An agency that posts daily would otherwise grow the prompt without bound.'''
     calls = _repost_llm(monkeypatch, '')
     monkeypatch.setattr(tools, 'RECRUITER_REPOST_MAX_PRIORS', 2)
     for name, days_ago in (('prior-oldest', 5), ('prior-middle', 3), ('prior-newest', 1)):
@@ -5306,8 +5306,8 @@ def test_repost_prompt_says_what_is_not_evidence_and_which_way_to_err():
 
 
 def test_corrupt_recruiter_notifications_file_is_treated_as_empty():
-    """Fails open, unlike location_recommendations.yaml: this file holds no decision the user made
-    by hand, and an unreadable one must never be able to SUPPRESS a notification."""
+    '''Fails open, unlike location_recommendations.yaml: this file holds no decision the user made
+    by hand, and an unreadable one must never be able to SUPPRESS a notification.'''
     tools.RECRUITER_NOTIFICATIONS_PATH.write_text('not: [valid', encoding='utf-8')
     assert tools.load_recruiter_notifications() == []
 
@@ -5333,12 +5333,12 @@ def test_repost_warning_names_the_earlier_posting():
 
 @pytest.mark.live
 async def test_recruiter_repost_judgement_live():
-    """The judgement itself, against the real model: same role reworded vs. a genuinely different one.
+    '''The judgement itself, against the real model: same role reworded vs. a genuinely different one.
 
     Synthetic postings on purpose — the saved corpus is personal, and what is under test is whether
     the model can tell a re-advertised role from a different one by the same agency, which is the
     whole reason this is not a similarity threshold.
-    """
+    '''
     tools.record_recruiter_notification(_make_candidate(job_id='1001'), _agency_extract())
 
     same = await tools.recruiter_repost_of(
@@ -5379,7 +5379,7 @@ def _stage2_stats() -> dict:
 
 
 def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, list]:
-    """Everything around the repost check stubbed: extraction, triage, rating, saving, Telegram."""
+    '''Everything around the repost check stubbed: extraction, triage, rating, saving, Telegram.'''
     notifications: list[str] = []
     saved: list[dict] = []
 
@@ -5458,7 +5458,7 @@ async def test_stage_2_suppresses_the_notification_for_a_recruiter_repost(monkey
 
 
 async def test_stage_2_does_not_check_a_direct_employer(monkeypatch):
-    """Only recruiters repost one role under many ids; a direct employer must never be compared."""
+    '''Only recruiters repost one role under many ids; a direct employer must never be compared.'''
     calls = _repost_llm(monkeypatch, '111')
     tools.record_recruiter_notification(_make_candidate(job_id='111'), _agency_extract(company='Acme'))
     notifications, _ = _stage2_stubs(
@@ -5473,7 +5473,7 @@ async def test_stage_2_does_not_check_a_direct_employer(monkeypatch):
 
 
 async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypatch):
-    """The check exists to stop a duplicate MESSAGE, so a rating below the threshold never pays."""
+    '''The check exists to stop a duplicate MESSAGE, so a rating below the threshold never pays.'''
     calls = _repost_llm(monkeypatch, '4464637425')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
     notifications, _ = _stage2_stubs(monkeypatch, _agency_extract(), rating=3)
@@ -5486,7 +5486,7 @@ async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypat
 
 
 async def test_stage_2_compares_against_a_posting_notified_earlier_in_the_same_run(monkeypatch):
-    """Both Sep 09 Archer postings arrived in one run, so within-run recording is load-bearing."""
+    '''Both Sep 09 Archer postings arrived in one run, so within-run recording is load-bearing.'''
     _repost_llm(monkeypatch, '4464637425')
     notifications, _ = _stage2_stubs(monkeypatch, _agency_extract())
     funnel: dict = {}
@@ -5548,7 +5548,7 @@ def test_direct_fallback_schema_matches_the_agentic_extractors():
 
 
 def test_residency_scope_is_declared_optional_on_every_extractor():
-    """A required parameter the model cannot observe is fabrication pressure, not validation."""
+    '''A required parameter the model cannot observe is fabrication pressure, not validation.'''
     assert 'residency_scope' not in tools.submit_job_extract.input_schema['required']
     openrouter_tool = next(
         t for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
@@ -5579,7 +5579,7 @@ def test_merge_warnings_dedupes_case_insensitively_and_keeps_order():
 
 
 def test_merge_warnings_drops_a_restated_missing_salary():
-    """The reported Telegram pair collapses to the one code-built line."""
+    '''The reported Telegram pair collapses to the one code-built line.'''
     merged = agent.merge_warnings(
         ['No salary listed'],
         ['No salary listed — unverified against CAD $210K+ base target', 'AWS-heavy stack'],
@@ -5621,13 +5621,13 @@ def test_merge_warnings_leaves_bullets_that_only_mention_pay(warning):
 
 
 def test_merge_warnings_drops_the_unclear_if_it_meets_target_restatement():
-    """The 2026-09-14 BairesDev pair."""
+    '''The 2026-09-14 BairesDev pair.'''
     merged = agent.merge_warnings(['No salary listed'], ['No salary listed — unclear if it meets the CAD $210K+ target'])
     assert merged == ['No salary listed']
 
 
 def test_merge_warnings_trims_a_salary_absence_clause_after_a_semicolon():
-    """The 2026-09-17 Network Solutions bullet: the salary clause trailed an unrelated one."""
+    '''The 2026-09-17 Network Solutions bullet: the salary clause trailed an unrelated one.'''
     merged = agent.merge_warnings(
         ['No salary listed'],
         ['Senior (not Principal/Staff) title; no pay figure to confirm the CAD $210K+ base target'],
@@ -5701,8 +5701,8 @@ def test_format_extract_text_surfaces_workplace_line():
 
 
 async def test_devologyx_regression_end_to_end():
-    """The exact posting that was wrongly surfaced as a 4: capped to 3 (so never notified)
-    and carrying hybrid + contract warnings."""
+    '''The exact posting that was wrongly surfaced as a 4: capped to 3 (so never notified)
+    and carrying hybrid + contract warnings.'''
     candidate = _make_candidate(
         job_id='4442818316', company='DevologyX', title='Senior AI Engineer (Contract)',
         url='https://www.linkedin.com/jobs/view/4442818316/', snippet='Netherlands (Remote)',
@@ -5747,7 +5747,7 @@ async def test_devologyx_regression_end_to_end():
 
 @pytest.fixture
 def neutral_preferences(monkeypatch):
-    """Preferences as a fresh clone with no run_dir/preferences.yaml sees them."""
+    '''Preferences as a fresh clone with no run_dir/preferences.yaml sees them.'''
     defaults = preferences._deep_merge(preferences.DEFAULT_PREFERENCES, {})
     monkeypatch.setattr(preferences, '_cache', defaults)
     monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: defaults)
@@ -5766,7 +5766,7 @@ def test_default_preferences_apply_no_personal_gates(neutral_preferences):
 
 
 async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences, stub_location_classifier):
-    """Every personal gate must be inert when unconfigured — not silently inherited."""
+    '''Every personal gate must be inert when unconfigured — not silently inherited.'''
     extract = _make_extract(
         location='Berlin, Germany (Remote)',
         description='PhD in Machine Learning is required. Fluent Dutch is required.',
@@ -5779,7 +5779,7 @@ async def test_hard_rules_reject_nothing_without_preferences(neutral_preferences
 
 
 def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences):
-    """With no languages configured there is nothing to be foreign to — no cap, no warning."""
+    '''With no languages configured there is nothing to be foreign to — no cap, no warning.'''
     extract = _make_extract(
         posting_language='french', likely_working_language='french', salary='CAD 200,000 - 240,000 per year',
     )
@@ -5790,7 +5790,7 @@ def test_language_cap_and_warnings_inert_without_preferences(neutral_preferences
 
 
 async def test_hard_rules_still_reject_impersonal_conditions(neutral_preferences):
-    """Closed and stale are properties of the posting, not the person — always on."""
+    '''Closed and stale are properties of the posting, not the person — always on.'''
     assert 'closed' in await agent.apply_hard_rules(_make_candidate(), _make_extract(closed=True))
     old = (date.today() - timedelta(days=45)).isoformat()
     assert 'older than' in await agent.apply_hard_rules(_make_candidate(), _make_extract(date_posted=old))
@@ -5862,9 +5862,9 @@ async def test_exonym_matches_the_listed_english_name(monkeypatch):
 
 
 async def test_exonym_on_the_deny_list_also_rejects(monkeypatch):
-    """Tiers 1 and 2 compare the same kind of list against the same text; they must not disagree
+    '''Tiers 1 and 2 compare the same kind of list against the same text; they must not disagree
     about what counts as a match, which is how `roma` survived on one list while the other was
-    empty."""
+    empty.'''
     monkeypatch.setattr(preferences, 'would_live_here', lambda: ())
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ())
     monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ('Seville',))
@@ -5874,12 +5874,12 @@ async def test_exonym_on_the_deny_list_also_rejects(monkeypatch):
 
 
 async def test_alias_tier_does_not_fire_when_the_classifier_names_nothing(stub_location_classifier):
-    """Fail-open is unchanged: no place names, no alias match, no new way to reject."""
+    '''Fail-open is unchanged: no place names, no alias match, no new way to reject.'''
     assert await agent.rejected_location('Remote (EMEA)') == ''
 
 
 def test_hybrid_cap_uses_the_resolved_place_names(monkeypatch):
-    """Without this the async gate and the sync cap would disagree on the same posting."""
+    '''Without this the async gate and the sync cap would disagree on the same posting.'''
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('Seville',))
     extract = _make_extract(location='Sevilla, Spain (Hybrid)', workplace_type='hybrid')
     assert agent.apply_rating_caps(extract, 5) == (3, 'hybrid in Sevilla, Spain (Hybrid) (not an acceptable hybrid location)')
@@ -5912,11 +5912,11 @@ def test_classifier_returns_place_names_on_every_path():
 
 
 def test_reviewer_flags_an_entry_that_only_matches_when_folded(monkeypatch):
-    """The check that would have caught `malaga`, and the distinction it draws.
+    '''The check that would have caught `malaga`, and the distinction it draws.
 
     An entry that has simply not come up yet looks identical to one that can never match. This
     separates them: it reports only entries whose folded form DID appear this run.
-    """
+    '''
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('malaga', 'Bologna'))
     monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ())
     location.reset_countries_seen()
@@ -5928,7 +5928,7 @@ def test_reviewer_flags_an_entry_that_only_matches_when_folded(monkeypatch):
 
 
 async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatch, tmp_path):
-    """Adding `place_names` invalidates every cached entry. An outage must not turn that into a
+    '''Adding `place_names` invalidates every cached entry. An outage must not turn that into a
     silently disabled gate.
 
     Treating a `place_names`-less entry as a miss is right — serving it would disable alias
@@ -5936,7 +5936,7 @@ async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatc
     cannot be made the old answer is still the best answer available. Without this, one tool-server
     outage fails every previously-cached location open at once, which is a far larger blast radius
     than the per-location fail-open the module is designed around.
-    """
+    '''
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {
         # Deliberately the PRE-RENAME shape: no `place_names`, and the old `local_language` key.
@@ -6015,11 +6015,11 @@ def test_collisions_ignore_deliberate_spelling_pairs(monkeypatch):
 
 
 def test_countries_seen_takes_the_majority_region_not_the_first():
-    """A rare wrong region must not decide what the reviewer reports.
+    '''A rare wrong region must not decide what the reviewer reports.
 
     Austria came back `eastern_europe` from one Vienna entry while six others said
     `western_europe`; `setdefault` meant whichever was seen first won.
-    """
+    '''
     location.reset_countries_seen()
     location._record_countries({'countries': ['Austria'], 'regions': ['eastern_europe']})
     location._record_countries({'countries': ['Austria'], 'regions': ['western_europe']})
@@ -6048,7 +6048,7 @@ def test_reviewer_never_advises_writing_roma_as_romania(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _seen(countries: dict[str, str]):
-    """Seed the run-scoped accumulator the way classify_location would: country -> region."""
+    '''Seed the run-scoped accumulator the way classify_location would: country -> region.'''
     location.reset_countries_seen()
     location._record_countries({
         'countries': list(countries), 'regions': list(countries.values()),
@@ -6077,7 +6077,7 @@ def test_substring_collisions_ignores_a_whole_word_entry(monkeypatch):
 
 
 def test_classifier_keeps_country_names_proper():
-    """`_coerce` must not fold a name. Regions and languages ARE folded — they are vocabularies."""
+    '''`_coerce` must not fold a name. Regions and languages ARE folded — they are vocabularies.'''
     coerced = location._coerce({
         'countries': ['Spain', '  United  Kingdom '], 'regions': ['Southern_Europe', 'WESTERN_EUROPE'],
         'likely_working_language': 'Spanish',
@@ -6109,7 +6109,7 @@ def test_location_recommendations_alert_reaches_assess_run_health():
 
 
 def test_countries_seen_is_recorded_on_a_cache_hit_too():
-    """In steady state almost every location is a cache hit, so an llm-only accumulator sees nothing."""
+    '''In steady state almost every location is a cache hit, so an llm-only accumulator sees nothing.'''
     location.reset_countries_seen()
     location._record_countries({'countries': ['Romania'], 'regions': ['eastern_europe']})
     assert location.countries_seen_this_run() == {'Romania': 'eastern_europe'}
@@ -6142,11 +6142,11 @@ def test_countries_seen_is_recorded_on_a_cache_hit_too():
     ('Gothenburg, Västra Götaland County, Sweden (Remote)', '', ''),
 ])
 def test_derive_residency_scope_over_real_postings(location, relocation, expected):
-    """Table-driven over strings taken verbatim from the saved corpus.
+    '''Table-driven over strings taken verbatim from the saved corpus.
 
     The two that matter most are the last group: a posting naming a country and saying nothing
     about residence is NOT a residency requirement, and must derive as unspecified.
-    """
+    '''
     extract = _make_extract(
         location=location, relocation=relocation, description=_NEUTRAL_DESCRIPTION,
     )
@@ -6169,11 +6169,11 @@ def test_derive_residency_scope_over_real_postings(location, relocation, expecte
     ('Germany (Remote) — must be based in Germany or Europe', 'country_only'),
 ])
 def test_derive_residency_scope_distinguishes_a_country_object_from_an_area_object(location, expected):
-    """Every country-pinning pattern requires an object that is NOT an area name.
+    '''Every country-pinning pattern requires an object that is NOT an area name.
 
     That is the entire trick, and the two directions are equally load-bearing: a wrong `area_wide`
     silently disables the gate, a wrong `country_only` makes the EU default a no-op.
-    """
+    '''
     extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
     assert agent.derive_residency_scope(extract) == expected
 
@@ -6186,7 +6186,7 @@ def test_derive_residency_scope_distinguishes_a_country_object_from_an_area_obje
     'Germany (Remote across Europe)',
 ])
 def test_open_ended_areas_are_area_wide(location):
-    """An area too large to enumerate is what `area_wide` is for."""
+    '''An area too large to enumerate is what `area_wide` is for.'''
     extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
     assert agent.derive_residency_scope(extract) == 'area_wide'
 
@@ -6207,7 +6207,7 @@ def test_every_europe_branch_shares_one_definition_of_europe(location):
 
 
 def test_us_alone_is_not_an_area():
-    """US/USA stay out of `_AREA_WORDS`: alone they name one country, not an area to live in."""
+    '''US/USA stay out of `_AREA_WORDS`: alone they name one country, not an area to live in.'''
     extract = _make_extract(location='United States (Remote) — must be based in the US', relocation='',
                             description=_NEUTRAL_DESCRIPTION)
     assert agent.derive_residency_scope(extract) == 'country_only'
@@ -6220,7 +6220,7 @@ def test_us_alone_is_not_an_area():
     'Poland (Remote within CEE)',
 ])
 def test_small_closed_blocs_are_judged_on_the_anchor(location):
-    """DACH is NOT an area word, and leaving it out is a decision rather than an oversight.
+    '''DACH is NOT an area word, and leaving it out is a decision rather than an oversight.
 
     `area_wide` passes unconditionally, mirroring `broad_area`, whose justification is that a
     posting offering a whole multi-country area "is not limited to the countries it happens to
@@ -6228,7 +6228,7 @@ def test_small_closed_blocs_are_judged_on_the_anchor(location):
     "remote within DACH" IS limited to Germany, Austria and Switzerland. Listing it as an area
     would turn a role you must live in one of three specific countries for into an automatic pass
     — strictly worse than judging the anchor, which is what happens now.
-    """
+    '''
     extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
     assert agent.derive_residency_scope(extract) == 'country_only'
 
@@ -6302,7 +6302,7 @@ def test_residency_scope_fallback_country_only_wins_over_an_extractor_area_wide(
 
 
 def test_residency_scope_extractor_area_wide_wins_over_a_silent_fallback():
-    """Between the two permissive values the extractor wins — it read the body, the regex is a backstop."""
+    '''Between the two permissive values the extractor wins — it read the body, the regex is a backstop.'''
     extract = _make_extract(
         location='Poland (Remote)', residency_scope='area_wide', description=_NEUTRAL_DESCRIPTION,
     )
@@ -6317,7 +6317,7 @@ def test_residency_scope_ignores_a_value_outside_the_vocabulary():
 
 
 async def test_hybrid_in_an_eu_country_does_not_get_the_eu_remote_spare():
-    """An office pins you to the office — the Munich/Berlin case the gate was built for."""
+    '''An office pins you to the office — the Munich/Berlin case the gate was built for.'''
     extract = _make_extract(
         location='Warsaw, Poland (Hybrid — 2 days a week in the office)', workplace_type='hybrid',
         description=_NEUTRAL_DESCRIPTION,
@@ -6335,13 +6335,13 @@ async def test_onsite_in_an_eu_country_does_not_get_the_eu_remote_spare():
 
 
 async def test_would_not_live_here_applies_only_when_residence_is_pinned(monkeypatch):
-    """`would_not_live_here` says where you will not LIVE — so it bites when the job pins you there.
+    '''`would_not_live_here` says where you will not LIVE — so it bites when the job pins you there.
 
     This is rules 2 and 3 together. "Must live in Poland" is pinned, so the list rejects it. A
     German (or Polish) employer who accepts any EU location does not pin you, so you would live in
     Spain and the posting is kept — having Poland on the list does not change that. Hybrid and
     on-site are always pinned, by the office.
-    """
+    '''
     monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ('Poland',))
     monkeypatch.setattr(preferences, 'would_live_here', lambda: ('Spain',))
 
@@ -6363,11 +6363,11 @@ async def test_would_not_live_here_applies_only_when_residence_is_pinned(monkeyp
 
 
 async def test_relocation_rule_is_unaffected_by_the_eu_remote_spare():
-    """The most important test in this change: the location half loosened, the relocation half did not.
+    '''The most important test in this change: the location half loosened, the relocation half did not.
 
     This is what still rejects the two GlobalLogic Romania postings — both carried
     `Relocation required: Romania`, and before the `roma` fix neither rule ever ran.
-    """
+    '''
     extract = _make_extract(
         location='Romania (Remote)', relocation='Romania', workplace_type='remote',
         description=_NEUTRAL_DESCRIPTION,
@@ -6398,11 +6398,11 @@ async def test_globallogic_romania_regression_end_to_end():
 
 
 async def test_area_wide_keeps_a_posting_anchored_outside_the_eu():
-    """`area_wide` is unconditional, mirroring `broad_area`.
+    '''`area_wide` is unconditional, mirroring `broad_area`.
 
     Pinned by name because it is the one value that can switch the gate off for a non-EU anchor —
     which is exactly why the precedence table never lets the weak source assert it.
-    """
+    '''
     extract = _make_extract(
         location='United Kingdom (Remote — Work from Anywhere)', workplace_type='remote',
         description=_NEUTRAL_DESCRIPTION,
@@ -6414,7 +6414,7 @@ async def test_area_wide_keeps_a_posting_anchored_outside_the_eu():
 async def test_location_gate_makes_no_classifier_call_when_unconfigured(
     neutral_preferences, stub_location_classifier
 ):
-    """The EU branch reaches classify_location directly, so it needs its own short-circuit."""
+    '''The EU branch reaches classify_location directly, so it needs its own short-circuit.'''
     extract = _make_extract(location='Germany (Remote)', workplace_type='remote',
                             description=_NEUTRAL_DESCRIPTION)
     assert await agent.location_rejection_reason(extract) == ''
@@ -6433,9 +6433,9 @@ async def test_location_gate_makes_no_classifier_call_when_unconfigured(
 def test_legacy_preference_key_raises_rather_than_being_ignored(
     section, key, replacement, monkeypatch, tmp_path, real_load_preferences
 ):
-    """A renamed key must RAISE. `_deep_merge` drops what it does not recognise, so a stale name
+    '''A renamed key must RAISE. `_deep_merge` drops what it does not recognise, so a stale name
     leaves the list EMPTY and silently switches the rule off — a gate that rejects nothing, with no
-    error anywhere. This is the single most dangerous thing about the rename."""
+    error anywhere. This is the single most dangerous thing about the rename.'''
     path = tmp_path / 'preferences.yaml'
     path.write_text(yaml.safe_dump({section: {key: ['Anything']}}))
     monkeypatch.setattr(preferences, 'PREFERENCES_PATH', path)
@@ -6447,8 +6447,8 @@ def test_legacy_preference_key_raises_rather_than_being_ignored(
 
 
 def test_would_live_here_does_not_uncap_a_commute_job(monkeypatch):
-    """The defect the split exists for: one list answered both questions, so `Spain` on it (a place
-    you would LIVE) left an on-site role in any Spanish town uncapped and able to score 5."""
+    '''The defect the split exists for: one list answered both questions, so `Spain` on it (a place
+    you would LIVE) left an on-site role in any Spanish town uncapped and able to score 5.'''
     monkeypatch.setattr(preferences, 'would_live_here', lambda: ('Spain',))
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('Barcelona',))
     ourense = _make_extract(location='Ourense, Galicia, Spain (On-site)', workplace_type='onsite')
@@ -6458,7 +6458,7 @@ def test_would_live_here_does_not_uncap_a_commute_job(monkeypatch):
 
 
 async def test_gate_reads_the_union_of_live_and_commute(monkeypatch):
-    """Commuting somewhere implies being there, so a commute-only city still exempts the gate."""
+    '''Commuting somewhere implies being there, so a commute-only city still exempts the gate.'''
     monkeypatch.setattr(preferences, 'would_live_here', lambda: ())
     monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ('Spain',))
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('Barcelona',))
@@ -6467,8 +6467,8 @@ async def test_gate_reads_the_union_of_live_and_commute(monkeypatch):
 
 
 async def test_a_guess_never_rejects_and_is_queued_once(monkeypatch):
-    """A guess must never cost a job: the user corrects it, and they cannot correct one they were
-    never shown. The posting passes, the country is queued, and a second sighting adds nothing."""
+    '''A guess must never cost a job: the user corrects it, and they cannot correct one they were
+    never shown. The posting passes, the country is queued, and a second sighting adds nothing.'''
     monkeypatch.setattr(preferences, 'would_live_here', lambda: ('Spain',))
     monkeypatch.setattr(preferences, 'would_not_live_here', lambda: ('Germany',))
     monkeypatch.setattr(preferences, 'not_yet_bucketed', lambda: ())
@@ -6495,7 +6495,7 @@ def test_not_yet_bucketed_posting_carries_a_warning(monkeypatch):
 
 
 async def test_guess_resolution_fails_open(monkeypatch):
-    """Tool server down: no guess, nothing appended, nothing reported. Every posting already passed."""
+    '''Tool server down: no guess, nothing appended, nothing reported. Every posting already passed.'''
     async def _down(*a, **k):
         raise RuntimeError('unhandled errors in a TaskGroup (1 sub-exception)')
     monkeypatch.setattr(agent, 'chat_openrouter', _down)
@@ -6543,11 +6543,11 @@ def test_place_tokens_are_matched_case_sensitively():
 
 
 def test_accented_place_name_matches_itself_and_folding_is_not_a_match():
-    """`malaga` was a dead entry: LinkedIn writes `Málaga` and matching is accent-exact.
+    '''`malaga` was a dead entry: LinkedIn writes `Málaga` and matching is accent-exact.
 
     The fix is to write the entry correctly, NOT to fold accents at match time — folding would
     also fold the boundaries this file spent a whole diagnosis entry getting right.
-    """
+    '''
     assert location.location_token_matches('Málaga', 'Málaga, Andalusia, Spain (Remote)')
     assert not location.location_token_matches('Málaga', 'malaga, spain')
     assert location.location_token_matches('València', 'València, Spain')
@@ -6625,12 +6625,12 @@ def test_eu_membership_tolerates_classifier_spelling_variants():
 
 
 def test_eu_constants_are_written_as_proper_names():
-    """The constants hold the real names; folding lives in `is_eu_member`, not in the data.
+    '''The constants hold the real names; folding lives in `is_eu_member`, not in the data.
 
     A folded constant is invisible until someone displays it, and it cannot be unfolded. This
     fails if anyone "simplifies" the sets back to lowercase to match a comparison — the comparison
     is what should move. `_EU_LOOKUP` is derived, so the two can never disagree.
-    """
+    '''
     for name in location.EU_MEMBER_STATES | location._EU_ALIASES:
         assert name != name.casefold(), name
     assert frozenset(
@@ -6655,7 +6655,7 @@ async def test_rejected_location_spares_an_acceptable_region():
 
 
 async def test_rejected_location_exempt_list_beats_the_classifier(stub_location_classifier):
-    """Tier 1 short-circuits: an exempt location never reaches a paid call."""
+    '''Tier 1 short-circuits: an exempt location never reaches a paid call.'''
     assert await agent.rejected_location('Testville, Germany') == ''
     assert stub_location_classifier == [], 'exempt locations must not cost a classifier call'
 
@@ -6671,22 +6671,22 @@ async def test_rejected_location_spares_a_location_naming_no_country(stub_locati
 
 
 async def test_rejected_location_spares_a_multi_country_location_with_one_acceptable():
-    """Rejection requires EVERY named country to be rejected — one good option is enough."""
+    '''Rejection requires EVERY named country to be rejected — one good option is enough.'''
     assert await agent.rejected_location('Remote — anywhere in Spain or the Netherlands') == ''
 
 
 async def test_rejected_location_rejects_an_english_speaking_country_in_a_rejected_region():
-    """The gate is geographic, so being English-speaking does not rescue Ireland or the UK.
+    '''The gate is geographic, so being English-speaking does not rescue Ireland or the UK.
 
     This is the knob the user has to set deliberately: `western_europe` catches them along with
     Germany and the Netherlands. Wanting them back is what the exempt list is for — see the test
     below — rather than a language special case, which is the conflation this whole rule avoids.
-    """
+    '''
     assert await agent.rejected_location('Dublin, Ireland (Remote)') == 'Ireland'
 
 
 async def test_exempt_list_rescues_a_country_in_a_rejected_region(monkeypatch):
-    """Tier 1 is the documented way to keep one country out of a rejected region."""
+    '''Tier 1 is the documented way to keep one country out of a rejected region.'''
     monkeypatch.setattr(preferences, 'would_commute_here', lambda: ('Testville', 'Ireland'))
     assert await agent.rejected_location('Dublin, Ireland (Remote)') == ''
 
@@ -6709,7 +6709,7 @@ async def test_rejected_location_rejects_when_every_named_country_is_rejected():
 
 
 async def test_rejected_location_is_inert_without_preferences(neutral_preferences, stub_location_classifier):
-    """Unconfigured means no gate AND, deliberately, not one classifier call."""
+    '''Unconfigured means no gate AND, deliberately, not one classifier call.'''
     assert await agent.rejected_location('Germany (Remote)') == ''
     assert stub_location_classifier == []
 
@@ -6738,7 +6738,7 @@ async def test_classifier_fails_open_when_the_tool_server_is_down(monkeypatch, t
 # ---------------------------------------------------------------------------
 
 async def test_apply_hard_rules_rejects_a_location_in_a_rejected_region():
-    """A remote posting that pins residence to the anchor country is judged on the anchor."""
+    '''A remote posting that pins residence to the anchor country is judged on the anchor.'''
     extract = _make_extract(location='Germany (Remote within country)', workplace_type='remote')
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason == (
@@ -6765,7 +6765,7 @@ async def test_apply_hard_rules_keeps_a_silent_remote_posting_in_an_eu_country()
 
 
 async def test_apply_hard_rules_still_rejects_a_silent_remote_posting_outside_the_eu():
-    """The counterpart. A UK/Serbian/Norwegian/Swiss anchor implies no EU work rights."""
+    '''The counterpart. A UK/Serbian/Norwegian/Swiss anchor implies no EU work rights.'''
     for loc in (
         'United Kingdom (Remote)', 'Belgrade, Serbia (Remote)',
         'Oslo, Norway (Remote)', 'Zurich, Switzerland (Remote)',
@@ -6810,12 +6810,12 @@ def test_hard_rule_category_order_is_stable():
 # ---------------------------------------------------------------------------
 
 async def test_location_gate_ignores_likely_working_language():
-    """A Spanish-speaking location is acceptable; the gate is geographic, not linguistic.
+    '''A Spanish-speaking location is acceptable; the gate is geographic, not linguistic.
 
     This is the pin for the design error that nearly shipped: "non-English AND not on the
     acceptable list" gets Spain and Germany right for the wrong reason, and gets Quebec wrong.
     The classifier really does imply Spanish here — the gate must not consult it.
-    """
+    '''
     extract = _make_extract(location='Spain (Remote)')
     # `agent.classify_location`, which is the stub. Calling `location.classify_location` here made
     # this test pass only on a machine whose real cache happened to hold 'spain (remote)' — on a
@@ -6825,7 +6825,7 @@ async def test_location_gate_ignores_likely_working_language():
 
 
 async def test_likely_working_language_alone_never_rejects_or_caps():
-    """French-speaking Quebec: warned about, never gated. The Valtech mechanism, restated."""
+    '''French-speaking Quebec: warned about, never gated. The Valtech mechanism, restated.'''
     extract = _make_extract(location='Montreal, Canada (Remote)')
     extract['likely_working_language'] = await agent.derive_likely_working_language(extract)
     assert extract['likely_working_language'] == 'french'
@@ -6919,7 +6919,7 @@ def test_location_cache_survives_a_missing_file(monkeypatch, tmp_path):
 
 
 def test_location_cache_rebuilds_a_corrupt_file(monkeypatch, tmp_path):
-    """A corrupt cache costs money to rebuild, never a crashed run."""
+    '''A corrupt cache costs money to rebuild, never a crashed run.'''
     from agentic_job_search import location
     path = tmp_path / 'location_cache.yaml'
     path.write_text('{{{ not yaml at all', encoding='utf-8')
@@ -6929,7 +6929,7 @@ def test_location_cache_rebuilds_a_corrupt_file(monkeypatch, tmp_path):
 
 
 def test_location_classifier_defaults_broad_area_to_false():
-    """A model that omits the field must not accidentally wave every job through."""
+    '''A model that omits the field must not accidentally wave every job through.'''
     from agentic_job_search import location
     assert location._coerce({'countries': ['Germany'], 'regions': ['western_europe']})['broad_area'] is False
 
@@ -6943,8 +6943,8 @@ def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_th
 
 
 async def test_location_classification_is_cached(monkeypatch, tmp_path):
-    """The cache is what makes an LLM call inside a hard rule deterministic — two jobs in the
-    same city cannot get different answers, within a run or across runs."""
+    '''The cache is what makes an LLM call inside a hard rule deterministic — two jobs in the
+    same city cannot get different answers, within a run or across runs.'''
     from agentic_job_search import location
     calls = []
 
@@ -6994,7 +6994,7 @@ def test_extract_json_object_parses_a_fenced_code_block():
 
 
 def test_extract_json_object_error_reports_head_and_tail():
-    """The head is where the fence is; the fault is always in the tail."""
+    '''The head is where the fence is; the fault is always in the tail.'''
     with pytest.raises(ValueError) as excinfo:
         triage.extract_json_object(_JOBGETHER_TRUNCATED)
     message = str(excinfo.value)
@@ -7010,8 +7010,8 @@ def test_extract_json_object_error_exposes_a_malformed_value():
 
 
 async def test_chat_openrouter_sends_no_max_tokens_by_default(monkeypatch):
-    """No ceiling is sent at all: the MCP tool declares it optional and applies no clamp, and the
-    former 3000 default was inherited by all eight call sites rather than chosen by any."""
+    '''No ceiling is sent at all: the MCP tool declares it optional and applies no clamp, and the
+    former 3000 default was inherited by all eight call sites rather than chosen by any.'''
     seen = {}
 
     async def fake_call(url, tool, args, timeout_seconds=None):
@@ -7025,8 +7025,8 @@ async def test_chat_openrouter_sends_no_max_tokens_by_default(monkeypatch):
 
 
 async def test_chat_openrouter_raises_a_named_error_on_a_length_finish(monkeypatch):
-    """The real payload shape from run-2026-09-02_102421.log:304 — a company-match question that
-    spent its entire budget on reasoning and returned null."""
+    '''The real payload shape from run-2026-09-02_102421.log:304 — a company-match question that
+    spent its entire budget on reasoning and returned null.'''
     async def fake_call(url, tool, args, timeout_seconds=None):
         return json.dumps({
             'ok': True, 'content': None, 'tool_calls': None, 'finish_reason': 'length',
@@ -7042,7 +7042,7 @@ async def test_chat_openrouter_raises_a_named_error_on_a_length_finish(monkeypat
 
 
 async def test_chat_openrouter_raises_on_truncated_non_empty_content(monkeypatch):
-    """The case that used to reach the JSON parser disguised as a parse failure."""
+    '''The case that used to reach the JSON parser disguised as a parse failure.'''
     async def fake_call(url, tool, args, timeout_seconds=None):
         return json.dumps({
             'ok': True, 'content': _JOBGETHER_TRUNCATED, 'finish_reason': 'length',
@@ -7055,9 +7055,9 @@ async def test_chat_openrouter_raises_on_truncated_non_empty_content(monkeypatch
 
 
 async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
-    """Losing a rating call is not recoverable: the job is already in processed_jobs/ from Stage
+    '''Losing a rating call is not recoverable: the job is already in processed_jobs/ from Stage
     1b, so an eval_error means it returns already_processed forever. A posting the model had
-    scored 5 was lost that way on 2026-09-03."""
+    scored 5 was lost that way on 2026-09-03.'''
     attempts = []
 
     async def fake_chat(prompt, system='', model='', max_tokens=None):
@@ -7078,7 +7078,7 @@ async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _no_llm(monkeypatch):
-    """Make any confirmation call an error, so a test can assert none was attempted."""
+    '''Make any confirmation call an error, so a test can assert none was attempted.'''
     async def boom_openrouter(prompt):
         raise AssertionError('blacklist confirmation should not have called OpenRouter')
 
@@ -7091,7 +7091,7 @@ def _no_llm(monkeypatch):
 
 
 def _confirm_llm(monkeypatch, same_organization: bool):
-    """Patch both confirmation providers to answer the same way."""
+    '''Patch both confirmation providers to answer the same way.'''
     async def fake_openrouter(prompt):
         return {'same_organization': same_organization}
 
@@ -7105,7 +7105,7 @@ async def test_blacklist_exact_match_confirmed_returns_reason(monkeypatch):
 
 
 async def test_blacklist_name_collision_does_not_reject(monkeypatch):
-    """Same name, different organization — the whole point of the confirmation call."""
+    '''Same name, different organization — the whole point of the confirmation call.'''
     _confirm_llm(monkeypatch, False)
     assert await tools.company_blacklist_reason('Blocked Corp') is None
 
@@ -7130,7 +7130,7 @@ async def test_blacklist_empty_preference_makes_no_llm_call(monkeypatch):
 
 
 async def test_blacklist_confirmation_failure_still_rejects(monkeypatch):
-    """An outage must not quietly let a blacklisted company back through."""
+    '''An outage must not quietly let a blacklisted company back through.'''
     async def fail_openrouter(prompt):
         raise RuntimeError('tool server down')
 
@@ -7157,7 +7157,7 @@ async def test_blacklist_no_structured_output_still_rejects(monkeypatch):
 
 
 async def test_blacklist_description_not_budgeted_without_a_name_hit(monkeypatch, caplog):
-    """Budgeting it up front logged a truncation for every job (20 on 2026-09-24), all unread."""
+    '''Budgeting it up front logged a truncation for every job (20 on 2026-09-24), all unread.'''
     _no_llm(monkeypatch)
     long_description = 'x' * (config.BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS * 2)
     with caplog.at_level(logging.WARNING):
@@ -7235,7 +7235,7 @@ def test_blacklist_expiry_warning_names_the_entry(caplog):
 
 
 async def test_blacklist_yaml_date_object_is_accepted(monkeypatch):
-    """PyYAML parses an unquoted YYYY-MM-DD into a date, not a str."""
+    '''PyYAML parses an unquoted YYYY-MM-DD into a date, not a str.'''
     _confirm_llm(monkeypatch, True)
     merged = preferences._deep_merge(
         preferences.load_preferences(),
@@ -7284,7 +7284,7 @@ def test_hard_rule_category_buckets_blacklist():
 
 
 def test_example_preferences_blacklist_is_empty():
-    """The tracked example must not name a real company the user blocked."""
+    '''The tracked example must not name a real company the user blocked.'''
     loaded = yaml.safe_load(preferences.EXAMPLE_PREFERENCES_PATH.read_text(encoding='utf-8'))
     assert loaded['companies']['blacklist'] == []
 
@@ -7298,7 +7298,7 @@ def test_example_preferences_blacklist_is_empty():
 # ---------------------------------------------------------------------------
 
 def _sound_report(**overrides):
-    """A structurally healthy search page, as SCRAPER_UI_CONTRACT_JS would report it."""
+    '''A structurally healthy search page, as SCRAPER_UI_CONTRACT_JS would report it.'''
     report = {
         'url': 'https://www.linkedin.com/jobs/search-results/?keywords=X&geoId=91000000&f_TPR=r604800',
         'search_box': True,
@@ -7320,7 +7320,7 @@ def test_sound_page_produces_no_contract_violations():
 
 
 def test_missing_results_container_is_a_contract_violation():
-    """A renamed container is the change that silently returns zero listings."""
+    '''A renamed container is the change that silently returns zero listings.'''
     violations = tools.evaluate_ui_contract(_sound_report(results_container=False, job_cards=0))
     assert any('results_container' in v for v in violations)
 
@@ -7332,20 +7332,20 @@ def test_zero_cards_while_the_page_shows_results_is_a_violation():
 
 
 def test_block_signature_is_detected_before_any_contract_judgement():
-    """A challenge and a markup change need OPPOSITE responses, so they must not be conflated."""
+    '''A challenge and a markup change need OPPOSITE responses, so they must not be conflated.'''
     assert tools.detect_block_signature(_sound_report(body_sample='please verify your identity')) == 'verify your identity'
     assert tools.detect_block_signature(_sound_report(body_sample='we noticed unusual activity')) == 'unusual activity'
     assert tools.detect_block_signature(_sound_report()) == ''
 
 
 def test_filters_confirmed_from_the_url_the_chips_produced():
-    """We never navigate to geoId/f_TPR, but reading them back proves the clicks landed."""
+    '''We never navigate to geoId/f_TPR, but reading them back proves the clicks landed.'''
     region = {'name': 'European Union', 'linkedin_location': 'European Union', 'geo_id': '91000000'}
     assert tools.check_filters_applied(_sound_report(), region) == []
 
 
 def test_location_filter_that_did_not_apply_is_caught():
-    """The Aug-18 failure: the search ran, looked fine, and returned the wrong region entirely."""
+    '''The Aug-18 failure: the search ran, looked fine, and returned the wrong region entirely.'''
     region = {'name': 'European Union', 'linkedin_location': 'European Union', 'geo_id': '91000000'}
     report = _sound_report(
         url='https://www.linkedin.com/jobs/search-results/?keywords=X&f_TPR=r604800',
@@ -7395,9 +7395,9 @@ def geo_regions(monkeypatch, tmp_path):
 
 
 def test_filter_alert_fixed_before_harvest_does_not_need_attention(geo_regions):
-    """The 2026-09-10 run: the model re-navigated to shed a self-injected f_SAL, which dropped geoId
+    '''The 2026-09-10 run: the model re-navigated to shed a self-injected f_SAL, which dropped geoId
     while the sticky chip still showed "Canada". The check caught it, the model re-clicked the chip,
-    the next check passed and only then did it harvest. That is the check working, not an alert."""
+    the next check passed and only then did it harvest. That is the check working, not an alert.'''
     first = _report_search('Principal Data Scientist', 'Canada', _CANADA_NO_GEO_URL, 'Canada')
     assert 'FILTERS NOT APPLIED' in first['content'][0]['text']
     second = _report_search('Principal Data Scientist', 'Canada', _CANADA_OK_URL, 'Canada')
@@ -7414,7 +7414,7 @@ def test_filter_alert_never_followed_by_a_passing_check_still_alerts(geo_regions
 
 
 def test_filter_alert_is_not_resolved_by_a_pass_on_another_search(geo_regions):
-    """A sound EU page says nothing about whether the Canada search was ever filtered."""
+    '''A sound EU page says nothing about whether the Canada search was ever filtered.'''
     _report_search('Principal Data Scientist', 'Canada', _CANADA_NO_GEO_URL, 'Canada')
     _report_search('Principal Data Scientist', 'European Union',
                    'https://www.linkedin.com/jobs/search-results/?keywords=X&geoId=91000000&f_TPR=r604800',
@@ -7437,7 +7437,7 @@ def test_region_overlap_detects_a_dead_location_axis(monkeypatch):
 
 
 def test_fingerprint_drift_reports_changed_chips(tmp_path, monkeypatch):
-    """Catches a restructure the run it happens, even when every required element survives."""
+    '''Catches a restructure the run it happens, even when every required element survives.'''
     monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
     first = tools.check_fingerprint_drift(_sound_report())
     assert first == '', 'the first observation is a baseline, not a change'
@@ -7449,11 +7449,11 @@ def test_fingerprint_drift_reports_changed_chips(tmp_path, monkeypatch):
 
 
 def test_fingerprint_ignores_linkedins_per_query_topical_chips(tmp_path, monkeypatch):
-    """Gen AI / LLM / AWS / AI-ML / Analytics change with every query by design.
+    '''Gen AI / LLM / AWS / AI-ML / Analytics change with every query by design.
 
     Fingerprinting the whole chip row made drift fire on ordinary query-to-query variation on the
     first live run, and a warning that fires on success trains the reader to ignore it.
-    """
+    '''
     monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
     structural = ['Jobs', 'Past week', 'Senior', 'Employment type', 'Company']
     tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'Gen AI', 'AWS']))
@@ -7503,7 +7503,7 @@ def test_a_fingerprint_written_with_a_since_dropped_chip_does_not_alarm(tmp_path
 
 
 def test_low_yield_alert_fires_on_the_run_that_prompted_all_this():
-    """2026-08-18: 1 new job from 101 distinct listings, no notification, no signal."""
+    '''2026-08-18: 1 new job from 101 distinct listings, no notification, no signal.'''
     alerts = agent.assess_run_health({
         'listings_distinct': 101, 'check_status': {'new': 1},
         'region_overlap': {}, 'ui_alerts': [],
@@ -7512,7 +7512,7 @@ def test_low_yield_alert_fires_on_the_run_that_prompted_all_this():
 
 
 def test_low_yield_alert_stays_quiet_on_a_healthy_run():
-    """Aug 14: 26 new from 300. An alert that fires on success trains the reader to ignore it."""
+    '''Aug 14: 26 new from 300. An alert that fires on success trains the reader to ignore it.'''
     alerts = agent.assess_run_health({
         'listings_distinct': 300, 'check_status': {'new': 26},
         'region_overlap': {}, 'ui_alerts': [],
@@ -7529,7 +7529,7 @@ def test_region_overlap_alert_names_the_query():
 
 
 def test_block_and_ui_change_alerts_are_distinguishable():
-    """They demand different actions from the user, so they must not read the same."""
+    '''They demand different actions from the user, so they must not read the same.'''
     alerts = agent.assess_run_health({
         'listings_distinct': 10, 'check_status': {'new': 10}, 'region_overlap': {},
         'ui_alerts': [
@@ -7542,37 +7542,37 @@ def test_block_and_ui_change_alerts_are_distinguishable():
 
 
 def test_contract_js_dedupes_cards_and_chips():
-    """Both are rendered TWICE in the DOM. Verified live on 2026-08-18: a raw count reported 50
+    '''Both are rendered TWICE in the DOM. Verified live on 2026-08-18: a raw count reported 50
     cards and 44 chips on a page holding 25 jobs and 13 chips, so any count-based threshold built
-    on the raw numbers would be silently wrong."""
+    on the raw numbers would be silently wrong.'''
     js = agent.SCRAPER_UI_CONTRACT_JS
     assert 'new Set' in js, 'cards and chips must be deduped before counting'
     assert 'cardIds.size' in js, 'the card count must come from the deduped set'
 
 
 def test_contract_js_finds_the_search_box_by_placeholder():
-    """The search box is a plain <input> carrying a PLACEHOLDER and no aria-label — verified live.
+    '''The search box is a plain <input> carrying a PLACEHOLDER and no aria-label — verified live.
     An aria-label-only selector reported search_box=false on a perfectly healthy page, which would
-    have failed the contract on every single query."""
+    have failed the contract on every single query.'''
     js = agent.SCRAPER_UI_CONTRACT_JS
     assert 'placeholder' in js
     assert 'describe the job' in js.lower()
 
 
 def test_contract_js_is_read_only():
-    """Same rule as the harvest JS: JavaScript may read the page, never drive it."""
+    '''Same rule as the harvest JS: JavaScript may read the page, never drive it.'''
     js = agent.SCRAPER_UI_CONTRACT_JS
     for forbidden in ('.click(', '.submit(', 'dispatchEvent', '.value =', 'location.href ='):
         assert forbidden not in js, f'the contract probe must never {forbidden}'
 
 
 async def test_a_region_that_was_never_verified_is_reported(monkeypatch):
-    """A search the model never verified is silently unfiltered — the exact failure this guards.
+    '''A search the model never verified is silently unfiltered — the exact failure this guards.
 
     On the first live chip run, report_search was called 5 times across 12 expected searches and
     one query searched only one of its two regions, with turn budget to spare (49 of 260). So it
     was a choice, not starvation, and prompting harder is not the fix: code checks the omission.
-    """
+    '''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -7594,7 +7594,7 @@ async def test_a_region_that_was_never_verified_is_reported(monkeypatch):
 
 
 async def test_all_regions_verified_raises_no_coverage_alert(monkeypatch):
-    """An alert that fires on success trains the reader to ignore it."""
+    '''An alert that fires on success trains the reader to ignore it.'''
     monkeypatch.setattr(tools, '_check_status_counts', {})
     monkeypatch.setattr(tools, '_distinct_listing_ids', set())
     monkeypatch.setattr(tools, '_search_ids', {})
@@ -7615,11 +7615,11 @@ async def test_all_regions_verified_raises_no_coverage_alert(monkeypatch):
 
 
 def test_report_query_matching_tolerates_the_full_search_text():
-    """The model reports what it typed ("Principal Data Scientist, remote"), not the base query.
+    '''The model reports what it typed ("Principal Data Scientist, remote"), not the base query.
 
     Exact matching would make the coverage check silently never fire — the same shape of bug as
     the counters it exists to backstop.
-    """
+    '''
     assert agent._same_query('Principal Data Scientist, remote', 'Principal Data Scientist')
     assert agent._same_query('Alpha', 'Alpha')
     assert not agent._same_query('Beta, remote', 'Alpha')
@@ -7631,11 +7631,11 @@ def test_report_query_matching_tolerates_the_full_search_text():
 # ---------------------------------------------------------------------------
 
 def test_playwright_mcp_version_is_concrete():
-    """`@latest` is resolved by npm on EVERY run. npx had cached `^0.0.79` under the key
+    '''`@latest` is resolved by npm on EVERY run. npx had cached `^0.0.79` under the key
     `@playwright/mcp@latest`; upstream published 0.0.80, the cached tree stopped satisfying
     `latest`, and npx halted the run at an interactive `Ok to proceed? (y)` -- on the startup path
     cron uses. The prompt was the symptom; the real defect is that the tool surface the scraper
-    drives a real logged-in LinkedIn account through could change with no commit."""
+    drives a real logged-in LinkedIn account through could change with no commit.'''
     assert re.fullmatch(r'\d+\.\d+\.\d+', config.PLAYWRIGHT_MCP_VERSION), (
         f'PLAYWRIGHT_MCP_VERSION must be a concrete version, got '
         f'{config.PLAYWRIGHT_MCP_VERSION!r}'
@@ -7644,9 +7644,9 @@ def test_playwright_mcp_version_is_concrete():
 
 
 def test_playwright_mcp_is_pinned_at_every_launch_site():
-    """The static guard, in the shape of test_every_claude_agent_options_site_limits_context: the
+    '''The static guard, in the shape of test_every_claude_agent_options_site_limits_context: the
     fix was applied at two launch sites, and prose cannot stop a third from being added with
-    `@latest`. Every literal naming the package must carry a concrete version."""
+    `@latest`. Every literal naming the package must carry a concrete version.'''
     source_dir = Path(agent.__file__).parent
     offenders = []
     for path in sorted(p for p in source_dir.rglob('*.py')
@@ -7761,8 +7761,8 @@ def test_check_playwright_mcp_version_silent_when_not_newer(monkeypatch, publish
     TimeoutError('registry timed out'),
 ])
 def test_check_playwright_mcp_version_fails_open_on_network_error(monkeypatch, failure):
-    """This runs before the run lock and before the browser starts. A registry outage must cost a
-    log line, never a run."""
+    '''This runs before the run lock and before the browser starts. A registry outage must cost a
+    log line, never a run.'''
     def boom(*args, **kwargs):
         raise failure
 
@@ -7781,8 +7781,8 @@ def test_check_playwright_mcp_version_fails_open_on_bad_payload(monkeypatch, pay
 
 
 def test_upgrade_prompt_never_blocks_without_a_tty(monkeypatch):
-    """The whole point. cron has nobody to answer, so an available upgrade warns and continues --
-    it must not read stdin, which is precisely what `@latest` did via npx."""
+    '''The whole point. cron has nobody to answer, so an available upgrade warns and continues --
+    it must not read stdin, which is precisely what `@latest` did via npx.'''
     monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
     monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: False)
     monkeypatch.setattr(agent, '_startup_ui_alerts', [])
@@ -7799,9 +7799,9 @@ def test_upgrade_prompt_never_blocks_without_a_tty(monkeypatch):
 
 
 def test_upgrade_prompt_never_prompts_in_non_interactive_mode(monkeypatch):
-    """`-n` is the autonomous mode -- cron runs it, and so does a person at a terminal, where
+    '''`-n` is the autonomous mode -- cron runs it, and so does a person at a terminal, where
     isatty() is True. Gating on the TTY alone meant a hand-run `-n` stopped dead on a question,
-    which is the exact failure this mechanism exists to prevent. `-n` means do not ask."""
+    which is the exact failure this mechanism exists to prevent. `-n` means do not ask.'''
     monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
     monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)   # a real terminal
     monkeypatch.setattr(agent, '_startup_ui_alerts', [])
@@ -7817,7 +7817,7 @@ def test_upgrade_prompt_never_prompts_in_non_interactive_mode(monkeypatch):
 
 @pytest.mark.parametrize('failure', [EOFError, KeyboardInterrupt])
 def test_upgrade_prompt_survives_stdin_ending(monkeypatch, failure):
-    """Ctrl-D or Ctrl-C at the question must continue on the pin, not traceback out of startup."""
+    '''Ctrl-D or Ctrl-C at the question must continue on the pin, not traceback out of startup.'''
     monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: '0.0.80')
     monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)
 
@@ -7846,7 +7846,7 @@ def test_upgrade_prompt_continues_on_anything_else(monkeypatch, answer):
 
 
 def test_upgrade_prompt_is_silent_when_pin_is_current(monkeypatch):
-    """No newer version means no prompt, no alert, and no stdin read even on a TTY."""
+    '''No newer version means no prompt, no alert, and no stdin read even on a TTY.'''
     monkeypatch.setattr(agent, 'check_playwright_mcp_version', lambda: None)
     monkeypatch.setattr(agent.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(agent, '_startup_ui_alerts', [])
@@ -7938,7 +7938,7 @@ def test_pinned_playwright_mcp_version_exists_in_the_registry():
 # ---------------------------------------------------------------------------
 
 def _session(browser_reply):
-    """A ScrapeSession whose browser returns a canned response."""
+    '''A ScrapeSession whose browser returns a canned response.'''
     async def browser(name, args):
         return browser_reply
     return scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer')
@@ -7950,7 +7950,7 @@ _CHAT_DONE = json.dumps({'ok': True, 'content': 'done', 'tool_calls': None, 'fin
 
 
 def _run_with_chat_replies(monkeypatch, replies):
-    """Drive ScrapeSession.run against canned chat replies; returns how many chat calls were made."""
+    '''Drive ScrapeSession.run against canned chat replies; returns how many chat calls were made.'''
     calls = []
 
     async def fake_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
@@ -8034,7 +8034,7 @@ def test_no_nudge_after_a_block(monkeypatch):
 
 
 def test_scraper_retries_a_transient_502_once(monkeypatch):
-    """2026-09-10: one 502 discarded a query 71 iterations in, and its second region never ran."""
+    '''2026-09-10: one 502 discarded a query 71 iterations in, and its second region never ran.'''
     assert _run_with_chat_replies(monkeypatch, [_CHAT_502, _CHAT_DONE]) == 2
 
 
@@ -8046,7 +8046,7 @@ def test_scraper_gives_up_after_a_second_502_as_a_one_query_failure(monkeypatch)
 
 
 def test_scraper_does_not_retry_a_provider_refusal(monkeypatch):
-    """A 402 breaks every query; retrying it only burns pacing before the fallback runs."""
+    '''A 402 breaks every query; retrying it only burns pacing before the fallback runs.'''
     with pytest.raises(triage.ProviderUnavailableError):
         _run_with_chat_replies(monkeypatch, [_CHAT_402, _CHAT_DONE])
 
@@ -8080,8 +8080,8 @@ def test_evaluate_parser_handles_braces_inside_strings():
 
 
 def test_click_guard_refuses_the_results_list():
-    """The hard safety invariant, enforced in code rather than by prompt wording: to the model a
-    card and its Dismiss button are the same node, and one stray click destroys a real job."""
+    '''The hard safety invariant, enforced in code rather than by prompt wording: to the model a
+    card and its Dismiss button are the same node, and one stray click destroys a real job.'''
     for args in ({'target': 'job-card-component-ref-4455'},
                  {'element': 'the Dismiss button', 'target': 'e12'},
                  {'target': 'div[componentkey="SearchResultsMainContent"] p'}):
@@ -8111,8 +8111,8 @@ async def test_harvest_error_forbids_invention_and_records_nothing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_result_diverted_to_a_file_is_reported_not_reconstructed(monkeypatch):
-    """The 2026-08-21 canary: `filename` sent the evaluate result to disk, the model saw only a
-    link, and it invented a page report. Code must say it cannot read the page."""
+    '''The 2026-08-21 canary: `filename` sent the evaluate result to disk, the model saw only a
+    link, and it invented a page report. Code must say it cannot read the page.'''
     monkeypatch.setattr(tools, '_search_reports', [])
     session = _session('### Result\n- [Evaluation result](./step3.json)')
     out = await session.dispatch_local('run_ui_contract', {'region': 'Canada'})
@@ -8128,9 +8128,9 @@ async def test_result_diverted_to_a_file_is_reported_not_reconstructed(monkeypat
     ('browser_tool_a_later_release_adds', {}),
 ])
 def test_model_supplied_filename_never_reaches_the_browser(monkeypatch, tool_name, tool_args):
-    """`filename` diverts a result to disk and leaves the model a link to reason from. The tool
+    '''`filename` diverts a result to disk and leaves the model a link to reason from. The tool
     schemas come from the live server, so a release that adds the argument to another tool (as
-    @playwright/mcp did for browser_find) exposes it to the model with no change here."""
+    @playwright/mcp did for browser_find) exposes it to the model with no change here.'''
     browser_calls = []
 
     async def browser(name, args):
@@ -8181,7 +8181,7 @@ async def test_record_listings_ignores_model_supplied_job_data(monkeypatch, tmp_
 
 @pytest.mark.asyncio
 async def test_record_listings_caps_in_code(monkeypatch, tmp_path):
-    """SCRAPER_MAX_LISTINGS_PER_SEARCH used to be a prompt suggestion only."""
+    '''SCRAPER_MAX_LISTINGS_PER_SEARCH used to be a prompt suggestion only.'''
     monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path)
     for name, value in (('_processed_jobs', set()), ('_listing_records', {}),
                         ('_check_status_counts', {}), ('_distinct_listing_ids', set()),
@@ -8290,7 +8290,7 @@ def test_an_oversized_find_capture_names_its_file_relative_to_the_project(tmp_pa
 
 
 def test_an_oversized_find_capture_survives_a_relocated_capture_dir(tmp_path, monkeypatch, caplog):
-    """A path outside the project must not raise — this runs uncaught inside the tool-call loop."""
+    '''A path outside the project must not raise — this runs uncaught inside the tool-call loop.'''
     monkeypatch.setattr(scrape_openrouter, 'RUN_DIR', tmp_path / 'somewhere' / 'else')
     monkeypatch.setattr(scrape_openrouter, 'FIND_CAPTURE_DIR', tmp_path / 'captures')
     with caplog.at_level(logging.INFO, logger=scrape_openrouter.logger.name):
@@ -8395,7 +8395,7 @@ def test_raise_if_result_error_hints_at_backoff_for_rate_limits():
 
 
 def test_raise_if_result_error_survives_missing_status():
-    """api_error_status is None on older CLIs; the error must still be raised and readable."""
+    '''api_error_status is None on older CLIs; the error must still be raised and readable.'''
     with pytest.raises(tools.AgentApiError) as excinfo:
         tools._raise_if_result_error(_errored_result(None), 'ctx')
     assert excinfo.value.api_error_status is None
@@ -8425,7 +8425,7 @@ async def test_categorize_pdf_text_raises_on_api_error(monkeypatch):
 
 
 async def test_categorize_save_dir_pdfs_aborts_on_api_error(tmp_path, monkeypatch):
-    """One API failure must abort, not spawn a doomed call per PDF."""
+    '''One API failure must abort, not spawn a doomed call per PDF.'''
     for name in ('a.pdf', 'b.pdf', 'c.pdf'):
         (tmp_path / name).write_bytes(b'%PDF fake')
 
@@ -8451,7 +8451,7 @@ async def test_categorize_save_dir_pdfs_aborts_on_api_error(tmp_path, monkeypatc
 
 
 async def test_categorize_save_dir_pdfs_continues_past_per_file_error(tmp_path, monkeypatch):
-    """A per-file fault is recoverable and must not kill the run."""
+    '''A per-file fault is recoverable and must not kill the run.'''
     for name in ('bad.pdf', 'good.pdf'):
         (tmp_path / name).write_bytes(b'%PDF fake')
 
@@ -8474,7 +8474,7 @@ async def test_categorize_save_dir_pdfs_continues_past_per_file_error(tmp_path, 
 
 
 async def test_extract_applied_job_metadata_raises_on_api_error(monkeypatch):
-    """This path had no try/except at all, so the raw SDK text reached the user."""
+    '''This path had no try/except at all, so the raw SDK text reached the user.'''
     async def fake_sdk_query(**kwargs):
         yield _errored_result(529)
 
@@ -8572,7 +8572,7 @@ async def test_live_categorization_options_do_not_load_repo_context():
 # ---------------------------------------------------------------------------
 
 def test_optional_tool_params_are_not_declared_required():
-    """The {"name": str} shorthand marks EVERY key required.
+    '''The {"name": str} shorthand marks EVERY key required.
 
     claude_agent_sdk/__init__.py:422 builds `"required": list(properties.keys())` from the
     shorthand, so three tools spent months demanding fields their own descriptions called
@@ -8581,7 +8581,7 @@ def test_optional_tool_params_are_not_declared_required():
     told a field is mandatory and unable to observe it will either refuse the call or invent a
     value. Measured: the live save_job_posting test failed because the model refused to invent a
     job_id. Optionality requires the full JSON Schema form, which the SDK passes through as-is.
-    """
+    '''
     from claude_agent_sdk import SdkMcpTool
 
     expected_required = {
@@ -8604,7 +8604,7 @@ def test_optional_tool_params_are_not_declared_required():
 
 
 def test_optional_tool_params_still_declared_as_properties():
-    """Optional does not mean absent: the model must still know the params exist."""
+    '''Optional does not mean absent: the model must still know the params exist.'''
     from claude_agent_sdk import SdkMcpTool
 
     optional_by_tool = {
@@ -8626,7 +8626,7 @@ def test_optional_tool_params_still_declared_as_properties():
 # ---------------------------------------------------------------------------
 
 def _corpus(applied_dir, records):
-    """Build an applied-jobs corpus from (applied_date, text, filename) triples."""
+    '''Build an applied-jobs corpus from (applied_date, text, filename) triples.'''
     import yaml as yaml_mod
 
     index = {}
@@ -8673,7 +8673,7 @@ async def test_reference_texts_keep_the_newest_and_drop_the_oldest(tmp_path, mon
 
 
 async def test_reference_texts_order_by_applied_date_not_filename(tmp_path, monkeypatch):
-    """Ordering must not rely on filename sort — a legacy file with no date prefix sorts anywhere."""
+    '''Ordering must not rely on filename sort — a legacy file with no date prefix sorts anywhere.'''
     _no_legacy_cache(monkeypatch, tmp_path)
     applied = tmp_path / 'applied_jobs'
     recent = date.today() - timedelta(days=1)
@@ -8692,11 +8692,11 @@ async def test_reference_texts_order_by_applied_date_not_filename(tmp_path, monk
 
 
 async def test_a_newly_applied_job_changes_the_reference_set(tmp_path, monkeypatch):
-    """Structurally impossible before: new records sorted last and never entered the first N.
+    '''Structurally impossible before: new records sorted last and never entered the first N.
 
     That is why the run logged `Reference summary: cache hit` right after ingesting 8 new PDFs —
     `combined` was byte-identical, so the md5 matched and the profile never regenerated.
-    """
+    '''
     from agentic_job_search.config import MAX_REFERENCE_JOBS
 
     _no_legacy_cache(monkeypatch, tmp_path)
@@ -8726,7 +8726,7 @@ async def test_a_newly_applied_job_changes_the_reference_set(tmp_path, monkeypat
 
 
 async def test_build_reference_block_renders_the_newest_jobs(tmp_path, monkeypatch):
-    """End-to-end through the consumer that the rater actually sees."""
+    '''End-to-end through the consumer that the rater actually sees.'''
     from agentic_job_search.config import MAX_REFERENCE_JOBS
 
     _no_legacy_cache(monkeypatch, tmp_path)
@@ -8755,11 +8755,11 @@ async def test_build_reference_block_renders_the_newest_jobs(tmp_path, monkeypat
 # ---------------------------------------------------------------------------
 
 class _DuplicateHarvestClient:
-    """Every pass re-records the SAME listing ids: distinct stays flat while calls keep growing.
+    '''Every pass re-records the SAME listing ids: distinct stays flat while calls keep growing.
 
     This is the shape of a recovery pass re-harvesting the page it already harvested, which is
     what four of six queries did on the 2026-08-24 run.
-    """
+    '''
 
     def __init__(self, distinct_ids: int, calls_per_pass: int):
         self.requests = []
@@ -8791,13 +8791,13 @@ def _reset_scrape_globals(monkeypatch):
 
 
 async def test_recovery_pass_keeps_seen_a_distinct_count(monkeypatch, caplog):
-    """The regression: the recovery branch reassigned `seen` to sum(delta.values()) — a CALL
+    '''The regression: the recovery branch reassigned `seen` to sum(delta.values()) — a CALL
     count — and never refreshed `calls`, producing "100 distinct listing(s) of 50 checked".
 
     Distinct can never exceed checked. `seen` also feeds _queries_searched, so a recovered query
     reported a call count where every other query reports distinct listings — inflating coverage
     for exactly the queries that needed rescuing.
-    """
+    '''
     _reset_scrape_globals(monkeypatch)
     distinct = 3  # below SCRAPER_MIN_LISTINGS_PER_QUERY, so a recovery pass is triggered
     assert distinct < agent.SCRAPER_MIN_LISTINGS_PER_QUERY
@@ -8824,12 +8824,12 @@ async def test_recovery_pass_keeps_seen_a_distinct_count(monkeypatch, caplog):
 
 
 async def test_duplicate_listing_line_makes_no_region_claim(monkeypatch, caplog):
-    """`calls - seen` cannot tell cross-region duplication from a recovery re-harvest.
+    '''`calls - seen` cannot tell cross-region duplication from a recovery re-harvest.
 
     The old wording asserted the duplicates "were surfaced by more than one region", which is an
     inference the number does not support — and it manufactured a false diagnosis (a collapsed
     location filter) on a run where region_overlap correctly reported 0.0.
-    """
+    '''
     _reset_scrape_globals(monkeypatch)
     client = _DuplicateHarvestClient(distinct_ids=3, calls_per_pass=25)
 
@@ -8973,7 +8973,7 @@ def test_pages_to_prompt_reports_chars_per_page(caplog):
 
 
 def test_pages_to_prompt_keeps_content_behind_whitespace_padding(caplog):
-    """The categorizer read the first 3000 RAW chars: a PDF opening with padding lost its content."""
+    '''The categorizer read the first 3000 RAW chars: a PDF opening with padding lost its content.'''
     padded = ' ' * 5000 + '\n\n\n' * 500 + 'Staff AI Engineer at Acme'
     out = text_budget.pages_to_prompt([padded], 'PDF padded.pdf', 3000)
     assert 'Staff AI Engineer at Acme' in out
@@ -9045,7 +9045,7 @@ def test_gate_filler_is_longer_than_every_old_cap():
 
 
 async def test_sdk_stream_is_closed_when_an_api_error_aborts(monkeypatch):
-    """Raising mid-`async for` left the generator open; asyncio.run() then failed closing it."""
+    '''Raising mid-`async for` left the generator open; asyncio.run() then failed closing it.'''
     closed = []
 
     async def fake_sdk_query(**kwargs):
@@ -9108,14 +9108,14 @@ class _ExitedProc:
 
 
 async def test_browser_server_stop_tolerates_an_exited_process():
-    """terminate() on an exited process raised and cost the 2026-09-21 run its summary."""
+    '''terminate() on an exited process raised and cost the 2026-09-21 run its summary.'''
     browser = agent.BrowserServer('headless')
     browser.proc = _ExitedProc()
     await browser.stop()   # must not raise
 
 
 class _FakeBrowser:
-    """Duck-typed BrowserServer whose liveness the test drives."""
+    '''Duck-typed BrowserServer whose liveness the test drives.'''
 
     def __init__(self):
         self.dead = False
@@ -9135,7 +9135,7 @@ class _FakeBrowser:
 
 
 def _stage2_with_dying_browser(monkeypatch, browser, dies_on: list[str]):
-    """Stub extraction so each job id in ``dies_on`` kills the browser once, then fails normally."""
+    '''Stub extraction so each job id in ``dies_on`` kills the browser once, then fails normally.'''
     monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
     calls = []
 
@@ -9209,7 +9209,7 @@ async def test_stage2_stops_and_releases_jobs_when_the_browser_stays_dead(monkey
 
 
 async def test_a_closed_port_counts_as_dead_before_the_exit_is_reaped(monkeypatch):
-    """2026-09-28: the port closed and 3 jobs failed in 43 ms while proc.returncode was still None."""
+    '''2026-09-28: the port closed and 3 jobs failed in 43 ms while proc.returncode was still None.'''
     browser = agent.BrowserServer('headless')
     browser.proc = type('Running', (), {'returncode': None})()
     browser.port = 1
@@ -9260,7 +9260,7 @@ def test_forget_processed_job_removes_the_record(tmp_path, monkeypatch):
 
 
 async def test_main_logs_an_exception_that_ends_the_run(monkeypatch, caplog, tmp_path):
-    """On 2026-09-21 the cause of a dead run reached only the terminal, never the run log."""
+    '''On 2026-09-21 the cause of a dead run reached only the terminal, never the run log.'''
     requirements = tmp_path / 'JOB_REQUIREMENTS.md'
     requirements.write_text('x')
     monkeypatch.setattr(agent, 'JOB_REQUIREMENTS_PATH', requirements)
@@ -9290,7 +9290,7 @@ async def test_main_logs_an_exception_that_ends_the_run(monkeypatch, caplog, tmp
 
 
 def test_scraper_bad_tool_json_is_logged_and_returned_to_the_model(monkeypatch, caplog):
-    """It used to become {} silently, running the tool with arguments the model never chose."""
+    '''It used to become {} silently, running the tool with arguments the model never chose.'''
     bad_call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
                            'tool_calls': [{'id': 'c1', 'function': {'name': 'browser_snapshot',
                                                                     'arguments': '{not json'}}]})
@@ -9315,7 +9315,7 @@ def test_scraper_bad_tool_json_is_logged_and_returned_to_the_model(monkeypatch, 
 
 
 def _run_scraper_with_one_browser_call(monkeypatch, tool_name: str, result: str) -> str:
-    """Run a ScrapeSession whose model calls tool_name once; return what the model was sent back."""
+    '''Run a ScrapeSession whose model calls tool_name once; return what the model was sent back.'''
     call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
                        'tool_calls': [{'id': 'c1', 'function': {'name': tool_name, 'arguments': '{}'}}]})
     sent = []
@@ -9333,7 +9333,7 @@ def _run_scraper_with_one_browser_call(monkeypatch, tool_name: str, result: str)
 
 
 def test_scraper_snapshot_drops_the_detail_pane_and_keeps_every_card(monkeypatch, caplog):
-    """The pane inflated every snapshot past the cap, and the cut fell inside the cards (2026-09-30)."""
+    '''The pane inflated every snapshot past the cap, and the cut fell inside the cards (2026-09-30).'''
     card = '    - button "Acme Toronto (Remote) Dismiss Staff ML Engineer job" [ref=e{}] [cursor=pointer]\n'
     cards = ''.join(card.format(i) for i in range(config.SCRAPER_TOOL_RESULT_MAX_CHARS // len(card) + 1))
     pane_filler = '      - paragraph: posting text\n' * (config.SCRAPER_SNAPSHOT_RESULT_MAX_CHARS // 10)
@@ -9390,7 +9390,7 @@ def test_parse_posting_date_accepts_relative_dates_with_surrounding_text(raw, da
     'Posted 1 hours ago (viewed 2020-01-01, so ~2020-01-01)',
 ])
 def test_parse_posting_date_relative_beats_a_trailing_viewed_date(raw):
-    """A date AFTER the relative phrase is when the page was viewed, not when the job was posted."""
+    '''A date AFTER the relative phrase is when the page was viewed, not when the job was posted.'''
     parsed = tools.parse_posting_date(raw)
     assert date.today() - timedelta(days=1) <= parsed <= date.today()
 
@@ -9455,7 +9455,7 @@ def test_extract_json_object_chains_the_last_decode_error():
 # ---------------------------------------------------------------------------
 
 def _every_tool_name_there_is() -> set[str]:
-    """Every tool name either scraper has ever served: the SDK tools here plus the local defs."""
+    '''Every tool name either scraper has ever served: the SDK tools here plus the local defs.'''
     sdk = {value.name for value in vars(tools).values() if isinstance(value, SdkMcpTool)}
     return sdk | {d['function']['name'] for d in scrape_openrouter.LOCAL_TOOL_DEFS}
 
@@ -9467,7 +9467,7 @@ def _tools_named_in(text: str) -> set[str]:
 
 
 async def _scraper_prompts(monkeypatch) -> list[str]:
-    """The system prompt plus both recovery instructions run_scraper can send."""
+    '''The system prompt plus both recovery instructions run_scraper can send.'''
     for name in ('_check_status_counts', '_candidates_per_query', '_queries_searched', '_query_errors',
                  '_check_status_per_query'):
         monkeypatch.setattr(tools, name, {})
@@ -9604,7 +9604,7 @@ def _fx_rows(rates: dict = TEST_FX_RATES, base: str = TEST_CONVERT_TO) -> list[d
 
 
 def _fx_service(monkeypatch, response=None) -> list:
-    """Stand in for the rate service. Returns the list of (url, params) actually requested."""
+    '''Stand in for the rate service. Returns the list of (url, params) actually requested.'''
     calls: list = []
 
     def _get(url, params):
@@ -9654,7 +9654,7 @@ def test_parse_rates_reads_the_published_shape():
     [{'date': '2026-10-08', 'base': 'CAD', 'quote': 'GBP'}],
 ])
 def test_parse_rates_rejects_any_other_shape(payload):
-    """A table that parsed loosely would put a wrong figure in a notification."""
+    '''A table that parsed loosely would put a wrong figure in a notification.'''
     with pytest.raises(ValueError, match='exchange-rate'):
         fx.parse_rates(payload, TEST_CONVERT_TO)
 
@@ -9716,7 +9716,7 @@ def test_convert_bounds_converts_at_the_published_rate(monkeypatch, salary_conve
 
 
 def test_convert_bounds_keeps_the_period_and_rounds_to_significant_figures(monkeypatch, salary_conversion_set):
-    """An hourly rate rounded to the nearest thousand would be zero."""
+    '''An hourly rate rounded to the nearest thousand would be zero.'''
     _fx_service(monkeypatch, _FxResponse(_fx_rows({'GBP': 0.53})))
     conversion = fx.convert_bounds(None, 60.0, 'GBP', 'Up to £60/hr')
     assert conversion['minimum'] is None
@@ -9761,7 +9761,7 @@ TEST_ESTIMATE_COST = 0.00042
 
 
 def _estimator_llm(monkeypatch, answer=TEST_ESTIMATE_JSON) -> list:
-    """Stand in for the estimator model. Returns the list of prompts actually sent."""
+    '''Stand in for the estimator model. Returns the list of prompts actually sent.'''
     prompts: list = []
 
     async def _fake(prompt, model=None):
@@ -9839,7 +9839,7 @@ def test_an_estimate_that_does_not_validate_is_dropped_not_repaired(answer):
 
 
 def test_an_estimate_at_the_spread_limit_is_kept():
-    """The control for the over-wide case above: the limit itself is inside the vocabulary."""
+    '''The control for the over-wide case above: the limit itself is inside the vocabulary.'''
     estimate = salary_estimate._coerce({
         'can_estimate': True, 'minimum': 30_000, 'maximum': 30_000 * config.SALARY_ESTIMATE_MAX_SPREAD_RATIO,
         'currency': 'eur', 'period': 'Year', 'basis': '  mid-level\n role  ',
@@ -9929,7 +9929,7 @@ def test_neither_figure_reaches_the_text_the_rater_reads():
 
 
 async def test_an_unverified_salary_is_not_converted(monkeypatch, salary_conversion_set):
-    """Amounts that did not check out against the page get no second figure derived from them."""
+    '''Amounts that did not check out against the page get no second figure derived from them.'''
     _fx_service(monkeypatch)
     extract = _make_extract(salary='£80,000 - £95,000 per year')
     extract['salary_facts'] = dict(salary.classify_salary(extract['salary']), source='unverified')
@@ -9944,7 +9944,7 @@ async def test_an_unverified_salary_is_not_converted(monkeypatch, salary_convers
 # --- end to end, through Stage 2 ---------------------------------------------
 
 def _stage2_estimator(monkeypatch, estimate: dict | None = None) -> list:
-    """Replace the estimator Stage 2 calls. Returns the page texts it was handed."""
+    '''Replace the estimator Stage 2 calls. Returns the page texts it was handed.'''
     page_texts: list = []
 
     async def fake_estimate(candidate, extract, page_text='', stage_stats=None):
@@ -9956,7 +9956,7 @@ def _stage2_estimator(monkeypatch, estimate: dict | None = None) -> list:
 
 
 def _stage2_rater_inputs(monkeypatch, extract: dict, rating: int = 5) -> list:
-    """Re-stub the rater to record the extract text it is given."""
+    '''Re-stub the rater to record the extract text it is given.'''
     rater_inputs: list = []
 
     async def fake_rate(evaluator_prompt, extract_text, stats):
@@ -10014,7 +10014,7 @@ async def test_stage_2_pays_for_no_estimate_below_the_notification_threshold(mon
 
 
 async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repost(monkeypatch):
-    """The message is withheld; the saved file is the one place the role is still seen."""
+    '''The message is withheld; the saved file is the one place the role is still seen.'''
     _repost_llm(monkeypatch, '4464637425')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract(salary=''))
     notifications, saved = _stage2_stubs(monkeypatch, _agency_extract(salary=''))
@@ -10027,7 +10027,7 @@ async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repo
 
 
 async def test_stage_2_still_notifies_when_the_pay_display_fails(monkeypatch, caplog):
-    """An extra figure is a nicety. Losing it must never cost the notification itself."""
+    '''An extra figure is a nicety. Losing it must never cost the notification itself.'''
     notifications, _saved = _stage2_stubs(monkeypatch, _make_extract(salary=''))
 
     async def broken_estimate(candidate, extract, page_text='', stage_stats=None):
@@ -10045,12 +10045,12 @@ async def test_stage_2_still_notifies_when_the_pay_display_fails(monkeypatch, ca
 
 @pytest.mark.network
 def test_the_rate_service_still_publishes_what_parse_rates_reads():
-    """Does the real service still answer in the shape fx.parse_rates() accepts?
+    '''Does the real service still answer in the shape fx.parse_rates() accepts?
 
     Fetches and parses directly instead of calling fx.rates_for(), which fails open and would make
     any assertion around it a tautology (see test_npm_registry_still_reports_a_semver_version).
     Self-skips on a connection error only; a changed shape or a missing currency is a failure.
-    """
+    '''
     base = 'EUR'
     try:
         response = requests.get(config.FX_RATES_URL, params={'base': base}, timeout=10)
@@ -10065,7 +10065,7 @@ def test_the_rate_service_still_publishes_what_parse_rates_reads():
 
 @pytest.mark.live
 async def test_estimate_salary_live(monkeypatch):
-    """The real estimator against the real server. The cache is already isolated by conftest."""
+    '''The real estimator against the real server. The cache is already isolated by conftest.'''
     _require_llm_server(8006)
     monkeypatch.setattr(salary_estimate, 'chat_openrouter', triage.chat_openrouter)
     extract = _make_extract(
@@ -10126,7 +10126,7 @@ NARRATION_LINES_IN_A_LONG_QUERY = 40
 
 
 def _narrate_long_query(monkeypatch, caplog, trouble_at: dict, unfinished: bool = False) -> list[str]:
-    """Narrate numbered lines, running trouble_at[i] before line i; return the INFO messages."""
+    '''Narrate numbered lines, running trouble_at[i] before line i; return the INFO messages.'''
     monkeypatch.setattr(tools, '_ui_alerts', [])
     with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
         narration = agent.QueryNarration()
@@ -10325,8 +10325,8 @@ async def _stage2_with_a_broken_rater(monkeypatch, caplog, job_id: str) -> tuple
 
 
 async def test_stage_2_error_releases_the_job_for_the_next_run(tmp_path, monkeypatch, caplog):
-    """An errored job used to stay in processed_jobs/ and never be rated: on 2026-10-08 the reply
-    lost that way held a rating of 5."""
+    '''An errored job used to stay in processed_jobs/ and never be rated: on 2026-10-08 the reply
+    lost that way held a rating of 5.'''
     record = _processed_record(tmp_path, monkeypatch, '222')
 
     funnel, errors = await _stage2_with_a_broken_rater(monkeypatch, caplog, '222')
@@ -10339,7 +10339,7 @@ async def test_stage_2_error_releases_the_job_for_the_next_run(tmp_path, monkeyp
 
 
 async def test_stage_2_error_stops_releasing_a_job_that_keeps_failing(tmp_path, monkeypatch, caplog):
-    """Bounded: a posting that errors every time must not be opened on the real account every run."""
+    '''Bounded: a posting that errors every time must not be opened on the real account every run.'''
     for _ in range(agent.tools_module.EVAL_ERROR_MAX_RELEASES):
         _processed_record(tmp_path, monkeypatch, '222')   # the next run's Stage 1b queues it again
         assert tools.release_errored_job('linkedin', '222').startswith('released')
@@ -10396,7 +10396,7 @@ GOOD_RATING_REPLY = '{"rating": 4, "reasoning": "from a fallback"}'
 
 
 def _rating_models(monkeypatch, replies: dict[str, str]) -> list[str]:
-    """Three rating models on OpenRouter, each answering with its entry in `replies`."""
+    '''Three rating models on OpenRouter, each answering with its entry in `replies`.'''
     asked: list[str] = []
     monkeypatch.setattr(agent, 'MODEL_NAME_RATING', 'vendor/first')
     monkeypatch.setattr(agent, 'MODEL_NAME_RATING_FALLBACKS', ('vendor/second', 'vendor/third'))
@@ -10411,7 +10411,7 @@ def _rating_models(monkeypatch, replies: dict[str, str]) -> list[str]:
 
 
 async def test_rate_job_asks_a_different_model_when_the_rater_reply_is_malformed(monkeypatch, caplog):
-    """2026-10-08: a reply holding a rating of 5 in unclosed JSON errored the job, and it was never rated."""
+    '''2026-10-08: a reply holding a rating of 5 in unclosed JSON errored the job, and it was never rated.'''
     asked = _rating_models(monkeypatch, {'vendor/first': UNCLOSED_ARRAY_REPLY, 'vendor/second': GOOD_RATING_REPLY})
     stats = agent.new_stage_stats()
     with caplog.at_level(logging.WARNING, logger='agentic_job_search.agent'):

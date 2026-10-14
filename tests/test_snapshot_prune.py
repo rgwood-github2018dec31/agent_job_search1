@@ -61,7 +61,7 @@ def test_snapshot_without_a_pane_is_unchanged_and_not_logged(caplog):
 
 
 def test_pane_sharing_its_only_ancestor_with_the_cards_is_kept():
-    """If the pane cannot be separated from the search UI, nothing is removed."""
+    '''If the pane cannot be separated from the search UI, nothing is removed.'''
     snapshot = '''\
 - main [ref=e1]:
   - button "Acme Toronto (Remote) Dismiss Staff ML Engineer job" [ref=e2] [cursor=pointer]
