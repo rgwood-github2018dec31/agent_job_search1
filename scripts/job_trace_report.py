@@ -350,8 +350,12 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
     # 6. Salary
     story += [PageBreak(), h1('6. Salary: what the posting said, and what the pipeline added'), rule()]
     story += [label('VERBATIM — the Saved Job salary lines'), verbatim(estimate_line or '(none)')]
+    # Since 2026-10-14 the pay note rides on the job's Rating line (`; pay: …`); older logs carry
+    # a `Pay display:` line of its own.
+    pay_lines = (log_lines_about(log_path, f'Pay display: job {job_id}')
+                 or [ln for ln in log_lines_about(log_path, f'job {job_id}:') if 'Rating [' in ln and '; pay: ' in ln])
     story += [label('VERBATIM — the pay-display log line'),
-              verbatim('\n'.join(log_lines_about(log_path, f'Pay display: job {job_id}')) or '(not found)')]
+              verbatim('\n'.join(pay_lines) or '(not found)')]
     story += [note('A model estimate is shown on the notification labelled as such, and reaches no '
                    'rating, cap or warning — it is computed after the rating and kept out of the '
                    'extract text the rater reads.')]

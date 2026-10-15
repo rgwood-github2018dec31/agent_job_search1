@@ -16,6 +16,7 @@ Two design rules hold this file together, both learned the hard way (see AGENTS.
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -90,6 +91,42 @@ def _result_cap(tool_name: str) -> int:
     if tool_name == _SNAPSHOT_TOOL_NAME:
         return SCRAPER_SNAPSHOT_RESULT_MAX_CHARS
     return SCRAPER_TOOL_RESULT_MAX_CHARS
+
+# A @playwright/mcp error is Markdown: an `### Error` section, then `### Page` (URL, title, console
+# count) and `### Events` (a console-log path). The model is handed all of it; the log keeps the
+# error itself, since the rest doubled a one-line failure to eight lines on 2026-10-14.
+_PLAYWRIGHT_SECTION_RE = re.compile(r'### (\w+)[ \t]*$', re.MULTILINE)
+
+
+def browser_error_for_log(error: object) -> str:
+    '''One line for the log: the `### Error` section of a browser-tool error, its other sections named.'''
+    text = str(error)
+    headers = list(_PLAYWRIGHT_SECTION_RE.finditer(text))
+    if not headers:
+        return ' '.join(text.split())
+    kept, dropped = [text[:headers[0].start()]], []
+    for header, following in zip(headers, [*headers[1:], None], strict=True):
+        body = text[header.end():following.start() if following else len(text)]
+        if header[1] == 'Error':
+            kept.append(body)
+        else:
+            dropped.append(header[1])
+    line = ' '.join(' '.join(kept).split())
+    return f'{line} [{", ".join(dropped)} section(s) not shown]' if dropped else line
+
+
+# requests words a dropped connection as a tuple repr wrapping the OS error:
+# "('Connection aborted.', ConnectionResetError(54, 'Connection reset by peer'))".
+_WRAPPED_OS_ERROR_RE = re.compile(r"^\(.*?\b(\w+Error)\(\d+, '([^']*)'\)\)*$", re.DOTALL)
+
+
+def compact_error(error: object) -> str:
+    '''"ConnectionResetError: Connection reset by peer" for a wrapped OS error; else a snippet.'''
+    text = str(error)
+    if match := _WRAPPED_OS_ERROR_RE.match(text.strip()):
+        return f'{match[1]}: {match[2]}'
+    return snippet(text)
+
 
 # Gateway/server errors worth one retry of the same chat call. Deliberately disjoint from
 # PROVIDER_UNAVAILABLE_STATUSES (401/402/403/429): those break every query and must abort at once.
@@ -181,7 +218,7 @@ class ProviderPin:
     failed: list[str] = field(default_factory=list)
     switches: int = 0
 
-    async def choose(self) -> bool:
+    async def choose(self, announce: bool = True) -> bool:
         '''Pin the cheapest usable endpoint not yet failed. Raises when the listing fails.'''
         raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'list_endpoints', {'model': self.model},
                                   timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
@@ -195,7 +232,10 @@ class ProviderPin:
         self.estimate_per_million, best = ranked[0]
         self.tag, self.quantization = best['tag'], best.get('quantization')
         runners_up = [f"{e['tag']} ${price:.4f}/M" for price, e in ranked[1:]]
-        logger.info(
+        # A re-choose after a failure is announced by switch()'s own WARNING, which names the new
+        # endpoint and its estimate; the pin line beside it said the same thing again.
+        logger.log(
+            logging.INFO if announce else logging.DEBUG,
             f'Stage 1b: pinned {self.model} to {self.tag} — est. ${self.estimate_per_million:.4f}/M prompt '
             f'tokens at the scraper\'s token mix (next: {runners_up[0] if runners_up else "none"})'
         )
@@ -210,21 +250,23 @@ class ProviderPin:
         self.failed.append(failed_tag)
         if self.switches >= SCRAPER_PROVIDER_MAX_SWITCHES:
             logger.warning(f'Stage 1b: {failed_tag} failed and the {SCRAPER_PROVIDER_MAX_SWITCHES}-switch '
-                           f'cap is used up: {snippet(error)}')
+                           f'cap is used up: {compact_error(error)}')
             return False
         self.switches += 1
         try:
-            chose = await self.choose()
+            chose = await self.choose(announce=False)
         except Exception as ex:
             logger.warning(f'Stage 1b: could not re-choose a provider after {failed_tag} failed: '
                            f'{type(ex).__name__}: {ex}')
             return False
         if not chose:
-            logger.warning(f'Stage 1b: {failed_tag} failed and no other usable endpoint is left: {snippet(error)}')
+            logger.warning(f'Stage 1b: {failed_tag} failed and no other usable endpoint is left: {compact_error(error)}')
             return False
-        detail = f'{failed_tag} failed ({snippet(error)}); switched to {self.tag} for the rest of the run'
+        detail = (f'{failed_tag} failed ({compact_error(error)}); switched to {self.tag} '
+                  f'(est. ${self.estimate_per_million:.4f}/M) for the rest of the run')
         logger.warning(f'Stage 1b: {detail}')
-        tools_generic._ui_alerts.append({'kind': 'provider_switch', 'query': query, 'region': '(all)', 'detail': detail})
+        tools_generic._ui_alerts.append({'kind': 'provider_switch', 'query': query, 'region': '(all)', 'detail': detail,
+                                         'from': failed_tag, 'to': self.tag, 'reason': compact_error(error)})
         return True
 
 
@@ -655,7 +697,7 @@ class ScrapeSession:
                     except Exception as ex:
                         logger.warning(
                             f'Stage 1b: browser tool {name} failed for query {self.query!r} '
-                            f'(args {snippet(args)}): {type(ex).__name__}: {ex}'
+                            f'(args {snippet(args)}): {type(ex).__name__}: {browser_error_for_log(ex)}'
                         )
                         out = f'ERROR calling {name}: {ex}'
                     else:

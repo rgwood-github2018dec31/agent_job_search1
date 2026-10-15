@@ -143,6 +143,7 @@ src/agentic_job_search/
   fx.py                           # Display-only currency conversion of a salary: daily rate table, fails open
   salary_estimate.py              # Model pay estimate for a notified posting with no salary; cached per job, gates nothing
   text_budget.py                  # Reported truncation: truncate_reported, pages_to_prompt, snippet
+  system_sleep.py                 # Holds a no-idle-sleep assertion for the run; logs and alerts a sleep it could not stop
 scripts/
   migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)

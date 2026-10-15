@@ -364,6 +364,17 @@ def _coerce(raw: dict) -> dict[str, Any]:
     }
 
 
+# Cache keys this process classified with the model, as opposed to read from the cache. Every
+# Stage 2 caller after the first reads the cached answer, so `source` alone cannot tell the job's
+# log line that this location was new.
+_classified_by_model: set[str] = set()
+
+
+def classified_by_model(text: str) -> bool:
+    '''True when this process asked the model about `text` (rather than finding it cached).'''
+    return cache_key(text) in _classified_by_model
+
+
 async def classify_location(text: str) -> dict[str, Any]:
     '''Geographic facts about `text`: {countries, regions, likely_spoken_languages}.
 
@@ -425,7 +436,9 @@ async def classify_location(text: str) -> dict[str, Any]:
     result['classified_on'] = date.today().isoformat()
     cache[key] = result
     _write_cache()
-    logger.info(
+    _classified_by_model.add(key)
+    # DEBUG: Stage 2 names the new geography on the job's `Extract signal:` line.
+    logger.debug(
         f'Location classified: {text!r} -> countries={result["countries"]} '
         f'regions={result["regions"]} likely_spoken_languages={result["likely_spoken_languages"]!r} (${cost:.6f})'
     )

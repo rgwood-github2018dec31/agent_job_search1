@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from contextlib import aclosing
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
@@ -2019,11 +2020,18 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
     parts = ', '.join(f'{count} {status}' for status, count in sorted(tally.items()))
     for status in RECORD_LISTINGS_FOLDED_STATUSES:
         if (ids := folded_ids.get(status)):
-            # Every id, never a sample: this line is what tells seen-but-deduped from never-seen.
-            company_note = f' companies={"; ".join(applied_companies)}' if status == 'already_applied' else ''
-            logger.info(f'{status}: {len(ids)}/{len(capped)} linkedin={",".join(ids)}{company_note}')
+            # Every id, never a sample — at DEBUG: the run audit log lists each listing with its
+            # status, and at INFO this was the longest line of the log (20+ ids, 2026-10-14).
+            logger.debug(f'{status}: {len(ids)}/{len(capped)} linkedin={",".join(ids)}')
+    # The companies are the part worth reading at INFO: they say WHY a listing was skipped.
+    applied = ', '.join(f'{name} ×{n}' if n > 1 else name
+                        for name, n in Counter(c or '(no company)' for c in applied_companies).items())
+    logged_parts = ', '.join(
+        f'{count} {status}' + (f' ({applied})' if status == 'already_applied' and applied else '')
+        for status, count in sorted(tally.items())
+    )
     queued_note = f' linkedin={",".join(queued_ids)}' if queued_ids else ''
-    logger.info(f'record_listings: {len(capped)}{cap_note} recorded — {parts}; '
+    logger.info(f'record_listings: {len(capped)}{cap_note} recorded — {logged_parts}; '
                 f'{queued} queued{queued_note}, {skipped} skipped by title')
     return (f'recorded {len(capped)}{cap_note}: {parts}. {queued} queued, '
             f'{skipped} skipped by title. Continue with the next search.')

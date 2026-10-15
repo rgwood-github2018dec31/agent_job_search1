@@ -202,6 +202,20 @@ SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY = SCRAPER_MIN_LISTINGS_PER_QUERY // 2
 # dropped filename argument, one 502 retry), and on 2026-10-11 two truncations wrote 71 of the
 # log's 101 lines.
 NARRATION_WARNING_CONTEXT_LINES = 3
+# A warning is replayed inside the narration as a pointer to the line already in the log (time,
+# origin, first line cut to this), not in full: on 2026-10-14 a browser_find error was logged twice,
+# Page URL, console path and all, eight lines each time.
+NARRATION_WARNING_REPLAY_MAX_CHARS = 160
+# Lines of one model message shown in a written narration. The rest of a long message is withheld,
+# with a count: the end-of-query recaps restated in ~20 Markdown lines what code had already logged.
+NARRATION_MESSAGE_MAX_LINES = 3
+# Alerts about the infrastructure, not the model's conduct of the search. They are reported by
+# their own warning and the run-health block; the model's narration explains none of them, so on
+# their own they release only the lines near a warning, not the whole narration.
+NARRATION_INFRASTRUCTURE_ALERT_KINDS = frozenset({
+    'system_sleep', 'provider_switch', 'provider_fallback', 'provider_unpinned', 'scrape_cost',
+    'local_model_missing', 'playwright_mcp_outdated',
+})
 
 # Date-posted filter applied via the "Date posted" chip. LinkedIn expresses the choice as
 # f_TPR=r<seconds>; we never navigate to that parameter ourselves (see the chip rationale above),
@@ -495,6 +509,9 @@ TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (c
 EVAL_ERROR_MAX_RELEASES = 2
 # The Rating log line carries triage's reason only when the two scores differ by at least this.
 TRIAGE_DISAGREEMENT_LOG_MIN = 2
+# That reason on the job's Rating line, cut (with the cut reported) past this; a 360-char reason
+# made the line the longest of a job's (2026-10-14). The saved job file keeps all of it.
+TRIAGE_REASON_LOG_MAX_CHARS = 140
 # What the reference-summary prompt ASKS the model for. A model given a length instruction
 # routinely ignores it — ask for n and ~1.5n comes back — so this is the ask, not the enforcement.
 REFERENCE_SUMMARY_MAX_CHARS = 2500
@@ -633,6 +650,9 @@ SALARY_ESTIMATE_ENABLED = True
 # against what the page said, and a capture that drops the compensation block answers nothing.
 RAW_POSTING_MAX_CHARS = 200_000
 
+# An annual figure whose top is under this is a typo in any currency a posting here uses, not a
+# salary: LinkedIn's pill read '100 CAD/yr' on 2026-10-14. It is warned about, never altered.
+SALARY_IMPLAUSIBLE_ANNUAL_FLOOR = 1_000
 # Multipliers for the amount suffixes a posting writes instead of zeros ('60-75K', '€1.2M').
 SALARY_THOUSAND_MULTIPLIER = 1_000
 SALARY_MILLION_MULTIPLIER = 1_000_000
@@ -723,3 +743,9 @@ PAGE_SECTION_SIGNATURE_MAX_WORDS = 8
 
 # Local LLM sampling: low for the 1-5 triage score and JSON answers, which should be repeatable.
 LOCAL_LLM_TEMPERATURE = 0.2
+
+# The run's sleep watcher (system_sleep.py) ticks this often and reports a wall-clock step longer
+# than the tick by at least SLEEP_GAP_MIN_SECONDS: on 2026-10-14 a closed lid stopped the run for
+# 45 minutes and the log only showed a hole.
+SLEEP_WATCH_INTERVAL_SECONDS = 30
+SLEEP_GAP_MIN_SECONDS = 120

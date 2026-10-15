@@ -24,6 +24,7 @@ from agentic_job_search import (
     salary,
     salary_estimate,
     scrape_openrouter,
+    system_sleep,
     text_budget,
     triage,
 )
@@ -2311,6 +2312,73 @@ def test_local_model_missing_alert_reaches_run_health():
     assert any('LOCAL TRIAGE DISABLED' in a and 'gone:latest' in a for a in alerts)
 
 
+def test_a_runs_provider_switches_are_one_health_line():
+    '''Two switches on 2026-10-14 wrote two health lines, each repeating its WARNING.'''
+    reset = 'ConnectionResetError: Connection reset by peer'
+    alerts = agent.assess_run_health({'ui_alerts': [
+        {'kind': 'provider_switch', 'query': 'Principal Data Scientist', 'region': '(all)', 'detail': 'd1',
+         'from': 'streamlake/fp8', 'to': 'deepinfra/fp8', 'reason': reset},
+        {'kind': 'low_listings', 'query': 'Q', 'region': '(all)', 'detail': 'few'},
+        {'kind': 'provider_switch', 'query': 'Principal Data Scientist', 'region': '(all)', 'detail': 'd2',
+         'from': 'deepinfra/fp8', 'to': 'gmicloud/fp8', 'reason': reset},
+    ]})
+    switched = [a for a in alerts if 'SCRAPER PROVIDER SWITCHED' in a]
+    assert switched == [f'SCRAPER PROVIDER SWITCHED 2× streamlake/fp8 → deepinfra/fp8 → gmicloud/fp8 '
+                        f'(Principal Data Scientist: {reset})']
+    assert any('LOW LISTING COUNT' in a for a in alerts)
+
+
+async def test_a_wall_clock_jump_is_logged_and_alerted_as_a_sleep(monkeypatch, caplog):
+    '''2026-10-14: a closed lid stopped the run for ~45 min and the log showed only a hole.'''
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_current_query', 'Principal Data Scientist')
+    interval = config.SLEEP_WATCH_INTERVAL_SECONDS
+    slept = config.SLEEP_GAP_MIN_SECONDS + 600
+    clock = iter([1_000.0, 1_000.0 + interval, 1_000.0 + 2 * interval + slept])
+    monkeypatch.setattr(system_sleep.time, 'time', lambda: next(clock))
+    ticks = 0
+
+    async def fake_sleep(_seconds):
+        nonlocal ticks
+        ticks += 1
+        if ticks > 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(system_sleep.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await system_sleep.watch_for_sleep(interval)
+
+    sleeps = [a for a in tools._ui_alerts if a['kind'] == system_sleep.SYSTEM_SLEEP_ALERT_KIND]
+    assert len(sleeps) == 1, 'the healthy tick raised nothing; the jump raised one'
+    assert sleeps[0]['seconds'] == slept and 'during Principal Data Scientist' in sleeps[0]['detail']
+    assert any('did not run for' in r.message and r.levelname == 'WARNING' for r in caplog.records)
+    health = agent.assess_run_health({'ui_alerts': sleeps * 2})
+    assert [a for a in health if a.startswith('MACHINE SLEPT 2×')], health
+
+
+def test_hold_awake_does_nothing_off_macos(monkeypatch):
+    monkeypatch.setattr(system_sleep.sys, 'platform', 'linux')
+    assert system_sleep.hold_awake() is None
+
+
+@pytest.mark.parametrize('error, expected', [
+    ("('Connection aborted.', ConnectionResetError(54, 'Connection reset by peer'))",
+     'ConnectionResetError: Connection reset by peer'),
+    ('MCP tool chat timed out after 300.0s', 'MCP tool chat timed out after 300.0s'),
+])
+def test_compact_error_reads_a_wrapped_os_error(error, expected):
+    assert scrape_openrouter.compact_error(error) == expected
+
+
+def test_a_browser_error_is_logged_without_its_page_and_events_sections():
+    error = ("MCP tool 'browser_find' at http://localhost:1/mcp returned an error: ### Error\n"
+             'Provide only one of "text" or "regex", not both.\n### Page\n- Page URL: https://x\n'
+             '### Events\n- New console entries: ../c.log#L1')
+    line = scrape_openrouter.browser_error_for_log(error)
+    assert line == ("MCP tool 'browser_find' at http://localhost:1/mcp returned an error: Provide only one of "
+                    '"text" or "regex", not both. [Page, Events section(s) not shown]')
+
+
 # ---------------------------------------------------------------------------
 # Live tests for the LLM MCP tool servers (require servers on :8002/:8006)
 # ---------------------------------------------------------------------------
@@ -2781,6 +2849,7 @@ class _FakeScraperClient:
                     key = f'{name}-{len(tools._check_status_counts)}-{i}'
                     tools._check_status_counts[key] = 1
                     tools._distinct_listing_ids.add(f'linkedin/{name}-{i}')
+                    tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'{name}-{i}')
                 break
 
     async def receive_response(self):
@@ -2820,6 +2889,34 @@ async def test_run_scraper_sends_one_request_per_query(monkeypatch):
     for q in queries:
         assert any(f'"{q}"' in r for r in client.requests), f'{q} was never searched'
         assert tools._queries_searched[q] == healthy
+
+
+async def test_run_scraper_does_not_retry_a_query_whose_listings_earlier_queries_saw(monkeypatch):
+    '''2026-10-14: "Applied AI Engineer" harvested 25 cards per region, every one already seen by an
+    earlier query. Counted as new-to-the-run it read as 2, was retried as "never harvested" and
+    raised a LOW LISTING COUNT alert. The query's own harvest is what decides.'''
+    for name in ('_check_status_counts', '_search_ids', '_candidates_per_query', '_queries_searched',
+                 '_check_status_per_query'):
+        monkeypatch.setattr(tools, name, {})
+    for name in ('_ui_alerts', '_search_reports', '_candidates'):
+        monkeypatch.setattr(tools, name, [])
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+
+    class _OverlappingClient(_FakeScraperClient):
+        async def query(self, instruction):
+            self.requests.append(instruction)
+            for i in range(healthy):
+                tools._check_status_counts[f'{len(self.requests)}-{i}'] = 1
+                tools._distinct_listing_ids.add(f'linkedin/shared-{i}')
+                tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'shared-{i}')
+
+    client = _OverlappingClient()
+    await _scrape(client, ['First', 'Second'])
+
+    assert len(client.requests) == 2, 'no recovery pass for a query that harvested a full page'
+    assert not [a for a in tools._ui_alerts if a['kind'] == 'low_listings']
+    assert tools._queries_searched['Second'] == 0, 'coverage still counts listings new to the run'
 
 
 async def test_run_scraper_retries_empty_query_then_continues(monkeypatch):
@@ -2935,6 +3032,7 @@ class _PerPassScraperClient:
         for _ in range(count):
             tools._check_status_counts[f'k{self.next_id}'] = 1
             tools._distinct_listing_ids.add(f'linkedin/{self.query_name}-{self.next_id}')
+            tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'{self.query_name}-{self.next_id}')
             self.next_id += 1
 
     async def receive_response(self):
@@ -3059,6 +3157,7 @@ async def test_run_scraper_records_per_query_check_status(monkeypatch):
                 # decision reads the distinct set, not these call counts.
                 for i in range(28):
                     tools._distinct_listing_ids.add(f'linkedin/saturated-{i}')
+                    tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'saturated-{i}')
 
         async def receive_response(self):
             return
@@ -3539,6 +3638,7 @@ def _two_pass_scraper(first_turns: int, recovery_listings: int, recovery_verifie
         for i in range(recovery_listings):
             tools._check_status_counts[f'rec-{i}'] = 1
             tools._distinct_listing_ids.add(f'linkedin/rec-{i}')
+            tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'rec-{i}')
         if recovery_verifies:
             for region in preferences.search_regions():
                 tools._search_reports.append({'query': 'Staff AI Engineer', 'region': region['name']})
@@ -4775,6 +4875,10 @@ def test_prune_raw_postings_leaves_anything_that_is_not_a_capture_directory(capl
     ('CA$208580 - CA$273770', 'CA$208,580 - CA$273,770', True),
     ('CA$208,600–$273,800 annually', 'base pay range CA$208,580 - CA$273,770', False),
     ('Competitive salary', 'no figures anywhere on this page', True),
+    # 2026-10-14: the page's k-magnitude, including one shared across a range, is the same number.
+    ('€80,000 - €100,000 base per year + equity', 'EU remote | Base 80-100K euros + Equity', True),
+    ('EUR 80,000 - EUR 120,000 per year', '80K EUR/yr - 120K EUR/yr', True),
+    ('€90,000 - €100,000', 'Base 80-100K euros', False),
 ])
 def test_salary_digits_are_in_the_source(salary_text, raw_text, verified):
     assert salary.salary_digits_are_in_the_source(salary_text, raw_text) is verified
@@ -8330,14 +8434,17 @@ def _info_messages(caplog):
 
 @pytest.mark.asyncio
 async def test_record_listings_logs_already_processed_on_one_line(monkeypatch, tmp_path, caplog):
-    '''A saturated search logged one line per listing it had seen before; now one line names them all.'''
+    '''A saturated search logged one line per listing it had seen before; now one DEBUG line names
+    them all and INFO carries only the count (the audit log lists each listing's status).'''
     _fresh_listing_state(monkeypatch, tmp_path, processed={('linkedin', '111'), ('linkedin', '333')})
     jobs = [*json.loads(_two_jobs())['jobs'],
             {'id': '333', 'title': 'Staff AI Engineer', 'company': 'Initech', 'posted': '4 days ago'}]
     with caplog.at_level(logging.DEBUG, logger=tools.logger.name):
         await tools.do_record_listings(jobs, query='Staff AI Engineer')
     info = _info_messages(caplog)
-    assert [m for m in info if m.startswith('already_processed:')] == ['already_processed: 2/3 linkedin=111,333']
+    assert not [m for m in info if m.startswith('already_processed:')]
+    debug = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+    assert 'already_processed: 2/3 linkedin=111,333' in debug
     assert not [m for m in info if m.startswith('check_and_record_job:')]
     assert not [m for m in info if m.startswith('queue_candidate:')]
     summary = [m for m in info if m.startswith('record_listings:')]
@@ -8366,12 +8473,12 @@ async def test_record_listings_logs_already_applied_on_one_line(monkeypatch, tmp
     with caplog.at_level(logging.INFO, logger=tools.logger.name):
         await tools.do_record_listings(jobs, query='Staff AI Engineer')
     info = _info_messages(caplog)
-    assert 'already_applied: 1/3 linkedin=111 companies=Acme' in info
-    assert 'already_processed: 1/3 linkedin=333' in info
+    assert not [m for m in info if m.startswith(('already_applied:', 'already_processed:'))]
     assert not [m for m in info if m.startswith('check_and_record_job:')]
     assert not [m for m in info if m.startswith('queue_candidate:')]
     summary = [m for m in info if m.startswith('record_listings:')]
     assert len(summary) == 1 and '1 queued linkedin=222' in summary[0], summary
+    assert '1 already_applied (Acme), 1 already_processed' in summary[0], 'the company says why it was skipped'
 
 
 @pytest.mark.asyncio
@@ -8877,6 +8984,7 @@ class _DuplicateHarvestClient:
             tools._check_status_counts[f'call-{len(tools._check_status_counts)}-{i}'] = 1
         for i in range(self.distinct_ids):
             tools._distinct_listing_ids.add(f'linkedin/dup-{i}')
+            tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'dup-{i}')
 
     async def receive_response(self):
         return
@@ -9588,6 +9696,7 @@ async def _scraper_prompts(monkeypatch) -> list[str]:
         sent.append(instruction)
         if tools._current_query == 'one listing' and len(sent) == 3:
             tools._distinct_listing_ids.add('linkedin/1')   # a first pass that saw exactly one
+            tools._search_ids.setdefault(('one listing', ''), set()).add('1')
         return None
 
     await agent.run_scraper(run_pass, ['no listings', 'one listing'], {'cost': 0.0})
@@ -9943,6 +10052,39 @@ def test_an_estimate_that_does_not_validate_is_dropped_not_repaired(answer):
     assert salary_estimate._coerce(answer) is None
 
 
+async def test_an_estimate_in_a_withdrawn_currency_is_shown_as_none(monkeypatch, caplog):
+    '''2026-10-14: two Bulgarian postings were estimated in BGN after Bulgaria moved to the euro;
+    no rate table carries it, so the figure reached the user unconverted. It is dropped, never
+    relabelled as euros, and a cache entry written before the rule is not shown either.'''
+    answer = TEST_ESTIMATE_JSON.replace('"PLN"', '"BGN"')
+    prompts = _estimator_llm(monkeypatch, answer)
+    candidate = _make_candidate()
+    assert await salary_estimate.estimate_salary(candidate, _make_extract(), 'page') is None
+    assert 'BGN (now EUR)' in prompts[0], 'the model is told which currencies are withdrawn'
+    assert any('withdrawn in favour of EUR' in r.message and r.levelname == 'WARNING' for r in caplog.records)
+
+    salary_estimate._load_cache()[salary_estimate.cache_key(candidate)] = {
+        'schema': salary_estimate.CACHE_SCHEMA_VERSION, 'can_estimate': True, 'minimum': 96_000,
+        'maximum': 144_000, 'currency': 'BGN', 'period': 'year', 'basis': '', 'model': 'm',
+    }
+    assert await salary_estimate.estimate_salary(candidate, _make_extract(), 'page') is None
+
+
+@pytest.mark.parametrize('salary_text, flagged', [
+    ('100 CAD/yr', True),                       # job 4479042966, LinkedIn's own pill
+    ('$128k to $150k per year', False),
+    ('46 per hour', False),
+    ('', False),
+])
+def test_an_implausibly_small_annual_salary_is_warned_about_and_kept(salary_text, flagged):
+    extract = _make_extract(salary=salary_text)
+    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
+    implausible = [w for w in warnings if w.startswith(agent.IMPLAUSIBLE_SALARY_WARNING_PREFIX)]
+    assert bool(implausible) is flagged
+    if flagged:
+        assert salary_text in implausible[0], 'the figure is shown as extracted'
+
+
 def test_an_estimate_at_the_spread_limit_is_kept():
     '''The control for the over-wide case above: the limit itself is inside the vocabulary.'''
     estimate = salary_estimate._coerce({
@@ -10193,21 +10335,23 @@ async def test_estimate_salary_live(monkeypatch):
 NARRATION_LINE = 'Let me take a snapshot to see the page.'
 
 
-def _narrate_one_query(trouble) -> None:
+def _narrate_one_query(trouble) -> str | None:
     narration = agent.QueryNarration()
     narration.begin('Staff AI Engineer')
     agent.log_agent_text('Stage 1b', NARRATION_LINE)
     unfinished = trouble()
-    narration.close(unfinished=bool(unfinished))
+    return narration.close(unfinished=bool(unfinished))
 
 
 def test_narration_of_a_clean_query_is_withheld(monkeypatch, caplog):
     monkeypatch.setattr(tools, '_ui_alerts', [])
     with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
-        _narrate_one_query(lambda: None)
+        withheld = _narrate_one_query(lambda: None)
     messages = [r.getMessage() for r in caplog.records]
     assert not any(NARRATION_LINE in m for m in messages)
-    assert any('narration withheld — 1 line(s)' in m for m in messages), 'the withholding itself is reported'
+    # Reported on the query's summary line by the caller, not on a line of its own.
+    assert withheld == 'narration withheld (1 line(s), DEBUG shows it)', 'the withholding itself is reported'
+    assert not any('narration withheld' in m for m in messages)
     assert agent._active_narration is None
     assert not [h for h in agent._PACKAGE_LOGGER.handlers if isinstance(h, agent._WarningCounter)]
 
@@ -10263,7 +10407,7 @@ def test_a_warning_releases_only_the_narration_around_it(monkeypatch, caplog):
 def test_the_warning_is_printed_in_the_narration_where_it_fell(monkeypatch, caplog):
     at = 20
     messages = _narrate_long_query(monkeypatch, caplog, {at: lambda: tools.logger.warning('Truncating browser_find')})
-    marker = [i for i, m in enumerate(messages) if 'warning logged here: WARNING Truncating browser_find' in m]
+    marker = [i for i, m in enumerate(messages) if '▶ WARNING at ' in m and 'Truncating browser_find' in m]
     assert len(marker) == 1
     assert 'step 19' in messages[marker[0] - 1] and 'step 20' in messages[marker[0] + 1]
 
@@ -10294,6 +10438,36 @@ def test_real_trouble_still_writes_the_whole_narration(monkeypatch, caplog, trou
     messages = _narrate_long_query(monkeypatch, caplog, trouble_at, unfinished)
     assert _narrated_steps(messages) == list(range(NARRATION_LINES_IN_A_LONG_QUERY))
     assert not any('line(s) withheld' in m for m in messages)
+
+
+def test_an_infrastructure_alert_releases_only_the_lines_near_its_warning(monkeypatch, caplog):
+    '''A provider switch is explained by its own warning, not by the model: on 2026-10-14 it
+    released a whole narration.'''
+    context, at = config.NARRATION_WARNING_CONTEXT_LINES, 20
+
+    def switch():
+        tools.logger.warning('Stage 1b: streamlake/fp8 failed; switched to deepinfra/fp8')
+        tools._ui_alerts.append({'kind': 'provider_switch'})
+
+    messages = _narrate_long_query(monkeypatch, caplog, {at: switch})
+    assert _narrated_steps(messages) == list(range(at - context, at + context))
+
+
+def test_a_long_model_message_is_cut_to_its_first_lines_with_a_count(monkeypatch, caplog):
+    '''The end-of-query recap restated in ~20 lines what code had already logged (2026-10-14).'''
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    cap, length = config.NARRATION_MESSAGE_MAX_LINES, config.NARRATION_MESSAGE_MAX_LINES + 5
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        narration = agent.QueryNarration()
+        narration.begin('Staff AI Engineer')
+        agent.log_agent_text('Stage 1b', 'a short message')
+        agent.log_agent_text('Stage 1b', '\n'.join(f'recap {i}' for i in range(length)))
+        agent.log_agent_text('Stage 1b', 'the next message')
+        narration.close(unfinished=True)
+    messages = [r.getMessage() for r in caplog.records]
+    assert [m.rpartition(': ')[2] for m in messages if 'recap ' in m] == [f'recap {i}' for i in range(cap)]
+    assert any(f'… {length - cap} more line(s) of this message withheld' in m for m in messages)
+    assert any('the next message' in m for m in messages) and any('a short message' in m for m in messages)
 
 
 def test_narration_always_reaches_debug(monkeypatch, caplog):

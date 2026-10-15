@@ -476,7 +476,8 @@ async def resolve_salary(extract: dict, stage_stats: dict | None = None) -> dict
         'classified_on': date.today().isoformat(), 'model': MODEL_NAME_SALARY,
     }
     _write_cache()
-    logger.info(
+    # DEBUG: the job's `Extract signal:` line already carries `->kind=…` and `salary_source=llm`.
+    logger.debug(
         f'Salary classified: {text!r} -> kind={result["kind"]} minimum={result["minimum"]} '
         f'maximum={result["maximum"]} currency={result["currency"]!r} period={result["period"]!r} '
         f'(${cost_usd:.6f})'
@@ -511,8 +512,26 @@ def salary_digits_are_in_the_source(salary_text: str, raw_text: str) -> bool:
         parsed = (parse_amount(match) for match in _AMOUNT_RE.findall(str(text or '')))
         return [value for value in parsed if value is not None]
 
+    def amounts_as_stated(text: str) -> set[float]:
+        """Every amount the page states, each both bare and with its k/m magnitude applied.
+
+        A page writing '80-100K euros' and an extract writing '€80,000 - €100,000' state the
+        same range; the 2026-10-14 run warned on exactly that twice. A range's shared suffix is
+        carried to its low end, so '80-100K' yields 80000 as well as 80.
+        """
+        text = str(text or '')
+        found = set(amounts(text))
+        for match in _AMOUNT_WITH_SUFFIX_RE.finditer(text):
+            if (value := parse_amount(match['digits'], match['suffix'] or '')) is not None:
+                found.add(value)
+        for match in _RANGE_RE.finditer(text):
+            suffix = match['low_suffix'] or match['high_suffix'] or ''
+            if (value := parse_amount(match['low'], suffix)) is not None:
+                found.add(value)
+        return found
+
     wanted = amounts(salary_text)
     if not wanted:
         return True
-    present = set(amounts(raw_text))
+    present = amounts_as_stated(raw_text)
     return all(value in present for value in wanted)

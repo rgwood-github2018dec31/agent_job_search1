@@ -50,7 +50,7 @@ from utils_tools_n_agents_common.telegram_client import send_message as telegram
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search import fx, location, location_review, scrape_openrouter
+from agentic_job_search import fx, location, location_review, scrape_openrouter, system_sleep
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
@@ -70,7 +70,10 @@ from agentic_job_search.config import (
     MODEL_NAME_RATING,
     MODEL_NAME_RATING_FALLBACKS,
     MODEL_NAME_SCRAPER,
+    NARRATION_INFRASTRUCTURE_ALERT_KINDS,
+    NARRATION_MESSAGE_MAX_LINES,
     NARRATION_WARNING_CONTEXT_LINES,
+    NARRATION_WARNING_REPLAY_MAX_CHARS,
     NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_SALARY_MAX_CHARS,
     PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS,
@@ -90,6 +93,7 @@ from agentic_job_search.config import (
     REGION_OVERLAP_ALERT_THRESHOLD,
     SALARY_ESTIMATE_ENABLED,
     SALARY_FIELD_DESCRIPTION,
+    SALARY_IMPLAUSIBLE_ANNUAL_FLOOR,
     SATURATION_MIN_NEW_JOBS,
     SATURATION_MIN_NEW_RATIO,
     SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY,
@@ -110,6 +114,7 @@ from agentic_job_search.config import (
     THINKING_MAX_CHARS,
     TRIAGE_DISAGREEMENT_LOG_MIN,
     TRIAGE_ENABLED,
+    TRIAGE_REASON_LOG_MAX_CHARS,
     WORKING_LANGUAGE_MIN_KNOWN_MASS,
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
@@ -1278,11 +1283,13 @@ def log_agent_text(stage: str, text: str) -> None:
     counters to diagnose from. Thinking blocks stay console-only; they are long and the
     findings live in the text blocks.
     """
+    first = True
     for line in text.strip().splitlines():
         if not line.strip():
             continue
         if stage == SCRAPER_NARRATION_STAGE and _active_narration is not None:
-            _active_narration.add(line.strip())
+            _active_narration.add(line.strip(), starts_message=first)
+            first = False
         else:
             logger.info(f'{stage}: {line.strip()}')
 
@@ -1309,7 +1316,13 @@ class _WarningCounter(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.positions.append(self._narration_length())
-        self.messages.append(f'{record.levelname} {record.getMessage()}')
+        # A pointer to the line already in the log, not a second copy of it.
+        first_line = record.getMessage().splitlines()[0] if record.getMessage() else ''
+        stamp = datetime.fromtimestamp(record.created).strftime(NARRATION_TIME_FORMAT)
+        self.messages.append(
+            f'{record.levelname} at {stamp} ({record.module}.{record.funcName}): '
+            f'{snippet(first_line, NARRATION_WARNING_REPLAY_MAX_CHARS)}'
+        )
         if record.levelno >= logging.ERROR:
             self.errors += 1
 
@@ -1329,6 +1342,8 @@ class QueryNarration:
     def __init__(self) -> None:
         self.query: str | None = None
         self._lines: list[tuple[str, str]] = []
+        # Per line: its position within the model message it came from (0 = the message's first).
+        self._line_in_message: list[int] = []
         self._counter: _WarningCounter | None = None
         self._alerts_before = 0
 
@@ -1337,34 +1352,41 @@ class QueryNarration:
         self.close()
         self.query = query
         self._lines = []
+        self._line_in_message = []
         self._counter = _WarningCounter(lambda: len(self._lines))
         _PACKAGE_LOGGER.addHandler(self._counter)
         self._alerts_before = len(tools_module._ui_alerts)
         _active_narration = self
 
-    def add(self, line: str) -> None:
+    def add(self, line: str, starts_message: bool = True) -> None:
         logger.debug(f'{SCRAPER_NARRATION_STAGE}: {line}')
         self._lines.append((datetime.now().strftime(NARRATION_TIME_FORMAT), line))
+        self._line_in_message.append(
+            0 if starts_message or not self._line_in_message else self._line_in_message[-1] + 1)
 
-    def close(self, unfinished: bool = False) -> None:
-        '''End the current query: write the narration its trouble calls for, else say how much was withheld.'''
+    def close(self, unfinished: bool = False) -> str | None:
+        '''End the current query and write the narration its trouble calls for.
+
+        Returns a short note when the whole narration was withheld, for the caller to fold into
+        the query's summary line; None when something was written or there was nothing to write.
+        '''
         global _active_narration
         if self.query is None:
-            return
+            return None
         _active_narration = None
         _PACKAGE_LOGGER.removeHandler(self._counter)
         warning_positions, errors_logged = self._counter.positions, self._counter.errors
         warning_messages = self._counter.messages
-        alerts_raised = len(tools_module._ui_alerts) - self._alerts_before
-        query, lines = self.query, self._lines
-        self.query, self._lines, self._counter = None, [], None
+        new_alerts = tools_module._ui_alerts[self._alerts_before:]
+        alerts_raised = len(new_alerts)
+        conduct_alerts = sum(a.get('kind') not in NARRATION_INFRASTRUCTURE_ALERT_KINDS for a in new_alerts)
+        query, lines, message_line = self.query, self._lines, self._line_in_message
+        self.query, self._lines, self._line_in_message, self._counter = None, [], [], None
         if not lines:
-            return
-        if not (unfinished or warning_positions or alerts_raised > 0):
-            logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration withheld — {len(lines)} '
-                        f'line(s), no warnings or alerts (LOG_LEVEL=DEBUG shows it)')
-            return
-        if unfinished or errors_logged or alerts_raised > 0:
+            return None
+        if not (unfinished or warning_positions or conduct_alerts):
+            return f'narration withheld ({len(lines)} line(s), DEBUG shows it)'
+        if unfinished or errors_logged or conduct_alerts:
             why = ('the query did not finish' if unfinished
                    else f'{len(warning_positions)} warning(s), {errors_logged} of them error(s), '
                         f'{max(alerts_raised, 0)} alert(s)')
@@ -1384,25 +1406,37 @@ class QueryNarration:
         warnings_at: dict[int, list[str]] = {}
         for position, message in zip(warning_positions, warning_messages, strict=True):
             warnings_at.setdefault(position, []).append(message)
+        # Past NARRATION_MESSAGE_MAX_LINES of one model message the rest is withheld and counted.
         previous = -1
         for index in shown:
             if (gap := index - previous - 1):
                 logger.info(f'{SCRAPER_NARRATION_STAGE} narration: … {gap} line(s) withheld …')
             for message in warnings_at.pop(index, []):
-                logger.info(f'{SCRAPER_NARRATION_STAGE} narration: ▶ warning logged here: {message}')
+                logger.info(f'{SCRAPER_NARRATION_STAGE} narration: ▶ {message}')
             stamp, line = lines[index]
-            logger.info(f'{SCRAPER_NARRATION_STAGE} narration [{stamp}]: {line}')
+            if message_line[index] < NARRATION_MESSAGE_MAX_LINES:
+                logger.info(f'{SCRAPER_NARRATION_STAGE} narration [{stamp}]: {line}')
+            elif message_line[index] == NARRATION_MESSAGE_MAX_LINES:
+                rest = next((i for i in range(index + 1, len(lines)) if message_line[i] == 0), len(lines)) - index
+                logger.info(f'{SCRAPER_NARRATION_STAGE} narration [{stamp}]: … {rest} more line(s) of this '
+                            f'message withheld (NARRATION_MESSAGE_MAX_LINES) …')
             previous = index
         if (gap := len(lines) - previous - 1):
             logger.info(f'{SCRAPER_NARRATION_STAGE} narration: … {gap} line(s) withheld …')
         for message in warnings_at.pop(len(lines), []):
-            logger.info(f'{SCRAPER_NARRATION_STAGE} narration: ▶ warning logged here (after the last line): {message}')
+            logger.info(f'{SCRAPER_NARRATION_STAGE} narration: ▶ (after the last line) {message}')
+        return None
 
 
 _active_narration: QueryNarration | None = None
 
 
-def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> None:
+def print_result_stats(msg: ResultMessage, cost_delta: float | None = None, summarized_by_caller: bool = False) -> None:
+    '''Console summary of one SDK result, mirrored to the log.
+
+    `summarized_by_caller`: the caller logs this call's cost and turns on its own line, so a
+    healthy result goes to DEBUG; an errored one is still logged in full at INFO.
+    '''
     parts = []
     if msg.usage:
         parts.append(f"in={msg.usage.get('input_tokens', 0)} out={msg.usage.get('output_tokens', 0)}")
@@ -1421,7 +1455,8 @@ def print_result_stats(msg: ResultMessage, cost_delta: float | None = None) -> N
     # with the session identity and turn count needed to tell a cumulative cost field from a
     # per-request one.
     usage = msg.usage or {}
-    logger.info(
+    logger.log(
+        logging.DEBUG if summarized_by_caller and not getattr(msg, 'is_error', False) else logging.INFO,
         f'Result stats: session={msg.session_id} turns={msg.num_turns} '
         f'in={usage.get("input_tokens", 0)} out={usage.get("output_tokens", 0)} '
         f'cache_read={usage.get("cache_read_input_tokens", 0)} '
@@ -1595,6 +1630,18 @@ def _check_status_snapshot() -> dict[str, int]:
     return dict(tools_module._check_status_counts)
 
 
+def _query_distinct_count(query: str) -> int:
+    '''Distinct listings this query's own searches checked, whatever earlier queries already saw.
+
+    The recovery pass and the low-listing alert ask "did this query harvest?", and the run-distinct
+    count cannot answer that: on 2026-10-14 "Applied AI Engineer" harvested 25 cards in each region,
+    all seen by earlier queries, read as 2 and was retried as "never harvested".
+    '''
+    return len(set().union(*(
+        ids for (searched, _region), ids in tools_module._search_ids.items() if searched == query
+    )))
+
+
 def _check_status_delta(before: dict[str, int]) -> dict[str, int]:
     '''Per-status counts accrued since `before`; zero-delta statuses are omitted.'''
     return {
@@ -1624,6 +1671,13 @@ def assess_run_health(funnel: dict) -> list[str]:
     actionable, so the alert names which one applies rather than just saying "quiet run".
     """
     alerts: list[str] = []
+
+    # Every switch of the run is one chain on one line: on 2026-10-14 two switches in one query
+    # wrote two health lines, each restating a WARNING the log already carried.
+    switches = [a for a in funnel.get('ui_alerts') or [] if a.get('kind') == 'provider_switch']
+    switch_chain_reported = False
+    sleeps = [a for a in funnel.get('ui_alerts') or [] if a.get('kind') == system_sleep.SYSTEM_SLEEP_ALERT_KIND]
+    sleep_reported = False
 
     # 1. A changed page or a block. Most decisive, so it comes first.
     for alert in funnel.get('ui_alerts') or []:
@@ -1660,8 +1714,27 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'BROWSER RESTARTED: {alert.get("detail")}')
         elif kind == 'browser_dead':
             alerts.append(f'BROWSER DIED, STAGE 2 STOPPED: {alert.get("detail")}')
+        elif kind == system_sleep.SYSTEM_SLEEP_ALERT_KIND:
+            if sleep_reported:
+                continue
+            sleep_reported = True
+            total = sum(a.get('seconds', 0) for a in sleeps) / SECONDS_PER_MINUTE
+            alerts.append(
+                f'MACHINE SLEPT {len(sleeps)}× ({total:.0f} min in all: '
+                f'{"; ".join(a.get("detail", "") for a in sleeps)}) — calls in flight failed on resume; '
+                'a lid closed on battery sleeps the machine whatever the run holds'
+            )
         elif kind == 'provider_switch':
-            alerts.append(f'SCRAPER PROVIDER SWITCHED on {alert.get("query", "?")}: {alert.get("detail")}')
+            if switch_chain_reported:
+                continue
+            switch_chain_reported = True
+            if not all(a.get('from') and a.get('to') for a in switches):
+                alerts.extend(f'SCRAPER PROVIDER SWITCHED on {a.get("query", "?")}: {a.get("detail")}'
+                              for a in switches)
+                continue
+            chain = ' → '.join([switches[0]['from'], *(a['to'] for a in switches)])
+            causes = '; '.join(dict.fromkeys(f'{a.get("query", "?")}: {a.get("reason", "")}' for a in switches))
+            alerts.append(f'SCRAPER PROVIDER SWITCHED {len(switches)}× {chain} ({causes})')
         elif kind == 'provider_unpinned':
             alerts.append(f'SCRAPER PROVIDER NOT PINNED (cost is OpenRouter\'s choice): {alert.get("detail")}')
         elif kind == 'scrape_cost':
@@ -2101,10 +2174,12 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
         # otherwise read as double coverage and push a collapsed query away from this retry.
         seen = len(_distinct_snapshot() - before_distinct)
         calls = sum(delta.values())
-        first_pass_seen = seen
-        recovered = seen < SCRAPER_MIN_LISTINGS_PER_QUERY
+        # Harvest health is judged on what THIS query checked; `seen` (new to the run) is coverage.
+        query_seen = _query_distinct_count(query)
+        first_pass_seen = query_seen
+        recovered = query_seen < SCRAPER_MIN_LISTINGS_PER_QUERY
         if recovered:
-            if seen == 0:
+            if query_seen == 0:
                 logger.warning(
                     f'Stage 1b: query "{query}" inspected 0 distinct listings — retrying once '
                     'without the location filter (possible auth wall, block page, or empty shell).'
@@ -2124,12 +2199,12 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
                 )
             else:
                 logger.warning(
-                    f'Stage 1b: query "{query}" inspected only {seen} listing(s) '
+                    f'Stage 1b: query "{query}" inspected only {query_seen} listing(s) '
                     f'(below {SCRAPER_MIN_LISTINGS_PER_QUERY}) — retrying once; the results list was '
                     'likely never harvested.'
                 )
                 retry_instruction = (
-                    f'The query "{query}" inspected only {seen} job listing(s). A real search returns '
+                    f'The query "{query}" inspected only {query_seen} job listing(s). A real search returns '
                     'roughly 25 on the first page, so the results list was not actually harvested.\n\n'
                     'Retry now: scroll the results list to load the cards, then call '
                     'harvest_listings and then record_listings. Report the count harvest_listings '
@@ -2154,6 +2229,7 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
             # the queries that needed rescuing, which is the "saturated run looks healthy" shape.
             seen = len(_distinct_snapshot() - before_distinct)
             calls = sum(delta.values())
+            query_seen = _query_distinct_count(query)
 
         # Every configured region must actually be searched, and each search must have been
         # verified. Both are prompted steps, and a model skips prompted steps: on the first live
@@ -2183,14 +2259,14 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
                 'detail': f'no report_search for {", ".join(missing)} — search unrun or unverified',
             })
 
-        if seen < SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY:
+        if query_seen < SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY:
             expected, basis = expected_listings_per_query(query)
             expected_text = f'expected ~{expected:g} ({basis})' if expected is not None else basis
             first_pass_text = (f'after recovery (first pass {first_pass_seen}' if recovered
                                else '(no recovery pass')
             tools_module._ui_alerts.append({
                 'kind': 'low_listings', 'query': query, 'region': '(all)',
-                'detail': f'only {seen} distinct listing(s) {first_pass_text}; '
+                'detail': f'only {query_seen} distinct listing(s) {first_pass_text}; '
                           f'below {SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY}) — {expected_text}',
             })
 
@@ -2207,7 +2283,7 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
         # A short first pass the recovery pass made good (enough listings, every region verified)
         # needs nobody's attention: logged, not alerted (2026-09-28).
         if (turns is not None and turns < SCRAPER_MIN_TURNS_PER_QUERY
-                and seen >= SCRAPER_MIN_LISTINGS_PER_QUERY and not missing):
+                and query_seen >= SCRAPER_MIN_LISTINGS_PER_QUERY and not missing):
             logger.info(
                 f'Stage 1b: query "{query}" used only {turns} turns on its first pass (expected at '
                 f'least {SCRAPER_MIN_TURNS_PER_QUERY}); the recovery pass completed it '
@@ -2224,12 +2300,13 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
                 'detail': f'used only {turns} turns (expected >= {SCRAPER_MIN_TURNS_PER_QUERY}) '
                           '— stopped before completing a harvest cycle',
             })
+        withheld = narration.close()
         logger.info(
             f'Stage 1b: query "{query}" inspected {seen} distinct listing(s) of {calls} checked '
             f'[{tools_module.format_status_counts(delta)}], '
             f'{tools_module._candidates_per_query.get(query, 0)} queued'
+            + (f'; {withheld}' if withheld else '')
         )
-        narration.close()
 
     logger.info(
         f'Stage 1b complete: {len(queries)} quer(ies) searched, {_listings_seen()} listing(s) inspected, '
@@ -2341,15 +2418,19 @@ async def extract_job_page_direct(
         cwd=str(PROJECT_DIR),
     )
     structured: dict | None = None
+    cost_note = ''
     async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
         async for msg in stream:
             if isinstance(msg, ResultMessage):
                 cost_delta = accumulate_stage_stats(stage_stats, msg)
-                print_result_stats(msg, cost_delta)
+                print_result_stats(msg, cost_delta, summarized_by_caller=True)
+                charged = cost_delta if cost_delta is not None else msg.total_cost_usd
+                cost_note = f', ${charged or 0.0:.4f} over {msg.num_turns} turn(s)'
                 if msg.structured_output:
                     structured = msg.structured_output
     if structured is None:
-        logger.warning(f"Extract fallback: {candidate['company']} — {candidate['title']}: no structured output")
+        logger.warning(f"Extract fallback: job {candidate['job_id']} {candidate['company']} — "
+                       f"{candidate['title']}: no structured output{cost_note}")
         return None
     extract = {
         'title': structured['title'], 'company': structured['company'],
@@ -2366,8 +2447,8 @@ async def extract_job_page_direct(
         'education_requirement': (structured.get('education_requirement') or '').strip().lower(),
     }
     logger.info(
-        f"Extract fallback: {candidate['company']} — {candidate['title']}: "
-        f"{len(page.text)} page chars ({page.source}) → {len(extract['description'])} chars condensed"
+        f"Extract fallback: job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
+        f"{len(page.text)} page chars ({page.source}) → {len(extract['description'])} chars condensed{cost_note}"
     )
     return extract
 
@@ -3316,6 +3397,8 @@ PARTIAL_SALARY_WARNING_PREFIX = 'Partial salary'
 UNREADABLE_SALARY_WARNING_PREFIX = 'Salary not interpretable'
 # Emitted only when code could make the comparison itself (see salary_meets_target).
 BELOW_TARGET_SALARY_WARNING_PREFIX = 'Salary below target'
+# Emitted beside the salary line, never instead of it: the figure is what the page said.
+IMPLAUSIBLE_SALARY_WARNING_PREFIX = 'Implausible salary'
 
 # What each reading is worth telling the user. The table is the policy, and it lives in code: the
 # classifier reports what a string says, this decides what that means (see salary.py's docstring).
@@ -3388,6 +3471,22 @@ def below_target_salary_warning(extract: dict) -> str | None:
     )
 
 
+def implausible_salary_warning(extract: dict) -> str | None:
+    '''A line for an annual figure too small to be a salary, or None.
+
+    The figure is faithful — '100 CAD/yr' was on LinkedIn's own pill (job 4479042966, 2026-10-14) —
+    so it is shown as extracted; this only says it cannot be what the employer meant.
+    '''
+    facts = salary_facts_of(extract)
+    if facts.get('period') != 'year':
+        return None
+    bounds = [b for b in (facts.get('minimum'), facts.get('maximum')) if isinstance(b, (int, float))]
+    if not bounds or max(bounds) >= SALARY_IMPLAUSIBLE_ANNUAL_FLOOR:
+        return None
+    return (f'{IMPLAUSIBLE_SALARY_WARNING_PREFIX} — under {SALARY_IMPLAUSIBLE_ANNUAL_FLOOR:,} a year, '
+            f"likely a typo on the posting: {facts['text']}")
+
+
 def is_code_emitted_salary_warning(warning: str) -> bool:
     '''True for any salary line this module produced, whichever reading produced it.'''
     text = str(warning).strip()
@@ -3458,6 +3557,8 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     # Absent, one-ended, a lone figure or unreadable — each says something different, and a digit
     # test said the same thing about all four (2026-09-22). See salary.py.
     if warning := salary_warning(extract) or below_target_salary_warning(extract):
+        warnings.append(warning)
+    if warning := implausible_salary_warning(extract):
         warnings.append(warning)
 
     # Who is actually hiring changes how you apply, and the rater reports it only by luck: on the
@@ -3691,7 +3792,7 @@ def format_pay_lines(extract: dict) -> list[str]:
 
 async def resolve_pay_display(
     candidate: dict, extract: dict, page: JobPage | None, stage_stats: dict
-) -> None:
+) -> str:
     """Resolve what the 💰 line adds to the posting's figure, and write it onto the extract.
 
     `salary_conversion` is the stated salary in the user's conversion currency; `salary_estimate`
@@ -3699,6 +3800,8 @@ async def resolve_pay_display(
     and called AFTER rating for exactly that reason: neither can reach the rater, a cap, a gate or
     a warning. An unverified reading is not converted — its amounts did not check out against the
     page, and a second figure derived from them would lend them weight.
+
+    Returns what was added, for the job's `Rating` line ('' when nothing was).
     """
     facts = salary_facts_of(extract)
     conversion = None
@@ -3715,12 +3818,10 @@ async def resolve_pay_display(
                 estimate['minimum'], estimate['maximum'], estimate['currency']
             )
     extract['salary_estimate'] = estimate
-    if conversion or estimate:
-        logger.info(
-            f"Pay display: job {candidate['job_id']}: "
-            + (f"conversion {format_salary_conversion(conversion).strip('()')}" if conversion else '')
-            + (f"estimate {format_salary_estimate(estimate)} by {estimate.get('model')}" if estimate else '')
-        )
+    return (
+        (f"conversion {format_salary_conversion(conversion).strip('()')}" if conversion else '')
+        + (f"estimate {format_salary_estimate(estimate)} by {estimate.get('model')}" if estimate else '')
+    )
 
 
 _ORDINAL_SUFFIX_BY_LAST_DIGIT = {1: 'st', 2: 'nd', 3: 'rd'}
@@ -4047,7 +4148,8 @@ async def evaluate_all_candidates(
                 tools_module.record_job_outcome(
                     candidate['site'], candidate['job_id'], 'extract_failed', summary='page extraction failed'
                 )
-                logger.warning(f"Extract failed (both paths): {candidate['company']} — {candidate['title']}")
+                logger.warning(f"Extract failed (both paths): job {candidate['job_id']} "
+                               f"{candidate['company']} — {candidate['title']}")
                 continue
             bump('extract_ok')
             # Resolve the likely spoken languages ONCE, here, and write it back — so
@@ -4066,9 +4168,8 @@ async def evaluate_all_candidates(
             # cached from derive_likely_spoken_languages above, which now calls it unconditionally,
             # so this is always free) and written back, so the sync consumers below read a plain
             # field instead of each needing to be async.
-            extract['place_names'] = (
-                await classify_location(extract.get('location', ''))
-            ).get('place_names') or []
+            geography = await classify_location(extract.get('location', ''))
+            extract['place_names'] = geography.get('place_names') or []
             # And the salary reading, same pattern: resolved once here (the rules answer almost
             # every string for free; only one they cannot read reaches a model, and then only
             # once ever, cached) so the sync consumers -- the warning, the notification line, the
@@ -4076,9 +4177,16 @@ async def evaluate_all_candidates(
             extract['salary_facts'] = await resolve_salary(extract, stage_stats['salary'])
             check_salary_provenance(candidate, extract)
             extract_text = format_extract_text(candidate, extract)
+            # A location classified just now (not from the cache) is shown here rather than on a
+            # line of its own; salary.py's classified line is likewise DEBUG, since `->kind=` and
+            # `salary_source=` below already say what it decided.
+            geo_note = ''
+            if location.classified_by_model(extract.get('location', '')):
+                geo_note = (f" geo={'/'.join(geography.get('countries') or []) or '?'}"
+                            f"|{'/'.join(geography.get('regions') or []) or '?'} (new)")
             logger.info(
                 f"Extract signal: job {candidate['job_id']}: "
-                f'{format_extract_signal(extract, raw_residency_scope)}'
+                f'{format_extract_signal(extract, raw_residency_scope)}{geo_note}'
             )
             logger.debug(f"Place names: job {candidate['job_id']}: {extract.get('place_names')}")
 
@@ -4122,7 +4230,8 @@ async def evaluate_all_candidates(
             hard_rule_reason = await apply_hard_rules(candidate, extract)
             if hard_rule_reason:
                 bump(_hard_rule_category(hard_rule_reason))
-                logger.info(f"Hard rule: job {candidate['job_id']}: rated 1 ({hard_rule_reason})")
+                logger.info(f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: "
+                            f'{RATING_AUTO_REJECT}/5 by hard rule ({hard_rule_reason}) — saved, not notified')
                 await _save_and_notify(
                     candidate, rating=RATING_AUTO_REJECT, summary=f'auto rejected {hard_rule_reason}',
                     content=f'# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}', notify=False,
@@ -4206,10 +4315,11 @@ async def evaluate_all_candidates(
             # notification threshold (a suppressed repost included: its saved file is the one
             # place it is seen), and only now, after rating. A failure here costs the extra figure,
             # never the notification.
+            pay_note = ''
             if should_notify_based_on_rating(rating):
                 estimate_stats = stage_stats['salary_estimate']
                 try:
-                    await resolve_pay_display(candidate, extract, page, estimate_stats)
+                    pay_note = await resolve_pay_display(candidate, extract, page, estimate_stats)
                 except Exception as ex:
                     logger.warning(
                         f"Pay display failed for {candidate['company']} — {candidate['title']} "
@@ -4241,7 +4351,8 @@ async def evaluate_all_candidates(
             if triage_result:
                 triage_note = f", triage {triage_result['score']}"
                 if abs(triage_result['score'] - result['rating']) >= TRIAGE_DISAGREEMENT_LOG_MIN:
-                    triage_note += f" ({triage_result['reason']})"
+                    # Cut, with the cut said: the whole reason is in the saved job file.
+                    triage_note += f" ({snippet(triage_result['reason'], TRIAGE_REASON_LOG_MAX_CHARS)})"
             if repost:
                 notify_note = 'not notified (recruiter repost)'
             elif sent is None:
@@ -4252,6 +4363,7 @@ async def evaluate_all_candidates(
                 f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: {rating}/5 via {rated_by}"
                 + (f' (fallback: {MODEL_NAME_RATING} failed)' if rated_by != MODEL_NAME_RATING else '')
                 + f'{triage_note}, {rating_seconds:.0f}s — saved, {notify_note}'
+                + (f'; pay: {pay_note}' if pay_note else '')
             )
             # Only what was actually SENT is recorded: a role first rated 3 never reached the user,
             # so a later repost of it that rates 4 must still notify.
@@ -5039,6 +5151,8 @@ async def main() -> None:
 
     # Release on every exit path — a lock left behind by a crash would block the next run
     # until someone noticed the stale file (read_run_lock also treats a dead PID as stale).
+    awake = system_sleep.hold_awake()
+    sleep_watch = asyncio.create_task(system_sleep.watch_for_sleep())
     try:
         load_processed_jobs()
         await tools_module.categorize_save_dir_pdfs()
@@ -5077,6 +5191,8 @@ async def main() -> None:
         logger.exception(f'Run aborted by {type(ex).__name__}: {ex}')
         raise
     finally:
+        sleep_watch.cancel()
+        system_sleep.release_awake(awake)
         tools_module.release_run_lock()
 
 

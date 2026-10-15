@@ -172,7 +172,7 @@ async def extract_job_page_openrouter(
         data = json.loads(raw)
         if not data.get('ok'):
             logger.warning(
-                f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat failed: {data.get('error') or snippet(raw)}"
             )
             return None
@@ -185,7 +185,7 @@ async def extract_job_page_openrouter(
         tool_calls = data.get('tool_calls')
         if not tool_calls:
             logger.warning(
-                f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"model stopped without submitting (iteration {iteration + 1}, "
                 f"finish_reason={data.get('finish_reason')})"
             )
@@ -199,7 +199,7 @@ async def extract_job_page_openrouter(
                 args = json.loads(tool_call['function'].get('arguments') or '{}')
             except json.JSONDecodeError as ex:
                 logger.warning(
-                    f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+                    f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                     f"{name} called with invalid JSON arguments ({ex}): "
                     f"{snippet(tool_call['function'].get('arguments'))}"
                 )
@@ -235,7 +235,7 @@ async def extract_job_page_openrouter(
             return extract
 
     logger.warning(
-        f"Extract (openrouter): {candidate['company']} — {candidate['title']}: "
+        f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
         f"iteration cap ({EXTRACTOR_OPENROUTER_MAX_ITERATIONS}) reached without submit, ${total_cost:.4f} spent"
     )
     return None

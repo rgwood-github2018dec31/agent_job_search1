@@ -55,8 +55,13 @@ CACHE_SCHEMA_VERSION = 1
 # rather than shown. An estimate in a currency missing here is lost, not converted wrongly.
 ESTIMATE_CURRENCIES = SALARY_CURRENCIES | frozenset({
     'NZD', 'HKD', 'ILS', 'TRY', 'ZAR', 'AED', 'SAR', 'KRW', 'CNY', 'TWD', 'THB', 'MYR', 'PHP',
-    'IDR', 'BGN', 'ISK', 'COP', 'CLP', 'ARS', 'PEN',
+    'IDR', 'ISK', 'COP', 'CLP', 'ARS', 'PEN',
 })
+# Currencies withdrawn from circulation, each with what replaced it. The model still quotes them —
+# BGN for two Bulgarian postings on 2026-10-14, nine months after Bulgaria moved to the euro — and
+# no rate table carries them, so the estimate reached the user unconverted. An estimate in one is
+# dropped, not relabelled: rewriting the code would present the model's BGN figure as euros.
+RETIRED_CURRENCIES = {'BGN': 'EUR', 'HRK': 'EUR'}
 
 _PROMPT = '''You are a compensation analyst. The job posting below states no salary. Estimate the
 gross BASE pay range an employer would typically offer for this role, from the seniority, scope,
@@ -82,6 +87,8 @@ Return ONLY a JSON object, no prose and no code fence:
 Rules:
 - Quote the range in the currency of the job's OWN labour market (where the role is based or
   hired from), never converted into another currency.
+- Use the currency in circulation TODAY. {retired} are withdrawn; an estimate quoted in one is
+  discarded.
 - `period` is how such a role is normally paid: `year` for a salaried role, `day` or `hour` for a
   contract or freelance role.
 - Base pay only: no bonus, equity or benefits.
@@ -90,6 +97,8 @@ Rules:
   not say enough to place the role (no location, no seniority, a vague or multi-country
   opening). Use it freely: a missing estimate costs nothing, a baseless one misleads.
 '''
+
+_RETIRED_NOTE = ', '.join(f'{old} (now {new})' for old, new in RETIRED_CURRENCIES.items())
 
 _cache: dict[str, Any] | None = None
 
@@ -135,7 +144,7 @@ def _coerce(raw: dict) -> dict[str, Any] | None:
         return None
     currency = str(raw.get('currency') or '').strip().upper()
     period = str(raw.get('period') or '').strip().lower()
-    if currency not in ESTIMATE_CURRENCIES or period not in SALARY_PERIODS:
+    if currency not in ESTIMATE_CURRENCIES or currency in RETIRED_CURRENCIES or period not in SALARY_PERIODS:
         return None
     basis = snippet(' '.join(str(raw.get('basis') or '').split()), SALARY_ESTIMATE_BASIS_MAX_CHARS)
     return {'minimum': minimum, 'maximum': maximum, 'currency': currency, 'period': period, 'basis': basis}
@@ -143,6 +152,9 @@ def _coerce(raw: dict) -> dict[str, Any] | None:
 
 def _estimate_from_entry(entry: dict[str, Any], source: str) -> dict[str, Any] | None:
     if not entry.get('can_estimate'):
+        return None
+    # A cache entry written before RETIRED_CURRENCIES existed is not shown either.
+    if entry.get('currency') in RETIRED_CURRENCIES:
         return None
     return {
         'minimum': entry.get('minimum'), 'maximum': entry.get('maximum'),
@@ -179,12 +191,13 @@ async def estimate_salary(
             ('Location', extract.get('location')), ('Workplace type', extract.get('workplace_type')),
         ) if value
     )
-    prompt = _PROMPT.format(header=header, body=truncate_reported_middle(
+    prompt = _PROMPT.format(header=header, retired=_RETIRED_NOTE, body=truncate_reported_middle(
         body, SALARY_ESTIMATE_TEXT_MAX_CHARS, f'salary estimate input for job {key}'
     ))
     try:
         content, cost_usd = await chat_openrouter(prompt, model=MODEL_NAME_SALARY_ESTIMATE)
-        result = _coerce(extract_json_object(content))
+        answer = extract_json_object(content)
+        result = _coerce(answer)
     except Exception as ex:
         logger.warning(
             f"Salary estimate failed for job {key} ({candidate.get('company')} — "
@@ -194,6 +207,12 @@ async def estimate_salary(
 
     if stage_stats is not None:
         stage_stats['cost'] = stage_stats.get('cost', 0.0) + cost_usd
+    retired = str(answer.get('currency') or '').strip().upper()
+    if retired in RETIRED_CURRENCIES:
+        logger.warning(
+            f"Salary estimate for job {key} ({candidate.get('company')} — {candidate.get('title')}) "
+            f'was quoted in {retired}, withdrawn in favour of {RETIRED_CURRENCIES[retired]} — showing none'
+        )
     cache[key] = {
         'schema': CACHE_SCHEMA_VERSION, 'can_estimate': result is not None,
         **(result or {}),
@@ -201,7 +220,7 @@ async def estimate_salary(
         'input_source': input_source,
     }
     _write_cache()
-    # The figure and its conversion are logged once, on the `Pay display:` line; the basis prose is
+    # The figure and its conversion are logged once, on the job's `Rating` line (`pay:`); the basis prose is
     # in the Saved Job. Cost is in cost_log.jsonl.
     logger.debug(
         f"Salary estimated for job {key} ({candidate.get('company')} — {candidate.get('title')}) "
