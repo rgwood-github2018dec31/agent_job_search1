@@ -196,12 +196,6 @@ SCRAPER_MIN_LISTINGS_PER_QUERY = 6
 # rescued, and an alert that fires on success trains the reader to ignore it.
 SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY = SCRAPER_MIN_LISTINGS_PER_QUERY // 2
 
-# Stage 1b narration lines written before and after each WARNING a query logged (QueryNarration).
-# One warning used to release the query's whole narration: on 2026-10-10 four of six queries wrote
-# 58-104 lines each for 1-3 warnings the scraper had already recovered from (a find truncation, a
-# dropped filename argument, one 502 retry), and on 2026-10-11 two truncations wrote 71 of the
-# log's 101 lines.
-NARRATION_WARNING_CONTEXT_LINES = 3
 # A warning is replayed inside the narration as a pointer to the line already in the log (time,
 # origin, first line cut to this), not in full: on 2026-10-14 a browser_find error was logged twice,
 # Page URL, console path and all, eight lines each time.
@@ -209,12 +203,15 @@ NARRATION_WARNING_REPLAY_MAX_CHARS = 160
 # Lines of one model message shown in a written narration. The rest of a long message is withheld,
 # with a count: the end-of-query recaps restated in ~20 Markdown lines what code had already logged.
 NARRATION_MESSAGE_MAX_LINES = 3
-# Alerts about the infrastructure, not the model's conduct of the search. They are reported by
-# their own warning and the run-health block; the model's narration explains none of them, so on
-# their own they release only the lines near a warning, not the whole narration.
-NARRATION_INFRASTRUCTURE_ALERT_KINDS = frozenset({
-    'system_sleep', 'provider_switch', 'provider_fallback', 'provider_unpinned', 'scrape_cost',
-    'local_model_missing', 'playwright_mcp_outdated',
+# The ui_alert kinds about how the MODEL ran the search: the only trouble its narration can
+# explain, and so the only alerts that write it to the log (with a query that did not finish).
+# Warnings, UI drift and infrastructure alerts do not: on 2026-10-14 a stale-ref click, an
+# "Under 10 applicants" chip LinkedIn added and removed, and a company-match fallback each wrote
+# 6-50 lines of the model replaying its clicks, none of them bearing on the cause. Before that
+# (2026-10-10/11) a warning released its NARRATION context lines, and before that the whole thing.
+NARRATION_CONDUCT_ALERT_KINDS = frozenset({
+    'model_reported', 'blocked_click', 'blocked', 'unverified_search', 'stopped_early',
+    'low_listings', 'empty_harvest', 'filters',
 })
 
 # Date-posted filter applied via the "Date posted" chip. LinkedIn expresses the choice as

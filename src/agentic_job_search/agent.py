@@ -70,9 +70,8 @@ from agentic_job_search.config import (
     MODEL_NAME_RATING,
     MODEL_NAME_RATING_FALLBACKS,
     MODEL_NAME_SCRAPER,
-    NARRATION_INFRASTRUCTURE_ALERT_KINDS,
+    NARRATION_CONDUCT_ALERT_KINDS,
     NARRATION_MESSAGE_MAX_LINES,
-    NARRATION_WARNING_CONTEXT_LINES,
     NARRATION_WARNING_REPLAY_MAX_CHARS,
     NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_SALARY_MAX_CHARS,
@@ -1332,11 +1331,11 @@ class QueryNarration:
 
     Most of it is "Let me take a snapshot" — 356 lines of a 1,125-line log on 2026-10-08. What
     the mirroring exists for (see log_agent_text) is the model's account of a query that went
-    wrong, so each query's lines are held. All of them are written at INFO when the query logged
-    an ERROR or above, raised a ui_alert, or did not finish. A query that only logged WARNINGs
-    writes the NARRATION_WARNING_CONTEXT_LINES lines on each side of each one: a warning the
-    scraper recovered from released 58-104 lines per query on 2026-10-10. Every line still goes
-    to DEBUG as it arrives.
+    wrong, so each query's lines are held. They are written at INFO only when the query did not
+    finish or raised an alert in NARRATION_CONDUCT_ALERT_KINDS, the trouble the model's own
+    account can explain. A warning alone is counted on the query's summary line: on 2026-10-14
+    warnings from code the model never sees released 6-50 lines a query. Every line still goes to
+    DEBUG as it arrives.
     """
 
     def __init__(self) -> None:
@@ -1378,29 +1377,18 @@ class QueryNarration:
         warning_positions, errors_logged = self._counter.positions, self._counter.errors
         warning_messages = self._counter.messages
         new_alerts = tools_module._ui_alerts[self._alerts_before:]
-        alerts_raised = len(new_alerts)
-        conduct_alerts = sum(a.get('kind') not in NARRATION_INFRASTRUCTURE_ALERT_KINDS for a in new_alerts)
+        conduct = sorted({a.get('kind', '?') for a in new_alerts if a.get('kind') in NARRATION_CONDUCT_ALERT_KINDS})
         query, lines, message_line = self.query, self._lines, self._line_in_message
         self.query, self._lines, self._line_in_message, self._counter = None, [], [], None
         if not lines:
             return None
-        if not (unfinished or warning_positions or conduct_alerts):
-            return f'narration withheld ({len(lines)} line(s), DEBUG shows it)'
-        if unfinished or errors_logged or conduct_alerts:
-            why = ('the query did not finish' if unfinished
-                   else f'{len(warning_positions)} warning(s), {errors_logged} of them error(s), '
-                        f'{max(alerts_raised, 0)} alert(s)')
-            logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration follows ({len(lines)} line(s); {why})')
-            shown = range(len(lines))
-        else:
-            shown = sorted({
-                index for position in warning_positions
-                for index in range(max(position - NARRATION_WARNING_CONTEXT_LINES, 0),
-                                   min(position + NARRATION_WARNING_CONTEXT_LINES, len(lines)))
-            })
-            logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration near '
-                        f'{len(warning_positions)} warning(s) follows ({len(shown)} of {len(lines)} line(s); '
-                        f'LOG_LEVEL=DEBUG shows all)')
+        if not (unfinished or conduct):
+            warned = (f', {len(warning_positions)} warning(s) above, {errors_logged} of them error(s)'
+                      if warning_positions else '')
+            return f'narration withheld ({len(lines)} line(s){warned}; DEBUG shows it)'
+        why = 'the query did not finish' if unfinished else f'alert(s): {", ".join(conduct)}'
+        logger.info(f'{SCRAPER_NARRATION_STAGE}: query "{query}" narration follows ({len(lines)} line(s); {why})')
+        shown = range(len(lines))
         # A warning fell after the first `position` narration lines; it is printed where it fell, so
         # the narration reads against the thing that triggered it.
         warnings_at: dict[int, list[str]] = {}

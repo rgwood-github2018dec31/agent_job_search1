@@ -10350,25 +10350,48 @@ def test_narration_of_a_clean_query_is_withheld(monkeypatch, caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert not any(NARRATION_LINE in m for m in messages)
     # Reported on the query's summary line by the caller, not on a line of its own.
-    assert withheld == 'narration withheld (1 line(s), DEBUG shows it)', 'the withholding itself is reported'
+    assert withheld == 'narration withheld (1 line(s); DEBUG shows it)', 'the withholding itself is reported'
     assert not any('narration withheld' in m for m in messages)
     assert agent._active_narration is None
     assert not [h for h in agent._PACKAGE_LOGGER.handlers if isinstance(h, agent._WarningCounter)]
 
 
 @pytest.mark.parametrize('trouble', [
-    lambda: agent.logger.warning('Stage 1b: something failed'),
-    lambda: tools.logger.warning('Stage 1b filters not applied'),
-    lambda: agent.logger.error('Stage 1b: something broke'),
     lambda: tools._ui_alerts.append({'kind': 'low_listings'}),
+    lambda: tools._ui_alerts.append({'kind': 'model_reported'}),
     lambda: True,   # the query did not finish
-], ids=['warning', 'warning_in_another_module', 'error', 'ui_alert', 'unfinished'])
-def test_narration_is_written_when_the_query_had_trouble(monkeypatch, caplog, trouble):
+], ids=['low_listings', 'model_reported', 'unfinished'])
+def test_narration_is_written_when_the_model_ran_the_search_into_trouble(monkeypatch, caplog, trouble):
     monkeypatch.setattr(tools, '_ui_alerts', [])
     with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
         _narrate_one_query(trouble)
     narrated = [r.getMessage() for r in caplog.records if NARRATION_LINE in r.getMessage()]
     assert len(narrated) == 1 and r'narration [' in narrated[0], 'written once, with its original time'
+
+
+@pytest.mark.parametrize('trouble', [
+    lambda: agent.logger.warning('Stage 1b: browser tool browser_click failed'),
+    lambda: tools.logger.warning('company_matches_applied via OpenRouter failed'),
+    lambda: agent.logger.error('Stage 1b: something broke'),
+    lambda: tools._ui_alerts.append({'kind': 'drift'}),
+    lambda: tools._ui_alerts.append({'kind': 'provider_switch'}),
+    lambda: tools._ui_alerts.append({'kind': 'system_sleep'}),
+], ids=['warning', 'warning_in_another_module', 'error', 'drift', 'provider_switch', 'system_sleep'])
+def test_trouble_the_model_did_not_cause_withholds_the_narration(monkeypatch, caplog, trouble):
+    '''2026-10-14: a stale-ref click, a chip LinkedIn added and removed, and a company-match fallback
+    each wrote 6-50 lines of the model replaying its clicks, none bearing on the cause.'''
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        withheld = _narrate_one_query(trouble)
+    assert not [r for r in caplog.records if NARRATION_LINE in r.getMessage()]
+    assert withheld and withheld.startswith('narration withheld (1 line(s)')
+
+
+def test_the_withheld_note_counts_the_warnings(monkeypatch, caplog):
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        withheld = _narrate_one_query(lambda: agent.logger.error('Stage 1b: something broke'))
+    assert withheld == 'narration withheld (1 line(s), 1 warning(s) above, 1 of them error(s); DEBUG shows it)'
 
 
 NARRATION_LINES_IN_A_LONG_QUERY = 40
@@ -10392,65 +10415,23 @@ def _narrated_steps(messages: list[str]) -> list[int]:
     return [int(m.rpartition('step ')[2]) for m in messages if 'narration [' in m]
 
 
-def test_a_warning_releases_only_the_narration_around_it(monkeypatch, caplog):
-    context, at = config.NARRATION_WARNING_CONTEXT_LINES, 20
-    messages = _narrate_long_query(monkeypatch, caplog, {at: lambda: tools.logger.warning('Truncating browser_find')})
-    assert _narrated_steps(messages) == list(range(at - context, at + context))
-    shown = 2 * context
-    assert any(f'narration near 1 warning(s) follows ({shown} of {NARRATION_LINES_IN_A_LONG_QUERY} line(s)' in m
-               for m in messages)
-    gaps = [m for m in messages if 'line(s) withheld …' in m]
-    assert [int(m.split('… ')[1].split()[0]) for m in gaps] == [
-        at - context, NARRATION_LINES_IN_A_LONG_QUERY - at - context], 'both gaps are counted, in order'
-
-
-def test_the_warning_is_printed_in_the_narration_where_it_fell(monkeypatch, caplog):
+def test_a_written_narration_shows_the_warning_where_it_fell(monkeypatch, caplog):
     at = 20
-    messages = _narrate_long_query(monkeypatch, caplog, {at: lambda: tools.logger.warning('Truncating browser_find')})
+    messages = _narrate_long_query(monkeypatch, caplog, {at: lambda: tools.logger.warning('Truncating browser_find')},
+                                   unfinished=True)
     marker = [i for i, m in enumerate(messages) if '▶ WARNING at ' in m and 'Truncating browser_find' in m]
     assert len(marker) == 1
     assert 'step 19' in messages[marker[0] - 1] and 'step 20' in messages[marker[0] + 1]
 
 
-def test_warnings_close_together_write_each_line_once(monkeypatch, caplog):
-    context = config.NARRATION_WARNING_CONTEXT_LINES
-
-    def warn():
-        tools.logger.warning('Truncating browser_find')
-
-    messages = _narrate_long_query(monkeypatch, caplog, {20: warn, 21: warn})
-    assert _narrated_steps(messages) == list(range(20 - context, 21 + context))
-    assert any('narration near 2 warning(s)' in m for m in messages)
-
-
-def test_a_warning_at_the_start_of_a_query_has_no_leading_gap(monkeypatch, caplog):
-    messages = _narrate_long_query(monkeypatch, caplog, {0: lambda: tools.logger.warning('pinned endpoint failed')})
-    assert _narrated_steps(messages) == list(range(config.NARRATION_WARNING_CONTEXT_LINES))
-    assert len([m for m in messages if 'line(s) withheld …' in m]) == 1
-
-
 @pytest.mark.parametrize('trouble_at, unfinished', [
-    ({20: lambda: agent.logger.error('Stage 1b: something broke')}, False),
     ({20: lambda: tools._ui_alerts.append({'kind': 'low_listings'})}, False),
     ({20: lambda: tools.logger.warning('Truncating browser_find')}, True),
-], ids=['error', 'ui_alert', 'warning_then_unfinished'])
-def test_real_trouble_still_writes_the_whole_narration(monkeypatch, caplog, trouble_at, unfinished):
+], ids=['conduct_alert', 'warning_then_unfinished'])
+def test_real_trouble_writes_the_whole_narration(monkeypatch, caplog, trouble_at, unfinished):
     messages = _narrate_long_query(monkeypatch, caplog, trouble_at, unfinished)
     assert _narrated_steps(messages) == list(range(NARRATION_LINES_IN_A_LONG_QUERY))
     assert not any('line(s) withheld' in m for m in messages)
-
-
-def test_an_infrastructure_alert_releases_only_the_lines_near_its_warning(monkeypatch, caplog):
-    '''A provider switch is explained by its own warning, not by the model: on 2026-10-14 it
-    released a whole narration.'''
-    context, at = config.NARRATION_WARNING_CONTEXT_LINES, 20
-
-    def switch():
-        tools.logger.warning('Stage 1b: streamlake/fp8 failed; switched to deepinfra/fp8')
-        tools._ui_alerts.append({'kind': 'provider_switch'})
-
-    messages = _narrate_long_query(monkeypatch, caplog, {at: switch})
-    assert _narrated_steps(messages) == list(range(at - context, at + context))
 
 
 def test_a_long_model_message_is_cut_to_its_first_lines_with_a_count(monkeypatch, caplog):
