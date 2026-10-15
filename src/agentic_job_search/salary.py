@@ -54,7 +54,7 @@ from agentic_job_search.config import (
 )
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.text_budget import truncate_reported
-from agentic_job_search.triage import chat_openrouter, extract_json_object
+from agentic_job_search.triage import chat_openrouter
 
 logger = logging.getLogger(__name__)
 
@@ -399,30 +399,37 @@ def mentions_pay(text: str) -> bool:
 
 
 def _coerce(raw: dict, text: str) -> dict[str, Any]:
-    """Validate the model's JSON into the contract, dropping anything unrecognised.
+    """Validate the model's JSON into the contract; raise ValueError on anything that does not fit.
 
-    An out-of-vocabulary kind becomes `unclassified` and an out-of-vocabulary period becomes '',
-    rather than being passed through: a typo'd value that matched no branch would read as the
-    benign case instead of "I could not tell" (the location.py coercion lesson).
+    An out-of-vocabulary kind, period or currency, a non-number bound, or a `range` without two
+    numbers raises rather than being coerced: the coerced answer used to be cached as if the model
+    had given it, and nobody saw the reply. The caller falls back to `unclassified` — a warning
+    that the text could not be read, never a silent upgrade — and does not cache it, so the log
+    carries the reply and the string is asked again next time.
     """
     kind = str(raw.get('kind') or '').strip().lower()
-    kind = kind if kind in SALARY_KINDS else 'unclassified'
+    if kind not in SALARY_KINDS:
+        raise ValueError(f'kind {raw.get("kind")!r} is not one of {sorted(SALARY_KINDS)}')
     period = str(raw.get('period') or '').strip().lower()
-    period = period if period in SALARY_PERIODS else ''
+    if period and period not in SALARY_PERIODS:
+        raise ValueError(f'period {raw.get("period")!r} is not one of {sorted(SALARY_PERIODS)}')
     currency = str(raw.get('currency') or '').strip().upper()
-    currency = currency if currency in SALARY_CURRENCIES else ''
+    if currency and currency not in SALARY_CURRENCIES:
+        raise ValueError(f'currency {raw.get("currency")!r} is not a known currency code')
 
     def number(key: str) -> float | None:
         value = raw.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if value is None:
             return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f'{key} {value!r} is not a number')
         return float(value)
 
     minimum, maximum = number('minimum'), number('maximum')
-    # A `range` the model did not give two numbers for is not a range. Downgrading rather than
-    # trusting the label is the whole point: this module must never upgrade a partial to a full one.
+    # A `range` the model did not give two numbers for is not a range: this module must never
+    # upgrade a partial to a full one.
     if kind == 'range' and (minimum is None or maximum is None):
-        kind = 'unclassified'
+        raise ValueError(f'kind is range but minimum={minimum} maximum={maximum}')
     return _facts(kind, text, 'llm', minimum=minimum, maximum=maximum,
                   currency=currency, period=period)
 
@@ -457,8 +464,8 @@ async def resolve_salary(extract: dict, stage_stats: dict | None = None) -> dict
         text=text, context=f'\nCompensation lines from the posting body:\n"{context}"\n' if context else ''
     )
     try:
-        content, cost_usd = await chat_openrouter(prompt, model=MODEL_NAME_SALARY)
-        result = _coerce(extract_json_object(content), text)
+        reply = await chat_openrouter(prompt, model=MODEL_NAME_SALARY)
+        result = reply.parse(lambda raw: _coerce(raw, text), f'salary classification of {text!r}')
     except Exception as ex:
         # Fail toward saying less. The deterministic reading is `unclassified`, which warns that
         # the string could not be read — never a silent upgrade to a complete range.
@@ -468,19 +475,19 @@ async def resolve_salary(extract: dict, stage_stats: dict | None = None) -> dict
         return _facts('unclassified', text, 'error')
 
     if stage_stats is not None:
-        stage_stats['cost'] = stage_stats.get('cost', 0.0) + cost_usd
+        stage_stats['cost'] = stage_stats.get('cost', 0.0) + reply.cost_usd
     cache[key] = {
         'schema': CACHE_SCHEMA_VERSION, 'kind': result['kind'],
         'minimum': result['minimum'], 'maximum': result['maximum'],
         'currency': result['currency'], 'period': result['period'],
-        'classified_on': date.today().isoformat(), 'model': MODEL_NAME_SALARY,
+        'classified_on': date.today().isoformat(), 'model': reply.model, 'provider': reply.provider,
     }
     _write_cache()
     # DEBUG: the job's `Extract signal:` line already carries `->kind=…` and `salary_source=llm`.
     logger.debug(
         f'Salary classified: {text!r} -> kind={result["kind"]} minimum={result["minimum"]} '
         f'maximum={result["maximum"]} currency={result["currency"]!r} period={result["period"]!r} '
-        f'(${cost_usd:.6f})'
+        f'({reply.describe()})'
     )
     return result
 

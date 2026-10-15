@@ -148,7 +148,6 @@ from agentic_job_search.tools_generic import (
 from agentic_job_search.triage import (
     ProviderUnavailableError,
     chat_openrouter,
-    extract_json_object,
     generate_local,
     preflight_local_model,
     rate_with_ollama,
@@ -918,13 +917,17 @@ QUERY_JSON_INSTRUCTIONS = (
 
 async def _generate_queries_openrouter(prompt: str, stage_stats: dict | None) -> list[str]:
     '''Query generation via the OpenRouter MCP server. Raises on any failure.'''
-    content, cost_usd = await chat_openrouter(f'{prompt}\n\n{QUERY_JSON_INSTRUCTIONS}', model=MODEL_NAME_QUERY)
+    reply = await chat_openrouter(f'{prompt}\n\n{QUERY_JSON_INSTRUCTIONS}', model=MODEL_NAME_QUERY)
     if stage_stats is not None:
-        stage_stats['cost'] += cost_usd
-    queries = extract_json_object(content).get('queries') or []
-    if not isinstance(queries, list) or not queries:
-        raise ValueError(f'OpenRouter returned no usable queries: {snippet(content)!r}')
-    return [str(q).strip() for q in queries if str(q).strip()]
+        stage_stats['cost'] += reply.cost_usd
+
+    def queries_of(raw: dict) -> list[str]:
+        queries = raw.get('queries')
+        if not isinstance(queries, list) or not queries:
+            raise ValueError(f'"queries" is {type(queries).__name__} {queries!r}, not a non-empty list')
+        return [str(q).strip() for q in queries if str(q).strip()]
+
+    return reply.parse(queries_of, 'query generation')
 
 
 async def generate_search_queries(stage_stats: dict | None = None) -> list[str]:
@@ -1109,10 +1112,11 @@ class ReferenceSummaryTooLongError(RuntimeError):
 async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict | None) -> str:
     """One provider's answer to `prompt`. Raises whatever the provider raised."""
     if provider == 'openrouter':
-        content, cost_usd = await chat_openrouter(prompt)
+        reply = await chat_openrouter(prompt)
         if stage_stats is not None:
-            stage_stats['cost'] += cost_usd
-        return content
+            stage_stats['cost'] += reply.cost_usd
+        logger.debug(f'Reference summary from OpenRouter: {reply.describe()}')
+        return reply.content
     if provider == 'ollama':
         return await generate_local(prompt, purpose_slug=LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY)
     return await _summarize_references_anthropic(prompt, stage_stats)
@@ -3159,20 +3163,24 @@ async def resolve_location_guesses(stage_stats: dict | None = None) -> list[tupl
     not_live = list(preferences.would_not_live_here()) or ['(none)']
     for country in pending:
         try:
-            content, cost = await chat_openrouter(
+            reply = await chat_openrouter(
                 _GUESS_PROMPT.format(live=live, not_live=not_live, country=country)
             )
             if stage_stats is not None:
-                stage_stats['cost'] = stage_stats.get('cost', 0.0) + cost
-            answer = extract_json_object(content)
-            guess = str(answer.get('guess') or '').strip().lower()
-            if guess not in {'would_live', 'would_not_live'}:
-                raise ValueError(f'guess outside the vocabulary: {guess!r}')
+                stage_stats['cost'] = stage_stats.get('cost', 0.0) + reply.cost_usd
+
+            def guess_of(raw: dict) -> tuple[dict, str]:
+                guess = str(raw.get('guess') or '').strip().lower()
+                if guess not in {'would_live', 'would_not_live'}:
+                    raise ValueError(f'guess outside the vocabulary: {raw.get("guess")!r}')
+                return raw, guess
+
+            answer, guess = reply.parse(guess_of, f'location guess for {country!r}')
             _location_guesses[country] = (
                 'would live' if guess == 'would_live' else 'would NOT live',
                 _trim(' '.join(str(answer.get('reason') or '').split()), LOCATION_GUESS_REASON_MAX_CHARS),
             )
-            logger.info(f'Location guess: {country} -> {_location_guesses[country][0]} (${cost:.6f})')
+            logger.info(f'Location guess: {country} -> {_location_guesses[country][0]} ({reply.describe()})')
         except Exception as ex:
             logger.warning(f'Could not guess about {country!r}: {unwrap_exception(ex)}')
             _location_guesses.pop(country, None)

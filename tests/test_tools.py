@@ -30,6 +30,7 @@ from agentic_job_search import (
 )
 from agentic_job_search import tools_generic as tools
 from claude_agent_sdk import ResultMessage, SdkMcpTool
+from fakes import chat_reply
 from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_LOW,
     ANTHROPIC_MODEL_NAME_MEDIUM,
@@ -1641,7 +1642,7 @@ async def test_build_reference_summary_openrouter_first(tmp_path, monkeypatch):
 
     async def fake_openrouter(prompt, system='', model='', max_tokens=0):
         calls.append('openrouter')
-        return 'Ideal role: senior AI engineering.', 0.001
+        return chat_reply('Ideal role: senior AI engineering.', 0.001)
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
     stats = agent.new_stage_stats()
@@ -1723,7 +1724,7 @@ async def test_build_reference_summary_cache_hit_skips_llm(tmp_path, monkeypatch
 
     async def fake_openrouter(prompt, system='', model='', max_tokens=0):
         calls.append('openrouter')
-        return 'Summary v1.', 0.001
+        return chat_reply('Summary v1.', 0.001)
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
     block1 = await agent.build_reference_summary(agent.new_stage_stats())
@@ -1750,7 +1751,7 @@ async def test_reference_summary_within_the_limit_is_never_cut(tmp_path, monkeyp
     body = 'y' * agent.REFERENCE_SUMMARY_LIMIT_CHARS
 
     async def fake_openrouter(prompt, system='', model='', max_tokens=0):
-        return body, 0.001
+        return chat_reply(body, 0.001)
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
     block = await agent.build_reference_summary(agent.new_stage_stats())
@@ -1768,7 +1769,7 @@ async def test_reference_summary_over_the_limit_is_re_summarized_by_the_same_pro
 
     async def fake_openrouter(prompt, system='', model='', max_tokens=0):
         prompts.append(prompt)
-        return (long_summary, 0.001) if len(prompts) == 1 else ('SHORT PROFILE', 0.001)
+        return chat_reply(*((long_summary, 0.001) if len(prompts) == 1 else ('SHORT PROFILE', 0.001)))
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
     block = await agent.build_reference_summary(agent.new_stage_stats())
@@ -1790,7 +1791,7 @@ async def test_reference_summary_stops_the_run_when_re_summarizing_fails(tmp_pat
         nonlocal calls
         calls += 1
         if calls == 1:
-            return _over_limit(), 0.001
+            return chat_reply(_over_limit(), 0.001)
         raise RuntimeError('provider died mid-retry')
 
     async def fake_notify(text):
@@ -1813,7 +1814,7 @@ async def test_reference_summary_stops_when_the_retry_is_still_over_the_limit(tm
     sent: list[str] = []
 
     async def fake_openrouter(prompt, system='', model='', max_tokens=0):
-        return _over_limit(), 0.001
+        return chat_reply(_over_limit(), 0.001)
 
     async def fake_notify(text):
         sent.append(text)
@@ -1837,7 +1838,7 @@ async def test_reference_summary_stops_when_the_retry_returns_nothing(tmp_path, 
     async def fake_openrouter(prompt, system='', model='', max_tokens=0):
         nonlocal calls
         calls += 1
-        return (_over_limit(), 0.001) if calls == 1 else ('   \n  ', 0.001)
+        return chat_reply(*((_over_limit(), 0.001) if calls == 1 else ('   \n  ', 0.001)))
 
     async def fake_notify(text):
         return True
@@ -1864,7 +1865,7 @@ async def test_reference_summary_cache_over_the_limit_is_regenerated(tmp_path, m
     async def fake_openrouter(prompt, system='', model='', max_tokens=0):
         nonlocal calls
         calls += 1
-        return 'FRESH PROFILE', 0.001
+        return chat_reply('FRESH PROFILE', 0.001)
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
     block = await agent.build_reference_summary(agent.new_stage_stats())
@@ -2404,9 +2405,10 @@ async def test_generate_local_live():
 @pytest.mark.live
 async def test_chat_openrouter_live():
     _require_llm_server(8006)
-    content, cost_usd = await triage.chat_openrouter('Reply with exactly: OK', max_tokens=500)
-    assert content.strip() != ''
-    assert cost_usd >= 0
+    reply = await triage.chat_openrouter('Reply with exactly: OK', max_tokens=500)
+    assert reply.content.strip() != ''
+    assert reply.cost_usd >= 0
+    assert reply.provider, 'the server names who served the call'
 
 
 @pytest.mark.live
@@ -2759,7 +2761,7 @@ async def test_generate_search_queries_uses_openrouter(tmp_path, monkeypatch):
 
     async def fake_chat(prompt, **kwargs):
         assert 'Staff AI Engineer — Acme' in prompt, 'applied jobs must reach the prompt'
-        return '{"queries": ["Principal AI Engineer", "Staff AI Engineer"]}', 0.01
+        return chat_reply('{"queries": ["Principal AI Engineer", "Staff AI Engineer"]}', 0.01)
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_chat)
     stage_stats = {'cost': 0.0}
@@ -2778,7 +2780,7 @@ async def test_generate_search_queries_enforces_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, 'applied_jobs_summary', lambda: '')
 
     async def fake_chat(prompt, **kwargs):
-        return '{"queries": ["a", "b", "c", "d", "e"]}', 0.0
+        return chat_reply('{"queries": ["a", "b", "c", "d", "e"]}', 0.0)
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_chat)
 
@@ -4544,7 +4546,7 @@ async def test_resolve_salary_escalates_only_what_the_rules_cannot_read(monkeypa
 
     async def _fake(prompt, model=None):
         calls.append(prompt)
-        return ('{"kind": "single", "minimum": 5014.3, "maximum": null, '
+        return chat_reply('{"kind": "single", "minimum": 5014.3, "maximum": null, '
                 '"currency": "EUR", "period": "month"}', 0.000123)
 
     monkeypatch.setattr(salary, 'chat_openrouter', _fake)
@@ -4582,7 +4584,7 @@ async def test_resolve_salary_fails_toward_saying_less_when_the_server_is_down(m
 async def test_resolve_salary_never_upgrades_a_partial_to_a_range(monkeypatch):
     '''A model that labels something `range` without two numbers is downgraded, not trusted.'''
     async def _fake(prompt, model=None):
-        return ('{"kind": "range", "minimum": 70000, "maximum": null, "currency": "EUR"}', 0.0)
+        return chat_reply('{"kind": "range", "minimum": 70000, "maximum": null, "currency": "EUR"}', 0.0)
 
     monkeypatch.setattr(salary, 'chat_openrouter', _fake)
     facts = await salary.resolve_salary({'salary': 'attractive package, six figures', 'description': ''})
@@ -4595,7 +4597,7 @@ async def test_resolve_salary_shows_the_model_the_compensation_lines_when_the_fi
 
     async def _fake(prompt, model=None):
         prompts.append(prompt)
-        return ('{"kind": "range", "minimum": 180000, "maximum": 220000, "currency": "CAD"}', 0.0)
+        return chat_reply('{"kind": "range", "minimum": 180000, "maximum": 220000, "currency": "CAD"}', 0.0)
 
     monkeypatch.setattr(salary, 'chat_openrouter', _fake)
     extract = {
@@ -6057,10 +6059,10 @@ def test_place_names_rule_asks_for_omitted_levels_not_proximity():
 def test_classifier_returns_place_names_on_every_path():
     """Every return path must have the same shape, or a consumer reads a missing key as 'no aliases'."""
     assert location._empty('error')['place_names'] == []
-    coerced = location._coerce({'countries': ['Spain'], 'regions': ['southern_europe'],
+    coerced = location._coerce({'countries': ['Spain'], 'regions': ['southern_europe'], 'broad_area': False,
+                                'likely_spoken_languages': {'spanish': 1.0},
                                 'place_names': ['  Sevilla ', 'Seville', 'Sevilla', '']})
     assert coerced['place_names'] == ['Sevilla', 'Seville'], 'trimmed, deduped, order preserved'
-    assert location._coerce({})['place_names'] == []
 
 
 def test_reviewer_flags_an_entry_that_only_matches_when_folded(monkeypatch):
@@ -6118,8 +6120,8 @@ async def test_an_entry_from_the_national_language_question_is_re_asked(monkeypa
 
     async def fake_chat(prompt, **kwargs):
         calls.append(prompt)
-        return ('{"countries": ["Luxembourg"], "regions": ["western_europe"], "broad_area": false, '
-                '"likely_spoken_languages": {"english": 1.0}, "place_names": ["Luxembourg"]}'), 0.0
+        return chat_reply('{"countries": ["Luxembourg"], "regions": ["western_europe"], "broad_area": false, '
+                '"likely_spoken_languages": {"english": 1.0}, "place_names": ["Luxembourg"]}', 0.0)
 
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {
@@ -6144,9 +6146,9 @@ async def test_a_scalar_language_entry_is_re_asked(monkeypatch, tmp_path):
 
     async def fake_chat(prompt, **kwargs):
         calls.append(prompt)
-        return ('{"countries": ["Germany"], "regions": ["western_europe"], "broad_area": false, '
+        return chat_reply('{"countries": ["Germany"], "regions": ["western_europe"], "broad_area": false, '
                 '"likely_spoken_languages": {"german": 0.6, "english": 0.4}, '
-                '"place_names": ["Berlin"]}'), 0.0
+                '"place_names": ["Berlin"]}', 0.0)
 
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {
@@ -6259,7 +6261,7 @@ def test_classifier_keeps_country_names_proper():
     '''`_coerce` must not fold a name. Regions and language KEYS ARE folded — they are vocabularies.'''
     coerced = location._coerce({
         'countries': ['Spain', '  United  Kingdom '], 'regions': ['Southern_Europe', 'WESTERN_EUROPE'],
-        'likely_spoken_languages': {'Spanish': 1},
+        'likely_spoken_languages': {'Spanish': 1}, 'broad_area': False, 'place_names': [],
     })
     assert coerced['countries'] == ['Spain', 'United Kingdom']
     assert coerced['regions'] == ['southern_europe', 'western_europe']
@@ -6290,10 +6292,17 @@ def test_language_shares_drop_noise_cap_the_count_and_keep_the_total():
     assert sum(top.values()) == 1.0
 
 
-def test_language_shares_reject_junk():
-    '''Anything that is not a positive number, or names nothing, is dropped.'''
-    for junk in ([], 'german', None, 1.0, {'german': 'lots'}, {'german': 0}, {'': 1}):
-        assert location._language_shares(junk) == {}, junk
+def test_language_shares_drop_what_names_or_weighs_nothing():
+    '''A zero share, or a share that names no language, is dropped: that is an answer, not junk.'''
+    for empty in ({}, {'german': 0}, {'': 1}):
+        assert location._language_shares(empty) == {}, empty
+
+
+@pytest.mark.parametrize('junk', [[], 'german', None, 1.0, {'german': 'lots'}, {'german': True}])
+def test_language_shares_raise_on_a_wrong_type(junk):
+    '''A wrong-typed answer raises: read as {} it was cached as if the model had said "no language".'''
+    with pytest.raises(ValueError):
+        location._language_shares(junk)
 
 
 async def test_review_skips_rather_than_rebuilds_a_corrupt_file(monkeypatch):
@@ -6717,7 +6726,7 @@ async def test_guess_vocabulary_is_closed(monkeypatch):
     """Anti-fabrication: the answer is persisted into the user's config, so it must be one of two
     values or it is dropped."""
     async def _chat(prompt, **kwargs):
-        return '{"guess": "maybe", "reason": "unsure"}', 0.0
+        return chat_reply('{"guess": "maybe", "reason": "unsure"}', 0.0)
     monkeypatch.setattr(agent, 'chat_openrouter', _chat)
     agent.reset_location_guesses()
     agent.queue_location_guess('Freedonia')
@@ -7137,17 +7146,27 @@ def test_location_cache_rebuilds_a_corrupt_file(monkeypatch, tmp_path):
     assert location._load_cache() == {}
 
 
-def test_location_classifier_defaults_broad_area_to_false():
-    '''A model that omits the field must not accidentally wave every job through.'''
+_WHOLE_LOCATION_ANSWER = {'countries': ['Germany'], 'regions': ['western_europe'], 'broad_area': False,
+                          'likely_spoken_languages': {'german': 1.0}, 'place_names': ['Berlin']}
+
+
+@pytest.mark.parametrize('key', sorted(_WHOLE_LOCATION_ANSWER))
+def test_location_classifier_rejects_an_answer_missing_a_field(key):
+    '''A missing field raises, so the classifier fails open uncached and the reply is logged.
+
+    It used to default (broad_area to False, lists to []) and the defaulted answer was cached as if
+    the model had given it.
+    '''
     from agentic_job_search import location
-    assert location._coerce({'countries': ['Germany'], 'regions': ['western_europe']})['broad_area'] is False
+    answer = {k: v for k, v in _WHOLE_LOCATION_ANSWER.items() if k != key}
+    with pytest.raises(ValueError, match=key):
+        location._coerce(answer)
 
 
 def test_location_classifier_coerces_an_unknown_region_rather_than_passing_it_through():
     """An out-of-vocabulary region must read as 'I could not tell', not as 'acceptable'."""
     from agentic_job_search import location
-    coerced = location._coerce(
-        {'countries': ['Germany'], 'regions': ['middle_earth'], 'likely_spoken_languages': {'german': 1.0}})
+    coerced = location._coerce({**_WHOLE_LOCATION_ANSWER, 'regions': ['middle_earth']})
     assert coerced['regions'] == ['unknown']
 
 
@@ -7159,8 +7178,8 @@ async def test_location_classification_is_cached(monkeypatch, tmp_path):
 
     async def fake_chat(prompt, **kwargs):
         calls.append(prompt)
-        return ('{"countries": ["germany"], "regions": ["western_europe"], '
-                '"likely_spoken_languages": {"german": 1.0}}'), 0.0
+        return chat_reply('{"countries": ["germany"], "regions": ["western_europe"], "broad_area": false, '
+                          '"likely_spoken_languages": {"german": 1.0}, "place_names": ["Berlin"]}', 0.0)
 
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {})
@@ -7228,9 +7247,100 @@ async def test_chat_openrouter_sends_no_max_tokens_by_default(monkeypatch):
         return json.dumps({'ok': True, 'content': '{"ok": 1}', 'finish_reason': 'stop', 'cost_usd': 0.001})
 
     monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
-    content, _cost = await triage.chat_openrouter('hi')
-    assert content == '{"ok": 1}'
+    reply = await triage.chat_openrouter('hi')
+    assert reply.content == '{"ok": 1}'
     assert 'max_tokens' not in seen
+
+
+def _chat_server_reply(**fields) -> str:
+    return json.dumps({'ok': True, 'content': '{"answer": 1}', 'finish_reason': 'stop', 'cost_usd': 0.001,
+                       'model': 'z-ai/glm-5.3-flash', 'provider': 'SomeHost', 'served_quantization': 'fp8',
+                       'usage': {'prompt_tokens': 10, 'completion_tokens': 5}, **fields})
+
+
+async def test_chat_openrouter_keeps_who_served_the_reply(monkeypatch):
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return _chat_server_reply()
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    reply = await triage.chat_openrouter('hi', model='z-ai/glm-5.3-flash')
+    assert (reply.model, reply.provider, reply.served_quantization, reply.finish_reason) == (
+        'z-ai/glm-5.3-flash', 'SomeHost', 'fp8', 'stop')
+    assert 'provider=SomeHost' in reply.describe()
+
+
+async def test_a_provider_notice_returned_as_content_fails_naming_the_provider(monkeypatch):
+    '''2026-10-14: "Your quota is exhausted" came back as a completion and failed as "No JSON
+    object found", with no record of which provider had sent it.'''
+    notice = 'Your quota is exhausted. Name: VIP.aaa, USDT balance -2.16'
+
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return _chat_server_reply(content=notice)
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    reply = await triage.chat_openrouter('hi')
+    with pytest.raises(ValueError) as caught:
+        reply.parse(what='company match')
+    message = str(caught.value)
+    assert 'provider=SomeHost' in message
+    assert notice in message
+    assert 'finish_reason=stop' in message
+
+
+async def test_a_reply_failing_the_callers_validation_carries_the_metadata(monkeypatch):
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return _chat_server_reply(content='{"matches": "yes"}')
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    reply = await triage.chat_openrouter('hi')
+    with pytest.raises(ValueError, match=r"'matches' is str, not bool.*provider=SomeHost"):
+        reply.parse(lambda raw: tools._require_fields(raw, matches=bool), 'company match')
+
+
+async def test_a_failed_chat_carries_the_whole_server_reply(monkeypatch):
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return json.dumps({'ok': False, 'error': 'chat failed for model=m served_by=SomeHost: HTTP 402'})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    with pytest.raises(RuntimeError, match='served_by=SomeHost'):
+        await triage.chat_openrouter('hi')
+
+
+async def test_a_non_json_chat_reply_is_quoted(monkeypatch):
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return 'Internal Server Error'
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    with pytest.raises(ValueError, match=r"not JSON.*'Internal Server Error'"):
+        await triage.chat_openrouter('hi')
+
+
+async def test_list_local_models_does_not_read_an_error_as_no_models(monkeypatch):
+    '''An error reply read as "nothing installed", which reported the triage model as missing.'''
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return json.dumps({'ok': False, 'error': 'Ollama not reachable'})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    with pytest.raises(ValueError, match='Ollama not reachable'):
+        await triage.list_local_models()
+
+
+async def test_generate_local_raises_a_named_error_on_a_length_stop(monkeypatch):
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return json.dumps({'model': 'm', 'response': '{"score": ', 'done': True, 'done_reason': 'length'})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    with pytest.raises(triage.TruncatedResponseError, match='done_reason=length'):
+        await triage.generate_local('hi', purpose_slug='test')
+
+
+def test_quote_for_error_keeps_head_and_tail_and_logs_the_whole(caplog):
+    text = 'H' * config.ERROR_QUOTE_MAX_CHARS + 'TAIL'
+    with caplog.at_level(logging.WARNING):
+        quoted = text_budget.quote_for_error(text, 'a reply')
+    assert quoted.startswith('H') and quoted.endswith('TAIL')
+    assert f'of {len(text)} chars cut; full text logged' in quoted
+    assert text in caplog.text
 
 
 async def test_chat_openrouter_raises_a_named_error_on_a_length_finish(monkeypatch):
@@ -7273,7 +7383,7 @@ async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
         attempts.append(max_tokens)
         if len(attempts) == 1:
             raise triage.TruncatedResponseError('truncated', max_tokens=None)
-        return '{"rating": 5, "reasoning": "great"}', 0.002
+        return chat_reply('{"rating": 5, "reasoning": "great"}', 0.002)
 
     monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
     result, _ = await triage.rate_with_openrouter('sys', 'user')
@@ -9982,7 +10092,7 @@ def _estimator_llm(monkeypatch, answer=TEST_ESTIMATE_JSON) -> list:
         prompts.append(prompt)
         if isinstance(answer, Exception):
             raise answer
-        return answer, TEST_ESTIMATE_COST
+        return chat_reply(answer, TEST_ESTIMATE_COST, model=model)
 
     monkeypatch.setattr(salary_estimate, 'chat_openrouter', _fake)
     return prompts
@@ -10048,8 +10158,27 @@ async def test_estimate_salary_shows_nothing_when_the_server_is_down(monkeypatch
     {'can_estimate': True, 'minimum': 30_000, 'maximum': 30_000 * config.SALARY_ESTIMATE_MAX_SPREAD_RATIO + 1,
      'currency': 'EUR', 'period': 'year'},
 ])
-def test_an_estimate_that_does_not_validate_is_dropped_not_repaired(answer):
-    assert salary_estimate._coerce(answer) is None
+def test_an_estimate_that_does_not_validate_is_rejected_not_repaired(answer):
+    '''It raises, so the caller shows none, logs the reply, and does not cache it as "cannot estimate".'''
+    with pytest.raises(ValueError):
+        salary_estimate._coerce(answer)
+
+
+async def test_an_estimate_that_does_not_validate_is_not_cached(monkeypatch, caplog):
+    answer = json.dumps({'can_estimate': True, 'minimum': 110_000, 'maximum': 90_000, 'currency': 'EUR',
+                         'period': 'year'})
+    prompts = _estimator_llm(monkeypatch, answer)
+    for _ in range(2):
+        assert await salary_estimate.estimate_salary(_make_candidate(), _make_extract(), 'page') is None
+    assert len(prompts) == 2, 'a reply that did not validate is not an answer'
+    assert any('110000' in r.message and 'provider=' in r.message for r in caplog.records), 'the reply is logged'
+
+
+async def test_an_explicit_cannot_estimate_is_cached(monkeypatch):
+    prompts = _estimator_llm(monkeypatch, json.dumps({'can_estimate': False, 'basis': 'no market data'}))
+    for _ in range(2):
+        assert await salary_estimate.estimate_salary(_make_candidate(), _make_extract(), 'page') is None
+    assert len(prompts) == 1
 
 
 async def test_an_estimate_in_a_withdrawn_currency_is_shown_as_none(monkeypatch, caplog):
@@ -10636,7 +10765,7 @@ UNCLOSED_ARRAY_REPLY = '{"rating": 5, "reasoning": "near-perfect", "warnings": [
 
 async def test_rate_with_openrouter_names_a_malformed_reply_and_does_not_repair_it(monkeypatch):
     async def fake_chat(prompt, system='', model='', max_tokens=None):
-        return UNCLOSED_ARRAY_REPLY, 0.002
+        return chat_reply(UNCLOSED_ARRAY_REPLY, 0.002)
 
     monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
     with pytest.raises(triage.MalformedRatingReplyError, match='No JSON object found'):
@@ -10664,7 +10793,7 @@ def _rating_models(monkeypatch, replies: dict[str, str]) -> list[str]:
 
     async def fake_chat(prompt, system='', model='', max_tokens=None):
         asked.append(model)
-        return replies[model], 0.002
+        return chat_reply(replies[model], 0.002)
 
     monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
     return asked

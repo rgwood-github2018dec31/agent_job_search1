@@ -7,7 +7,7 @@ gates) must not use this at all; they scan the full text.
 import logging
 import re
 
-from agentic_job_search.config import LOG_SNIPPET_MAX_CHARS, SNAPSHOT_HEAD_SHARE
+from agentic_job_search.config import ERROR_QUOTE_MAX_CHARS, LOG_SNIPPET_MAX_CHARS, SNAPSHOT_HEAD_SHARE
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,21 @@ def snippet(text: object, max_chars: int = LOG_SNIPPET_MAX_CHARS) -> str:
     if len(s) <= max_chars:
         return s
     return f'{s[:max_chars]}… [+{len(s) - max_chars} of {len(s)} chars not shown]'
+
+
+def quote_for_error(text: object, what: str, max_chars: int = ERROR_QUOTE_MAX_CHARS) -> str:
+    '''A server reply or model content for an exception message, never the only copy when cut.
+
+    Whole when it fits. Otherwise the full text is logged at WARNING under `what`, and the returned
+    quote keeps the head and the tail — a bad reply is usually wrong at one end: an HTML error page
+    or a provider's notice at the head, a cut-off body at the tail — with the cut named between.
+    '''
+    s = str(text)
+    if len(s) <= max_chars:
+        return s
+    half = max_chars // 2
+    logger.warning(f'{what} is {len(s)} chars, over ERROR_QUOTE_MAX_CHARS; quoted as head and tail, full text:\n{s}')
+    return f'{s[:half]}… [{len(s) - 2 * half} of {len(s)} chars cut; full text logged] …{s[-half:]}'
 
 
 def normalize_whitespace(text: str) -> str:

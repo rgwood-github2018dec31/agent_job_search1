@@ -57,7 +57,7 @@ from agentic_job_search.config import (
     is_mid_rated,
 )
 from agentic_job_search.text_budget import pages_to_prompt, snippet, truncate_reported
-from agentic_job_search.triage import chat_openrouter, extract_json_object
+from agentic_job_search.triage import chat_openrouter
 
 console = Console()
 
@@ -328,16 +328,29 @@ _COMPANY_NOISE_WORDS = {
 }
 
 
+def _require_fields(raw: dict, **kinds: type) -> dict:
+    '''raw, once each named field has its type; raises ValueError naming the first that does not.
+
+    A missing field used to read as its falsy default — `same_organization` missing meant "a
+    different organization", which let a blacklisted company through.
+    '''
+    for key, kind in kinds.items():
+        if not isinstance(raw.get(key), kind):
+            raise ValueError(f'{key!r} is {type(raw.get(key)).__name__}, not {kind.__name__}')
+    return raw
+
+
 async def _company_matches_openrouter(candidate: str, companies_list: str) -> dict:
     '''Fuzzy company match via the OpenRouter MCP server. Raises on any failure.'''
-    content, _cost = await chat_openrouter(
+    reply = await chat_openrouter(
         f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
         f'{companies_list}\n\n'
         'Respond with ONLY a JSON object: '
         '{"matches": <true|false>, "matched_company_name": "<exact name from the list, or empty string>"}',
         model=MODEL_NAME_COMPANY_MATCH,
     )
-    return extract_json_object(content)
+    return reply.parse(lambda raw: _require_fields(raw, matches=bool, matched_company_name=str),
+                       f'company match for {candidate!r}')
 
 
 async def company_matches_applied(candidate: str) -> str | None:
@@ -365,7 +378,8 @@ async def company_matches_applied(candidate: str) -> str | None:
                 return None
             return _applied_companies.get(structured.get('matched_company_name', ''), '<unknown PDF>')
         except Exception as ex:
-            logger.warning(f'company_matches_applied via OpenRouter failed, falling back to Anthropic: {ex}')
+            logger.warning(f'company_matches_applied via OpenRouter failed for {candidate!r}, falling back to '
+                           f'Anthropic: {unwrap_exception(ex)}')
 
     options = ClaudeAgentOptions(
         model=ANTHROPIC_MODEL_NAME_LOW,
@@ -419,8 +433,8 @@ def _blacklist_confirm_prompt(company: str, entry_name: str, reason: str, contex
 
 async def _blacklist_confirms_openrouter(prompt: str) -> dict:
     '''Confirm a blacklist name hit via the OpenRouter MCP server. Raises on any failure.'''
-    content, _cost = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
-    return extract_json_object(content)
+    reply = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
+    return reply.parse(lambda raw: _require_fields(raw, same_organization=bool), 'blacklist confirmation')
 
 
 async def company_blacklist_reason(company: str, context: str = '', description: str = '') -> str | None:
@@ -464,7 +478,8 @@ async def company_blacklist_reason(company: str, context: str = '', description:
         try:
             structured = await _blacklist_confirms_openrouter(prompt)
         except Exception as ex:
-            logger.warning(f'Blacklist confirmation via OpenRouter failed for {candidate!r}, falling back to Anthropic: {ex}')
+            logger.warning(f'Blacklist confirmation via OpenRouter failed for {candidate!r}, falling back to Anthropic: '
+                           f'{unwrap_exception(ex)}')
 
     if structured is None:
         options = ClaudeAgentOptions(
@@ -499,7 +514,7 @@ async def company_blacklist_reason(company: str, context: str = '', description:
                         structured = msg.structured_output
         except Exception as ex:
             logger.warning(
-                f'Blacklist confirmation failed for {candidate!r} ({ex}) — rejecting on the exact '
+                f'Blacklist confirmation failed for {candidate!r} ({unwrap_exception(ex)}) — rejecting on the exact '
                 f'name match alone.'
             )
             return label
@@ -511,7 +526,14 @@ async def company_blacklist_reason(company: str, context: str = '', description:
         )
         return label
 
-    if not structured.get('same_organization'):
+    same_organization = structured.get('same_organization')
+    if not isinstance(same_organization, bool):
+        logger.warning(
+            f'Blacklist confirmation for {candidate!r} has no boolean same_organization '
+            f'({structured!r}) — rejecting on the exact name match alone.'
+        )
+        return label
+    if not same_organization:
         logger.info(
             f'Blacklist name collision: {candidate!r} matches blacklist entry {entry_name!r} by '
             f'name but was confirmed to be a different organization — not rejecting.'
@@ -770,10 +792,10 @@ def _repost_match_prompt(new_posting: dict, priors: list[dict]) -> str:
 
 async def _repost_match_openrouter(prompt: str, stage_stats: dict | None) -> dict:
     '''Judge a repost via the OpenRouter MCP server. Raises on any failure.'''
-    content, cost_usd = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
+    reply = await chat_openrouter(prompt, model=MODEL_NAME_COMPANY_MATCH)
     if stage_stats is not None:
-        stage_stats['cost'] += cost_usd
-    return extract_json_object(content)
+        stage_stats['cost'] += reply.cost_usd
+    return reply.parse(lambda raw: _require_fields(raw, same_as_job_id=str), 'repost check')
 
 
 async def recruiter_repost_of(

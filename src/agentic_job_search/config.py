@@ -621,6 +621,9 @@ OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS = 1024
 SCRAPER_WHAT_HAPPENED_MAX_CHARS = 500
 # Diagnostic excerpts of a response, error or command in log lines and exception messages.
 LOG_SNIPPET_MAX_CHARS = 300
+# A server reply or model content quoted in an exception (text_budget.quote_for_error). Over it the
+# full text is logged once and the exception keeps the head and tail, the cut named.
+ERROR_QUOTE_MAX_CHARS = 4000
 # A job's title appears once per job in the run log, on its Extract line, cut to this; later lines
 # for the job name it by id. LinkedIn titles run to 150+ chars of keyword stuffing.
 LOG_TITLE_MAX_CHARS = 80

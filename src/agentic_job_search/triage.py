@@ -13,6 +13,9 @@ agent_stock_trends1.
 import json
 import logging
 import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
 from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
@@ -29,7 +32,7 @@ from agentic_job_search.config import (
     OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
 )
-from agentic_job_search.text_budget import snippet
+from agentic_job_search.text_budget import quote_for_error
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +138,64 @@ def extract_json_object(text: str) -> dict:
     ) from last_error
 
 
+_Parsed = TypeVar('_Parsed')
+
+
+@dataclass(frozen=True)
+class ChatReply:
+    '''One OpenRouter completion and who served it.
+
+    Returning only (content, cost) is how a provider's "Your quota is exhausted" notice, sent back
+    as an ordinary completion, failed later as "No JSON object found" with no record of which
+    provider had sent it (2026-10-14). Everything the server reports about the call stays here, so
+    a caller whose parse fails can say which model, provider and finish_reason produced the text.
+    '''
+
+    content: str
+    cost_usd: float
+    requested_model: str
+    model: str
+    provider: str
+    served_quantization: str
+    finish_reason: str
+    usage: dict = field(default_factory=dict)
+
+    def describe(self) -> str:
+        '''The call's metadata in one line, for log lines and exception messages.'''
+        served = self.model if self.model == self.requested_model else f'{self.model} (requested {self.requested_model})'
+        return (f'model={served} provider={self.provider or "?"} quantization={self.served_quantization or "?"} '
+                f'finish_reason={self.finish_reason or "?"} tokens={self.usage.get("prompt_tokens")}/'
+                f'{self.usage.get("completion_tokens")} cost=${self.cost_usd:.6f}')
+
+    def parse(self, coerce: Callable[[dict], _Parsed] | None = None, what: str = 'reply') -> _Parsed | dict:
+        '''The content's JSON object, run through `coerce` when given.
+
+        A parse or validation failure raises ValueError carrying the call's metadata and the
+        content: whether it was a model's slip or a provider's notice, the log alone tells.
+        '''
+        try:
+            obj = extract_json_object(self.content)
+            return coerce(obj) if coerce is not None else obj
+        except (ValueError, KeyError, TypeError) as ex:
+            raise ValueError(
+                f'OpenRouter {what} unusable ({type(ex).__name__}: {ex}) — {self.describe()}; '
+                f'content: {quote_for_error(self.content, f"unusable OpenRouter {what} from {self.model}")!r}'
+            ) from ex
+
+
+def _field(data: dict, key: str, kinds: type | tuple[type, ...], raw: str) -> Any:
+    '''data[key] when it has one of `kinds`; raises naming the field, with the whole reply.'''
+    value = data.get(key)
+    if not isinstance(value, kinds):
+        raise ValueError(f'OpenRouter chat reply field {key!r} is {type(value).__name__}, not {kinds}: '
+                         f'{quote_for_error(raw, "OpenRouter chat reply")!r}')
+    return value
+
+
 async def chat_openrouter(
     prompt: str, system: str = '', model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, max_tokens: int | None = None
-) -> tuple[str, float]:
-    """One completion via the OpenRouter MCP server. Returns (content, cost_usd).
+) -> ChatReply:
+    """One completion via the OpenRouter MCP server, with who served it (ChatReply).
 
     `max_tokens` defaults to None, i.e. it is NOT SENT and the model's own ceiling applies. There
     is nothing to protect against here: the MCP tool declares it optional and applies no clamp,
@@ -159,29 +216,53 @@ async def chat_openrouter(
     if max_tokens is not None:
         args['max_tokens'] = max_tokens
     raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
-    data = json.loads(raw)
-    if not data.get('ok'):
-        raise provider_error('OpenRouter chat failed', str(data.get('error') or snippet(raw)))
+    try:
+        data = json.loads(raw)
+    except ValueError as ex:
+        raise ValueError(f'OpenRouter chat reply for {model} is not JSON ({ex}): '
+                         f'{quote_for_error(raw, "OpenRouter chat reply")!r}') from ex
+    if not isinstance(data, dict):
+        raise ValueError(f'OpenRouter chat reply for {model} is not an object: {quote_for_error(raw, "OpenRouter chat reply")!r}')
+    if data.get('ok') is not True:
+        # The whole reply, not just `error`: the server's other fields say who failed.
+        raise provider_error(f'OpenRouter chat failed for {model}', quote_for_error(raw, 'OpenRouter chat failure reply'))
+    _field(data, 'content', (str, type(None)), raw)
+    usage = data.get('usage') or {}
+    if data.get('cost_usd') is None:
+        logger.warning(f'OpenRouter reported no cost for a {model} call (counted as $0): '
+                       f'{quote_for_error(raw, "OpenRouter chat reply with no cost")}')
+    reply = ChatReply(
+        content=data.get('content') or '', cost_usd=float(data.get('cost_usd') or 0.0),
+        requested_model=model, model=str(data.get('model') or model), provider=str(data.get('provider') or ''),
+        served_quantization=str(data.get('served_quantization') or ''),
+        finish_reason=str(data.get('finish_reason') or ''), usage=usage if isinstance(usage, dict) else {},
+    )
     # Checked BEFORE the content test, and regardless of whether content is empty: a truncated
     # non-empty body is the case that used to reach the JSON parser disguised as a parse failure.
-    if data.get('finish_reason') == 'length':
-        usage = data.get('usage') or {}
+    if reply.finish_reason == 'length':
         raise TruncatedResponseError(
-            f'OpenRouter response truncated (finish_reason=length) from {model}: '
-            f'max_tokens={max_tokens}, completion_tokens={usage.get("completion_tokens")}, '
-            f'prompt_tokens={usage.get("prompt_tokens")}, content_chars={len(data.get("content") or "")}',
+            f'OpenRouter response truncated (finish_reason=length): max_tokens={max_tokens}, '
+            f'content_chars={len(reply.content)} — {reply.describe()}',
             max_tokens=max_tokens,
         )
-    if not data.get('content'):
-        raise RuntimeError(f'OpenRouter chat returned empty content: {snippet(raw)}')
-    return data['content'], float(data.get('cost_usd') or 0.0)
+    if not reply.content:
+        raise RuntimeError(f'OpenRouter chat returned empty content — {reply.describe()}; '
+                           f'reply: {quote_for_error(raw, "OpenRouter empty-content reply")!r}')
+    return reply
 
 
 async def list_local_models() -> list[str]:
     '''Names of the models actually installed on the local Ollama server.'''
     raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'list_models', {})
-    data = json.loads(raw)
-    return [m['name'] for m in data.get('models', ()) if m.get('name')]
+    try:
+        data = json.loads(raw)
+    except ValueError as ex:
+        raise ValueError(f'Local list_models reply is not JSON ({ex}): {quote_for_error(raw, "local list_models reply")!r}') from ex
+    # An error reply used to read as "no models installed", which then reported the triage model
+    # as missing: a false diagnosis that disables triage.
+    if not isinstance(data, dict) or not isinstance(data.get('models'), list):
+        raise ValueError(f'Local list_models reply has no models list: {quote_for_error(raw, "local list_models reply")!r}')
+    return [m['name'] for m in data['models'] if isinstance(m, dict) and m.get('name')]
 
 
 def _looks_like_missing_model(message: str) -> bool:
@@ -239,10 +320,25 @@ async def generate_local(
         if _looks_like_missing_model(unwrap_exception(ex)):
             raise LocalModelMissingError(await _describe_missing_model(model)) from ex
         raise
-    data = json.loads(raw)
-    response = data.get('response', '')
-    if not response:
-        raise RuntimeError(f'Local LLM returned empty response: {snippet(raw)}')
+    try:
+        data = json.loads(raw)
+    except ValueError as ex:
+        raise ValueError(f'Local generate reply ({model}) is not JSON ({ex}): {quote_for_error(raw, "local generate reply")!r}') from ex
+    if not isinstance(data, dict):
+        raise ValueError(f'Local generate reply ({model}) is not an object: {quote_for_error(raw, "local generate reply")!r}')
+    if data.get('error') or data.get('ok') is False:
+        raise RuntimeError(f'Local generate ({model}) reported an error: {quote_for_error(raw, "local generate error reply")!r}')
+    done_reason = data.get('done_reason')
+    meta = (f'model={data.get("model") or model} done={data.get("done")} done_reason={done_reason} '
+            f'tokens={data.get("prompt_eval_count")}/{data.get("eval_count")}')
+    if done_reason == 'length':
+        raise TruncatedResponseError(
+            f'Local LLM response truncated (done_reason=length): max_tokens={max_tokens}, '
+            f'response_chars={len(data.get("response") or "")} — {meta}', max_tokens=max_tokens,
+        )
+    response = data.get('response')
+    if not isinstance(response, str) or not response:
+        raise RuntimeError(f'Local LLM returned no response text — {meta}; reply: {quote_for_error(raw, "local generate reply")!r}')
     return response
 
 
@@ -336,13 +432,18 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
     '''
     prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}'
     try:
-        content, cost_usd = await chat_openrouter(prompt, system=system_prompt, model=model)
+        reply = await chat_openrouter(prompt, system=system_prompt, model=model)
     except TruncatedResponseError as ex:
         logger.warning(f'Rating call truncated, retrying once with max_tokens={_TRUNCATION_RETRY_MAX_TOKENS}: {ex}')
-        content, cost_usd = await chat_openrouter(
+        reply = await chat_openrouter(
             prompt, system=system_prompt, model=model, max_tokens=_TRUNCATION_RETRY_MAX_TOKENS
         )
-    return parse_rating_reply(content), cost_usd
+    try:
+        return parse_rating_reply(reply.content), reply.cost_usd
+    except MalformedRatingReplyError as ex:
+        raise MalformedRatingReplyError(
+            f'{ex} — {reply.describe()}; content: {quote_for_error(reply.content, f"malformed rating reply from {reply.model}")!r}'
+        ) from ex
 
 
 async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OLLAMA_MODEL_NAME_TRIAGE) -> dict:

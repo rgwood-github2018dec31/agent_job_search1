@@ -35,6 +35,7 @@ from pathlib import Path
 import requests
 import yaml
 from bs4 import BeautifulSoup, Tag
+from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
@@ -54,7 +55,7 @@ from agentic_job_search.config import (
 from agentic_job_search.salary import mentions_pay
 from agentic_job_search.scrape_openrouter import parse_evaluate_result
 from agentic_job_search.text_budget import normalize_whitespace, snippet, truncate_reported, truncate_reported_middle
-from agentic_job_search.triage import chat_openrouter, extract_json_object
+from agentic_job_search.triage import chat_openrouter
 
 logger = logging.getLogger(__name__)
 
@@ -456,14 +457,20 @@ async def decide_unknown_blocks(soup: BeautifulSoup, candidate: dict, stage_stat
             norm(by_signature[sig][0].get_text(' ')), PAGE_SECTION_SAMPLE_MAX_CHARS,
             f'unknown page section {sig!r} shown to the classifier')) for sig in unseen]
         try:
-            content, cost_usd = await chat_openrouter(_classify_prompt(candidate, samples), model=MODEL_NAME_PAGE_SECTIONS)
+            reply = await chat_openrouter(_classify_prompt(candidate, samples), model=MODEL_NAME_PAGE_SECTIONS)
             if stage_stats is not None:
-                stage_stats['cost'] += cost_usd
-            verdicts = extract_json_object(content).get('decisions') or []
+                stage_stats['cost'] += reply.cost_usd
+
+            def decisions_of(raw: dict) -> list:
+                if not isinstance(raw.get('decisions'), list):
+                    raise ValueError(f'"decisions" is {type(raw.get("decisions")).__name__}, not a list')
+                return raw['decisions']
+
+            verdicts = reply.parse(decisions_of, f'page-section classification for job {candidate.get("job_id")}')
         except Exception as ex:
             logger.warning(
                 f"Page-section classification failed for job {candidate.get('job_id')} "
-                f'({type(ex).__name__}: {ex}) — keeping {len(unseen)} unknown section(s): {unseen}'
+                f'({unwrap_exception(ex)}) — keeping {len(unseen)} unknown section(s): {unseen}'
             )
             verdicts = []
         for verdict in verdicts:

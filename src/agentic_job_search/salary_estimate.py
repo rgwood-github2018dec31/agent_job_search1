@@ -41,7 +41,7 @@ from agentic_job_search.config import (
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.salary import SALARY_CURRENCIES, SALARY_PERIODS, salary_facts_of
 from agentic_job_search.text_budget import snippet, truncate_reported_middle
-from agentic_job_search.triage import chat_openrouter, extract_json_object
+from agentic_job_search.triage import chat_openrouter
 
 logger = logging.getLogger(__name__)
 
@@ -123,29 +123,39 @@ def cache_key(candidate: dict) -> str:
 
 
 def _coerce(raw: dict) -> dict[str, Any] | None:
-    """Validate the model's JSON into an estimate, or None for "cannot estimate".
+    """Validate the model's JSON into an estimate; None only when the model said it cannot estimate.
 
-    Anything that does not validate is None rather than repaired: a range with one end, an inverted
-    or absurdly wide one, an unknown currency or period would each be shown to the user as a figure.
+    None is cached as "cannot estimate", so it is returned only for an explicit `can_estimate:
+    false` and for a retired currency (withdrawn on purpose, logged by the caller). Anything else
+    that does not validate — a missing flag, a range with one end, an inverted or absurdly wide
+    one, an unknown currency or period — raises and is never repaired: it would be shown to the
+    user as a figure. The caller then shows none, logs the reply, and does not cache it.
     """
-    if raw.get('can_estimate') is not True:
+    can_estimate = raw.get('can_estimate')
+    if can_estimate is False:
         return None
+    if can_estimate is not True:
+        raise ValueError(f'can_estimate is {can_estimate!r}, not true or false')
 
-    def number(key: str) -> float | None:
+    def number(key: str) -> float:
         value = raw.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            return None
+            raise ValueError(f'{key} {value!r} is not a finite number')
         return float(value)
 
     minimum, maximum = number('minimum'), number('maximum')
-    if minimum is None or maximum is None or minimum <= 0 or minimum > maximum:
-        return None
+    if minimum <= 0 or minimum > maximum:
+        raise ValueError(f'range {minimum}–{maximum} is not a positive ascending range')
     if maximum / minimum > SALARY_ESTIMATE_MAX_SPREAD_RATIO:
-        return None
+        raise ValueError(f'range {minimum}–{maximum} is wider than SALARY_ESTIMATE_MAX_SPREAD_RATIO')
     currency = str(raw.get('currency') or '').strip().upper()
     period = str(raw.get('period') or '').strip().lower()
-    if currency not in ESTIMATE_CURRENCIES or currency in RETIRED_CURRENCIES or period not in SALARY_PERIODS:
+    if currency in RETIRED_CURRENCIES:
         return None
+    if currency not in ESTIMATE_CURRENCIES:
+        raise ValueError(f'currency {raw.get("currency")!r} is not one of ESTIMATE_CURRENCIES')
+    if period not in SALARY_PERIODS:
+        raise ValueError(f'period {raw.get("period")!r} is not one of {sorted(SALARY_PERIODS)}')
     basis = snippet(' '.join(str(raw.get('basis') or '').split()), SALARY_ESTIMATE_BASIS_MAX_CHARS)
     return {'minimum': minimum, 'maximum': maximum, 'currency': currency, 'period': period, 'basis': basis}
 
@@ -195,9 +205,9 @@ async def estimate_salary(
         body, SALARY_ESTIMATE_TEXT_MAX_CHARS, f'salary estimate input for job {key}'
     ))
     try:
-        content, cost_usd = await chat_openrouter(prompt, model=MODEL_NAME_SALARY_ESTIMATE)
-        answer = extract_json_object(content)
-        result = _coerce(answer)
+        reply = await chat_openrouter(prompt, model=MODEL_NAME_SALARY_ESTIMATE)
+        answer = reply.parse(what=f'salary estimate for job {key}')
+        result = reply.parse(_coerce, f'salary estimate for job {key}')
     except Exception as ex:
         logger.warning(
             f"Salary estimate failed for job {key} ({candidate.get('company')} — "
@@ -206,7 +216,7 @@ async def estimate_salary(
         return None
 
     if stage_stats is not None:
-        stage_stats['cost'] = stage_stats.get('cost', 0.0) + cost_usd
+        stage_stats['cost'] = stage_stats.get('cost', 0.0) + reply.cost_usd
     retired = str(answer.get('currency') or '').strip().upper()
     if retired in RETIRED_CURRENCIES:
         logger.warning(
@@ -216,7 +226,7 @@ async def estimate_salary(
     cache[key] = {
         'schema': CACHE_SCHEMA_VERSION, 'can_estimate': result is not None,
         **(result or {}),
-        'estimated_on': date.today().isoformat(), 'model': MODEL_NAME_SALARY_ESTIMATE,
+        'estimated_on': date.today().isoformat(), 'model': reply.model, 'provider': reply.provider,
         'input_source': input_source,
     }
     _write_cache()
@@ -224,6 +234,6 @@ async def estimate_salary(
     # in the Saved Job. Cost is in cost_log.jsonl.
     logger.debug(
         f"Salary estimated for job {key} ({candidate.get('company')} — {candidate.get('title')}) "
-        f'from the {input_source}: {result if result is not None else "cannot estimate"} (${cost_usd:.6f})'
+        f'from the {input_source}: {result if result is not None else "cannot estimate"} ({reply.describe()})'
     )
     return _estimate_from_entry(cache[key], 'llm')

@@ -19,6 +19,7 @@ from agentic_job_search.config import (
 )
 from agentic_job_search.scrape_openrouter import _guard_call
 from bs4 import BeautifulSoup
+from fakes import chat_reply
 
 JOB_ID = '4415518989'
 LOGO_URL = 'https://media.licdn.com/dms/image/logo-acme.png'
@@ -218,7 +219,7 @@ def _classifier(monkeypatch, decisions: dict, calls: list):
         calls.append(prompt)
         numbered = [line.split('signature: ', 1)[1] for line in prompt.splitlines() if 'signature: ' in line]
         verdicts = [{'block': i, 'remove': decisions[sig], 'reason': 'test'} for i, sig in enumerate(numbered, 1)]
-        return json.dumps({'decisions': verdicts}), 0.001
+        return chat_reply(json.dumps({'decisions': verdicts}), 0.001)
 
     monkeypatch.setattr(lp, 'chat_openrouter', fake_chat)
 

@@ -37,11 +37,10 @@ from datetime import date
 from typing import Any
 
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
-from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 from agentic_job_search import cache_io
 from agentic_job_search.preferences import RUN_DIR
-from agentic_job_search.triage import chat_openrouter, extract_json_object
+from agentic_job_search.triage import chat_openrouter
 
 logger = logging.getLogger(__name__)
 
@@ -301,14 +300,13 @@ def _language_shares(raw: Any) -> dict[str, float]:
     unusable answer gives {}, which no rule can warn on.
     """
     if not isinstance(raw, dict):
-        return {}
+        raise ValueError(f'likely_spoken_languages is {type(raw).__name__}, not an object of shares: {raw!r}')
     shares: dict[str, float] = {}
     for name, fraction in raw.items():
         key = ' '.join(str(name or '').split()).lower()
-        try:
-            value = float(fraction)
-        except (TypeError, ValueError):
-            continue
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+            raise ValueError(f'likely_spoken_languages share for {name!r} is not a number: {fraction!r}')
+        value = float(fraction)
         if key and value > 0:
             shares[key] = shares.get(key, 0.0) + value
     total = sum(shares.values())
@@ -341,6 +339,12 @@ def _coerce(raw: dict) -> dict[str, Any]:
     check compares against a configured list, and a typo'd region that matched nothing would
     silently read as "acceptable" instead of "I could not tell".
     """
+    # A missing or wrong-typed field raises (the caller fails open, uncached) instead of defaulting:
+    # a defaulted answer was cached as if the model had said it.
+    for key, kind in (('countries', list), ('regions', list), ('place_names', list), ('broad_area', bool),
+                      ('likely_spoken_languages', dict)):
+        if not isinstance(raw.get(key), kind):
+            raise ValueError(f'{key!r} is {type(raw.get(key)).__name__}, not {kind.__name__}')
     # Countries keep the case the classifier returned -- 'Spain', not 'spain'. They are proper
     # names, they are compared against the user's (also proper) lists, and every comparison that
     # needs folding does it at the point of comparison. A name folded here could never be unfolded.
@@ -405,8 +409,8 @@ async def classify_location(text: str) -> dict[str, Any]:
         return entry
 
     try:
-        content, cost = await chat_openrouter(_PROMPT.format(text=text, regions=', '.join(LOCATION_REGIONS)))
-        result = _coerce(extract_json_object(content))
+        reply = await chat_openrouter(_PROMPT.format(text=text, regions=', '.join(LOCATION_REGIONS)))
+        result = reply.parse(_coerce, f'location classification of {text!r}')
     except Exception as ex:
         # Fail open: nothing the user wrote down matched this location, so an outage must not
         # start rejecting jobs. Logged at WARNING because a silent classifier is a silent gate.
@@ -432,7 +436,9 @@ async def classify_location(text: str) -> dict[str, Any]:
             return entry
         return _empty('error')
 
-    result['model'] = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+    # Who answered, as served: the requested id alone cannot tell a provider's bad answer apart.
+    result['model'] = reply.model
+    result['provider'] = reply.provider
     result['classified_on'] = date.today().isoformat()
     cache[key] = result
     _write_cache()
@@ -440,7 +446,7 @@ async def classify_location(text: str) -> dict[str, Any]:
     # DEBUG: Stage 2 names the new geography on the job's `Extract signal:` line.
     logger.debug(
         f'Location classified: {text!r} -> countries={result["countries"]} '
-        f'regions={result["regions"]} likely_spoken_languages={result["likely_spoken_languages"]!r} (${cost:.6f})'
+        f'regions={result["regions"]} likely_spoken_languages={result["likely_spoken_languages"]!r} ({reply.describe()})'
     )
     entry = dict(result)
     entry['source'] = 'llm'
