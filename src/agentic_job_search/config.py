@@ -498,8 +498,9 @@ EXTRACTOR_SNAPSHOT_MAX_CHARS = 80_000
 # Share of a middle-truncated text kept as the head; the rest is the tail. Above half because a
 # page's own structure is front-loaded and only the trailing facts need rescuing.
 SNAPSHOT_HEAD_SHARE = 0.6
-# The `salary` field's contract, defined ONCE and imported by all three extract schemas
-# (agent.EXTRACT_OUTPUT_SCHEMA, tools_generic.submit_job_extract, extract_openrouter's tool spec).
+# The `salary` field's contract, defined ONCE and imported by both extract schemas
+# (agent.EXTRACT_OUTPUT_SCHEMA and extract_openrouter's tool spec; the Anthropic agentic extractor
+# and its tools_generic.submit_job_extract were removed on 2026-10-19).
 # Two of those carried a "must stay in sync" comment and no test; the field itself carried no
 # description at all, and a model handed back a rounded, one-ended range that reached the user
 # (2026-09-22). Asking for the text verbatim is the courier-argument exception the Anti-fabrication
@@ -721,8 +722,7 @@ AUDIT_FALSE_NEGATIVE_MIN_RATING = 3
 # Guess Unbucketed Location: the model's reason, cut at a word boundary for a YAML comment and Telegram.
 LOCATION_GUESS_REASON_MAX_CHARS = 150
 
-# Stage 2 extract fallback (Anthropic, deterministic Playwright)
-EXTRACT_FALLBACK_MAX_TURNS = 16
+# Stage 2 page read (linkedin_page.read_job_page)
 EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after navigation
 
 # LinkedIn job pages are read by CODE, not by the extractor model (2026-09-24). One read-only
@@ -776,3 +776,20 @@ LOCAL_LLM_TEMPERATURE = 0.2
 # 45 minutes and the log only showed a hole.
 SLEEP_WATCH_INTERVAL_SECONDS = 30
 SLEEP_GAP_MIN_SECONDS = 120
+
+# Verify Source Reference (evidence.py). A prediction is accepted only when the text it cites is
+# found in its input; otherwise it is rejected as a hallucination (2026-10-16: a 17-hour-old
+# posting rated 1 as stale on a year the extractor invented). A cited quote shorter than this many
+# chars, after normalisation, is too common to prove anything unless it IS the predicted value.
+EVIDENCE_MIN_QUOTE_CHARS = 4
+# The model that relocates a citation regex search could not find. It only points at a span;
+# acceptance still needs that span to be found in the source by code.
+MODEL_NAME_EVIDENCE = MODEL_NAME_SINGLE_TURN
+# The extract fields a model predicts as facts of the page, each cited and verified. `description`
+# is a condensation, not a fact, and `date_posted` is read from the page by code whenever the page
+# shows the usual "N hours ago" line (linkedin_page.posted_age_from_page).
+EXTRACT_CITED_FIELDS = (
+    'title', 'company', 'location', 'workplace_type', 'date_posted', 'closed', 'salary',
+    'sponsorship_note', 'language_requirement', 'posting_language', 'stated_working_language',
+    'residency_scope', 'relocation', 'education_requirement', 'is_agency', 'end_client',
+)

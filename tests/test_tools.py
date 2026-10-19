@@ -17,6 +17,7 @@ import yaml
 from agentic_job_search import (
     agent,
     config,
+    evidence,
     extract_openrouter,
     fx,
     linkedin_page,
@@ -1286,70 +1287,6 @@ def test_extract_json_object_raises_without_json():
 
 
 # ---------------------------------------------------------------------------
-# do_submit_job_extract
-# ---------------------------------------------------------------------------
-
-async def test_submit_job_extract_captures(monkeypatch):
-    monkeypatch.setattr(tools, '_job_extracts', [])
-
-    await tools.do_submit_job_extract(
-        'Staff Engineer', 'Acme', 'Build agents in Python.',
-        location='Canada (Remote)', date_posted='3 days ago', closed=False, salary='CAD 200k',
-    )
-
-    assert len(tools._job_extracts) == 1
-    extract = tools._job_extracts[0]
-    assert extract['title'] == 'Staff Engineer'
-    assert extract['company'] == 'Acme'
-    assert extract['location'] == 'Canada (Remote)'
-    assert extract['closed'] is False
-
-
-async def test_submit_job_extract_defaults(monkeypatch):
-    monkeypatch.setattr(tools, '_job_extracts', [])
-
-    await tools.do_submit_job_extract('Engineer', 'Corp', 'desc')
-
-    extract = tools._job_extracts[0]
-    assert extract['location'] == ''
-    assert extract['date_posted'] == ''
-    assert extract['closed'] is False
-    assert extract['salary'] == ''
-    assert extract['sponsorship_note'] == ''
-    assert extract['language_requirement'] == ''
-    assert extract['relocation'] == ''
-    assert extract['education_requirement'] == ''
-    assert extract['posting_language'] == ''
-    assert 'local_language' not in extract, 'the extractor no longer supplies it — the location does'
-
-
-async def test_submit_job_extract_normalizes_language_fields(monkeypatch):
-    monkeypatch.setattr(tools, '_job_extracts', [])
-
-    await tools.do_submit_job_extract(
-        'Scientifique principal', 'Valtech', 'desc', posting_language=' French ',
-    )
-
-    assert tools._job_extracts[0]['posting_language'] == 'french'
-
-
-async def test_submit_job_extract_normalizes_stated_working_language(monkeypatch):
-    monkeypatch.setattr(tools, '_job_extracts', [])
-    await tools.do_submit_job_extract('t', 'c', 'desc', stated_working_language=' English ')
-    assert tools._job_extracts[0]['stated_working_language'] == 'english'
-
-
-async def test_submit_job_extract_rejects_a_local_language_argument():
-    '''The implied local language is a fact about a PLACE, resolved by the cached classifier.
-
-    Pinned as a signature check rather than prose: re-adding the parameter would otherwise be
-    accepted and silently ignored, which is the shape this repo keeps catching.
-    '''
-    with pytest.raises(TypeError):
-        await tools.do_submit_job_extract('t', 'c', 'desc', local_language='french')
-
-
-# ---------------------------------------------------------------------------
 # apply_hard_rules
 # ---------------------------------------------------------------------------
 
@@ -2149,7 +2086,7 @@ async def test_openrouter_loop_returns_none_on_chat_error(monkeypatch):
 
 async def test_extractor_provider_dispatch_openrouter(monkeypatch):
     monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
-    called = {'openrouter': 0, 'anthropic': 0, 'direct': 0}
+    called = {'openrouter': 0, 'direct': 0}
     reads = []
     page = linkedin_page.JobPage(text='the page', source='dom')
     _stub_read_page(monkeypatch, page=page, calls=reads)
@@ -2160,17 +2097,12 @@ async def test_extractor_provider_dispatch_openrouter(monkeypatch):
         assert system_prompt is agent.PAGE_EXTRACTOR_INSTRUCTIONS
         return None
 
-    async def fake_anthropic(candidate, mcp, stats):
-        called['anthropic'] += 1
-        return None
-
     async def fake_direct(candidate, url, stats, page=None):
         called['direct'] += 1
         assert page is not None and page.text == 'the page', 'the fallback reuses the page already read'
         return None
 
     monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_openrouter)
-    monkeypatch.setattr(agent, 'extract_job_page', fake_anthropic)
     monkeypatch.setattr(agent, 'extract_job_page_direct', fake_direct)
 
     stats = {'extraction': agent.new_stage_stats(), 'rating': agent.new_stage_stats()}
@@ -2178,8 +2110,28 @@ async def test_extractor_provider_dispatch_openrouter(monkeypatch):
         [_make_candidate()], {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', stats
     )
 
-    assert called == {'openrouter': 1, 'anthropic': 0, 'direct': 1}  # fallback still fires
+    assert called == {'openrouter': 1, 'direct': 1}  # fallback still fires
     assert len(reads) == 1, 'the page is read once per job'
+
+
+async def test_a_non_openrouter_extractor_reads_the_page_in_code_too(monkeypatch):
+    '''The Anthropic agentic extractor browsed for itself and kept no text to verify a field
+    against; since 2026-10-19 every route reads the page in code and uses the direct extractor.'''
+    monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', 'claude-haiku-5-5')
+    reads, directs = [], []
+    page = linkedin_page.JobPage(text='the page', source='dom')
+    _stub_read_page(monkeypatch, page=page, calls=reads)
+
+    async def fake_direct(candidate, url, stats, page=None):
+        directs.append(page)
+        return None
+
+    monkeypatch.setattr(agent, 'extract_job_page_direct', fake_direct)
+    stats = {'extraction': agent.new_stage_stats(), 'rating': agent.new_stage_stats()}
+    await agent.evaluate_all_candidates(
+        [_make_candidate()], {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', stats
+    )
+    assert len(reads) == 1 and directs == [page]
 
 
 # ---------------------------------------------------------------------------
@@ -4912,24 +4864,79 @@ def test_salary_digits_are_in_the_source(salary_text, raw_text, verified):
     assert salary.salary_digits_are_in_the_source(salary_text, raw_text) is verified
 
 
-def test_check_salary_provenance_flags_a_figure_the_page_does_not_contain(caplog):
-    candidate = dict(_make_candidate(), job_id='4470298356', site='linkedin')
-    tools.save_raw_posting(candidate, 'base pay range CA$208,580 - CA$273,770', 'openrouter_loop', 40)
-    extract = _make_extract(salary='CA$208,600 - CA$273,800 annually')
-    extract['salary_facts'] = salary.classify_salary(extract['salary'])
+# The page linkedin-4477326789 showed on 2026-10-16 (header and the lines the tests cite).
+OVERSTORY_PAGE_TEXT = '''Overstory
+Staff Machine Learning Engineer - Wildfire
+Netherlands
+·
+17 hours ago
+·
+Over 100 people clicked apply
+Remote
+About the job
+You will build wildfire risk models. Base pay range CA$208,580 - CA$273,770.'''
 
-    assert agent.check_salary_provenance(candidate, extract) is False
-    assert extract['salary_facts']['source'] == 'unverified'
-    assert any('Salary provenance' in r.message and r.levelname == 'WARNING'
-               for r in caplog.records)
+
+@pytest.fixture
+def no_relocation(monkeypatch):
+    '''Evidence relocation finds nothing: only what regex finds in the page stands.'''
+    async def finds_nothing(call_site, subject, claims, source, stage_stats):
+        return {}, 'fake relocation reply'
+    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
 
 
-def test_check_salary_provenance_passes_when_the_page_backs_the_figure():
-    candidate = dict(_make_candidate(), job_id='4470298356', site='linkedin')
-    tools.save_raw_posting(candidate, 'base pay range CA$208,580 - CA$273,770', 'openrouter_loop', 40)
-    extract = _make_extract(salary='CA$208,580–$273,770 annually')
-    extract['salary_facts'] = salary.classify_salary(extract['salary'])
-    assert agent.check_salary_provenance(candidate, extract) is True
+async def test_verify_extract_reads_the_date_from_the_page_not_the_model(no_relocation):
+    '''2026-10-16: an invented year hard-rated a 17-hour-old posting as stale.'''
+    candidate = _make_candidate(job_id='4477326789', company='Overstory')
+    extract = _make_extract(date_posted='2025-10-14 (posted 16-17 hours ago)', location='Netherlands (Remote)',
+                            page_text=OVERSTORY_PAGE_TEXT, quotes={'location': 'Netherlands'})
+    statuses = await agent.verify_extract(candidate, extract, agent.new_stage_stats())
+    assert extract['date_posted'] == '17 hours ago'
+    assert statuses['date_posted'] == 'read_by_code'
+    # Netherlands is on the test deny list; the point is that the stale rule no longer fires.
+    assert 'older than' not in (await agent.apply_hard_rules(candidate, extract) or '')
+
+
+async def test_verify_extract_rejects_an_uncited_field_as_absent(no_relocation, caplog):
+    extract = _make_extract(relocation='United Kingdom', language_requirement='dutch', closed=True,
+                            page_text=OVERSTORY_PAGE_TEXT,
+                            quotes={'relocation': 'Based in the United Kingdom', 'closed': ''})
+    statuses = await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats())
+    assert (extract['relocation'], extract['language_requirement'], extract['closed']) == ('', '', False)
+    assert statuses['relocation'] == evidence.STATUS_REJECTED
+    assert any('Hallucination rejected' in r.message and r.levelname == 'WARNING' for r in caplog.records)
+
+
+async def test_verify_extract_keeps_a_cited_field(no_relocation):
+    extract = _make_extract(workplace_type='remote', title='Staff Machine Learning Engineer - Wildfire',
+                            page_text=OVERSTORY_PAGE_TEXT,
+                            quotes={'workplace_type': 'Remote', 'title': 'Staff Machine Learning Engineer - Wildfire'})
+    statuses = await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats())
+    assert extract['workplace_type'] == 'remote'
+    assert statuses['title'] == evidence.STATUS_REGEX
+
+
+async def test_verify_extract_falls_back_to_the_listing_title_and_company(no_relocation):
+    candidate = _make_candidate(title='Staff ML Engineer', company='Overstory')
+    extract = _make_extract(title='Principal Scientist', company='Invented Corp', page_text=OVERSTORY_PAGE_TEXT)
+    await agent.verify_extract(candidate, extract, agent.new_stage_stats())
+    assert (extract['title'], extract['company']) == ('Staff ML Engineer', 'Overstory')
+
+
+async def test_verify_extract_rejects_a_salary_whose_figures_are_not_on_the_page(no_relocation):
+    '''Since 2026-10-19 a figure absent from the page is rejected, not merely marked unverified.'''
+    extract = _make_extract(salary='CA$208,600 - CA$273,800 annually', page_text=OVERSTORY_PAGE_TEXT,
+                            quotes={'salary': 'Base pay range CA$208,580 - CA$273,770'})
+    statuses = await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats())
+    assert extract['salary'] == ''
+    assert statuses['salary'] == evidence.STATUS_REJECTED
+
+
+async def test_verify_extract_keeps_a_salary_the_page_states(no_relocation):
+    extract = _make_extract(salary='CA$208,580–$273,770 annually', page_text=OVERSTORY_PAGE_TEXT,
+                            quotes={'salary': 'Base pay range CA$208,580 - CA$273,770'})
+    await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats())
+    assert extract['salary'] == 'CA$208,580–$273,770 annually'
 
 
 @pytest.mark.live
@@ -4945,40 +4952,26 @@ async def test_resolve_salary_live(monkeypatch, tmp_path):
     assert facts['source'] in ('llm', 'error')
 
 
-def test_the_three_extract_schemas_share_one_salary_description():
-    """Two of them carried a 'must stay in sync' comment and no test to enforce it."""
-    from agentic_job_search import extract_openrouter as extract_or
-    from agentic_job_search import tools_generic
-    from agentic_job_search.config import SALARY_FIELD_DESCRIPTION
-
-    openrouter_schema = next(
-        t['function']['parameters'] for t in extract_or.OPENROUTER_EXTRACT_TOOLS
+def _openrouter_extract_properties() -> dict:
+    return next(
+        t['function']['parameters']['properties'] for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
         if t['function']['name'] == 'submit_job_extract'
     )
-    sdk_schema = tools_generic.submit_job_extract.input_schema['properties']
-    for properties in (agent.EXTRACT_OUTPUT_SCHEMA['properties'],
-                       openrouter_schema['properties'], sdk_schema):
+
+
+def test_both_extract_schemas_share_one_salary_description():
+    """They carried a 'must stay in sync' comment and no test to enforce it."""
+    from agentic_job_search.config import SALARY_FIELD_DESCRIPTION
+    for properties in (agent.EXTRACT_OUTPUT_SCHEMA['properties'], _openrouter_extract_properties()):
         assert properties['salary'].get('description') == SALARY_FIELD_DESCRIPTION
     assert 'BOTH ends' in SALARY_FIELD_DESCRIPTION
 
 
 def test_the_extract_schemas_all_accept_stated_working_language():
-    '''A field added to one extractor and not the others silently returns empty for that provider.'''
-    from agentic_job_search import extract_openrouter as extract_or
-    from agentic_job_search import tools_generic
+    '''A field added to one extractor and not the other silently returns empty for that path.'''
     from agentic_job_search.config import STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION
-
-    openrouter_schema = next(
-        t['function']['parameters'] for t in extract_or.OPENROUTER_EXTRACT_TOOLS
-        if t['function']['name'] == 'submit_job_extract'
-    )
-    sdk_schema = tools_generic.submit_job_extract.input_schema['properties']
-    for properties in (agent.EXTRACT_OUTPUT_SCHEMA['properties'],
-                       openrouter_schema['properties'], sdk_schema):
+    for properties in (agent.EXTRACT_OUTPUT_SCHEMA['properties'], _openrouter_extract_properties()):
         assert properties['stated_working_language']['description'] == STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION
-    parsed = extract_or._extract_from_submit_args(
-        {'title': 't', 'company': 'c', 'description': 'd', 'stated_working_language': 'English'})
-    assert parsed['stated_working_language'] == 'english'
 
 
 @pytest.mark.parametrize('description', [
@@ -5558,6 +5551,21 @@ def _stage2_stats() -> dict:
     return {k: agent.new_stage_stats() for k in ('extraction', 'rating', 'recruiter_repost', 'salary', 'salary_estimate')}
 
 
+def _page_stating(extract: dict) -> linkedin_page.JobPage:
+    '''A page that states every field of `extract`, so Verify Source Reference keeps them all.
+
+    Stage 2 tests about something else (reposts, pay display) must not lose their fixture's
+    fields to the hallucination check; the tests about that check build their own pages.
+    '''
+    lines = [str(value) for field, value in extract.items()
+             if field in config.EXTRACT_CITED_FIELDS and isinstance(value, str) and value]
+    if extract.get('closed'):
+        lines.append('No longer accepting applications')
+    if extract.get('is_agency'):
+        lines.append('is_agency: True')
+    return linkedin_page.JobPage(text='\n'.join([*lines, 'About the job', extract.get('description', '')]), source='dom')
+
+
 def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, list]:
     '''Everything around the repost check stubbed: extraction, triage, rating, saving, Telegram.'''
     notifications: list[str] = []
@@ -5588,7 +5596,7 @@ def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, li
     async def fake_estimate(candidate, extract, page_text='', stage_stats=None):
         return None
 
-    _stub_read_page(monkeypatch)
+    _stub_read_page(monkeypatch, page=_page_stating(extract))
     monkeypatch.setattr(agent, 'estimate_salary', fake_estimate)
     monkeypatch.setattr(agent, 'extract_job_page_openrouter', fake_extract)
     monkeypatch.setattr(agent, 'triage_job_fit', fake_triage)
@@ -5690,46 +5698,29 @@ def test_extract_text_surfaces_the_hiring_company():
     assert 'Hiring company: Automotive Martech Inc' in text
 
 
-def test_extract_schemas_stay_in_sync_across_both_providers():
-    """A field added to one extractor and not the other silently returns empty for that provider,
-    which looks identical to 'the posting did not say'."""
-    # The SDK @tool decorator keeps the raw schema on the wrapped function.
-    anthropic_schema = tools.submit_job_extract.input_schema['properties']
-    openrouter_schema = next(
-        t['function']['parameters']['properties']
-        for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
-        if t['function']['name'] == 'submit_job_extract'
-    )
-    assert set(anthropic_schema) == set(openrouter_schema), (
-        'extract schemas drifted: '
-        f'anthropic-only={sorted(set(anthropic_schema) - set(openrouter_schema))}, '
-        f'openrouter-only={sorted(set(openrouter_schema) - set(anthropic_schema))}'
+def test_extract_schemas_stay_in_sync_across_both_extractors():
+    """A field added to one extractor and not the other silently returns empty for that path,
+    which looks identical to 'the posting did not say'. Until 2026-10-19 the direct fallback
+    lacked is_agency/end_client; with the agentic extractor removed the two now match exactly."""
+    openrouter_schema = set(_openrouter_extract_properties())
+    direct_schema = set(agent.EXTRACT_OUTPUT_SCHEMA['properties'])
+    assert openrouter_schema == direct_schema, (
+        f'extract schemas drifted: openrouter-only={sorted(openrouter_schema - direct_schema)}, '
+        f'direct-only={sorted(direct_schema - openrouter_schema)}'
     )
     for field in ('is_agency', 'end_client', 'residency_scope'):
-        assert field in anthropic_schema and field in openrouter_schema
+        assert field in openrouter_schema
 
 
-# The direct fallback is a THIRD surface, and it drifted unnoticed: `is_agency`/`end_client` are
-# declared on both agentic extractors and on neither half of the deterministic path, so a posting
-# that falls through to it silently loses agency detection to a regex docs/requirements.md (Flag Agency Posting) measures at 1-in-10
-# against the extractor field's 15-in-16. Recorded rather than silently fixed — the point here is
-# that residency_scope must not join it.
-KNOWN_DIRECT_FALLBACK_GAPS = {'is_agency', 'end_client'}
-
-
-def test_direct_fallback_schema_matches_the_agentic_extractors():
-    anthropic_schema = set(tools.submit_job_extract.input_schema['properties'])
-    direct_schema = set(agent.EXTRACT_OUTPUT_SCHEMA['properties'])
-    assert anthropic_schema - direct_schema == KNOWN_DIRECT_FALLBACK_GAPS, (
-        'a new field reached the agentic extractors but not extract_job_page_direct — a posting '
-        'that falls through to the fallback would silently return empty for it'
-    )
-    assert not direct_schema - anthropic_schema
+def test_every_cited_extract_field_has_a_quote_property_on_both_extractors():
+    from agentic_job_search.config import EXTRACT_CITED_FIELDS
+    for properties in (agent.EXTRACT_OUTPUT_SCHEMA['properties'], _openrouter_extract_properties()):
+        for field in EXTRACT_CITED_FIELDS:
+            assert field in properties and f'{field}_quote' in properties, field
 
 
 def test_residency_scope_is_declared_optional_on_every_extractor():
     '''A required parameter the model cannot observe is fabrication pressure, not validation.'''
-    assert 'residency_scope' not in tools.submit_job_extract.input_schema['required']
     openrouter_tool = next(
         t for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
         if t['function']['name'] == 'submit_job_extract'
@@ -5740,15 +5731,7 @@ def test_residency_scope_is_declared_optional_on_every_extractor():
 
 def test_residency_scope_vocabulary_is_closed_and_identical_everywhere():
     expected = ['country_only', 'area_wide', '']
-    openrouter_tool = next(
-        t for t in extract_openrouter.OPENROUTER_EXTRACT_TOOLS
-        if t['function']['name'] == 'submit_job_extract'
-    )
-    for properties in (
-        tools.submit_job_extract.input_schema['properties'],
-        openrouter_tool['function']['parameters']['properties'],
-        agent.EXTRACT_OUTPUT_SCHEMA['properties'],
-    ):
+    for properties in (_openrouter_extract_properties(), agent.EXTRACT_OUTPUT_SCHEMA['properties']):
         assert properties['residency_scope']['enum'] == expected
     assert list(agent.RESIDENCY_SCOPES) == ['country_only', 'area_wide']
 
@@ -10525,7 +10508,7 @@ async def test_stage_2_estimates_pay_for_a_notified_job_with_no_salary(monkeypat
 
     await _run_stage2(_make_candidate(), {})
 
-    assert page_texts == ['Staff Engineer\nAbout the job\nBuild agents.'], 'the estimator reads the full page'
+    assert page_texts == [_page_stating(extract).text], 'the estimator reads the full page'
     assert len(notifications) == 1
     assert '💰 Not listed — model estimate: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000)' in notifications[0]
     assert '• No salary listed' in notifications[0]

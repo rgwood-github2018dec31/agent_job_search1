@@ -15,6 +15,7 @@ import time
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 from agentic_job_search.config import (
+    EXTRACT_CITED_FIELDS,
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
     LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
@@ -24,6 +25,7 @@ from agentic_job_search.config import (
     STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
 )
 from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
+from agentic_job_search.evidence import CITATION_INSTRUCTION, quote_properties, quotes_from
 from agentic_job_search.text_budget import snippet
 
 logger = logging.getLogger(__name__)
@@ -67,7 +69,8 @@ OPENROUTER_EXTRACT_TOOLS = [
                 'aggregator reposting on behalf of another company rather than the employer that would '
                 "actually hire, and pass end_client with that hiring company's name if the posting "
                 "names it (agencies usually keep it anonymous, e.g. 'our client, a leading fintech' — "
-                'leave end_client empty in that case).'
+                'leave end_client empty in that case). '
+                + CITATION_INSTRUCTION
             ),
             'parameters': {
                 'type': 'object',
@@ -101,8 +104,8 @@ OPENROUTER_EXTRACT_TOOLS = [
                         'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; "
                                        'empty when merely preferred or when equivalent experience is accepted',
                     },
-                    # Must stay in sync with submit_job_extract in tools_generic.py — a field added
-                    # to one extractor and not the other silently returns empty for that provider.
+                    # Must stay in sync with agent.EXTRACT_OUTPUT_SCHEMA — a field added to one
+                    # extractor and not the other silently returns empty for that path.
                     'is_agency': {
                         'type': 'boolean',
                         'description': (
@@ -115,6 +118,7 @@ OPENROUTER_EXTRACT_TOOLS = [
                         'type': 'string',
                         'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
                     },
+                    **quote_properties(EXTRACT_CITED_FIELDS),
                 },
                 'required': ['title', 'company', 'description'],
             },
@@ -142,6 +146,8 @@ def _extract_from_submit_args(args: dict) -> dict:
         # "judged not an agency" from "did not answer".
         'is_agency': args.get('is_agency'),
         'end_client': str(args.get('end_client') or '').strip(),
+        # Checked against the page by agent.verify_extract before any field is used.
+        'quotes': quotes_from(args, EXTRACT_CITED_FIELDS),
     }
 
 

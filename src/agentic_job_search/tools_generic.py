@@ -42,13 +42,11 @@ from agentic_job_search.config import (
     RAW_POSTINGS_RETENTION_DAYS,
     RECRUITER_REPOST_MAX_PRIORS,
     RECRUITER_REPOST_WINDOW_DAYS,
-    SALARY_FIELD_DESCRIPTION,
     SCRAPER_DATE_POSTED_LABEL,
     SCRAPER_DATE_POSTED_SECONDS,
     SCRAPER_EXPERIENCE_LABEL,
     SCRAPER_MAX_LISTINGS_PER_SEARCH,
     SECONDS_PER_MINUTE,
-    STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
     UI_BLOCK_SIGNATURES,
     UI_CHIP_CHOSEN_VALUES,
     UI_CONTRACT_ELEMENTS,
@@ -115,7 +113,6 @@ _applied_companies: dict[str, str] = {}  # company_name -> PDF filename
 _reference_job_pages: list[list[str]] = []
 # In-horizon applied-job records: filename, applied_date, company, job_title, is_agency, end_client
 _applied_jobs: list[dict] = []
-_job_extracts: list[dict] = []           # condensed page extracts captured from the Stage 2 extractor
 # Scraper funnel observability: counts every check_and_record_job outcome this run.
 _check_status_counts: dict[str, int] = {}  # status -> count (new/already_processed/already_applied/too_old/auth_required)
 # Per-listing audit trail: one record per check_and_record_job call, keyed by (site, job_id).
@@ -1922,34 +1919,6 @@ async def do_check_and_record_job(
     return _result('new')
 
 
-async def do_submit_job_extract(
-    title: str, company: str, description: str,
-    location: str | None = None, date_posted: str | None = None,
-    closed: bool = False, salary: str | None = None, sponsorship_note: str | None = None,
-    language_requirement: str | None = None, relocation: str | None = None,
-    residency_scope: str | None = None,
-    workplace_type: str | None = None, education_requirement: str | None = None,
-    is_agency: bool | None = None, end_client: str | None = None,
-    posting_language: str | None = None, stated_working_language: str | None = None,
-) -> dict:
-    _job_extracts.append({
-        'title': title, 'company': company, 'description': description,
-        'location': location or '', 'date_posted': date_posted or '',
-        'closed': closed, 'salary': salary or '', 'sponsorship_note': sponsorship_note or '',
-        'language_requirement': language_requirement or '', 'relocation': relocation or '',
-        'residency_scope': (residency_scope or '').strip().lower(),
-        'posting_language': (posting_language or '').strip().lower(),
-        'stated_working_language': (stated_working_language or '').strip().lower(),
-        'workplace_type': (workplace_type or '').strip().lower(),
-        'education_requirement': (education_requirement or '').strip().lower(),
-        # None (not False) when the extractor said nothing, so derive_agency_posting() can tell
-        # "the model judged this not an agency" from "the model did not answer".
-        'is_agency': is_agency,
-        'end_client': (end_client or '').strip(),
-    })
-    return {'content': [{'type': 'text', 'text': 'Extract submitted.'}]}
-
-
 async def do_queue_candidate(
     site: str, job_id: str, url: str, title: str, company: str,
     snippet: str, date_posted: str | None = None, query: str | None = None,
@@ -2156,110 +2125,6 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
         args['site'], args['job_id'], args['url'], args['title'],
         args['company'], args['snippet'], date_posted=args.get('date_posted'),
         query=args.get('query'),
-    )
-
-
-@tool(
-    'submit_job_extract',
-    "Submit the condensed extract of the job posting page you navigated to. "
-    "Include only information-dense content: requirements, responsibilities, stack, seniority — "
-    "strip navigation chrome, boilerplate, and similar-jobs lists. "
-    "Set closed=true if the page shows 'No longer accepting applications' or equivalent. "
-    "Pass date_posted exactly as shown (absolute or relative like '4 days ago'). "
-    "Pass sponsorship_note with any visa/work-authorization statement, verbatim, if present. "
-    "Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), comma-separated "
-    "lowercase, e.g. 'english, german'; omit if no language requirement is stated. "
-    "Pass posting_language with the language the SOURCE PAGE ITSELF IS WRITTEN IN, lowercase, e.g. "
-    "'english', 'french'. Judge the original page you read, NOT the condensed English text you are "
-    "writing here — you translate as you condense, so your own output says nothing about the "
-    "original. The original job title is usually the clearest tell (a title like 'Scientifique "
-    "principal des données en IA' means 'french'). Omit only if genuinely undeterminable. "
-    "Pass stated_working_language with the language the posting SAYS the team works in "
-    "('our working language is English'); omit it unless stated. "
-    "Pass relocation with the country/city if the posting requires relocating to or residing in a "
-    "specific place (e.g. 'must be based in Portugal'); omit for work-from-anywhere roles. "
-    "Pass residency_scope as 'country_only' if the posting requires LIVING IN the country it "
-    "is advertised in ('Remote within country', 'must be based in Germany', 'open only to "
-    "candidates residing in Poland'), or 'area_wide' if it offers a whole multi-country area "
-    "('remote anywhere in the EU', 'Work from Anywhere', 'any EMEA country'); omit it when the "
-    "posting does not say. This is where the HOLDER MUST LIVE, not where the job is "
-    "advertised \u2014 'Romania (Remote)' on its own says nothing here. "
-    "Pass workplace_type as exactly 'remote', 'hybrid', or 'onsite' when the page states the work "
-    "arrangement; omit only if the page genuinely does not say. Any mention of required days in "
-    "the office (e.g. '2-3 days onsite') is 'hybrid', not 'remote'. "
-    "Pass education_requirement as 'master' or 'phd' ONLY if the posting states an advanced degree "
-    "as a hard requirement (e.g. 'MSc in Computer Science required', 'PhD is a must'); omit it when "
-    "the degree is merely preferred, when equivalent experience is accepted (\"Master's or equivalent "
-    "practical experience\", 'MSc a plus', \"Bachelor's or Master's\"), or when only a Bachelor's is required. "
-    "Pass is_agency=true if the poster is a staffing firm, recruiting agency, or job aggregator "
-    "reposting on behalf of another company rather than the employer that would actually hire, and "
-    "pass end_client with that hiring company's name if the posting names it (agencies usually keep "
-    "it anonymous, e.g. 'our client, a leading fintech' — leave end_client empty in that case).",
-    {
-        'type': 'object',
-        'properties': {
-            'title': {'type': 'string'},
-            'company': {'type': 'string'},
-            'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
-            'location': {'type': 'string', 'description': 'Location including workplace type as shown, e.g. "Bucharest, Romania (Remote within country)"'},
-            'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
-            'date_posted': {'type': 'string'},
-            'closed': {'type': 'boolean'},
-            'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
-            'sponsorship_note': {'type': 'string'},
-            'language_requirement': {
-                'type': 'string',
-                'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'",
-            },
-            'posting_language': {
-                'type': 'string',
-                'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — "
-                               'judge the original page, not your condensed English output; '
-                               'the original title is the clearest tell',
-            },
-            'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
-            'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
-                                'description': "Whether the posting pins residence to the country it is anchored in "
-                                               "('country_only') or offers a whole multi-country area ('area_wide'); "
-                                               'empty when the posting does not say'},
-            'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
-            'education_requirement': {
-                'type': 'string',
-                'description': "'master' or 'phd' if an advanced degree is a HARD requirement; "
-                               'empty when merely preferred or when equivalent experience is accepted',
-            },
-            # Wording mirrors _extract_applied_job_metadata's is_recruiting_agency/end_client_name
-            # so the applied-job and scraped sides classify a poster identically.
-            'is_agency': {
-                'type': 'boolean',
-                'description': (
-                    'True if the poster is a staffing firm, recruiting agency, or job aggregator '
-                    'reposting on behalf of another company, rather than the employer that '
-                    'would actually hire.'
-                ),
-            },
-            'end_client': {
-                'type': 'string',
-                'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
-            },
-        },
-        'required': ['title', 'company', 'description'],
-    },
-)
-async def submit_job_extract(args: dict[str, Any]) -> dict:
-    return await do_submit_job_extract(
-        args['title'], args['company'], args['description'],
-        location=args.get('location'), date_posted=args.get('date_posted'),
-        closed=args.get('closed', False), salary=args.get('salary'),
-        sponsorship_note=args.get('sponsorship_note'),
-        language_requirement=args.get('language_requirement'), relocation=args.get('relocation'),
-        residency_scope=args.get('residency_scope'),
-        workplace_type=args.get('workplace_type'),
-        education_requirement=args.get('education_requirement'),
-        is_agency=args.get('is_agency'),
-        end_client=args.get('end_client'),
-        posting_language=args.get('posting_language'),
-        stated_working_language=args.get('stated_working_language'),
     )
 
 
@@ -2509,11 +2374,3 @@ def region_overlap_report() -> dict[str, float]:
                 worst = max(worst, len(id_sets[i] & id_sets[j]) / len(union))
         overlaps[query] = round(worst, REGION_OVERLAP_DECIMALS)
     return overlaps
-
-
-def make_evaluator_server():
-    '''MCP server for stage 2: captures the condensed page extract from the Haiku extractor.'''
-    return create_sdk_mcp_server(
-        name='job_evaluator', version='1.0.0',
-        tools=[submit_job_extract],
-    )

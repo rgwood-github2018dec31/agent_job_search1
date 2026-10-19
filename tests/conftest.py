@@ -11,6 +11,7 @@ import agentic_job_search.tools_generic as tools
 import pytest
 from agentic_job_search import (
     agent,
+    evidence,
     fx,
     linkedin_page,
     location,
@@ -234,6 +235,24 @@ _REAL_LOAD_PREFERENCES = preferences.load_preferences
 def real_load_preferences():
     '''The unpatched loader, for tests that exercise file loading itself.'''
     return _REAL_LOAD_PREFERENCES
+
+
+@pytest.fixture(autouse=True)
+def stub_evidence_relocation(monkeypatch):
+    '''Autouse: no unit test may reach the real evidence relocation model.
+
+    The stub is a faithful relocator for test fixtures that cite nothing: it points at the claimed
+    VALUE itself when the value is written in the source, and at nothing otherwise. So a fake
+    extract whose fields are on its fake page passes, and one whose fields are not is rejected,
+    exactly as production would after regex search. Tests about relocation override this.
+    '''
+    async def relocate_by_value(call_site, subject, claims, source, stage_stats):
+        found = {}
+        for i, claim in enumerate(claims):
+            value = str(claim.value)
+            found[str(i)] = value if evidence.find_quote(value, source) else ''
+        return found, 'conftest stub relocation'
+    monkeypatch.setattr(evidence, '_relocate', relocate_by_value)
 
 
 @pytest.fixture(autouse=True)

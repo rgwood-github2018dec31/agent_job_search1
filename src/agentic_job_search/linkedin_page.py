@@ -99,6 +99,20 @@ class JobPage:
     removed: list[dict] = field(default_factory=list)
 
 
+# The posting's age as LinkedIn prints it on a line of its own in the job header ("17 hours ago",
+# "Reposted 3 days ago"). Present in 309 of 310 captures from 2026-10-11..18, once each. Read by
+# code because a model asked for it once returned '2025-10-14 (posted 16-17 hours ago)' for a page
+# saying '17 hours ago', and the invented year hard-rated a fresh job as stale (2026-10-16).
+_POSTED_AGE_LINE_RE = re.compile(
+    r'^\s*(?:(?:re)?posted\s+)?\d+\s+(?:minute|hour|day|week|month)s?\s+ago\s*$', re.IGNORECASE | re.MULTILINE)
+
+
+def posted_age_from_page(page_text: str) -> str:
+    '''The header's "N units ago" line as written, or '' when the page has none.'''
+    found = _POSTED_AGE_LINE_RE.search(page_text or '')
+    return found.group(0).strip() if found else ''
+
+
 def norm(text: str | None) -> str:
     return re.sub(r'\s+', ' ', text or '').strip()
 

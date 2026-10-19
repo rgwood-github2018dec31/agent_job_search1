@@ -51,14 +51,14 @@ from utils_tools_n_agents_common.telegram_client import send_message as telegram
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search import endpoint_pin, fx, location, location_review, scrape_openrouter, system_sleep
+from agentic_job_search import endpoint_pin, evidence, fx, location, location_review, scrape_openrouter, system_sleep
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
     AUDIT_OPUS_SAMPLE_SIZE,
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
-    EXTRACT_FALLBACK_MAX_TURNS,
+    EXTRACT_CITED_FIELDS,
     FAILED_QUERIES_NAMED_MAX,
     JOB_STALE_AGE_DAYS,
     LISTING_ESTIMATE_HISTORY_RUNS,
@@ -123,8 +123,9 @@ from agentic_job_search.config import (
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
 )
+from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim, quote_properties, quotes_from
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
-from agentic_job_search.linkedin_page import JobPage, read_job_page, strip_saved_page_furniture
+from agentic_job_search.linkedin_page import JobPage, posted_age_from_page, read_job_page, strip_saved_page_furniture
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search.salary import (
     SALARY_KIND_ABSENT,
@@ -146,7 +147,6 @@ from agentic_job_search.tools_generic import (
     console,
     load_processed_jobs,
     log_run_cost,
-    make_evaluator_server,
     make_job_search_server,
     parse_posting_date,
 )
@@ -552,25 +552,6 @@ Spain", "relocation to Madrid"), give that location. Leave empty for work-from-a
 is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a
 plus", "Bachelor's or Master's"), or when only a Bachelor's is required.'''
 
-# The Anthropic agentic path (the non-default route) still browses for itself.
-EXTRACTOR_INSTRUCTIONS = '''You are a job page extractor. Navigate to the job URL provided and capture a condensed extract of the posting.
-
-Follow EXACTLY this sequence — you have a hard turn budget, and calling submit_job_extract is the only thing that counts as success:
-1. browser_navigate to the URL.
-2. browser_snapshot.
-3. If (and only if) the job description text is visibly cut off and a "… more" / "See more" button exists inside the description: click it, then
-browser_snapshot once more.
-4. Call submit_job_extract IMMEDIATELY with what you have. Do not scroll, do not take additional snapshots, do not search the page, do not run JavaScript, do
-not verify anything else. A partial description is acceptable — submitting something always beats running out of turns.
-
-If you have a title, company, and any description text, calling submit_job_extract is ALWAYS your next action. Never end a turn without having either taken
-your one snapshot or submitted the extract.
-
-''' + EXTRACT_FIELD_GUIDANCE + '''
-
-Do not rate the job. Do not browse other pages. Extract this one posting, submit it, then stop.
-'''
-
 # The default path: code has already read the page (linkedin_page.read_job_page), so the model
 # has the text and one tool, and no browser.
 PAGE_EXTRACTOR_INSTRUCTIONS = '''You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code — you
@@ -756,6 +737,12 @@ EXTRACT_OUTPUT_SCHEMA = {
                            "(e.g. 'MSc required', 'PhD is a must'); empty when merely preferred, "
                            "when equivalent experience is accepted, or when only a Bachelor's is required",
         },
+        # Same meaning as in extract_openrouter.OPENROUTER_EXTRACT_TOOLS. Until 2026-10-19 this
+        # schema lacked both, so a job extracted by the fallback silently lost its agency status.
+        'is_agency': {'type': 'boolean', 'description': 'True if the poster is a staffing firm, recruiting agency or '
+                                                        'aggregator posting on behalf of the employer that would hire'},
+        'end_client': {'type': 'string', 'description': 'The company that would actually hire, if the posting names one'},
+        **quote_properties(EXTRACT_CITED_FIELDS),
     },
     'required': ['title', 'company', 'description'],
 }
@@ -2317,68 +2304,6 @@ async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNar
     )
 
 
-async def extract_job_page(candidate: dict, playwright_mcp: dict, stage_stats: dict) -> dict | None:
-    '''Stage 2a: Haiku agentic session fetches the job page and submits a condensed extract.'''
-    options = ClaudeAgentOptions(
-        setting_sources=[],
-        strict_mcp_config=True,
-        skills=[],
-        tools=[],
-        system_prompt=EXTRACTOR_INSTRUCTIONS,
-        mcp_servers={
-            'playwright': playwright_mcp,
-            'job_evaluator': make_evaluator_server(),
-        },
-        allowed_tools=[
-            'mcp__playwright__browser_navigate',
-            'mcp__playwright__browser_snapshot',
-            'mcp__playwright__browser_click',
-            'mcp__job_evaluator__submit_job_extract',
-        ],
-        permission_mode='bypassPermissions',
-        cwd=str(PROJECT_DIR),
-        model=ANTHROPIC_MODEL_NAME_LOW,
-        max_turns=EXTRACT_FALLBACK_MAX_TURNS,
-    )
-    query = (
-        f"Extract this job posting:\n"
-        f"Company: {candidate['company']}\n"
-        f"Title: {candidate['title']}\n"
-        f"URL: {candidate['url']}\n"
-        f"Posted: {candidate['date_posted']}\n"
-        f"Snippet: {candidate['snippet']}"
-    )
-    extracts_before = len(tools_module._job_extracts)
-    session_tokens_in = 0
-    async with ClaudeSDKClient(options) as client:
-        await client.query(query)
-        async for msg in client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, ThinkingBlock):
-                        print_thinking(block.thinking)
-                    elif isinstance(block, TextBlock):
-                        log_agent_text('Stage 2a', block.text)
-            elif isinstance(msg, ResultMessage):
-                cost_delta = accumulate_stage_stats(stage_stats, msg)
-                print_result_stats(msg, cost_delta)
-                if msg.usage:
-                    session_tokens_in = (
-                        msg.usage.get('input_tokens', 0)
-                        + msg.usage.get('cache_read_input_tokens', 0)
-                        + msg.usage.get('cache_creation_input_tokens', 0)
-                    )
-    if len(tools_module._job_extracts) <= extracts_before:
-        logger.warning(f"Extract: {candidate['company']} — {candidate['title']}: no extract submitted")
-        return None
-    extract = tools_module._job_extracts[-1]
-    logger.info(
-        f"Extract: {candidate['company']} — {candidate['title']}: "
-        f"~{session_tokens_in} session input tokens → {len(extract['description'])} chars condensed"
-    )
-    return extract
-
-
 async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> JobPage | None:
     """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
     try:
@@ -2407,7 +2332,7 @@ async def extract_job_page_direct(
         f'Below is {what}. Condense it into a structured extract. '
         'Keep requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or '
         '"no longer accepting applications" statements. Strip navigation chrome, footers, similar-jobs '
-        'lists, and marketing boilerplate.\n\n'
+        f'lists, and marketing boilerplate. {CITATION_INSTRUCTION}\n\n'
         + page.text
     )
     options = ClaudeAgentOptions(
@@ -2448,6 +2373,10 @@ async def extract_job_page_direct(
         'residency_scope': (structured.get('residency_scope') or '').strip().lower(),
         'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
         'education_requirement': (structured.get('education_requirement') or '').strip().lower(),
+        'is_agency': structured.get('is_agency'),
+        'end_client': str(structured.get('end_client') or '').strip(),
+        'quotes': quotes_from(structured, EXTRACT_CITED_FIELDS),
+        'page_text': page.text,
     }
     logger.info(
         f"Extract fallback: job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
@@ -2766,36 +2695,67 @@ _SALARY_VS_TARGET_NOTE = {
 }
 
 
-def check_salary_provenance(candidate: dict, extract: dict) -> bool:
-    '''Warn when a reported salary figure is not in the page the extract was made from.
+def _rejected_extract_value(field: str, candidate: dict) -> Any:
+    '''What a field rejected as a hallucination becomes: absent, never a negative answer.
 
-    `submit_job_extract` is generative, so a figure it hands back is only as good as the page it
-    read — and until raw postings were retained there was nothing to check one against. This is
-    the first concrete piece of the provenance validation the Anti-fabrication requirement has
-    carried as designed-but-unimplemented. It reports; it never rejects, because a capture that
-    missed the compensation block is at least as likely as a model inventing a number.
-
-    Returns True when the figures check out or there was nothing to check against.
+    Title and company fall back to the listing card Stage 1b harvested in code, which is what
+    the job was queued under.
     '''
-    facts = extract.get('salary_facts') or {}
-    if not facts.get('text'):
-        return True
-    path = tools_module.raw_posting_path(candidate)
-    if not path.is_file():
-        return True
-    try:
-        raw_text = path.read_text(encoding='utf-8', errors='replace')
-    except OSError as ex:
-        logger.warning(f'Could not read the raw posting {path} to check the salary: {ex}')
-        return True
-    if salary_digits_are_in_the_source(facts['text'], raw_text):
-        return True
-    logger.warning(
-        f"Salary provenance: job {candidate.get('job_id')}: extracted salary {facts['text']!r} contains figures "
-        f'that do not appear in the retained page {path.name} — treat the figure as unverified.'
-    )
-    facts['source'] = 'unverified'
-    return False
+    if field in ('title', 'company'):
+        return candidate.get(field, '')
+    if field == 'closed':
+        return False
+    if field == 'is_agency':
+        return None
+    return ''
+
+
+async def verify_extract(candidate: dict, extract: dict, stage_stats: dict) -> dict[str, str]:
+    """Verify Source Reference for an extract: every cited field stands only on text found in the
+    page it was made from (`extract['page_text']`). Rejected fields are reset to absent in place.
+    Returns, and stores as `extract['evidence']`, field -> how it was grounded.
+
+    Two fields are read by code instead. The posting date comes from the page header's own
+    "N hours ago" line whenever the page has one: on 2026-10-16 the extractor returned
+    '2025-10-14 (posted 16-17 hours ago)' for a page saying '17 hours ago', and the invented year
+    hard-rated a fresh job as stale. A salary's AMOUNTS must also each appear in the page as
+    numbers (salary_digits_are_in_the_source), whatever its quote says: the page the extractor
+    read is retained word for word since 2026-09-24, so a figure absent from it was invented, and
+    a rejected salary now reads as absent instead of as an `unverified` figure.
+    """
+    page_text = extract.get('page_text') or ''
+    subject = f"job {candidate.get('job_id')} {candidate.get('company')}"
+    source_label = str(tools_module.raw_posting_path(candidate))
+    statuses: dict[str, str] = {}
+    posted = posted_age_from_page(page_text)
+    if posted:
+        if extract.get('date_posted') and extract['date_posted'] != posted:
+            logger.debug(f"Posted age: {subject}: page says {posted!r}, extractor said {extract['date_posted']!r}")
+        extract['date_posted'] = posted
+        statuses['date_posted'] = 'read_by_code'
+    quotes = extract.get('quotes') or {}
+    claims = [
+        Claim(field, extract.get(field), quotes.get(field, ''))
+        for field in EXTRACT_CITED_FIELDS
+        if field not in statuses
+        and (extract.get(field) is True or (isinstance(extract.get(field), str) and extract[field].strip()))
+    ]
+    verdicts = await evidence.verify_claims('extract', subject, claims, page_text, source_label, stage_stats)
+    for field, verdict in verdicts.items():
+        statuses[field] = verdict.status
+        if not verdict.accepted:
+            extract[field] = _rejected_extract_value(field, candidate)
+    salary_text = extract.get('salary') or ''
+    if salary_text and not salary_digits_are_in_the_source(salary_text, page_text):
+        evidence.count_rejection('extract', 'salary_figures')
+        logger.warning(
+            f'Hallucination rejected (extract, {subject}): salary {salary_text!r} states amounts that are '
+            f'not in {source_label} ({len(page_text)} chars) — treated as absent'
+        )
+        extract['salary'] = ''
+        statuses['salary'] = evidence.STATUS_REJECTED
+    extract['evidence'] = statuses
+    return statuses
 
 
 # Words the extractor wraps around a country when the requirement is the country itself ('Canada
@@ -4124,6 +4084,7 @@ async def evaluate_all_candidates(
                       f'evaluated, released for the next run',
         })
 
+    stage_stats.setdefault('evidence', new_stage_stats())
     logger.info(f'Stage 2: evaluating {len(candidates)} candidate(s)')
     stage_started = time.monotonic()
     cost_before = sum(s['cost'] for s in stage_stats.values())
@@ -4142,18 +4103,21 @@ async def evaluate_all_candidates(
         index += 1
         logger.debug(f"Evaluating: {candidate['company']} — {candidate['title']}")
         try:
-            page: JobPage | None = None
-            if route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
-                # Read once, in code; both extractors below work from the same text.
-                page = await read_page(candidate, playwright_mcp['url'], stage_stats['extraction'])
-                extract = (await extract_job_page_openrouter(
-                    candidate, page.text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS
-                ) if page is not None else None)
-            else:
-                extract = await extract_job_page(candidate, playwright_mcp, stage_stats['extraction'])
+            # Read once, in code; both extractors below work from the same text, and every field
+            # they return is checked against it (verify_extract). The Anthropic agentic extractor,
+            # which browsed for itself and kept no text to check against, was removed 2026-10-19.
+            page = await read_page(candidate, playwright_mcp['url'], stage_stats['extraction'])
+            extract = None
+            if page is not None and route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
+                extract = await extract_job_page_openrouter(
+                    candidate, page.text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS)
+                if extract is not None:
+                    extract['page_text'] = page.text
             if extract is None:
                 extract = await extract_job_page_direct(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)
+            if extract is not None:
+                await verify_extract(candidate, extract, stage_stats['evidence'])
             if extract is None and browser is not None and await browser.confirm_dead():
                 index -= 1   # the browser, not the page, failed: retry this job after the restart
                 continue
@@ -4189,7 +4153,6 @@ async def evaluate_all_candidates(
             # once ever, cached) so the sync consumers -- the warning, the notification line, the
             # extract text -- all read ONE reading instead of each deriving its own.
             extract['salary_facts'] = await resolve_salary(extract, stage_stats['salary'])
-            check_salary_provenance(candidate, extract)
             extract_text = format_extract_text(candidate, extract)
             # A location classified just now (not from the cache) is shown here rather than on a
             # line of its own; salary.py's classified line is likewise DEBUG, since `->kind=` and
@@ -4483,6 +4446,7 @@ async def audit_unsurfaced_with_opus(
                 if extract is None:
                     logger.warning(f'Opus audit: extract failed for {record["company"]} — {record["title"]}')
                     continue
+                await verify_extract(candidate, extract, stage_stats.setdefault('evidence', new_stage_stats()))
                 result = await _rate_with_opus(evaluator_prompt, format_extract_text(candidate, extract), stage_stats['rating'])
             except Exception as ex:
                 logger.warning(f'Opus audit failed for {record["company"]} — {record["title"]}: {ex}')
@@ -4910,7 +4874,6 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         scrape_openrouter.min_bits_for(MODEL_NAME_SCRAPER)
     tools_module._candidates = []
     tools_module._candidates_per_query = {}
-    tools_module._job_extracts = []
     tools_module._check_status_counts = {}
     tools_module._listing_records = {}
     tools_module._queries_searched = {}
@@ -4950,6 +4913,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         'salary': new_stage_stats(),
         # One call per notified job that states no salary; $0.0000 on a run with none.
         'salary_estimate': new_stage_stats(),
+        # Relocating citations regex search could not find (evidence.py); $0.0000 when every
+        # model quoted its source faithfully.
+        'evidence': new_stage_stats(),
     }
     jobs_before = set(RUN_DIR.glob('saved_jobs-*/job_posting-*.md'))
 
