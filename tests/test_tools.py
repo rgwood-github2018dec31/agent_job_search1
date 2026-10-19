@@ -6657,6 +6657,16 @@ def test_area_words_are_matched_case_insensitively_unlike_place_names():
     assert not location.location_token_matches('Nice', 'NICE, FRANCE')
 
 
+@pytest.mark.parametrize('sentence', [
+    'take ownership of solutions that must work in the field – not just in theory',
+    'You must work in a team of five engineers',
+])
+def test_must_work_in_a_non_place_is_not_a_residency_pin(sentence):
+    '''2026-10-18: "must work in the field" pinned two DACH postings to their country.'''
+    extract = _make_extract(location='Germany (Remote)', description=f'{_NEUTRAL_DESCRIPTION}\n{sentence}')
+    assert agent.derive_residency_scope(extract) == ''
+
+
 def test_derive_residency_scope_country_only_beats_area_wide_on_one_posting():
     """'Romania (Remote) — role is remote anywhere in the EU' with an explicit in-country clause.
 

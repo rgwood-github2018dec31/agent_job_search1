@@ -8,8 +8,8 @@ rejections. A field rejected as "absent" can let a job through a gate it should 
 (a rejected `language_requirement`), so the rate of rejections per field is the number to
 watch when the extractor model, its prompt, or the matcher changes. This measures it on real pages.
 
-It also compares each derive_* regex fallback on the raw page against the same regex on the
-model's condensed description, which is what they read before 2026-10-19.
+It also reports each derive_* regex fallback that would change if it read the raw page instead
+of the model's condensed description (it reads the description; see agent.regex_source_text).
 
 Usage:
     uv run python scripts/replay_evidence.py                       # newest capture day, 20 pages
@@ -83,10 +83,12 @@ async def replay_one(path: Path) -> dict:
     if extract is None:
         return {'path': path, 'candidate': candidate, 'failed': True}
     before = dict(extract)
-    derived_from_description = {name: fn(dict(before, page_text='')) for name, fn in DERIVERS.items()}
+    derived_from_description = {name: fn(dict(before)) for name, fn in DERIVERS.items()}
     extract['page_text'] = page_text
     statuses = await verify_extract(candidate, extract, stats)
-    derived_from_page = {name: fn(extract) for name, fn in DERIVERS.items()}
+    # What the regex fallbacks would say if they read the page rather than the description (they
+    # do not: see agent.regex_source_text), kept as the measurement behind that choice.
+    derived_from_page = {name: fn(dict(extract, description=page_text)) for name, fn in DERIVERS.items()}
     return {'path': path, 'candidate': candidate, 'failed': False, 'before': before, 'after': extract,
             'statuses': statuses, 'derived_from_description': derived_from_description,
             'derived_from_page': derived_from_page, 'cost': stats['cost']}

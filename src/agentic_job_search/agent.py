@@ -2490,11 +2490,16 @@ _AREA_WIDE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Objects of "must work in …" that are not places. Since 2026-10-19 the regex reads the raw page,
+# not the condensed description, and "solutions that must work in the field" (2026-10-18, two
+# DACH postings) read as a residency pin.
+_NOT_A_PLACE = r'(?!(?:the\s+|an?\s+)?(?:field|team|teams|practice|production)\b)'
+
 _COUNTRY_ONLY_RE = re.compile(
     r'\bremote\s+(?:only\s+)?(?:(?:with)?in|across|throughout)\s+(?:the\s+)?' + _NOT_AREA
     + r'(?:country|[a-zÀ-ɏ]+)\b'
     r'|\bmust\s+(?:be\s+)?(?:based|located|resident|reside|residing|live|living|work|working)'
-    r'(?:\s+\w+){0,2}?\s+(?:in|from|within)\s+' + _NOT_AREA + r'(?:the\s+|an?\s+)?[a-zÀ-ɏ]'
+    r'(?:\s+\w+){0,2}?\s+(?:in|from|within)\s+' + _NOT_AREA + _NOT_A_PLACE + r'(?:the\s+|an?\s+)?[a-zÀ-ɏ]'
     r'|\b(?:open\s+)?only\s+to\s+candidates\s+(?:residing|located|based)\s+in\s+'
     r'(?:the\s+|an?\s+)?' + _NOT_AREA + r'[a-zÀ-ɏ]'
     r'|\b(?:based|located|residing|resident)\s+in\s+' + _NOT_AREA + r'[a-zÀ-ɏ]+\s+only\b'
@@ -2508,13 +2513,16 @@ RESIDENCY_SCOPES = ('country_only', 'area_wide')
 
 
 def regex_source_text(extract: dict) -> str:
-    """The text a derive_* regex fallback reads: the page the extract was made from.
+    """The text a derive_* regex fallback reads: the condensed `description`, NOT the raw page.
 
-    Until 2026-10-19 these read the model's condensed `description`, so a regex 'confirming' a
-    field was reading the same model's paraphrase, not independent evidence. The condensed text
-    is used only when no page was kept (an extract built outside Stage 2, e.g. in a test).
+    Reading the raw page was tried on 2026-10-19 and measured over the 308 retained postings that
+    have a saved job: it changed a derive_* result on 56, and moved residency_scope from
+    `country_only` to `area_wide` on about a dozen. That is the direction that silently switches
+    the geographic gate off. The raw page carries company blurbs ("we work across Europe") that
+    the condensation drops. Kept on the description until the patterns are scoped to the job's own
+    sections; see Known open issues.
     """
-    return str(extract.get('page_text') or extract.get('description') or '')
+    return str(extract.get('description') or '')
 
 
 def derive_residency_scope(extract: dict) -> str:

@@ -7,7 +7,6 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-
 from agentic_job_search import job_audit, job_trace
 from agentic_job_search import tools_generic as tools
 
