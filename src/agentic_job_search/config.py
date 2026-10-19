@@ -401,9 +401,12 @@ MODEL_NAME_EXTRACTOR = MODEL_NAME_SINGLE_TURN
 # intelligence tier; called only for a section signature never seen before, then cached for good.
 MODEL_NAME_PAGE_SECTIONS = MODEL_NAME_SINGLE_TURN
 # Stage 1b scraping is the one place DeepSeek wins (implicit caching, no cache-write fee;
-# measured 9.3x cheaper than Haiku on one live search — $0.0283 vs $0.4330 — because
+# measured 9.3x cheaper than Haiku 4.5 on one live search — $0.0283 vs $0.4330 — because
 # OPENROUTER_MODEL_NAME_SCRAPER caches implicitly at ~88% and cache writes were 42% of
-# the Haiku bill). Do NOT repoint it at the intelligence default: glm-5.2 measured
+# the Haiku bill). 2026-10-19: replaying 26 DeepSeek-era runs' token counts at Haiku 5.5 prices
+# ($0.10/$0.50 per M, 5x above 100K-token prompts) gives $0.38-1.90 a run vs $0.34 actual
+# (typical run ~$0.14), so DeepSeek still wins on a typical run; Haiku 5.5 only beats the bad-endpoint
+# outliers. Do NOT repoint it at the intelligence default: glm-5.2 measured
 # $0.1932/M cache-read (~2x Haiku's rate, costing MORE than what it replaces), as did
 # deepseek-v4-pro and qwen3.8-max. The win is specific to the flash tier. Pointing it at
 # an ANTHROPIC_MODEL_NAME_* const instead routes Stage 1b through the original
@@ -434,9 +437,11 @@ SCRAPER_PROVIDER_MAX_SWITCHES = 4
 SCRAPER_VERBOSE_MIN_ITERATIONS = 8
 SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION = 800
 # Spend ceiling for the Anthropic scraper fallback, per run. The fallback bills Haiku prices on the
-# same ~13M-token scrape the OpenRouter path runs for cents: on 2026-09-28 it cost ~$4.96 of a $5.30
-# run. Past this, the remaining queries are skipped and reported (a `scrape_budget` alert) — a thinner
-# run is preferable to a silent multi-dollar one. Roughly two queries' worth at the 09-28 rate.
+# same ~13M-token scrape the OpenRouter path runs for cents: on 2026-09-28, at Haiku 4.5 prices, it
+# cost ~$4.96 of a $5.30 run (roughly two queries' worth at the cap). Haiku 5.5 would replay that
+# run at ~$0.57-2.84 (2026-10-19), so the cap now covers more of a run; kept as the guard against a
+# silent multi-dollar one. Past this, the remaining queries are skipped and reported (a
+# `scrape_budget` alert) — a thinner run is preferable.
 SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD = 1.50
 # Lowest bits-per-weight an endpoint may serve the scraper model at. The scraper used to accept only
 # the tool server's DEFAULT precision; when that default became bf16 (~2026-09-27) exactly one
@@ -580,8 +585,9 @@ FX_RATES_STALE_MAX_DAYS = 7
 # PDF categorizer read only the first 3000 raw chars, whitespace included, and said nothing).
 # Deterministic checks (regex gates) are never truncated at all: scanning the full text is free.
 #
-# Model-derived cap for PDF text sent to ANTHROPIC_MODEL_NAME_LOW (claude-haiku-4-5, 200K-token
-# context window per https://platform.claude.com/docs/en/about-claude/models/overview). The
+# Model-derived cap for PDF text sent to ANTHROPIC_MODEL_NAME_LOW. Kept at the 200K-token window of
+# the previous Haiku (4.5) on purpose, though Haiku 5.5's window is 1M tokens (2026-10-19): its
+# price rises 5x per token once a prompt passes 100K tokens, and no PDF needs more. The
 # chars-per-token figure is a deliberately low estimate for English prose, so the char cap errs
 # toward fitting; the share leaves the rest of the window for the prompt scaffolding and output.
 ANTHROPIC_MODEL_LOW_CONTEXT_TOKENS = 200_000
