@@ -10,6 +10,7 @@ import logging
 
 import pytest
 import yaml
+from agentic_job_search import evidence
 from agentic_job_search import linkedin_page as lp
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.config import (
@@ -214,14 +215,29 @@ def test_signatures_ignore_numbers_so_one_verdict_covers_every_job():
     assert lp.block_signature(soup.div) == 'N people viewed this job'
 
 
-def _classifier(monkeypatch, decisions: dict, calls: list):
+def _classifier(monkeypatch, decisions: dict, calls: list, quote=lambda sig: sig):
     async def fake_chat(prompt, model=None, **kwargs):
         calls.append(prompt)
         numbered = [line.split('signature: ', 1)[1] for line in prompt.splitlines() if 'signature: ' in line]
-        verdicts = [{'block': i, 'remove': decisions[sig], 'reason': 'test'} for i, sig in enumerate(numbered, 1)]
+        verdicts = [{'block': i, 'remove': decisions[sig], 'reason': 'test', 'quote': quote(sig)}
+                    for i, sig in enumerate(numbered, 1)]
         return chat_reply(json.dumps({'decisions': verdicts}), 0.001)
 
     monkeypatch.setattr(lp, 'chat_openrouter', fake_chat)
+
+
+async def test_a_removal_whose_quote_is_not_in_the_block_is_kept(monkeypatch):
+    '''Verify Source Reference: "this is clutter" stands only on words of the block itself.'''
+    async def finds_nothing(call_site, subject, claims, source, stage_stats):
+        return {}, 'fake relocation reply'
+
+    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
+    _classifier(monkeypatch, {HARMLESS: True, PAY_SECTION: False, 'Commitments': False}, [],
+                quote=lambda sig: 'Try Premium for free')
+    soup = _cleaned()
+    removed = await lp.decide_unknown_blocks(soup, _candidate(), {'cost': 0.0})
+    assert removed == []
+    assert lp.load_section_decisions()[HARMLESS]['decision'] == 'keep'
 
 
 async def test_new_sections_are_judged_once_then_cached(monkeypatch, caplog):

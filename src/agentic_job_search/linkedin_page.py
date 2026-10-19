@@ -37,7 +37,7 @@ import yaml
 from bs4 import BeautifulSoup, Tag
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
-from agentic_job_search import tools_generic
+from agentic_job_search import evidence, tools_generic
 from agentic_job_search.config import (
     EXTRACT_PAGE_RENDER_WAIT_SECONDS,
     EXTRACTOR_SNAPSHOT_MAX_CHARS,
@@ -447,8 +447,11 @@ def _classify_prompt(candidate: dict, samples: list[tuple[str, str]]) -> str:
         f'remove=false for anything about this job, its pay, location, work arrangement, '
         f'requirements, applicants or employer — and whenever you are unsure.\n\n'
         f'{listed}\n\n'
+        f'For every remove=true, "quote" must copy the words of that block that show what it is '
+        f'(e.g. "Try Premium for free"); code looks the quote up in the block and keeps any block '
+        f'whose quote it cannot find.\n\n'
         f'Respond with ONLY a JSON object: {{"decisions": [{{"block": <number>, "remove": <true|false>, '
-        f'"reason": "<a few words>"}}]}}'
+        f'"reason": "<a few words>", "quote": "<words copied from the block, for remove=true>"}}]}}'
     )
 
 
@@ -494,6 +497,15 @@ async def decide_unknown_blocks(soup: BeautifulSoup, candidate: dict, stage_stat
                 logger.warning(f'Ignoring a malformed page-section verdict {verdict!r}: {type(ex).__name__}: {ex}')
                 continue
             decision = 'remove' if verdict.get('remove') is True else 'keep'
+            if decision == 'remove':
+                # Verify Source Reference: "this block is clutter" stands only on words of the block.
+                sample = norm(by_signature[sig][0].get_text(' '))
+                grounded = (await evidence.verify_claims(
+                    'page_section', f"job {candidate.get('job_id')} section {sig!r}",
+                    [evidence.Claim('remove', True, str(verdict.get('quote') or ''))], sample,
+                    f'page section {sig!r}', stage_stats))['remove']
+                if not grounded.accepted:
+                    decision = 'keep'
             decisions[sig] = {
                 'decision': decision, 'reason': str(verdict.get('reason') or ''),
                 'decided_by': MODEL_NAME_PAGE_SECTIONS, 'decided': date.today().isoformat(),

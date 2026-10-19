@@ -30,7 +30,7 @@ from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 
 import agentic_job_search.preferences as preferences
-from agentic_job_search import location_review
+from agentic_job_search import evidence, location_review
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
@@ -373,7 +373,7 @@ async def company_matches_applied(candidate: str) -> str | None:
             structured = await _company_matches_openrouter(candidate, companies_list)
             if not structured.get('matches'):
                 return None
-            return _applied_companies.get(structured.get('matched_company_name', ''), '<unknown PDF>')
+            return _applied_match_from_list(candidate, structured.get('matched_company_name', ''))
         except Exception as ex:
             logger.warning(f'company_matches_applied via OpenRouter failed for {candidate!r}, falling back to '
                            f'Anthropic: {unwrap_exception(ex)}')
@@ -411,8 +411,22 @@ async def company_matches_applied(candidate: str) -> str | None:
                 structured = msg.structured_output
     if not structured or not structured.get('matches'):
         return None
-    matched = structured.get('matched_company_name', '')
-    return _applied_companies.get(matched, '<unknown PDF>')
+    return _applied_match_from_list(candidate, structured.get('matched_company_name', ''))
+
+
+def _applied_match_from_list(candidate: str, matched: str) -> str | None:
+    '''The applied-job PDF for the company a model named, or None when it named no listed company.
+
+    Verify Source Reference for the fuzzy match: the list shown to the model is its whole input,
+    so a name not on it is a hallucination. Until 2026-10-19 such a name still counted as a match
+    ('<unknown PDF>') and auto-rejected the job as already applied.
+    '''
+    if matched in _applied_companies:
+        return _applied_companies[matched]
+    evidence.count_rejection('applied_company_match', 'matched_company_name')
+    logger.warning(f'Hallucination rejected (applied_company_match, {candidate!r}): matched_company_name '
+                   f'{matched!r} is not one of the {len(_applied_companies)} applied companies shown — no match')
+    return None
 
 
 def _blacklist_confirm_prompt(company: str, entry_name: str, reason: str, context: str) -> str:
@@ -424,7 +438,10 @@ def _blacklist_confirm_prompt(company: str, entry_name: str, reason: str, contex
         'Is the organization in this posting the SAME organization the user blacklisted, or a '
         'different one that happens to share the name?\n\n'
         f'Posting context:\n{context or "(none available)"}\n\n'
-        'Respond with ONLY a JSON object: {"same_organization": <true|false>}'
+        'Respond with ONLY a JSON object: {"same_organization": <true|false>, '
+        '"quote": "<the words of the posting context that show it, copied as written>"}\n'
+        'Code looks the quote up in the posting context; an answer whose quote it cannot find is '
+        'discarded and the name match alone decides.'
     )
 
 
@@ -495,6 +512,7 @@ async def company_blacklist_reason(company: str, context: str = '', description:
                             'type': 'boolean',
                             'description': 'True if the posting is from the blacklisted organization',
                         },
+                        'quote': {'type': 'string', 'description': 'Words of the posting context that show it'},
                     },
                     'required': ['same_organization'],
                 },
@@ -529,6 +547,16 @@ async def company_blacklist_reason(company: str, context: str = '', description:
             f'Blacklist confirmation for {candidate!r} has no boolean same_organization '
             f'({structured!r}) — rejecting on the exact name match alone.'
         )
+        return label
+    # Verify Source Reference: the verdict stands only on words of the posting context. One that
+    # cannot be grounded is no verdict at all, and the exact name match decides, as on a failure.
+    grounded = (await evidence.verify_claims(
+        'blacklist_confirm', repr(candidate), [evidence.Claim('same_organization', same_organization,
+                                                              str(structured.get('quote') or ''))],
+        f'{candidate}\n{context}', 'posting context'))['same_organization']
+    if not grounded.accepted:
+        logger.warning(f'Blacklist confirmation for {candidate!r} cited nothing found in the posting — '
+                       f'rejecting on the exact name match alone.')
         return label
     if not same_organization:
         logger.info(

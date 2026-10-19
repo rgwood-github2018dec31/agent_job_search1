@@ -685,6 +685,14 @@ async def test_company_matches_applied_returns_filename_on_yes(monkeypatch):
     assert result == 'shopify_jd.pdf'
 
 
+async def test_company_matches_applied_rejects_a_company_not_on_the_list(monkeypatch):
+    '''Verify Source Reference: a matched name the model was never shown is a hallucination, not
+    an "already applied" — until 2026-10-19 it auto-rejected the job as '<unknown PDF>'.'''
+    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
+    _make_sdk_mock(monkeypatch, {'matches': True, 'matched_company_name': 'Shopify Payments Ltd'})
+    assert await tools.company_matches_applied('Shopify Payments') is None
+
+
 async def test_company_matches_applied_returns_none_on_no(monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
     _make_sdk_mock(monkeypatch, {'matches': False, 'matched_company_name': ''})
@@ -7469,13 +7477,17 @@ def _no_llm(monkeypatch):
     monkeypatch.setattr(tools, 'sdk_query', boom_sdk)
 
 
-def _confirm_llm(monkeypatch, same_organization: bool):
-    '''Patch both confirmation providers to answer the same way.'''
+def _confirm_llm(monkeypatch, same_organization: bool, quote: str = 'Blocked Corp'):
+    '''Patch both confirmation providers to answer the same way, citing `quote`.'''
     async def fake_openrouter(prompt):
-        return {'same_organization': same_organization}
+        return {'same_organization': same_organization, 'quote': quote}
 
     monkeypatch.setattr(tools, '_blacklist_confirms_openrouter', fake_openrouter)
-    _make_sdk_mock(monkeypatch, {'same_organization': same_organization})
+    _make_sdk_mock(monkeypatch, {'same_organization': same_organization, 'quote': quote})
+
+
+# Posting context that sets a same-named company apart from the blacklisted one.
+COLLISION_CONTEXT = 'Company: Blocked Corp\nAbout: Blocked Corp Health runs community clinics.'
 
 
 async def test_blacklist_exact_match_confirmed_returns_reason(monkeypatch):
@@ -7485,8 +7497,15 @@ async def test_blacklist_exact_match_confirmed_returns_reason(monkeypatch):
 
 async def test_blacklist_name_collision_does_not_reject(monkeypatch):
     '''Same name, different organization — the whole point of the confirmation call.'''
-    _confirm_llm(monkeypatch, False)
-    assert await tools.company_blacklist_reason('Blocked Corp') is None
+    _confirm_llm(monkeypatch, False, quote='Blocked Corp Health runs community clinics')
+    assert await tools.company_blacklist_reason('Blocked Corp', context=COLLISION_CONTEXT) is None
+
+
+async def test_a_collision_verdict_that_cites_nothing_on_the_posting_still_rejects(monkeypatch):
+    '''Verify Source Reference: "a different organization" readmits a blacklisted name only when
+    the posting says so. An ungrounded verdict is no verdict, and the name match stands.'''
+    _confirm_llm(monkeypatch, False, quote='Blocked Corp is a fintech in Lisbon')
+    assert await tools.company_blacklist_reason('Blocked Corp', context=COLLISION_CONTEXT) == 'test entry'
 
 
 async def test_blacklist_match_is_case_sensitive(monkeypatch):
