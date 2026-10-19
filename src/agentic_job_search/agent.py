@@ -747,6 +747,16 @@ EXTRACT_OUTPUT_SCHEMA = {
     'required': ['title', 'company', 'description'],
 }
 
+# A rater's pro or warning: the phrase, and the words of the posting it stands on (Verify Source Reference).
+_CITED_ITEM_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'text': {'type': 'string', 'description': 'Short phrase'},
+        'quote': {'type': 'string', 'description': 'Words of the job posting that show it, copied as written'},
+    },
+    'required': ['text', 'quote'],
+}
+
 RATING_OUTPUT_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -756,12 +766,12 @@ RATING_OUTPUT_SCHEMA = {
         'reasoning': {'type': 'string', 'description': '2-3 sentences on the fit'},
         'summary': {'type': 'string', 'description': 'Short label for the job, used in the saved filename'},
         'pros': {
-            'type': 'array', 'items': {'type': 'string'},
-            'description': '2-4 short bullet phrases naming concrete strengths of the role',
+            'type': 'array', 'items': _CITED_ITEM_SCHEMA,
+            'description': '2-4 short bullet phrases naming concrete strengths of the role, each citing the posting',
         },
         'warnings': {
-            'type': 'array', 'items': {'type': 'string'},
-            'description': '0-4 short bullet phrases naming anything conflicting with the requirements',
+            'type': 'array', 'items': _CITED_ITEM_SCHEMA,
+            'description': '0-4 short bullet phrases naming anything conflicting with the requirements, each citing the posting',
         },
     },
     'required': ['rating', 'company', 'title', 'reasoning', 'summary', 'pros', 'warnings'],
@@ -3860,6 +3870,48 @@ def format_job_notification(
     return '\n\n'.join(sections)
 
 
+def _cited_items(items: object) -> list[tuple[str, str]]:
+    """(text, quote) for each pro or warning a rater returned; a bare string has no quote."""
+    pairs = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict):
+            pairs.append((str(item.get('text') or '').strip(), str(item.get('quote') or '').strip()))
+        else:
+            pairs.append((str(item).strip(), ''))
+    return [(text, quote) for text, quote in pairs if text]
+
+
+async def verified_rating_items(candidate: dict, kind: str, items: object, extract_text: str,
+                                stage_stats: dict) -> list[str]:
+    """The rater's pros or warnings that stand on words of the posting it was shown.
+
+    Verify Source Reference for the rater. The rating itself is a judgment and stays; each pro and
+    warning is a claim about the posting and reaches the user only when its quote is found in the
+    rater's input. A dropped one is logged with its quote by evidence.verify_claims.
+    """
+    pairs = _cited_items(items)
+    if not pairs:
+        return []
+    claims = [Claim(f'{kind}:{i}', text, quote) for i, (text, quote) in enumerate(pairs)]
+    verdicts = await evidence.verify_claims(
+        f'rating_{kind}', f"job {candidate.get('job_id')} {candidate.get('company')}", claims,
+        extract_text, 'the extract text shown to the rater', stage_stats)
+    return [text for i, (text, _quote) in enumerate(pairs) if verdicts[f'{kind}:{i}'].accepted]
+
+
+async def triage_is_grounded(candidate: dict, triage_result: dict, extract_text: str, stage_stats: dict) -> bool:
+    """Whether a triage score that would reject the job stands on words of the posting.
+
+    Checked only for a rejecting score, the one that gates anything: a low score whose reason cites
+    nothing found in the posting is treated like a triage outage, and the job goes to the rater.
+    """
+    claim = Claim('score', triage_result['score'], triage_result.get('quote') or '')
+    verdicts = await evidence.verify_claims(
+        'triage', f"job {candidate.get('job_id')} {candidate.get('company')}", [claim], extract_text,
+        'the extract text shown to triage', stage_stats)
+    return verdicts['score'].accepted
+
+
 async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_stats: dict,
                                model: str = ANTHROPIC_MODEL_NAME_MEDIUM) -> dict:
     options = ClaudeAgentOptions(
@@ -4229,6 +4281,9 @@ async def evaluate_all_candidates(
             triage_result = None
             if TRIAGE_ENABLED and triage_enabled:
                 triage_result = await triage_job_fit(extract_text, profile_block)
+                if triage_rejects(triage_result) and not await triage_is_grounded(
+                        candidate, triage_result, extract_text, stage_stats['evidence']):
+                    triage_result = None   # an ungrounded score gates nothing: fail open, as on an outage
                 if triage_rejects(triage_result):
                     bump('triaged_out')
                     logger.info(
@@ -4267,7 +4322,8 @@ async def evaluate_all_candidates(
             rated_by = result.get('rated_by') or MODEL_NAME_RATING
             if rated_by != MODEL_NAME_RATING:
                 bump('rating_fallback')
-            pros = [str(p) for p in (result.get('pros') or [])]
+            pros = await verified_rating_items(candidate, 'pros', result.get('pros'), extract_text,
+                                               stage_stats['evidence'])
             deterministic = build_deterministic_warnings(candidate, extract)
 
             # A recruiter re-advertising ONE role under a new job id defeats (site, job_id) dedup,
@@ -4292,7 +4348,8 @@ async def evaluate_all_candidates(
 
             warnings = merge_warnings(
                 deterministic,
-                [str(w) for w in (result.get('warnings') or [])],
+                await verified_rating_items(candidate, 'warnings', result.get('warnings'), extract_text,
+                                            stage_stats['evidence']),
                 salary_on_target=salary_meets_target(extract) is True,
             )
             # What the 💰 line adds to the posting's own figure. Only for a job at the
@@ -4312,7 +4369,7 @@ async def evaluate_all_candidates(
                     )
             pay_lines = format_pay_lines(extract)
             content = (
-                f"# {result['title']} at {result['company']} — rating {rating}/5\n\n"
+                f"# {extract['title']} at {extract['company']} — rating {rating}/5\n\n"
                 + (f"⚠ rating capped from {result['rating']}: {cap_reason}\n\n" if cap_reason else '')
                 + (_bullet_block('## Good', pros) + '\n\n' if pros else '')
                 + (_bullet_block('## Warnings', warnings) + '\n\n' if warnings else '')

@@ -378,7 +378,7 @@ TRIAGE_INSTRUCTIONS = '''You are a fast job-fit triage filter. Score how well th
 
 Be conservative: when unsure, score HIGHER so a stronger model takes a closer look. Only score 1-2 when the mismatch is obvious.
 
-Respond with ONLY a JSON object: {"score": <1-5>, "reason": "<one sentence>"}'''
+Respond with ONLY a JSON object: {"score": <1-5>, "reason": "<one sentence>", "quote": "<words of the job posting that support the score, copied as written>"}'''
 
 
 async def triage_job_fit(job_text: str, profile_block: str) -> dict | None:
@@ -394,7 +394,7 @@ async def triage_job_fit(job_text: str, profile_block: str) -> dict | None:
             f'Triage unavailable, failing open (job goes to full rating): {unwrap_exception(ex)}'
         )
         return None
-    return {'score': score, 'reason': str(result.get('reason', ''))}
+    return {'score': score, 'reason': str(result.get('reason', '')), 'quote': str(result.get('quote') or '')}
 
 
 def triage_rejects(triage_result: dict | None) -> bool:
@@ -405,8 +405,11 @@ RATING_JSON_INSTRUCTIONS = (
     'Respond with ONLY a JSON object: '
     '{"rating": <1-5>, "company": "<hiring company>", "title": "<job title>", '
     '"reasoning": "<2-3 sentences on the fit>", "summary": "<short snake_case-friendly label for the job>", '
-    '"pros": ["<short phrase naming a concrete strength>", ...], '
-    '"warnings": ["<short phrase naming anything conflicting with the requirements>", ...]}'
+    '"pros": [{"text": "<short phrase naming a concrete strength>", "quote": "<words of the posting that show it>"}, ...], '
+    '"warnings": [{"text": "<short phrase naming anything conflicting with the requirements>", '
+    '"quote": "<words of the posting that show it>"}, ...]}. '
+    'Each quote is copied from the job posting text above, as written. Code looks it up there and '
+    'drops any pro or warning whose quote it cannot find.'
 )
 
 

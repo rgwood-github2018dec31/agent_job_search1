@@ -1543,11 +1543,30 @@ def test_hard_rule_category_buckets_education():
 
 async def test_triage_job_fit_parses_score(monkeypatch):
     async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
-        return 'Sure! {"score": 2, "reason": "wrong domain"}'
+        return 'Sure! {"score": 2, "reason": "wrong domain", "quote": "Senior Accountant"}'
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
     result = await triage.triage_job_fit('job text', 'profile')
-    assert result == {'score': 2, 'reason': 'wrong domain'}
+    assert result == {'score': 2, 'reason': 'wrong domain', 'quote': 'Senior Accountant'}
+
+
+async def test_a_rejecting_triage_score_must_cite_the_posting():
+    '''Verify Source Reference for triage: a low score gates only on words of the posting.'''
+    extract_text = 'Title: Senior Accountant\nDescription: Month-end close and audit preparation.'
+    grounded = {'score': 1, 'reason': 'accounting role', 'quote': 'Month-end close'}
+    invented = {'score': 1, 'reason': 'requires Java', 'quote': '10 years of Java required'}
+    assert await agent.triage_is_grounded(_make_candidate(), grounded, extract_text, agent.new_stage_stats())
+    assert not await agent.triage_is_grounded(_make_candidate(), invented, extract_text, agent.new_stage_stats())
+
+
+async def test_the_raters_warnings_reach_the_user_only_when_cited():
+    extract_text = 'Location: Testville (Hybrid, 3 days on site)\nDescription: Build agents in Python.'
+    items = [{'text': 'Hybrid — 3 office days', 'quote': '3 days on site'},
+             {'text': 'Requires German', 'quote': 'Fluent German required'},
+             'Bare string with no quote at all']
+    kept = await agent.verified_rating_items(_make_candidate(), 'warnings', items, extract_text,
+                                             agent.new_stage_stats())
+    assert kept == ['Hybrid — 3 office days']
 
 
 async def test_triage_job_fit_fails_open_when_server_down(monkeypatch):
