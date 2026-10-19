@@ -2737,6 +2737,24 @@ def test_write_run_audit_log_breaks_down_check_status_per_query(tmp_path, monkey
     assert 'already_processed 25, new 3' in path.read_text()
 
 
+def test_write_run_audit_log_counts_hallucination_rejections(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, '_applied_companies', {})
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {'q': 1})
+    monkeypatch.setattr(tools, '_listing_records', {})
+    evidence.reset_rejections()
+    evidence.count_rejection('extract', 'relocation')
+    evidence.count_rejection('extract', 'relocation')
+    try:
+        path = tools.write_run_audit_log(
+            queries=['q'], applied_jobs_in_horizon=1, applied_jobs_total=1, funnel={}, audit_findings=[],
+            run_dir=tmp_path, timestamp=datetime(2026, 10, 19, 9, 0, 0),
+        )
+    finally:
+        evidence.reset_rejections()
+    assert 'Hallucinations rejected (call site / field: count): extract / relocation: 2' in path.read_text()
+
+
 def test_write_run_audit_log_includes_opus_findings(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {})
     monkeypatch.setattr(tools, '_candidates_per_query', {})

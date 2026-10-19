@@ -1543,6 +1543,15 @@ def write_run_audit_log(
             f'{report.get("job_cards")} cards, pin "{report.get("location_pin")}" — {status}'
         )
 
+    # Verify Source Reference (evidence.py): predictions rejected because their citation was not in
+    # the input. Listed, not alerted: each rejection already logged a WARNING with its quote, and a
+    # count that jumps for one field is the sign its prompt or the matcher needs a look.
+    if rejections := evidence.rejection_counts():
+        lines.append('- Hallucinations rejected (call site / field: count): ' + ', '.join(
+            f'{site} / {field}: {count}' for (site, field), count in sorted(rejections.items())))
+    else:
+        lines.append('- Hallucinations rejected: none — every cited prediction was found in its input.')
+
     # 1c. Country-list review. Advisory: nothing here changed a rating or a preference. It lives in
     # the audit log rather than only in the alert because the alert carries a count and this
     # carries the reasoning, which is what the user needs in order to promote or dismiss an entry.

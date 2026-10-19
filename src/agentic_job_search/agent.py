@@ -4956,6 +4956,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     tools_module._ui_alerts = list(_startup_ui_alerts)
     location.reset_countries_seen()
     fx.reset_run_state()
+    evidence.reset_rejections()
     reset_location_guesses()
     tools_module.prune_raw_postings()
     funnel: dict[str, int] = {}
