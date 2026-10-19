@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
-from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
 
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
@@ -30,9 +29,11 @@ from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
     LOCAL_LLM_TEMPERATURE,
     LOG_SNIPPET_MAX_CHARS,
+    MODEL_NAME_SINGLE_TURN,
     OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
 )
+from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
 from agentic_job_search.text_budget import quote_for_error
 
 logger = logging.getLogger(__name__)
@@ -194,7 +195,7 @@ def _field(data: dict, key: str, kinds: type | tuple[type, ...], raw: str) -> An
 
 
 async def chat_openrouter(
-    prompt: str, system: str = '', model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, max_tokens: int | None = None,
+    prompt: str, system: str = '', model: str = MODEL_NAME_SINGLE_TURN, max_tokens: int | None = None,
     timeout_seconds: float = LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
 ) -> ChatReply:
     """One completion via the OpenRouter MCP server, with who served it (ChatReply).
@@ -217,7 +218,13 @@ async def chat_openrouter(
     args = {'messages': messages, 'model': model}
     if max_tokens is not None:
         args['max_tokens'] = max_tokens
-    raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=timeout_seconds)
+    routing = routing_for(model)
+    args.update(routing)
+    try:
+        raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=timeout_seconds)
+    except Exception as ex:
+        endpoint_failed(model, routing, f'{type(ex).__name__}: {ex}')
+        raise
     try:
         data = json.loads(raw)
     except ValueError as ex:
@@ -226,6 +233,7 @@ async def chat_openrouter(
     if not isinstance(data, dict):
         raise ValueError(f'OpenRouter chat reply for {model} is not an object: {quote_for_error(raw, "OpenRouter chat reply")!r}')
     if data.get('ok') is not True:
+        endpoint_failed(model, routing, str(data.get('error') or raw))
         # The whole reply, not just `error`: the server's other fields say who failed.
         raise provider_error(f'OpenRouter chat failed for {model}', quote_for_error(raw, 'OpenRouter chat failure reply'))
     _field(data, 'content', (str, type(None)), raw)
@@ -421,7 +429,7 @@ def parse_rating_reply(content: str) -> dict:
     return result
 
 
-async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE) -> tuple[dict, float]:
+async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = MODEL_NAME_SINGLE_TURN) -> tuple[dict, float]:
     '''Rate a job via OpenRouter. Returns (rating dict, cost_usd).
 
     Retries once on truncation because losing this call is costly: the job was written to

@@ -50,7 +50,7 @@ from utils_tools_n_agents_common.telegram_client import send_message as telegram
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search import fx, location, location_review, scrape_openrouter, system_sleep
+from agentic_job_search import endpoint_pin, fx, location, location_review, scrape_openrouter, system_sleep
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
@@ -71,6 +71,7 @@ from agentic_job_search.config import (
     MODEL_NAME_RATING,
     MODEL_NAME_RATING_FALLBACKS,
     MODEL_NAME_SCRAPER,
+    MODEL_NAME_SINGLE_TURN,
     NARRATION_CONDUCT_ALERT_KINDS,
     NARRATION_MESSAGE_MAX_LINES,
     NARRATION_WARNING_REPLAY_MAX_CHARS,
@@ -4846,6 +4847,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     browser = BrowserServer(browser_mode)
     await browser.start()
     playwright_mcp = browser.mcp
+    await endpoint_pin.pin_single_turn_endpoints(MODEL_NAME_SINGLE_TURN)
 
     try:
         # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping

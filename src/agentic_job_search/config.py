@@ -1,5 +1,4 @@
 from utils_tools_n_agents_common.models import (
-    OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
     OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
     OPENROUTER_MODEL_NAME_SCRAPER,
 )
@@ -112,12 +111,9 @@ LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS = 180.0
 # The OLLAMA_ prefix is the one place that says "machine-local tag" — unlike the OpenRouter-routed
 # consts from utils_tools_n_agents_common.models, this value is defined here and nowhere else.
 OLLAMA_MODEL_NAME_TRIAGE = 'granite4.1:3b'
-# Single-call OpenRouter tasks (query generation, company matching, rating) and agentic loops
-# (extraction, scraping) each name their shared const DIRECTLY at call sites — no local aliases:
-# query-gen / company-match / rating import OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, extraction
-# imports OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC (flash tier for cost, not the strongest single-call
-# model), scraping imports OPENROUTER_MODEL_NAME_SCRAPER. All come from
-# utils_tools_n_agents_common.models — a model swap is one edit there, not a per-project hunt.
+# Single-call OpenRouter tasks and the extract loop use MODEL_NAME_SINGLE_TURN, defined below
+# (2026-10-18: a project choice, no longer the shared glm default); scraping uses the shared
+# OPENROUTER_MODEL_NAME_SCRAPER from utils_tools_n_agents_common.models.
 
 # Stage 1 (discovery) configuration
 MAX_SEARCH_QUERIES = 6  # hard cap; every query costs one LinkedIn search per configured region
@@ -366,32 +362,44 @@ SCRAPER_REQUIRED_BROWSER_TOOLS = [
 # Repoint a const at a different family to change the route; repoint it within a family
 # to change only the model.
 
-MODEL_NAME_QUERY = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
-MODEL_NAME_COMPANY_MATCH = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
-MODEL_NAME_RATING = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
-OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH = 'deepseek/deepseek-v4.1-flash'
+# The dated snapshot published 2026-10-17; the undated id is the earlier 2026-09 release.
+OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH = 'deepseek/deepseek-v4.1-flash-1017'
+# Every single-turn OpenRouter call (and the extract loop) runs on this model, served on the
+# endpoint endpoint_pin.py chooses per run. It replaced the shared glm-5.3-flash default on
+# 2026-10-18, after four glm hangs each burned a full call timeout on 2026-10-16.
+MODEL_NAME_SINGLE_TURN = OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH
+# Endpoint choice for MODEL_NAME_SINGLE_TURN (user's rule, 2026-10-18): over the usable endpoints,
+# drop this share with the lowest measured tok/s and this share with the highest price at the
+# single-turn token mix, then pin the cheapest left. The mix is this many completion tokens per
+# prompt token, measured on Stage 2 extraction 2026-10-16 (126,243 prompt / 51,981 completion).
+SINGLE_TURN_DROP_SLOWEST_SHARE = 1 / 3
+SINGLE_TURN_DROP_PRICIEST_SHARE = 1 / 3
+SINGLE_TURN_COMPLETION_TOKENS_PER_PROMPT_TOKEN = 0.4
+# Same floor and reasoning as SCRAPER_MIN_BITS_PER_WEIGHT: never a 4-bit quantization nobody chose.
+SINGLE_TURN_MIN_BITS_PER_WEIGHT = 8
+MODEL_NAME_QUERY = MODEL_NAME_SINGLE_TURN
+MODEL_NAME_COMPANY_MATCH = MODEL_NAME_SINGLE_TURN
+MODEL_NAME_RATING = MODEL_NAME_SINGLE_TURN
 # Asked in order when the MODEL_NAME_RATING call fails or its reply is not a usable rating: a
 # different model rather than the same one again. All three are flash-tier OpenRouter models, so
 # a fallback rating costs about what a normal one does — and an OpenRouter outage fails all of
 # them. Empty turns the fallback off.
 # DeepSeek V4 Flash is always the dated snapshot (OPENROUTER_MODEL_NAME_SCRAPER), never the
 # undated id, which is an older and slower one; a test enforces this for every model constant.
-MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH, OPENROUTER_MODEL_NAME_SCRAPER)
+MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, OPENROUTER_MODEL_NAME_SCRAPER)
 # Reading amounts out of a compensation phrase is a PARSE, not a judgement — the deterministic
 # tiers in salary.py answer all but a few strings, and this only sees what they could not read.
 # Flash tier for that reason, and cached per string so a phrase is parsed once, ever.
-MODEL_NAME_SALARY = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
+MODEL_NAME_SALARY = MODEL_NAME_SINGLE_TURN
 # Estimating a pay range for a posting that states none is a JUDGEMENT about the job, so the
 # intelligence tier. Reached only for a job about to be notified whose salary reading is `absent`,
 # once per job, then cached. It gates nothing: the answer is shown as a labelled estimate.
-MODEL_NAME_SALARY_ESTIMATE = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
-# The extraction loop is a many-iteration tool-calling conversation, so it runs on the
-# shared agentic (flash-tier) default rather than the intelligence default — glm-5.2
-# measured agentic 45.7 vs 58.2 for glm-5.3-flash, at ~1/19th the per-token price.
-MODEL_NAME_EXTRACTOR = OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC
+MODEL_NAME_SALARY_ESTIMATE = MODEL_NAME_SINGLE_TURN
+# The extraction loop is a short tool-calling conversation on the flash-tier single-turn model.
+MODEL_NAME_EXTRACTOR = MODEL_NAME_SINGLE_TURN
 # Judges a LinkedIn job-page section nobody has classified yet: keep or remove. A judgement, so the
 # intelligence tier; called only for a section signature never seen before, then cached for good.
-MODEL_NAME_PAGE_SECTIONS = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE
+MODEL_NAME_PAGE_SECTIONS = MODEL_NAME_SINGLE_TURN
 # Stage 1b scraping is the one place DeepSeek wins (implicit caching, no cache-write fee;
 # measured 9.3x cheaper than Haiku on one live search — $0.0283 vs $0.4330 — because
 # OPENROUTER_MODEL_NAME_SCRAPER caches implicitly at ~88% and cache writes were 42% of

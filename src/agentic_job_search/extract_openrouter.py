@@ -23,6 +23,7 @@ from agentic_job_search.config import (
     SALARY_FIELD_DESCRIPTION,
     STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
 )
+from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
 from agentic_job_search.text_budget import snippet
 
 logger = logging.getLogger(__name__)
@@ -166,13 +167,15 @@ async def extract_job_page_openrouter(
     for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
         # A timeout or transport failure raises rather than returning ok=false. Until 2026-10-18 it
         # escaped to the Stage 2 error handler, skipping the Haiku fallback and dropping the job.
+        routing = routing_for(MODEL_NAME_EXTRACTOR)
         try:
             raw = await call_mcp_tool(
                 LLM_OPENROUTER_MCP_URL, 'chat',
-                {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS},
+                {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS, **routing},
                 timeout_seconds=LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
             )
         except Exception as ex:
+            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, f'{type(ex).__name__}: {ex}')
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat with {MODEL_NAME_EXTRACTOR} failed (iteration {iteration + 1}): {type(ex).__name__}: {ex}"
@@ -187,6 +190,7 @@ async def extract_job_page_openrouter(
             )
             return None
         if not data.get('ok'):
+            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, str(data.get('error') or raw))
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat failed: {data.get('error') or snippet(raw)}"
