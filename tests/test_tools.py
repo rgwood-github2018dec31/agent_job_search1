@@ -1,10 +1,12 @@
 '''Tests for the job search agent.'''
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
+import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
@@ -3334,7 +3336,7 @@ async def test_stage_1b_does_not_fall_back_when_the_provider_is_healthy(monkeypa
 
     monkeypatch.setattr(agent, 'mcp_session', lambda url: _Ok())
 
-    async def fake_run_scraper(run_pass, queries, stats):
+    async def fake_run_scraper(run_pass, queries, stats, before_query=None):
         return None
 
     fallback_ran = []
@@ -3607,7 +3609,7 @@ def _stage_1b_with_a_provider_failure(monkeypatch, completed: dict) -> list[list
 
     monkeypatch.setattr(agent, 'mcp_session', lambda url: _Session())
 
-    async def dying_scraper(run_pass, queries, stats):
+    async def dying_scraper(run_pass, queries, stats, before_query=None):
         tools._queries_searched.update(completed)
         raise triage.ProviderUnavailableError('429 Client Error: Too Many Requests', status=429)
 
@@ -9448,6 +9450,7 @@ async def test_playwright_server_that_never_answers_raises(monkeypatch):
 
 class _ExitedProc:
     returncode = -6
+    pid = 4242
     terminated = False
 
     def terminate(self):
@@ -9475,6 +9478,7 @@ async def test_browser_recycle_moves_mcp_to_a_fresh_server_without_spending_a_re
 
     monkeypatch.setattr(agent, 'find_free_port', lambda: next(ports))
     monkeypatch.setattr(agent, 'start_playwright_server', fake_start_playwright_server)
+    monkeypatch.setattr(agent, 'process_tree_rss_mb', lambda pid: 1234.0)
     browser = agent.BrowserServer('headless')
     await browser.start()
     mcp = browser.mcp
@@ -9484,6 +9488,110 @@ async def test_browser_recycle_moves_mcp_to_a_fresh_server_without_spending_a_re
     assert browser.restarts == 0
 
 
+async def test_browser_recycles_only_once_old_and_logs_its_memory(monkeypatch, caplog):
+    '''Age, not stage, decides: node OOMs came 84-115 min into the process's life (2026-10-13..16).'''
+    ports = iter([4001, 4002])
+
+    async def fake_start_playwright_server(port, browser_mode):
+        return _ExitedProc()
+
+    monkeypatch.setattr(agent, 'find_free_port', lambda: next(ports))
+    monkeypatch.setattr(agent, 'start_playwright_server', fake_start_playwright_server)
+    monkeypatch.setattr(agent, 'process_tree_rss_mb', lambda pid: 1234.0)
+    browser = agent.BrowserServer('headless')
+    await browser.start()
+    assert await browser.recycle_if_old('young') is False
+    assert browser.port == 4001
+
+    browser.started_at -= agent.PLAYWRIGHT_RECYCLE_AGE_SECONDS
+    caplog.set_level(logging.INFO)
+    assert await browser.recycle_if_old('between Stage 1b queries') is True
+    assert browser.port == 4002 and browser.restarts == 0
+    assert browser.age_seconds() < agent.PLAYWRIGHT_RECYCLE_AGE_SECONDS, 'a fresh server starts young'
+    line = next(r.getMessage() for r in caplog.records if 'recycled' in r.getMessage())
+    assert 'between Stage 1b queries' in line and '1,234 MB RSS' in line
+
+
+async def test_browser_recycle_still_happens_when_memory_cannot_be_read(monkeypatch, caplog):
+    def no_ps(pid):
+        raise RuntimeError('ps could not list processes')
+
+    async def fake_start_playwright_server(port, browser_mode):
+        return _ExitedProc()
+
+    monkeypatch.setattr(agent, 'find_free_port', lambda: 4001)
+    monkeypatch.setattr(agent, 'start_playwright_server', fake_start_playwright_server)
+    monkeypatch.setattr(agent, 'process_tree_rss_mb', no_ps)
+    browser = agent.BrowserServer('headless')
+    await browser.start()
+    caplog.set_level(logging.INFO)
+    await browser.recycle('test')
+    assert any('RSS unknown (ps could not list processes)' in r.getMessage() for r in caplog.records)
+
+
+def test_process_tree_rss_sums_npx_node_and_chromium_but_not_siblings(monkeypatch):
+    listing = ('  1     0   100\n'
+               ' 10     1  1024\n'     # npx
+               ' 11    10  2048\n'     # node
+               ' 12    11  4096\n'     # Chromium
+               ' 20     1  9999\n')    # an unrelated process
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=listing, stderr='')
+
+    monkeypatch.setattr(agent.subprocess, 'run', fake_run)
+    assert agent.process_tree_rss_mb(10) == (1024 + 2048 + 4096) / agent.KB_PER_MB
+    with pytest.raises(RuntimeError, match='not in the ps listing'):
+        agent.process_tree_rss_mb(99)
+
+
+async def test_run_scraper_offers_a_recycle_before_every_query_but_the_first(monkeypatch):
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(tools, '_search_reports', [])
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queries_searched', {})
+    monkeypatch.setattr(tools, '_query_errors', {})
+    monkeypatch.setattr(tools, '_check_status_per_query', {})
+    monkeypatch.setattr(agent, 'SCRAPER_INTER_QUERY_DELAY_SECONDS', (0, 0))
+    events = []
+
+    async def run_pass(instruction):
+        events.append(tools._current_query)
+        raise RuntimeError('page did not load')
+
+    async def before_query():
+        events.append('recycle?')
+
+    await agent.run_scraper(run_pass, ['Q1', 'Q2', 'Q3'], {'cost': 0.0}, before_query=before_query)
+    assert events == ['Q1', 'recycle?', 'Q2', 'recycle?', 'Q3']
+
+
+async def test_reattachable_browser_call_follows_a_recycled_server(monkeypatch):
+    opened, closed = [], []
+
+    @contextlib.asynccontextmanager
+    async def fake_mcp_session(url):
+        opened.append(url)
+
+        async def call(name, args):
+            return f'{name} via {url}'
+        try:
+            yield call
+        finally:
+            closed.append(url)
+
+    monkeypatch.setattr(agent, 'mcp_session', fake_mcp_session)
+    browser_mcp = {'url': 'http://localhost:4001/mcp'}
+    async with agent.ReattachableBrowserCall(browser_mcp) as browser_call:
+        assert await browser_call('browser_snapshot', {}) == 'browser_snapshot via http://localhost:4001/mcp'
+        browser_mcp['url'] = 'http://localhost:4002/mcp'
+        await browser_call.reattach()
+        assert closed == ['http://localhost:4001/mcp']
+        assert await browser_call('browser_snapshot', {}) == 'browser_snapshot via http://localhost:4002/mcp'
+    assert closed == ['http://localhost:4001/mcp', 'http://localhost:4002/mcp']
+
+
 class _FakeBrowser:
     '''Duck-typed BrowserServer whose liveness the test drives.'''
 
@@ -9491,6 +9599,7 @@ class _FakeBrowser:
         self.dead = False
         self.restarts = 0
         self.mcp = {'type': 'http', 'url': 'http://localhost:1/mcp'}
+        self.recycle_points: list[str] = []
 
     def is_dead(self):
         return self.dead
@@ -9502,6 +9611,10 @@ class _FakeBrowser:
         self.restarts += 1
         self.dead = False
         self.mcp['url'] = 'http://localhost:2/mcp'
+
+    async def recycle_if_old(self, where):
+        self.recycle_points.append(where)
+        return False
 
 
 def _stage2_with_dying_browser(monkeypatch, browser, dies_on: list[str]):
@@ -9545,6 +9658,8 @@ async def test_stage2_restarts_a_dead_browser_and_retries_the_same_job(monkeypat
     )
 
     assert [job for job, _ in calls] == ['1', '1', '2'], 'the job the browser died on must be retried'
+    assert browser.recycle_points[0] == 'before Stage 2 job 1 of 2', 'each job is a safe point to recycle'
+    assert len(browser.recycle_points) == 2, 'a dead browser is restarted, not recycled'
     assert calls[1][1] == 'http://localhost:2/mcp', 'the retry must use the restarted server'
     assert browser.restarts == 1
     assert 'eval_error' not in funnel, "a dead browser is not the job's fault"

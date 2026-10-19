@@ -695,6 +695,13 @@ PLAYWRIGHT_MAX_RESTARTS_PER_RUN = 1
 PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS = 2
 # How long a server that stopped answering gets to exit on SIGTERM before it is killed.
 PLAYWRIGHT_STOP_TIMEOUT_SECONDS = 10
+# A live @playwright/mcp older than this is replaced at the next safe point: between two Stage 1b
+# queries, between Stage 1b and 2, or between two Stage 2 jobs. It leaks V8 heap with age: 4 of the
+# 6 runs of 2026-10-13..16 died of a node OOM 84-115 minutes into the process's life, and Stage 1b
+# alone has run 90 minutes (2026-10-14), so one fixed recycle before Stage 2 does not cover it.
+PLAYWRIGHT_RECYCLE_AGE_SECONDS = 45 * SECONDS_PER_MINUTE
+# Timeout for the `ps` call that measures the server's process-tree memory, logged at each recycle.
+PROCESS_RSS_PROBE_TIMEOUT_SECONDS = 5
 
 # Run reporting
 YIELD_HISTORY_RUNS_SHOWN = 5          # recent runs listed in the yield-history section of alerts

@@ -10,11 +10,12 @@ import random
 import re
 import socket
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
-from contextlib import aclosing
+from contextlib import AsyncExitStack, aclosing
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, NoReturn
@@ -85,7 +86,9 @@ from agentic_job_search.config import (
     PLAYWRIGHT_MCP_REGISTRY_URL,
     PLAYWRIGHT_MCP_VERSION,
     PLAYWRIGHT_MCP_VERSION_CHECK_TIMEOUT_SECONDS,
+    PLAYWRIGHT_RECYCLE_AGE_SECONDS,
     PLAYWRIGHT_STOP_TIMEOUT_SECONDS,
+    PROCESS_RSS_PROBE_TIMEOUT_SECONDS,
     RATING_AUTO_REJECT,
     REFERENCE_JOB_PROMPT_MAX_CHARS,
     REFERENCE_SUMMARY_LIMIT_CHARS,
@@ -2060,7 +2063,7 @@ async def _run_anthropic_scraper_session(playwright_mcp: dict, browser_call, que
                 {'kind': 'scrape_budget', 'query': '(all)', 'region': '(all)', 'detail': str(ex)})
 
 
-async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
+async def run_scraper(run_pass, queries: list[str], stage_stats: dict, before_query=None) -> None:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results.
 
     ONE REQUEST PER QUERY, on a SINGLE shared session. Two constraints have to hold at once:
@@ -2094,22 +2097,28 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict) -> None:
     function — the per-query loop, pacing, the region-verification check, the low-yield recovery
     pass — is shared between the OpenRouter and Anthropic scrapers rather than duplicated. The two
     differ only in how one request is executed.
+
+    `before_query()`, when given, runs before every query after the first (after its pause): the
+    point where the browser may be recycled, since each query starts from a fresh search page.
     """
     narration = QueryNarration()
     try:
-        await _run_scraper_queries(run_pass, queries, narration)
+        await _run_scraper_queries(run_pass, queries, narration, before_query)
     finally:
         # Still open here means an exception left the loop mid-query: write what the model said.
         narration.close(unfinished=True)
 
 
-async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNarration) -> None:
+async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNarration,
+                               before_query=None) -> None:
     """The per-query loop of `run_scraper`, which owns the narration's lifetime."""
     for i, query in enumerate(queries, 1):
         logger.debug(f'Stage 1b: query {i}/{len(queries)} — "{query}"')
         narration.begin(query)
         if i > 1:
             await _human_pause(SCRAPER_INTER_QUERY_DELAY_SECONDS, f'query {i}/{len(queries)}')
+            if before_query is not None:
+                await before_query()
         tools_module._current_query = query
         # A query re-run by the Anthropic fallback must not keep the error the aborted OpenRouter
         # loop stamped on it: on 2026-09-28 four queries that the fallback searched in full were
@@ -4120,6 +4129,13 @@ async def evaluate_all_candidates(
     cost_before = sum(s['cost'] for s in stage_stats.values())
     index = 0
     while index < len(candidates):
+        if browser is not None and not browser.is_dead():
+            try:
+                await browser.recycle_if_old(f'before Stage 2 job {index + 1} of {len(candidates)}')
+            except Exception as ex:
+                # The old server is already stopped, so browser_usable sees it dead and restarts it.
+                logger.error(f'Recycling {PLAYWRIGHT_MCP_PACKAGE} before Stage 2 job {index + 1} failed: '
+                             f'{type(ex).__name__}: {ex}')
         if not await browser_usable(candidates[index:]):
             break
         candidate = candidates[index]
@@ -4645,6 +4661,36 @@ async def start_playwright_server(port: int, browser_mode: str = 'minimized') ->
     return proc
 
 
+KB_PER_MB = 1024
+
+
+def process_tree_rss_mb(root_pid: int) -> float:
+    '''Resident memory of `root_pid` and all its descendants (npx -> node -> Chromium), in MB.'''
+    try:
+        listing = subprocess.run(['ps', '-A', '-o', 'pid=,ppid=,rss='], capture_output=True, text=True,
+                                 check=True, timeout=PROCESS_RSS_PROBE_TIMEOUT_SECONDS).stdout
+    except (OSError, subprocess.SubprocessError) as ex:
+        raise RuntimeError(f'ps could not list processes for the tree of pid {root_pid}: '
+                           f'{type(ex).__name__}: {ex}') from ex
+    children: dict[int, list[int]] = {}
+    rss_kb: dict[int, int] = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) != len(('pid', 'ppid', 'rss')):
+            continue   # ps prints exactly three columns; anything else is not a process row
+        pid, ppid, rss = (int(f) for f in fields)
+        children.setdefault(ppid, []).append(pid)
+        rss_kb[pid] = rss
+    if root_pid not in rss_kb:
+        raise RuntimeError(f'pid {root_pid} is not in the ps listing ({len(rss_kb)} processes)')
+    total, stack = 0, [root_pid]
+    while stack:
+        pid = stack.pop()
+        total += rss_kb.get(pid, 0)
+        stack.extend(children.get(pid, []))
+    return total / KB_PER_MB
+
+
 class BrowserServer:
     """The shared @playwright/mcp process, restartable when it dies mid-run.
 
@@ -4657,6 +4703,7 @@ class BrowserServer:
         self.port = 0
         self.proc: asyncio.subprocess.Process | None = None
         self.restarts = 0
+        self.started_at = 0.0
         self.mcp: dict = {'type': 'http', 'url': ''}
         # Set by confirm_dead when the port stops answering while the process is not yet reaped.
         self.unreachable = False
@@ -4667,6 +4714,10 @@ class BrowserServer:
         self.proc = await start_playwright_server(self.port, browser_mode=self.browser_mode)
         self.mcp['url'] = f'http://localhost:{self.port}/mcp'
         self.unreachable = False
+        self.started_at = time.monotonic()
+
+    def age_seconds(self) -> float:
+        return time.monotonic() - self.started_at
 
     def is_dead(self) -> bool:
         return self.proc is not None and (self.proc.returncode is not None or self.unreachable)
@@ -4709,18 +4760,30 @@ class BrowserServer:
                     f'{time.monotonic() - restart_started:.0f}s')
 
     async def recycle(self, reason: str) -> None:
-        """Replace a live server with a fresh one; not a crash, so not counted in ``restarts``.
-
-        @playwright/mcp leaks V8 heap over the process's life: 4 of the 6 runs of 2026-10-13..16
-        died of a node OOM 84-115 minutes in, every one during Stage 2, with one process serving
-        Stage 1b and 2. A fresh process for Stage 2 starts it with an empty heap.
-        """
+        '''Replace a live server with a fresh one; not a crash, so not counted in ``restarts``.'''
         recycle_started = time.monotonic()
-        old_port = self.port
+        old_port, old_age = self.port, self.age_seconds()
+        try:
+            memory = f'{process_tree_rss_mb(self.proc.pid):,.0f} MB RSS' if self.proc else 'no process'
+        except RuntimeError as ex:
+            memory = f'RSS unknown ({ex})'
         await self.stop()
         await self.start()
-        logger.info(f'{PLAYWRIGHT_MCP_PACKAGE} recycled ({reason}): port {old_port} -> {self.port} in '
-                    f'{time.monotonic() - recycle_started:.0f}s')
+        logger.info(f'{PLAYWRIGHT_MCP_PACKAGE} recycled ({reason}) after {old_age / SECONDS_PER_MINUTE:.0f} min '
+                    f'at {memory}: port {old_port} -> {self.port} in {time.monotonic() - recycle_started:.0f}s')
+
+    async def recycle_if_old(self, where: str) -> bool:
+        '''Recycle once the server is PLAYWRIGHT_RECYCLE_AGE_SECONDS old. Call only at a safe point.
+
+        @playwright/mcp leaks V8 heap with process age: 4 of the 6 runs of 2026-10-13..16 died of
+        a node OOM 84-115 minutes after it started. A safe point is one where no page state is
+        needed afterwards: before a Stage 1b query (each starts from a fresh search) or before a
+        Stage 2 job (each is its own page). True when it recycled.
+        '''
+        if self.proc is None or self.age_seconds() < PLAYWRIGHT_RECYCLE_AGE_SECONDS:
+            return False
+        await self.recycle(f'{where}; older than PLAYWRIGHT_RECYCLE_AGE_SECONDS')
+        return True
 
     async def stop(self) -> None:
         # terminate() on an already-exited process raises ProcessLookupError. On 2026-09-21 that
@@ -4738,7 +4801,41 @@ class BrowserServer:
             await self.proc.wait()
 
 
-async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scraping_stats: dict) -> bool:
+class ReattachableBrowserCall:
+    """An MCP session to the shared browser that follows it to a new port when it is recycled.
+
+    Stage 1b holds one session for all its queries; a recycled server is a new process on a new
+    port, so `reattach()` closes the old session and opens one to ``browser.mcp['url']``.
+    """
+
+    def __init__(self, browser_mcp: dict) -> None:
+        self._browser_mcp = browser_mcp
+        self._stack: AsyncExitStack | None = None
+        self._call = None
+
+    async def __aenter__(self) -> ReattachableBrowserCall:
+        await self.reattach()
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        if self._stack is not None:
+            await self._stack.aclose()
+
+    async def reattach(self) -> None:
+        if self._stack is not None:
+            await self._stack.aclose()
+        self._stack = AsyncExitStack()
+        self._call = await self._stack.enter_async_context(mcp_session(self._browser_mcp['url']))
+
+    async def __call__(self, name: str, args: dict):
+        return await self._call(name, args)
+
+    async def list_tools(self):
+        return await self._call.list_tools()
+
+
+async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scraping_stats: dict,
+                       browser: BrowserServer | None = None) -> bool:
     """Run Stage 1b, falling back to the Anthropic scraper on failure.
 
     The route (and model) is MODEL_NAME_SCRAPER: an OPENROUTER_* family value runs the
@@ -4751,12 +4848,22 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
     could have caught that, because nothing could call this code without a live browser.
 
     Returns True if the OpenRouter path completed, False if the Anthropic fallback ran.
+
+    ``browser``, when given, is recycled once old (BrowserServer.recycle_if_old) before a query and
+    before the Anthropic fallback starts. The fallback itself is never recycled mid-way: its SDK
+    client holds a session to the browser for all its queries.
     """
     if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
         # Browser tools come from the running Playwright server's own schemas rather than a
         # hand-transcribed constant, so a server-side change cannot drift silently.
         try:
-            async with mcp_session(f'http://localhost:{port}/mcp') as browser_call:
+            async with ReattachableBrowserCall(
+                    browser.mcp if browser is not None else {'url': f'http://localhost:{port}/mcp'}) as browser_call:
+
+                async def recycle_if_old() -> None:
+                    if browser is not None and await browser.recycle_if_old('between Stage 1b queries'):
+                        await browser_call.reattach()
+
                 tool_defs = (scrape_openrouter.browser_tool_defs(await browser_call.list_tools())
                              + scrape_openrouter.LOCAL_TOOL_DEFS)
                 logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
@@ -4766,7 +4873,7 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
                 await run_scraper(
                     _openrouter_run_pass(browser_call, tool_defs, scraping_stats,
                                          tools_module._scrape_per_query, provider_pin),
-                    queries, scraping_stats)
+                    queries, scraping_stats, before_query=recycle_if_old)
             return True
         except Exception as ex:
             # A provider outage must not end the run: fall through to the Anthropic scraper,
@@ -4790,6 +4897,8 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
             if not queries:
                 return False
 
+    if browser is not None:
+        await browser.recycle_if_old('before the Anthropic scraper')
     await _run_anthropic_scraper(playwright_mcp, queries, scraping_stats)
     return False
 
@@ -4867,7 +4976,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
             return
 
         console.print('[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n')
-        await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats['scraping'])
+        await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats['scraping'], browser=browser)
 
         candidates = tools_module._candidates
         candidates_per_query = tools_module._candidates_per_query
@@ -4976,7 +5085,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                     'kind': 'local_model_missing', 'query': '(all)', 'region': '(all)',
                     'detail': preflight_problem})
 
-        await browser.recycle('fresh heap for Stage 2')
+        await browser.recycle_if_old('before Stage 2')
         await evaluate_all_candidates(
             candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats,
             funnel=funnel, audit=audit, triage_enabled=triage_enabled, browser=browser,
