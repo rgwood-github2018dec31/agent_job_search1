@@ -38,7 +38,7 @@ from typing import Any
 
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
-from agentic_job_search import cache_io
+from agentic_job_search import cache_io, evidence
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.triage import chat_openrouter
 
@@ -150,7 +150,9 @@ Return ONLY a JSON object, no prose and no code fence:
   "regions": ["<one region per country, same order>", ...],
   "broad_area": <true|false>,
   "likely_spoken_languages": {{"<language, lowercase English name>": <fraction 0-1>, ...}},
-  "place_names": ["<every place this text refers to, English and local spellings>", ...]}}
+  "place_names": ["<every place this text refers to, English and local spellings>", ...],
+  "grounding": {{"<each country and each place name above, and broad_area if true>":
+                 "<the words of the location text it comes from, copied as written>", ...}}}}
 
 Rules:
 - `regions` must use exactly these values: {regions}.
@@ -186,6 +188,11 @@ Rules:
   This is administrative containment, a checkable fact -- never proximity, which is a
   judgement. Omit workplace words ("Remote", "Hybrid"), and return an empty list when the
   text names no place.
+- `grounding` maps every country, every place name and (when true) "broad_area" to the words of
+  the location text it was derived from, copied exactly: "Sevilla, Andalusia, Spain" grounds
+  "Seville" and "España" in "Sevilla" and "Spain"; "Grasse, France" grounds "Alpes-Maritimes" in
+  "Grasse"; "European Union (Remote)" grounds broad_area in "European Union". Code looks each
+  one up in the location text and DROPS any name or flag it cannot find there.
 '''
 
 _cache: dict[str, Any] | None = None
@@ -365,7 +372,49 @@ def _coerce(raw: dict) -> dict[str, Any]:
                 ' '.join(str(n or '').split()) for n in (raw.get('place_names') or [])
             ) if name
         )),
+        # Optional on purpose: a name the model gave no words for is not an error in the reply, it
+        # is an ungrounded name, and _ground asks the relocation model before dropping it.
+        'grounding': {' '.join(str(k).split()): str(v or '')
+                      for k, v in (raw.get('grounding') if isinstance(raw.get('grounding'), dict) else {}).items()},
     }
+
+
+# Location strings are a few words, so a two-letter token ('UK', 'QC') is the whole of the evidence
+# for a name; find_quote's word boundaries keep it from matching inside another word.
+GROUNDING_MIN_QUOTE_CHARS = 2
+
+
+async def _ground(text: str, result: dict[str, Any], use_llm: bool = True) -> dict[str, Any]:
+    """Verify Source Reference for a classification: keep only the countries, place names and
+    broad_area flag whose grounding words are found in the location text.
+
+    The derivation itself (Grasse lies in Alpes-Maritimes) is the model's geography; what must be
+    in the input is the word it was derived FROM. A name with nothing to point at is a name the
+    text never implied, and a place_name is what can exempt a job from the geographic gate.
+    `use_llm=False` grounds by regex alone, for an entry served while the model is unreachable.
+    """
+    grounding = result.get('grounding') or {}
+    # A name with no grounding words is first looked for as itself: 'Germany' needs no citation in
+    # 'Berlin, Germany'. Only what regex cannot find that way goes to the relocation model.
+    claims = (
+        [evidence.Claim(f'country:{c}', c, grounding.get(c) or c) for c in result['countries']]
+        + [evidence.Claim(f'place:{p}', p, grounding.get(p) or p) for p in result['place_names']]
+        + ([evidence.Claim('broad_area', True, grounding.get('broad_area', ''))] if result['broad_area'] else [])
+    )
+    if not claims:
+        return result
+    verdicts = await evidence.verify_claims(
+        'location_classify', repr(text), claims, text, 'location string',
+        use_llm=use_llm, min_quote_chars=GROUNDING_MIN_QUOTE_CHARS)
+    kept = [(c, r) for c, r in zip(result['countries'], result['regions'], strict=True)
+            if verdicts[f'country:{c}'].accepted]
+    return dict(
+        result,
+        countries=[c for c, _ in kept], regions=[r for _, r in kept],
+        place_names=[p for p in result['place_names'] if verdicts[f'place:{p}'].accepted],
+        broad_area=bool(result['broad_area'] and verdicts['broad_area'].accepted),
+        grounding={field: verdict.evidence for field, verdict in verdicts.items() if verdict.accepted},
+    )
 
 
 # Cache keys this process classified with the model, as opposed to read from the cache. Every
@@ -402,7 +451,8 @@ async def classify_location(text: str) -> dict[str, Any]:
     # national language of the first COUNTRY, which answered Luxembourg `luxembourgish` and
     # Montreal `english`. Keeping any of them would keep the wrong warnings, so every such entry is
     # re-asked the next time its location is seen.
-    if key in cache and 'place_names' in cache[key] and 'likely_spoken_languages' in cache[key]:
+    # And an entry predating `grounding` (2026-10-19): its names were never checked against the text.
+    if key in cache and all(field in cache[key] for field in ('place_names', 'likely_spoken_languages', 'grounding')):
         entry = dict(cache[key])
         entry['source'] = 'cache'
         _record_countries(entry)
@@ -431,11 +481,18 @@ async def classify_location(text: str) -> dict[str, Any]:
                 entry['likely_spoken_languages'] = (
                     {str(legacy).strip().lower(): 1.0} if str(legacy).strip() else {}
                 )
+            entry.setdefault('grounding', {})
+            entry.setdefault('broad_area', False)
+            # Served unverified it would break the rule this whole file now follows, and dropped
+            # it would disable the gate: so it is grounded by regex alone, keeping every name the
+            # text itself writes ('Germany' in 'Berlin, Germany') and dropping the rest.
+            entry = await _ground(text, entry, use_llm=False)
             entry['source'] = 'stale'
             _record_countries(entry)
             return entry
         return _empty('error')
 
+    result = await _ground(text, result)
     # Who answered, as served: the requested id alone cannot tell a provider's bad answer apart.
     result['model'] = reply.model
     result['provider'] = reply.provider

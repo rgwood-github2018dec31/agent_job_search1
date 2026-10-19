@@ -58,7 +58,8 @@ def find_quote(quote: object, source: object) -> tuple[int, int] | None:
     '''Where `quote` occurs in `source` (both normalised), or None.
 
     An ellipsis in the quote splits it into pieces that must occur in order, so a model may elide
-    the middle of a long sentence. Positions index the normalised source.
+    the middle of a long sentence. Each piece must start and end on a word boundary, so 'UK' is
+    not found inside 'Ukraine'. Positions index the normalised source.
     '''
     pieces = [piece.strip(_EDGE_CHARS) for piece in _ELLIPSIS_RE.split(normalize_for_match(quote))]
     pieces = [piece for piece in pieces if piece]
@@ -67,7 +68,8 @@ def find_quote(quote: object, source: object) -> tuple[int, int] | None:
     text = normalize_for_match(source)
     start = end = None
     for piece in pieces:
-        found = re.search(re.escape(piece), text[end or 0:])
+        pattern = (r'(?<!\w)' if piece[0].isalnum() else '') + re.escape(piece) + (r'(?!\w)' if piece[-1].isalnum() else '')
+        found = re.search(pattern, text[end or 0:])
         if found is None:
             return None
         piece_start = (end or 0) + found.start()
@@ -76,10 +78,15 @@ def find_quote(quote: object, source: object) -> tuple[int, int] | None:
     return start, end
 
 
-def quote_is_specific(quote: object, value: object) -> bool:
-    '''False for a citation too short to prove anything ('a', 'EU') unless it is the value itself.'''
+def quote_is_specific(quote: object, value: object, min_chars: int = EVIDENCE_MIN_QUOTE_CHARS) -> bool:
+    '''False for a citation too short to prove anything ('a', 'EU') unless it is the value itself.
+
+    A caller whose source is itself a few words (a location string) passes a lower `min_chars`:
+    there 'UK' is the whole of the evidence, and word boundaries keep it from matching 'Ukraine'.
+    '''
     normalised = normalize_for_match(quote).strip(_EDGE_CHARS)
-    return len(normalised) >= EVIDENCE_MIN_QUOTE_CHARS or normalised == normalize_for_match(value).strip(_EDGE_CHARS)
+    return bool(normalised) and (
+        len(normalised) >= min_chars or normalised == normalize_for_match(value).strip(_EDGE_CHARS))
 
 
 @dataclass(frozen=True)
@@ -123,8 +130,8 @@ def rejection_counts() -> dict[tuple[str, str], int]:
     return dict(_rejections)
 
 
-def _grounded(claim: Claim, source: str) -> tuple[int, int] | None:
-    if not quote_is_specific(claim.quote, claim.value):
+def _grounded(claim: Claim, source: str, min_chars: int) -> tuple[int, int] | None:
+    if not quote_is_specific(claim.quote, claim.value, min_chars):
         return None
     return find_quote(claim.quote, source)
 
@@ -172,7 +179,7 @@ async def _relocate(call_site: str, subject: str, claims: list[Claim], source: s
 
 async def verify_claims(
     call_site: str, subject: str, claims: list[Claim], source: str, source_label: str,
-    stage_stats: dict | None = None, use_llm: bool = True,
+    stage_stats: dict | None = None, use_llm: bool = True, min_quote_chars: int = EVIDENCE_MIN_QUOTE_CHARS,
 ) -> dict[str, Verdict]:
     '''Ground each claim in `source`; returns field -> Verdict.
 
@@ -183,7 +190,7 @@ async def verify_claims(
     verdicts: dict[str, Verdict] = {}
     missed: list[Claim] = []
     for claim in claims:
-        span = _grounded(claim, source)
+        span = _grounded(claim, source, min_quote_chars)
         if span is not None:
             verdicts[claim.field] = Verdict(claim, STATUS_REGEX, span, claim.quote)
         else:
@@ -198,7 +205,7 @@ async def verify_claims(
                            f'rejecting the {len(missed)} claim(s) it was asked to ground')
         for i, claim in enumerate(missed):
             relocated = spans.get(str(i), '')
-            span = find_quote(relocated, source) if quote_is_specific(relocated, claim.value) else None
+            span = find_quote(relocated, source) if quote_is_specific(relocated, claim.value, min_quote_chars) else None
             if span is not None:
                 verdicts[claim.field] = Verdict(claim, STATUS_RELOCATED, span, relocated, reply_note)
             else:

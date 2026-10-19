@@ -6144,6 +6144,35 @@ async def test_a_stale_cache_entry_survives_a_failed_reclassification(monkeypatc
     assert unseen['source'] == 'error' and unseen['countries'] == []
 
 
+async def test_an_ungrounded_place_name_is_dropped_and_cannot_exempt_a_job(monkeypatch, tmp_path):
+    """Verify Source Reference: a place name stands only on words of the location text. One the
+    model cannot point at is dropped, so it can never match the user's would-live list."""
+    async def fake_chat(prompt, **kwargs):
+        return chat_reply('{"countries": ["Germany"], "regions": ["western_europe"], "broad_area": true, '
+                          '"likely_spoken_languages": {"german": 1.0}, '
+                          '"place_names": ["Berlin", "Brandenburg", "Testville"], '
+                          '"grounding": {"Germany": "Germany", "Berlin": "Berlin", "Brandenburg": "Berlin", '
+                          '"Testville": "near Testville", "broad_area": "anywhere in Europe"}}', 0.0)
+
+    async def finds_nothing(call_site, subject, claims, source, stage_stats):
+        return {}, 'fake relocation reply'
+
+    monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
+    monkeypatch.setattr(location, '_cache', {})
+    monkeypatch.setattr(location, 'chat_openrouter', fake_chat)
+    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
+    facts = await location.classify_location('Berlin, Germany (Hybrid)')
+    assert facts['countries'] == ['Germany']
+    assert facts['place_names'] == ['Berlin', 'Brandenburg'], 'containment grounded in "Berlin" stays'
+    assert facts['broad_area'] is False, 'no words of the text offer a wider area'
+    assert not agent.location_is_allowed('Berlin, Germany (Hybrid)', facts['place_names'])
+
+
+def test_a_short_grounding_token_matches_only_as_a_whole_word():
+    assert evidence.find_quote('UK', 'London, UK (Remote)') is not None
+    assert evidence.find_quote('UK', 'Kyiv, Ukraine') is None
+
+
 async def test_an_entry_from_the_national_language_question_is_re_asked(monkeypatch, tmp_path):
     """The old question asked for the first COUNTRY's national language (Luxembourg ->
     luxembourgish, Montreal -> english). An entry carrying only that answer is a miss."""
