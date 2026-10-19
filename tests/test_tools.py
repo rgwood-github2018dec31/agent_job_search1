@@ -2737,6 +2737,22 @@ def test_write_run_audit_log_breaks_down_check_status_per_query(tmp_path, monkey
     assert 'already_processed 25, new 3' in path.read_text()
 
 
+def test_audit_1c_words_each_finding_by_its_kind_and_lists_an_entry_once():
+    '''2026-10-16: region conflicts were printed as substring collisions, Lithuania twice.'''
+    lines = tools.entry_warning_lines([
+        {'entry': 'Roma', 'list': 'hybrid.acceptable_locations', 'collides_with': 'Romania',
+         'kind': 'collision', 'detail': 'reads as ambiguous'},
+        {'entry': 'Lithuania', 'list': 'location_cache.yaml', 'collides_with': 'northern_europe',
+         'kind': 'region', 'detail': 'cached as northern_europe 1x but also as eastern_europe 1x'},
+        {'entry': 'Lithuania', 'list': 'location_cache.yaml', 'collides_with': 'eastern_europe',
+         'kind': 'region', 'detail': 'cached as eastern_europe 2x but also as northern_europe 1x'},
+    ])
+    assert lines[0] == '- entry `Roma` on `hybrid.acceptable_locations` is a substring of `Romania` — reads as ambiguous'
+    assert len(lines) == 2
+    assert 'substring' not in lines[1] and lines[1].startswith('- `Lithuania` on `location_cache.yaml` (region)')
+    assert 'eastern_europe 2x' in lines[1]
+
+
 def test_write_run_audit_log_counts_hallucination_rejections(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, '_applied_companies', {})
     monkeypatch.setattr(tools, '_candidates_per_query', {})
@@ -5692,6 +5708,27 @@ async def _run_stage2(candidate: dict, funnel: dict) -> None:
         [candidate], {'type': 'http', 'url': 'http://localhost:1/mcp'},
         'prompt', 'profile', _stage2_stats(), funnel=funnel,
     )
+
+
+async def test_one_role_posted_in_two_countries_notifies_once_and_lists_the_repeat(monkeypatch):
+    """2026-10-16: Yuno's role arrived twice at 5/5, one job id per country."""
+    notifications, saved = _stage2_stubs(monkeypatch, _make_extract(title='Staff AI Engineer (Copy)'))
+    funnel: dict = {}
+    await agent.evaluate_all_candidates(
+        [_make_candidate(job_id='4480376713'), _make_candidate(job_id='4480376714')],
+        {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', _stage2_stats(), funnel=funnel,
+    )
+    assert len(saved) == 2, 'each posting is still rated and saved'
+    assert len(notifications) == 2
+    assert 'Also posted (same role' in notifications[1] and 'first: job 4480376713' in notifications[1]
+    assert funnel['duplicate_role_suppressed'] == 1
+
+
+def test_role_key_ignores_case_punctuation_and_copy_markers():
+    a = agent.role_key({'company': 'Fetch, Inc.', 'title': 'Staff Machine Learning Engineer (Copy) (Copy)'})
+    b = agent.role_key({'company': 'Fetch', 'title': 'staff machine-learning engineer'})
+    c = agent.role_key({'company': 'Fetch', 'title': 'Staff Machine Learning Engineer - Ad Platform'})
+    assert a == b != c
 
 
 async def test_stage_2_notifies_and_records_a_first_agency_posting(monkeypatch):

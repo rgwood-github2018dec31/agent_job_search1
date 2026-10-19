@@ -1469,6 +1469,28 @@ def record_job_outcome(site: str, job_id: str, outcome: str, rating: int | None 
     record['summary'] = summary
 
 
+def entry_warning_lines(warnings: list[dict]) -> list[str]:
+    """Audit 1c lines for pending list-hygiene findings: one line per entry, worded by its kind.
+
+    Until 2026-10-19 every kind was printed as a substring collision, so a region conflict read
+    "entry `Austria` on `location_cache.yaml` is a substring of `western_europe`", and an entry
+    with two findings (one per region it was cached under) was listed twice.
+    """
+    by_entry: dict[tuple[str, str, str], list[dict]] = {}
+    for warning in warnings:
+        key = (str(warning.get('kind') or 'collision'), str(warning.get('entry')), str(warning.get('list')))
+        by_entry.setdefault(key, []).append(warning)
+    lines = []
+    for (kind, entry, list_name), group in by_entry.items():
+        details = '; '.join(dict.fromkeys(str(w.get('detail') or '') for w in group if w.get('detail')))
+        if kind == 'collision':
+            others = ', '.join(f"`{w.get('collides_with')}`" for w in group)
+            lines.append(f'- entry `{entry}` on `{list_name}` is a substring of {others} — {details}')
+        else:
+            lines.append(f'- `{entry}` on `{list_name}` ({kind}) — {details}')
+    return lines
+
+
 def write_run_audit_log(
     queries: list[str],
     applied_jobs_in_horizon: int,
@@ -1579,11 +1601,7 @@ def write_run_audit_log(
             f'- **{country}** ({entry.get("region", "?")}) -> `{entry.get("recommendation")}` '
             f'— {entry.get("reason", "")}'
         )
-    for warning in warnings:
-        lines.append(
-            f'- entry `{warning.get("entry")}` on `{warning.get("list")}` is a substring of '
-            f'`{warning.get("collides_with")}` — {warning.get("detail", "")}'
-        )
+    lines += entry_warning_lines(warnings)
     if pending or warnings:
         lines.append('')
         lines.append(

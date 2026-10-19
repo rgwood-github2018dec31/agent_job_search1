@@ -190,7 +190,7 @@ async def _send_pipeline_notification(text: str) -> bool:
     except Exception as ex:
         logger.warning(
             f'Telegram pipeline notification failed ({len(text)}-char message {snippet(text)!r}): '
-            f'{type(ex).__name__}: {unwrap_exception(ex)}'
+            f'{unwrap_exception(ex)}'
         )
         console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
         return False
@@ -1237,7 +1237,7 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
             shorter = (await _reference_summary_from(provider, retry_prompt, stage_stats)).strip()
         except Exception as ex:
             await _stop_over_long_reference_summary(
-                len(summary), provider, f'failed ({type(ex).__name__}: {unwrap_exception(ex)})')
+                len(summary), provider, f'failed ({unwrap_exception(ex)})')
         if not shorter:
             await _stop_over_long_reference_summary(len(summary), provider, 'returned nothing')
         if len(shorter) > REFERENCE_SUMMARY_LIMIT_CHARS:
@@ -3972,13 +3972,40 @@ async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) 
                 raise
             logger.warning(
                 f'Rating by {model} failed, asking {models[position + 1]} instead '
-                f'({position + 1} of {len(models)} rating models tried): '
-                f'{type(ex).__name__}: {unwrap_exception(ex)}'
+                # unwrap_exception already leads with the type name; prefixing it again printed
+                # 'RuntimeError: RuntimeError: …' (2026-10-16).
+                f'({position + 1} of {len(models)} rating models tried): {unwrap_exception(ex)}'
             )
             continue
         result['rated_by'] = model
         return result
     raise AssertionError('unreachable: the last rating model returns or raises')
+
+
+# Postings the User was notified about THIS run, by role_key: one employer often advertises one role
+# once per country under separate job ids (2026-10-16: Yuno twice at 5/5, Overstory seven times).
+# Each posting is still rated on its own -- location gates and the rater's location judgment are
+# per posting -- but only the first notification is sent; the rest are listed in one message at
+# the end of Stage 2. Reset at the top of evaluate_all_candidates, once per run.
+_notified_roles: dict[tuple[str, str], dict] = {}
+_duplicate_roles: list[dict] = []
+_COPY_SUFFIX_RE = re.compile(r'\(copy\)', re.IGNORECASE)
+_NON_WORD_RE = re.compile(r'[^\w]+')
+
+
+def role_key(extract: dict) -> tuple[str, str]:
+    """(company, title) folded for comparison: case, punctuation and LinkedIn's '(Copy)' ignored."""
+    title = _NON_WORD_RE.sub(' ', _COPY_SUFFIX_RE.sub(' ', str(extract.get('title') or ''))).casefold()
+    return tools_module._normalize_company(str(extract.get('company') or '')), ' '.join(title.split())
+
+
+def duplicate_roles_message(duplicates: list[dict]) -> str:
+    """One Telegram message naming every repeat posting of a role already notified this run."""
+    lines = ['Also posted (same role as a job already notified this run):']
+    for d in duplicates:
+        lines.append(f"• {d['company']} — {d['title']}: {d['location'] or 'location not stated'} — "
+                     f"rated {d['rating']}/5 (first: job {d['first_job_id']})\n  {d['url']}")
+    return '\n'.join(lines)
 
 
 async def _save_and_notify(
@@ -4147,6 +4174,8 @@ async def evaluate_all_candidates(
         })
 
     stage_stats.setdefault('evidence', new_stage_stats())
+    _notified_roles.clear()
+    _duplicate_roles.clear()
     logger.info(f'Stage 2: evaluating {len(candidates)} candidate(s)')
     stage_started = time.monotonic()
     cost_before = sum(s['cost'] for s in stage_stats.values())
@@ -4348,6 +4377,17 @@ async def evaluate_all_candidates(
                     f"notified {repost.get('notified')} ({repost.get('reason') or 'no reason given'})"
                 )
                 deterministic.insert(0, repost_warning(repost))
+            same_role = (_notified_roles.get(role_key(extract))
+                         if should_notify_based_on_rating(rating) and not repost else None)
+            if same_role:
+                bump('duplicate_role_suppressed')
+                logger.info(
+                    f"Same role: {candidate['company']} — {candidate['title']} (job {candidate['job_id']}): rated "
+                    f"{rating}/5, NOT notified — job {same_role['job_id']} ({same_role['location']}) was notified "
+                    f'this run; listed in the end-of-run message'
+                )
+                deterministic.insert(0, f"Same role as job {same_role['job_id']} ({same_role['location']}), "
+                                        'notified earlier this run')
 
             warnings = merge_warnings(
                 deterministic,
@@ -4382,13 +4422,23 @@ async def evaluate_all_candidates(
                 + f'\n{extract_text}'
             )
             tools_module.record_job_outcome(
-                candidate['site'], candidate['job_id'], 'recruiter_repost' if repost else 'rated',
+                candidate['site'], candidate['job_id'],
+                'recruiter_repost' if repost else 'duplicate_role' if same_role else 'rated',
                 rating=rating, summary=result['reasoning'],
             )
             sent = await _save_and_notify(
                 candidate, rating=rating, summary=result['summary'], content=content,
-                extract=extract, pros=pros, warnings=warnings, notify=not repost,
+                extract=extract, pros=pros, warnings=warnings, notify=not repost and not same_role,
             )
+            if sent:
+                _notified_roles[role_key(extract)] = {
+                    'job_id': candidate['job_id'], 'location': str(extract.get('location') or '')}
+            if same_role:
+                _duplicate_roles.append({
+                    'company': extract['company'], 'title': extract['title'],
+                    'location': str(extract.get('location') or ''), 'rating': rating,
+                    'url': candidate.get('url') or '', 'first_job_id': same_role['job_id'],
+                })
             # The reasoning is in the saved job and audit §4. Triage's reason appears only when
             # the two scores are far enough apart to be worth reading.
             triage_note = ''
@@ -4399,6 +4449,8 @@ async def evaluate_all_candidates(
                     triage_note += f" ({snippet(triage_result['reason'], TRIAGE_REASON_LOG_MAX_CHARS)})"
             if repost:
                 notify_note = 'not notified (recruiter repost)'
+            elif same_role:
+                notify_note = f"not notified (same role as job {same_role['job_id']}, notified this run)"
             elif sent is None:
                 notify_note = 'not notified (below the notification rating)'
             else:
@@ -4438,6 +4490,10 @@ async def evaluate_all_candidates(
                 f'{type(ex).__name__}: {ex}'
             )
 
+    if _duplicate_roles:
+        sent = await _send_pipeline_notification(duplicate_roles_message(_duplicate_roles))
+        logger.info(f'Same-role postings: {len(_duplicate_roles)} listed in one message '
+                    f"({'sent' if sent else 'send FAILED'})")
     logger.info(
         f'Stage 2 complete: {index} of {len(candidates)} job(s) in '
         f'{(time.monotonic() - stage_started) / SECONDS_PER_MINUTE:.1f} min, '
