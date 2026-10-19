@@ -30,7 +30,7 @@ from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 
 import agentic_job_search.preferences as preferences
-from agentic_job_search import evidence, location_review
+from agentic_job_search import evidence, job_trace, location_review
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
@@ -428,6 +428,9 @@ async def company_matches_applied(candidate: str) -> str | None:
             _raise_if_result_error(msg, f'Company match check failed for {candidate!r}')
             if msg.structured_output:
                 structured = msg.structured_output
+                job_trace.record('llm_call', transport='claude_agent_sdk', call_site='company_matches_applied',
+                                 model=ANTHROPIC_MODEL_NAME_LOW, prompt=f'{candidate}\n\n{companies_list}',
+                                 structured_output=structured)
     if not structured or not structured.get('matches'):
         return None
     return _applied_match_from_list(candidate, structured.get('matched_company_name', ''))
@@ -546,6 +549,8 @@ async def company_blacklist_reason(company: str, context: str = '', description:
                     _raise_if_result_error(msg, f'Blacklist confirmation failed for {candidate!r}')
                     if msg.structured_output:
                         structured = msg.structured_output
+                        job_trace.record('llm_call', transport='claude_agent_sdk', call_site='company_blacklist_reason',
+                                         model=ANTHROPIC_MODEL_NAME_LOW, prompt=prompt, structured_output=structured)
         except Exception as ex:
             logger.warning(
                 f'Blacklist confirmation failed for {candidate!r} ({unwrap_exception(ex)}) — rejecting on the exact '
@@ -614,6 +619,11 @@ def raw_posting_path(candidate: dict, captured_on: date | None = None) -> Path:
     site = re.sub(r'[^A-Za-z0-9_-]', '_', str(candidate.get('site') or 'unknown'))
     job_id = re.sub(r'[^A-Za-z0-9_-]', '_', str(candidate.get('job_id') or 'unknown'))
     return RAW_POSTINGS_DIR / captured_on.isoformat() / f'{site}-{job_id}.txt'
+
+
+def job_trace_path(candidate: dict, captured_on: date | None = None) -> Path:
+    """Where this job's Job Trace is written: beside its raw posting, so it is pruned with it."""
+    return raw_posting_path(candidate, captured_on).with_suffix('.trace.jsonl')
 
 
 def save_raw_posting(candidate: dict, text: str, source: str, chars_sent_to_model: int) -> Path | None:
@@ -933,6 +943,8 @@ async def recruiter_repost_of(
                         stage_stats['cost'] += msg.total_cost_usd
                     if msg.structured_output:
                         structured = msg.structured_output
+                        job_trace.record('llm_call', transport='claude_agent_sdk', call_site='recruiter_repost_of',
+                                         model=ANTHROPIC_MODEL_NAME_LOW, prompt=prompt, structured_output=structured)
     except Exception as ex:
         logger.warning(
             f'Repost check failed for {agency!r} job {job_id} ({unwrap_exception(ex)}) — '
@@ -1470,12 +1482,12 @@ def record_job_outcome(site: str, job_id: str, outcome: str, rating: int | None 
 
 
 def entry_warning_lines(warnings: list[dict]) -> list[str]:
-    """Audit 1c lines for pending list-hygiene findings: one line per entry, worded by its kind.
+    '''Audit 1c lines for pending list-hygiene findings: one line per entry, worded by its kind.
 
     Until 2026-10-19 every kind was printed as a substring collision, so a region conflict read
     "entry `Austria` on `location_cache.yaml` is a substring of `western_europe`", and an entry
     with two findings (one per region it was cached under) was listed twice.
-    """
+    '''
     by_entry: dict[tuple[str, str, str], list[dict]] = {}
     for warning in warnings:
         key = (str(warning.get('kind') or 'collision'), str(warning.get('entry')), str(warning.get('list')))
@@ -1564,6 +1576,9 @@ def write_run_audit_log(
             f'- search `{report.get("query", "")}` / {report.get("region", "")} — '
             f'{report.get("job_cards")} cards, pin "{report.get("location_pin")}" — {status}'
         )
+
+    if job_audit_pdf := funnel.get('job_audit'):
+        lines.append(f'- Job audit (every step that decided one rated job): `{job_audit_pdf}`')
 
     # Verify Source Reference (evidence.py): predictions rejected because their citation was not in
     # the input. Listed, not alerted: each rejection already logged a WARNING with its quote, and a

@@ -7,6 +7,13 @@ the profile it had cut. So this prints the raw material — the page text the ex
 extract it returned, the profile the rater was calibrated against, the rating it gave — and then
 states plainly what the pipeline does NOT retain, because that gap is the other half of the answer.
 
+Since 2026-10-19 every Stage 2 job also leaves a Job Trace beside its raw posting
+(`raw_postings/{date}/{site}-{job_id}.trace.jsonl`): every step in order, every LLM call with its
+full prompt and reply, every citation check, every hard rule with its inputs, the rating before and
+after caps, and the exact Telegram text. When it exists this report opens with the decision path
+it records and closes with the whole trace verbatim, and the "not kept" list shrinks to match.
+A run renders one of these per run by itself (job_audit.py); this script renders any other.
+
 Usage:
     uv run --with reportlab python scripts/job_trace_report.py --job-id 4479034008
     ... --job-id 4479034008 --date 2026-10-13 --out run_dir/trace.pdf
@@ -28,6 +35,8 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
     PageBreak,
@@ -44,6 +53,7 @@ sys.path.insert(0, str(PROJECT_DIR / 'src'))
 
 from agentic_job_search import agent as A  # noqa: E402
 from agentic_job_search import config as C  # noqa: E402
+from agentic_job_search import job_trace as T  # noqa: E402
 
 RUN_DIR = PROJECT_DIR / 'run_dir'
 WRAP = 108
@@ -51,8 +61,27 @@ WRAP = 108
 
 # --- rendering helpers -------------------------------------------------------
 
-# Standard PDF fonts are WinAnsi, so anything outside it renders as a black box. Map the glyphs
-# that have a readable ASCII form, then let cp1252 replace whatever is left.
+# Standard PDF fonts are WinAnsi, so anything outside it renders as a black box. Where the
+# machine has TrueType fonts covering more (macOS ships both below), they are embedded instead, so
+# 'Gdańsk' prints as written; otherwise the glyphs with a readable ASCII form are mapped and cp1252
+# replaces whatever is left.
+_UNICODE_FONTS = {
+    'TraceSans': Path('/System/Library/Fonts/Supplemental/Arial Unicode.ttf'),
+    'TraceSansBold': Path('/System/Library/Fonts/Supplemental/Arial Bold.ttf'),
+    'TraceMono': Path('/System/Library/Fonts/Supplemental/Courier New.ttf'),
+}
+
+
+def _register_unicode_fonts() -> bool:
+    if not all(path.is_file() for path in _UNICODE_FONTS.values()):
+        return False
+    for name, path in _UNICODE_FONTS.items():
+        pdfmetrics.registerFont(TTFont(name, str(path)))
+    pdfmetrics.registerFontFamily('TraceSans', normal='TraceSans', bold='TraceSansBold')
+    return True
+
+
+UNICODE_FONTS = _register_unicode_fonts()
 _GLYPHS = str.maketrans({
     '→': '->', '←': '<-', '≈': '~', '⭐': '[STAR]', '📍': '[LOC]', '💰': '[PAY]',
     '🗓': '[DATE]', '✅': '[OK]', '⚠': '[WARN]', '▶': '>', '·': '.', '\ufe0f': '',
@@ -60,6 +89,8 @@ _GLYPHS = str.maketrans({
 
 
 def _plain(text: str) -> str:
+    if UNICODE_FONTS:
+        return text.replace('\ufe0f', '')
     return text.translate(_GLYPHS).encode('cp1252', 'replace').decode('cp1252')
 
 
@@ -105,7 +136,8 @@ def rule() -> HRFlowable:
 
 
 def kv_table(rows: list[tuple[str, str]]) -> Table:
-    data = [[Paragraph(_xml(f'<b>{k}</b>'), BODY), Paragraph(_xml(v), BODY)] for k, v in rows]
+    # The tags wrap the escaped key: escaping them too printed a literal '<b>Job</b>'.
+    data = [[Paragraph(f'<b>{_xml(k)}</b>', BODY), Paragraph(_xml(v), BODY)] for k, v in rows]
     table = Table(data, colWidths=[42 * mm, None])
     table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
@@ -218,11 +250,133 @@ def stage_cost(run_date: str, stage: str) -> str:
 
 # --- document ----------------------------------------------------------------
 
-def build(job_id: str, run_date: str, out: Path) -> Path:
+# --- the Job Trace --------------------------------------------------------------
+
+def shown(path: Path) -> str:
+    '''A path relative to the project when it is inside it, else absolute (a --trace elsewhere).'''
+    return str(path.relative_to(PROJECT_DIR)) if path.is_relative_to(PROJECT_DIR) else str(path)
+
+
+def as_text(value: object) -> str:
+    '''A trace value for a VERBATIM block: strings as they are, anything else as indented JSON.'''
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, indent=1, ensure_ascii=False, default=str)
+
+
+def cell(value: object) -> str:
+    return as_text(value) if value not in (None, '', [], {}) else '—'
+
+
+def _reply_meta(step: dict) -> dict:
+    '''Cost, provider and finish_reason from a raw MCP reply (the extract loop records it whole).'''
+    if 'raw_reply' not in step:
+        return {}
+    try:
+        data = json.loads(step['raw_reply'])
+    except (TypeError, ValueError):
+        return {}
+    return {'cost_usd': data.get('cost_usd'), 'provider': data.get('provider'),
+            'finish_reason': data.get('finish_reason')} if isinstance(data, dict) else {}
+
+
+def decision_path(steps: list[dict]) -> list:
+    '''The trace boiled down to what decided the rating, each line pointing at its full step.'''
+    story: list = [h1('Decision path (from the Job Trace)'), rule()]
+    extract = next((s['fields'] for s in steps if s['kind'] == 'extract'), {})
+    statuses = extract.get('evidence') or {}
+    quotes = extract.get('quotes') or {}
+    rows = [('Field', 'Value', 'Cited words', 'Verification')]
+    for field in C.EXTRACT_CITED_FIELDS:
+        value = extract.get(field)
+        if value in (None, '', False) and field not in statuses:
+            continue
+        rows.append((field, cell(value), cell(quotes.get(field)), statuses.get(field, 'not cited')))
+    story += [label('Extracted fields, their citations, and how each was grounded'), grid(rows)]
+    rules = [s for s in steps if s['kind'] == 'hard_rule']
+    if rules:
+        story += [label('Hard rules, in evaluation order'), grid([('Rule', 'Result', 'Inputs')] + [
+            (r['rule'], f"FIRED: {r.get('reason')}" if r['fired'] else 'passed',
+             cell({k: v for k, v in r.items() if k not in ('kind', 'at', 'elapsed_s', 'rule', 'fired', 'reason')}))
+            for r in rules])]
+    rating = next((s for s in steps if s['kind'] == 'rating'), None)
+    if rating:
+        triage = rating.get('triage') or {}
+        story += [label('Rating'), kv_table([
+            ('Triage (local)', f"{triage.get('score')} — {triage.get('reason')}" if triage else 'not run'),
+            ('Rater', f"{rating['raw_rating']}/5 by {rating['result'].get('rated_by') or C.MODEL_NAME_RATING}"),
+            ('Caps', rating.get('cap_reason') or 'none'),
+            ('Final', f"{rating['capped_rating']}/5"),
+        ])]
+    rejected = [v for s in steps if s['kind'] == 'evidence' for v in s['verdicts'] if v['status'] == 'rejected']
+    story += [label(f'Hallucinations rejected for this job: {len(rejected)}')]
+    if rejected:
+        story += [grid([('Call', 'Field', 'Value', 'Cited')] + [
+            (s['call_site'], v['field'], cell(v['value']), cell(v['quote']))
+            for s in steps if s['kind'] == 'evidence' for v in s['verdicts'] if v['status'] == 'rejected'])]
+    calls = [dict(s, **_reply_meta(s)) for s in steps if s['kind'] == 'llm_call']
+    story += [label(f'LLM calls for this job: {len(calls)} (each in full in the last section)'), grid(
+        [('#', 'Call site', 'Model / served by', 'Seconds', 'Cost', 'Outcome')] + [
+            (str(n), c['call_site'], f"{c.get('model')} / {c.get('provider') or c.get('transport')}",
+             cell(c.get('seconds')), f"${c['cost_usd']:.5f}" if c.get('cost_usd') is not None else '—',
+             'ERROR' if c.get('error') else (c.get('finish_reason') or 'ok'))
+            for n, c in enumerate(calls, 1)])]
+    return story
+
+
+def trace_story(steps: list[dict], trace_path: Path) -> list:
+    '''Every step of the trace in order, nothing summarised.'''
+    story: list = [PageBreak(), h1('The Job Trace — every step, verbatim'), rule(),
+                   note(f'{shown(trace_path)}: {len(steps)} step(s). Times are wall clock; '
+                        'elapsed is seconds since this job started.')]
+    call_number = 0
+    for step in steps:
+        kind = step['kind']
+        heading = f"{step.get('at', '?')} (+{step.get('elapsed_s', '?')}s) — {kind}"
+        body_fields = {k: v for k, v in step.items() if k not in ('kind', 'at', 'elapsed_s')}
+        if kind == 'llm_call':
+            call_number += 1
+            heading += f" #{call_number}: {step.get('call_site')} — {step.get('model')}"
+            meta = [(k, cell(body_fields.pop(k))) for k in list(body_fields)
+                    if k not in ('system', 'prompt', 'messages', 'reply', 'raw_reply', 'structured_output', 'error')]
+            story += [h2(heading), kv_table(meta)]
+            for part in ('system', 'prompt', 'messages', 'reply', 'raw_reply', 'structured_output', 'error'):
+                if body_fields.get(part) not in (None, ''):
+                    story += [label(f'VERBATIM — {part}'), verbatim(as_text(body_fields[part]))]
+        elif kind == 'evidence':
+            story += [h2(heading + f" — {step['call_site']}"), grid(
+                [('Field', 'Value', 'Cited', 'Status', 'Passage found')] + [
+                    (v['field'], cell(v['value']), cell(v['quote']), v['status'], cell(v['evidence']))
+                    for v in step['verdicts']])]
+        elif kind == 'page_read' and step.get('text'):
+            text = body_fields.pop('text')
+            story += [h2(heading), kv_table([(k, cell(v)) for k, v in body_fields.items()]),
+                      label('VERBATIM — the page text the extractor read'), verbatim(text)]
+        else:
+            story += [h2(heading), verbatim(as_text(body_fields))]
+    return story
+
+
+def grid(rows: list[tuple]) -> Table:
+    '''A header row plus wrapped cells; long cells wrap rather than overflow the page.'''
+    data = [[Paragraph(_xml(_plain(str(c))), BODY) for c in row] for row in rows]
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 0.3, colors.HexColor('#bbbbbb')),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#eeeeee')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    return table
+
+
+def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> Path:
     saved = find_saved_job(job_id)
     processed = find_processed_record(job_id)
     raw_txt = RUN_DIR / 'raw_postings' / run_date / f'linkedin-{job_id}.txt'
     raw_html = RUN_DIR / 'raw_postings' / run_date / f'linkedin-{job_id}.html'
+    trace_path = trace or RUN_DIR / 'raw_postings' / run_date / f'linkedin-{job_id}.trace.jsonl'
+    steps = T.load(trace_path) if trace_path.exists() else []
+    sent = next((s for s in steps if s['kind'] == 'notification'), None)
 
     # The page read stamps its own capture time; that is what anchors which run this is.
     captured = None
@@ -266,6 +420,8 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
                               f'({raw_txt.stat().st_size:,} bytes)' if raw_txt.exists() else 'NOT FOUND'),
             ('Raw DOM archive', f'{raw_html.relative_to(PROJECT_DIR)} '
                                  f'({raw_html.stat().st_size:,} bytes)' if raw_html.exists() else 'NOT FOUND'),
+            ('Job Trace', f'{shown(trace_path)} ({len(steps)} steps)'
+                          if steps else 'NOT FOUND (written by runs from 2026-10-19 on)'),
         ]),
         Spacer(1, 3 * mm),
         note('Sections are in pipeline order. Blocks marked VERBATIM are copied byte-for-byte from '
@@ -274,6 +430,8 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
              'The final section lists what the pipeline does NOT keep.'),
         PageBreak(),
     ]
+    if steps:
+        story += [*decision_path(steps), PageBreak()]
 
     # 1. Stage 1a
     story += [h1('1. Stage 1a — the queries this run searched with'), rule()]
@@ -374,27 +532,34 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
 
     # 8. Notification
     story += [PageBreak(), h1('8. The Telegram message'), rule()]
-    story += [body("Rebuilt by calling the pipeline's own format_job_notification() with the "
-                   'fields the Saved Job and the run log retained. The message the user actually '
-                   'received was not stored.')]
-    try:
-        extract = {
-            'title': re.search(r'^Title:\s*(.+)$', md, re.M).group(1),
-            'company': company,
-            'location': group_or(r'^Location:\s*(.+)$', md, ''),
-            'workplace_type': group_or(r'^Workplace:\s*(.+)$', md, ''),
-            'date_posted': group_or(r'^Posted:\s*(.+)$', md, ''),
-            'salary': '',
-            'salary_estimate': {
-                'currency': 'EUR', 'minimum': 75000, 'maximum': 115000, 'period': 'year',
-                'model': 'z-ai/glm-5.3-flash',
-                'basis': estimate_line.split('basis:', 1)[-1].strip() if 'basis:' in estimate_line else '',
-            },
-        }
-        candidate = {'company': company, 'title': extract['title'], 'url': url, 'job_id': job_id}
-        story += [verbatim(A.format_job_notification(candidate, extract, int(rating), pros, warnings))]
-    except Exception as ex:  # a report must not die on one missing field
-        story += [body(f'Could not rebuild the message from the retained fields: {type(ex).__name__}: {ex}')]
+    if sent is not None:
+        story += [body('Exactly as sent, from the Job Trace.' if sent.get('text') else
+                       f"No message was sent: {sent.get('why')}.")]
+        if sent.get('text'):
+            story += [kv_table([('Delivered', 'yes' if sent.get('sent') else 'NO — the send failed')]),
+                      verbatim(sent['text'])]
+    else:
+        story += [body("Rebuilt by calling the pipeline's own format_job_notification() with the "
+                       'fields the Saved Job and the run log retained. The message the user actually '
+                       'received was not stored.')]
+    if sent is None:
+        try:
+            # No salary_estimate: the Saved Job keeps only its display line, and rebuilding one from
+            # it would put figures in this document that no file states. Until 2026-10-19 a
+            # hard-coded EUR 75,000-115,000 estimate stood in for every job here.
+            extract = {
+                'title': re.search(r'^Title:\s*(.+)$', md, re.M).group(1),
+                'company': company,
+                'location': group_or(r'^Location:\s*(.+)$', md, ''),
+                'workplace_type': group_or(r'^Workplace:\s*(.+)$', md, ''),
+                'date_posted': group_or(r'^Posted:\s*(.+)$', md, ''),
+                'salary': '',
+            }
+            candidate = {'company': company, 'title': extract['title'], 'url': url, 'job_id': job_id}
+            story += [verbatim(A.format_job_notification(candidate, extract, int(rating), pros, warnings)),
+                      note('The salary line above is not rebuilt; the Saved Job line in section 6 is what was shown.')]
+        except Exception as ex:  # a report must not die on one missing field
+            story += [body(f'Could not rebuild the message from the retained fields: {type(ex).__name__}: {ex}')]
 
     # 9. Cost
     story += [Spacer(1, 3 * mm), h1('9. Cost of this job'), rule()]
@@ -410,7 +575,7 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
     story += [PageBreak(), h1('10. What the pipeline does NOT keep'), rule()]
     story += [body('Stated explicitly, because the absence is what makes a summary look complete. '
                    'Each of these was in memory during the run and is gone:')]
-    story += [verbatim('\n'.join([
+    not_kept_without_trace = [
         '* The search-results CARD text for this listing (title/company/location as shown in the',
         '  results list). The harvest is held in ScrapeSession._harvest and handed straight to',
         "  do_record_listings; only the counts and the audit log's per-search lines survive.",
@@ -423,7 +588,16 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
         '  build_evaluator_instructions() and the extract text).',
         '* The search URL / filter state for the search that surfaced this job: the audit log keeps',
         '  the query, the region, the pin that was verified and the card count, not the URL.',
-    ]))]
+    ]
+    not_kept_with_trace = [
+        '* The search URL / filter state for the search that surfaced this job: the audit log keeps',
+        '  the query, the region, the pin that was verified and the card count, not the URL.',
+        '* The browser tool calls of Stage 1b (the scraper session), which happen before this job',
+        '  exists as a candidate; the trace starts at the listing record that queued it.',
+    ]
+    story += [verbatim('\n'.join(not_kept_with_trace if steps else not_kept_without_trace))]
+    if steps:
+        story += trace_story(steps, trace_path)
     story += [Spacer(1, 2 * mm),
               note('Everything else in this document is verbatim from a file on disk.'),
               Spacer(1, 3 * mm),
@@ -450,20 +624,23 @@ def build(job_id: str, run_date: str, out: Path) -> Path:
 # --- styles ------------------------------------------------------------------
 
 _sheet = getSampleStyleSheet()
-TITLE = ParagraphStyle('T', parent=_sheet['Title'], fontSize=17, leading=20, spaceAfter=2,
+_SANS = 'TraceSans' if UNICODE_FONTS else 'Helvetica'
+_SANS_BOLD = 'TraceSansBold' if UNICODE_FONTS else 'Helvetica-Bold'
+TITLE = ParagraphStyle('T', parent=_sheet['Title'], fontName=_SANS_BOLD, fontSize=17, leading=20, spaceAfter=2,
                        textColor=colors.HexColor('#111111'))
-SUBTITLE = ParagraphStyle('S', parent=_sheet['Normal'], fontSize=9.5, leading=12,
+SUBTITLE = ParagraphStyle('S', parent=_sheet['Normal'], fontName=_SANS, fontSize=9.5, leading=12,
                           textColor=colors.HexColor('#555555'))
-H1 = ParagraphStyle('H1', parent=_sheet['Heading1'], fontSize=12.5, leading=15, spaceBefore=2,
+H1 = ParagraphStyle('H1', parent=_sheet['Heading1'], fontName=_SANS_BOLD, fontSize=12.5, leading=15, spaceBefore=2,
                     spaceAfter=1, textColor=colors.HexColor('#0b3d6b'))
-H2 = ParagraphStyle('H2', parent=_sheet['Heading2'], fontSize=10.5, leading=13, spaceBefore=4,
+H2 = ParagraphStyle('H2', parent=_sheet['Heading2'], fontName=_SANS_BOLD, fontSize=10.5, leading=13, spaceBefore=4,
                     spaceAfter=1, textColor=colors.HexColor('#333333'))
-BODY = ParagraphStyle('B', parent=_sheet['Normal'], fontSize=8.8, leading=11.4)
+BODY = ParagraphStyle('B', parent=_sheet['Normal'], fontName=_SANS, fontSize=8.8, leading=11.4)
 NOTE = ParagraphStyle('N', parent=BODY, fontSize=8.2, leading=10.6,
                       textColor=colors.HexColor('#666666'), leftIndent=4)
 LABEL = ParagraphStyle('L', parent=BODY, fontSize=8.2, leading=10.4, spaceBefore=4, spaceAfter=1,
                        textColor=colors.HexColor('#7a4a00'))
-VERBATIM = ParagraphStyle('V', parent=_sheet['Code'], fontName='Courier', fontSize=7.0, leading=8.6,
+VERBATIM = ParagraphStyle('V', parent=_sheet['Code'], fontName='TraceMono' if UNICODE_FONTS else 'Courier',
+                          fontSize=7.0, leading=8.6,
                           backColor=colors.HexColor('#f6f6f4'), borderPadding=3, leftIndent=0)
 
 
@@ -474,11 +651,13 @@ def main() -> None:
     parser.add_argument('--date', default=date.today().isoformat(),
                         help='run date, YYYY-MM-DD (default today)')
     parser.add_argument('--out', type=Path, default=None)
+    parser.add_argument('--trace', type=Path, default=None,
+                        help='Job Trace file (default: raw_postings/{date}/linkedin-{job-id}.trace.jsonl)')
     args = parser.parse_args()
 
     out = args.out or RUN_DIR / f'job-trace-{args.job_id}-{args.date}.pdf'
     out.parent.mkdir(parents=True, exist_ok=True)
-    print(f'wrote {build(args.job_id, args.date, out)}')
+    print(f'wrote {build(args.job_id, args.date, out, args.trace)}')
 
 
 if __name__ == '__main__':

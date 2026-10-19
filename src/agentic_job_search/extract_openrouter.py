@@ -14,6 +14,7 @@ import time
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
+from agentic_job_search import job_trace
 from agentic_job_search.config import (
     EXTRACT_CITED_FIELDS,
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
@@ -174,6 +175,7 @@ async def extract_job_page_openrouter(
         # A timeout or transport failure raises rather than returning ok=false. Until 2026-10-18 it
         # escaped to the Stage 2 error handler, skipping the Haiku fallback and dropping the job.
         routing = routing_for(MODEL_NAME_EXTRACTOR)
+        call_started = time.monotonic()
         try:
             raw = await call_mcp_tool(
                 LLM_OPENROUTER_MCP_URL, 'chat',
@@ -181,12 +183,21 @@ async def extract_job_page_openrouter(
                 timeout_seconds=LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
             )
         except Exception as ex:
+            job_trace.record('llm_call', transport='openrouter', call_site='extract_job_page_openrouter',
+                             model=MODEL_NAME_EXTRACTOR, routing=routing, iteration=iteration + 1,
+                             messages=list(messages), error=f'{type(ex).__name__}: {ex}',
+                             seconds=round(time.monotonic() - call_started, 2))
             endpoint_failed(MODEL_NAME_EXTRACTOR, routing, f'{type(ex).__name__}: {ex}')
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat with {MODEL_NAME_EXTRACTOR} failed (iteration {iteration + 1}): {type(ex).__name__}: {ex}"
             )
             return None
+        # The whole exchange, raw: the tool spec is fixed (OPENROUTER_EXTRACT_TOOLS), so the
+        # messages and the server's reply are everything that varied.
+        job_trace.record('llm_call', transport='openrouter', call_site='extract_job_page_openrouter',
+                         model=MODEL_NAME_EXTRACTOR, routing=routing, iteration=iteration + 1,
+                         messages=list(messages), raw_reply=raw, seconds=round(time.monotonic() - call_started, 2))
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as ex:

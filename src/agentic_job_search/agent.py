@@ -51,7 +51,7 @@ from utils_tools_n_agents_common.telegram_client import send_message as telegram
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search import endpoint_pin, evidence, fx, location, location_review, scrape_openrouter, system_sleep
+from agentic_job_search import endpoint_pin, evidence, fx, job_audit, job_trace, location, location_review, scrape_openrouter, system_sleep
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
@@ -60,6 +60,7 @@ from agentic_job_search.config import (
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_CITED_FIELDS,
     FAILED_QUERIES_NAMED_MAX,
+    JOB_AUDIT_ENABLED,
     JOB_STALE_AGE_DAYS,
     LISTING_ESTIMATE_HISTORY_RUNS,
     LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY,
@@ -2320,8 +2321,13 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
     """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
     try:
         async with mcp_session(playwright_mcp_url) as call:
-            return await read_job_page(candidate, call, stage_stats)
+            page = await read_job_page(candidate, call, stage_stats)
+        job_trace.record('page_read', url=candidate.get('url'), source=page.source if page else None,
+                         chars=len(page.text) if page else 0, removed=page.removed if page else [],
+                         raw_posting=str(tools_module.raw_posting_path(candidate)), text=page.text if page else '')
+        return page
     except Exception as ex:
+        job_trace.record('page_read', url=candidate.get('url'), error=unwrap_exception(ex))
         logger.warning(
             f"Reading the page failed for {candidate['company']} — {candidate['title']} "
             f"(job {candidate.get('job_id')}, {candidate.get('url')}): {unwrap_exception(ex)}"
@@ -2368,6 +2374,9 @@ async def extract_job_page_direct(
                 cost_note = f', ${charged or 0.0:.4f} over {msg.num_turns} turn(s)'
                 if msg.structured_output:
                     structured = msg.structured_output
+    job_trace.record('llm_call', transport='claude_agent_sdk', call_site='extract_job_page_direct',
+                     model=ANTHROPIC_MODEL_NAME_LOW, prompt=prompt, structured_output=structured,
+                     cost_note=cost_note.strip(', '))
     if structured is None:
         logger.warning(f"Extract fallback: job {candidate['job_id']} {candidate['company']} — "
                        f"{candidate['title']}: no structured output{cost_note}")
@@ -2875,6 +2884,15 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     '''
     full_text = format_extract_text(candidate, extract)
 
+    # Every rule evaluated is recorded in the Job Trace with its inputs, so a Job Audit can show
+    # why a job survived each one as well as which one stopped it.
+    def passed(rule: str, **inputs: object) -> None:
+        job_trace.record('hard_rule', rule=rule, fired=False, **inputs)
+
+    def fired(rule: str, reason: str, **inputs: object) -> str:
+        job_trace.record('hard_rule', rule=rule, fired=True, reason=reason, **inputs)
+        return reason
+
     # Both the poster and the end client: a recruiting agency can repost a blacklisted company's
     # role under its own name, which is the same gap end-client dedup closes for applied jobs.
     blacklist_context = '\n'.join(filter(None, [
@@ -2886,10 +2904,12 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     for name in (extract.get('company') or candidate.get('company', ''), derive_end_client(extract)):
         if name and (reason := await tools_module.company_blacklist_reason(
                 name, context=blacklist_context, description=description)):
-            return f'blacklisted company: {name} ({reason})'
+            return fired('blacklist', f'blacklisted company: {name} ({reason})', name=name)
+    passed('blacklist', names=[extract.get('company') or candidate.get('company', ''), derive_end_client(extract)])
 
     if extract['closed'] or 'no longer accepting applications' in full_text.lower():
-        return 'posting closed (no longer accepting applications)'
+        return fired('closed', 'posting closed (no longer accepting applications)', closed=extract['closed'])
+    passed('closed', closed=extract['closed'])
     try:
         posted = parse_posting_date(extract['date_posted'] or candidate['date_posted'])
     except ValueError as ex:
@@ -2898,8 +2918,11 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
             f"— treating its age as unknown, so the stale-posting rule does not apply"
         )
         posted = None
+    stale_inputs = {'date_posted': extract['date_posted'] or candidate['date_posted'],
+                    'posted': posted.isoformat() if posted else None}
     if posted and (date.today() - posted).days > JOB_STALE_AGE_DAYS:
-        return f'posting older than {JOB_STALE_AGE_DAYS} days ({posted.isoformat()})'
+        return fired('stale', f'posting older than {JOB_STALE_AGE_DAYS} days ({posted.isoformat()})', **stale_inputs)
+    passed('stale', **stale_inputs)
     sponsorship_locations = preferences.sponsorship_required_in()
     # Folded HERE rather than in the accessor: the preference holds place names, and a name folded
     # on the way in cannot be unfolded on the way out. This rule is still a substring match, unlike
@@ -2909,7 +2932,9 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     if sponsorship_locations and (
         _requires_current_us_auth(full_text) or (needs_sponsorship and 'sponsor' not in full_text.lower())
     ):
-        return 'job without explicit visa sponsorship'
+        return fired('sponsorship', 'job without explicit visa sponsorship', location=extract['location'],
+                     sponsorship_required_in=list(sponsorship_locations))
+    passed('sponsorship', location=extract['location'], needs_sponsorship=needs_sponsorship)
     known_languages = preferences.languages()
     if known_languages:
         unsupported = [
@@ -2917,18 +2942,25 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
             if lang.strip() and not any(known in lang.lower() for known in known_languages)
         ]
         if unsupported:
-            return f'requires unsupported language: {", ".join(unsupported)}'
+            return fired('language', f'requires unsupported language: {", ".join(unsupported)}',
+                         language_requirement=extract.get('language_requirement', ''))
+    passed('language', language_requirement=extract.get('language_requirement', ''))
     # Where the role is ANCHORED, and separately whether the JD demands a move. A bare location is
     # NOT a residency requirement — "Germany (Remote)" means the role sits in Germany and you could
     # live anywhere in the EU — so the two are judged apart, on different fields.
+    location_inputs = {'location': extract.get('location', ''), 'residency_scope': extract.get('residency_scope', ''),
+                       'place_names': extract.get('place_names') or []}
     if region := await location_rejection_reason(extract):
-        return f'located in an excluded region: {region}'
+        return fired('location', f'located in an excluded region: {region}', **location_inputs)
+    passed('location', **location_inputs)
     if (relocation := str(extract.get('relocation') or '').strip()) and (
             region := await rejected_location(relocation)):
-        return f'relocation required to an excluded region: {region}'
+        return fired('relocation', f'relocation required to an excluded region: {region}', relocation=relocation)
+    passed('relocation', relocation=relocation)
     degree = derive_education_requirement(extract)
     if degree and degree in preferences.rejected_degrees():
-        return f'requires advanced degree: {degree}'
+        return fired('degree', f'requires advanced degree: {degree}', education_requirement=degree)
+    passed('degree', education_requirement=degree)
     return None
 
 
@@ -3937,6 +3969,9 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
                 print_result_stats(msg, cost_delta)
                 if msg.structured_output:
                     structured = msg.structured_output
+    job_trace.record('llm_call', transport='claude_agent_sdk', call_site='_rate_with_anthropic', model=model,
+                     system=evaluator_prompt, prompt=f'Evaluate this job posting:\n\n{extract_text}',
+                     structured_output=structured)
     if structured is None:
         raise RuntimeError('Anthropic rating call returned no structured output')
     return structured
@@ -4000,7 +4035,7 @@ def role_key(extract: dict) -> tuple[str, str]:
 
 
 def duplicate_roles_message(duplicates: list[dict]) -> str:
-    """One Telegram message naming every repeat posting of a role already notified this run."""
+    '''One Telegram message naming every repeat posting of a role already notified this run.'''
     lines = ['Also posted (same role as a job already notified this run):']
     for d in duplicates:
         lines.append(f"• {d['company']} — {d['title']}: {d['location'] or 'location not stated'} — "
@@ -4016,14 +4051,19 @@ async def _save_and_notify(
 
     Returns whether the notification was sent, or None when none was attempted.
     '''
-    await tools_module.do_save_job_posting(
+    saved = await tools_module.do_save_job_posting(
         company=candidate['company'], description=summary, rating=rating,
         content=content, job_id=candidate['job_id'],
     )
+    job_trace.record('saved', rating=rating, summary=summary, content=content, result=saved)
     if notify and should_notify_based_on_rating(rating):
-        return await _send_pipeline_notification(
-            format_job_notification(candidate, extract or {}, rating, pros or [], warnings or [])
-        )
+        text = format_job_notification(candidate, extract or {}, rating, pros or [], warnings or [])
+        sent = await _send_pipeline_notification(text)
+        job_trace.record('notification', text=text, sent=sent)
+        return sent
+    job_trace.record('notification', text=None, sent=None,
+                     why='withheld (repost or same role)' if should_notify_based_on_rating(rating)
+                     else 'below the notification rating')
     return None
 
 
@@ -4176,6 +4216,7 @@ async def evaluate_all_candidates(
     stage_stats.setdefault('evidence', new_stage_stats())
     _notified_roles.clear()
     _duplicate_roles.clear()
+    trace_token = None
     logger.info(f'Stage 2: evaluating {len(candidates)} candidate(s)')
     stage_started = time.monotonic()
     cost_before = sum(s['cost'] for s in stage_stats.values())
@@ -4193,6 +4234,13 @@ async def evaluate_all_candidates(
         candidate = candidates[index]
         index += 1
         logger.debug(f"Evaluating: {candidate['company']} — {candidate['title']}")
+        if trace_token is not None:
+            job_trace.finish(trace_token)
+        _trace, trace_token = job_trace.start(
+            tools_module.job_trace_path(candidate), candidate['site'], candidate['job_id'])
+        job_trace.record('origin', candidate=candidate,
+                         listing=tools_module._listing_records.get((candidate['site'], candidate['job_id'])),
+                         position=f'{index} of {len(candidates)}')
         try:
             # Read once, in code; both extractors below work from the same text, and every field
             # they return is checked against it (verify_extract). The Anthropic agentic extractor,
@@ -4209,6 +4257,7 @@ async def evaluate_all_candidates(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)
             if extract is not None:
                 await verify_extract(candidate, extract, stage_stats['evidence'])
+                job_trace.record('extract', fields={k: v for k, v in extract.items() if k != 'page_text'})
             if extract is None and browser is not None and await browser.confirm_dead():
                 index -= 1   # the browser, not the page, failed: retry this job after the restart
                 continue
@@ -4257,6 +4306,13 @@ async def evaluate_all_candidates(
                 f'{format_extract_signal(extract, raw_residency_scope)}{geo_note}'
             )
             logger.debug(f"Place names: job {candidate['job_id']}: {extract.get('place_names')}")
+            job_trace.record(
+                'classified', geography=geography, salary_facts=extract.get('salary_facts'),
+                likely_spoken_languages=extract.get('likely_spoken_languages'),
+                residency_scope={'extracted': raw_residency_scope, 'derived': extract['residency_scope']},
+                workplace_type=derive_workplace_type(extract), education_requirement=derive_education_requirement(extract),
+                is_agency=derive_agency_posting(extract), end_client=derive_end_client(extract),
+                extract_text=extract_text)
 
             # Already-applied, checked against the END CLIENT only.
             #
@@ -4344,6 +4400,8 @@ async def evaluate_all_candidates(
             result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
             rating_seconds = time.monotonic() - rating_started
             rating, cap_reason = apply_rating_caps(extract, result['rating'])
+            job_trace.record('rating', triage=triage_result, result=result, raw_rating=result['rating'],
+                             capped_rating=rating, cap_reason=cap_reason, seconds=round(rating_seconds, 1))
             if cap_reason:
                 bump('rating_capped')
                 logger.info(
@@ -4490,6 +4548,8 @@ async def evaluate_all_candidates(
                 f'{type(ex).__name__}: {ex}'
             )
 
+    if trace_token is not None:
+        job_trace.finish(trace_token)
     if _duplicate_roles:
         sent = await _send_pipeline_notification(duplicate_roles_message(_duplicate_roles))
         logger.info(f'Same-role postings: {len(_duplicate_roles)} listed in one message '
@@ -4991,7 +5051,8 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
     return False
 
 
-async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0) -> None:
+async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0,
+                              job_audit_enabled: bool = JOB_AUDIT_ENABLED, job_audit_job_id: str | None = None) -> None:
     # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
     # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
     if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
@@ -5192,6 +5253,10 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     finally:
         await browser.stop()
 
+    chosen = job_audit.choose_job(candidates, job_audit_job_id, seed=int(start_time)) if job_audit_enabled else None
+    if chosen and (audit_pdf := await job_audit.render(chosen, date.today())):
+        funnel['job_audit'] = str(audit_pdf)
+
     elapsed_mins = (time.time() - start_time) / SECONDS_PER_MINUTE
     num_evaluated, num_high_rated = count_new_jobs(jobs_before)
     total_cost = sum(s['cost'] for s in stage_stats.values())
@@ -5331,6 +5396,14 @@ async def main() -> None:
         help='Diagnostic: re-rate gate-killed jobs with the strong rater to detect false negatives '
              '(non-interactive mode only; saving/notification behaviour unchanged)',
     )
+    parser.add_argument(
+        '--job-audit', metavar='JOB_ID', default=None,
+        help='Render the end-of-run Job Audit PDF for this job instead of a randomly chosen rated one',
+    )
+    parser.add_argument(
+        '--no-job-audit', action='store_true',
+        help='Skip the end-of-run Job Audit PDF (one rated job, every step that decided its rating)',
+    )
     args = parser.parse_args()
     interactive = not args.non_interactive
 
@@ -5398,7 +5471,10 @@ async def main() -> None:
             async with ClaudeSDKClient(options) as client:
                 await run_interactive(client)
         else:
-            await run_non_interactive(browser_mode=args.browser, audit=args.audit, audit_opus=args.audit_opus)
+            await run_non_interactive(
+                browser_mode=args.browser, audit=args.audit, audit_opus=args.audit_opus,
+                job_audit_enabled=JOB_AUDIT_ENABLED and not args.no_job_audit, job_audit_job_id=args.job_audit,
+            )
     except BaseException as ex:
         # Without this the cause of a dead run reached only the terminal. On 2026-09-21 the log just
         # stopped at "Released run lock", with no hint that cleanup had raised ProcessLookupError.

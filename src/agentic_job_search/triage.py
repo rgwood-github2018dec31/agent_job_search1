@@ -13,12 +13,14 @@ agent_stock_trends1.
 import json
 import logging
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
 
+from agentic_job_search import job_trace
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
     LLM_LOCAL_PURPOSE_RATING,
@@ -198,6 +200,26 @@ async def chat_openrouter(
     prompt: str, system: str = '', model: str = MODEL_NAME_SINGLE_TURN, max_tokens: int | None = None,
     timeout_seconds: float = LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
 ) -> ChatReply:
+    '''One completion via the OpenRouter MCP server, recorded in the current Job Trace in full:
+    prompt, reply or error, who served it, tokens, cost and latency (see _chat_openrouter).'''
+    call_site = job_trace.caller_name()
+    started = time.monotonic()
+    try:
+        reply = await _chat_openrouter(prompt, system, model, max_tokens, timeout_seconds)
+    except Exception as ex:
+        job_trace.record('llm_call', transport='openrouter', call_site=call_site, model=model, system=system,
+                         prompt=prompt, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
+        raise
+    job_trace.record('llm_call', transport='openrouter', call_site=call_site, model=model, system=system,
+                     prompt=prompt, reply=reply.content, served_model=reply.model, provider=reply.provider,
+                     quantization=reply.served_quantization, finish_reason=reply.finish_reason,
+                     usage=reply.usage, cost_usd=reply.cost_usd, seconds=round(time.monotonic() - started, 2))
+    return reply
+
+
+async def _chat_openrouter(
+    prompt: str, system: str, model: str, max_tokens: int | None, timeout_seconds: float,
+) -> ChatReply:
     """One completion via the OpenRouter MCP server, with who served it (ChatReply).
 
     `max_tokens` defaults to None, i.e. it is NOT SENT and the model's own ceiling applies. There
@@ -305,6 +327,28 @@ async def generate_local(
     system: str = '',
     model: str = OLLAMA_MODEL_NAME_TRIAGE,
     max_tokens: int | None = None,
+    *,
+    purpose_slug: str,
+) -> str:
+    '''One local completion, recorded in the current Job Trace in full (see _generate_local).'''
+    call_site = job_trace.caller_name()
+    started = time.monotonic()
+    try:
+        response = await _generate_local(prompt, system, model, max_tokens, purpose_slug=purpose_slug)
+    except Exception as ex:
+        job_trace.record('llm_call', transport='ollama', call_site=call_site, model=model, system=system,
+                         prompt=prompt, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
+        raise
+    job_trace.record('llm_call', transport='ollama', call_site=call_site, model=model, system=system,
+                     prompt=prompt, reply=response, seconds=round(time.monotonic() - started, 2))
+    return response
+
+
+async def _generate_local(
+    prompt: str,
+    system: str,
+    model: str,
+    max_tokens: int | None,
     *,
     purpose_slug: str,
 ) -> str:

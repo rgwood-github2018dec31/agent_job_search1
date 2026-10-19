@@ -1,0 +1,100 @@
+'''Write Job Audit: choosing the job, and a render failure costing the PDF, never the run.'''
+
+import importlib.util
+import logging
+import sys
+from datetime import date
+from pathlib import Path
+
+import pytest
+
+from agentic_job_search import job_audit, job_trace
+from agentic_job_search import tools_generic as tools
+
+
+def _candidate(job_id: str) -> dict:
+    return {'site': 'linkedin', 'job_id': job_id, 'company': 'Acme', 'title': 'Staff AI Engineer',
+            'url': f'https://www.linkedin.com/jobs/view/{job_id}/'}
+
+
+def _trace(candidate: dict, *kinds: str) -> None:
+    _trace_obj, token = job_trace.start(tools.job_trace_path(candidate), candidate['site'], candidate['job_id'])
+    try:
+        for kind in kinds:
+            job_trace.record(kind)
+    finally:
+        job_trace.finish(token)
+
+
+def test_only_a_job_that_reached_the_rater_is_chosen():
+    rated, gated, untraced = _candidate('1'), _candidate('2'), _candidate('3')
+    _trace(rated, 'origin', 'extract', 'rating')
+    _trace(gated, 'origin', 'extract', 'hard_rule')
+    for seed in range(5):
+        assert job_audit.choose_job([gated, rated, untraced], None, seed) is rated
+
+
+def test_a_requested_job_is_audited_even_if_a_gate_stopped_it():
+    rated, gated = _candidate('1'), _candidate('2')
+    _trace(rated, 'origin', 'rating')
+    _trace(gated, 'origin', 'hard_rule')
+    assert job_audit.choose_job([rated, gated], '2', seed=0) is gated
+
+
+def test_a_requested_job_with_no_trace_falls_back_to_a_rated_one(caplog):
+    rated = _candidate('1')
+    _trace(rated, 'origin', 'rating')
+    with caplog.at_level(logging.WARNING):
+        assert job_audit.choose_job([rated], '999', seed=0) is rated
+    assert any('job 999 was not evaluated' in r.message for r in caplog.records)
+
+
+def test_the_audit_file_name_carries_date_company_title_and_id():
+    path = job_audit.audit_path_for(_candidate('4480376713'), date(2026, 10, 19))
+    assert path.name == '2026-10-19-acme-staff_ai_engineer-4480376713.pdf'
+
+
+async def test_a_failed_render_is_logged_with_its_output_and_returns_none(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(job_audit, 'JOB_AUDITS_DIR', tmp_path / 'job_audits')
+    # A local command that fails, so the test never reaches uv or the network.
+    monkeypatch.setattr(job_audit, 'render_command',
+                        lambda candidate, run_date, out: [sys.executable, '-c', 'import sys; sys.exit("no reportlab")'])
+    with caplog.at_level(logging.WARNING):
+        assert await job_audit.render(_candidate('1'), date(2026, 10, 19)) is None
+    assert any('Job audit render failed' in r.message for r in caplog.records)
+
+
+def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
+    '''Renders a fixture trace through scripts/job_trace_report.py. Needs reportlab, which the
+    project does not depend on: `uv run --with reportlab pytest tests/test_job_audit.py`.'''
+    pytest.importorskip('reportlab')
+    pypdf = pytest.importorskip('pypdf')
+    candidate = _candidate('4476053167')
+    trace = tmp_path / 'linkedin-4476053167.trace.jsonl'
+    _trace_obj, token = job_trace.start(trace, 'linkedin', '4476053167')
+    try:
+        job_trace.record('origin', candidate=candidate, listing=None)
+        job_trace.record('llm_call', transport='openrouter', call_site='rate_with_openrouter', model='m',
+                         prompt='FULL PROMPT ' * 400, reply='{"rating": 4}', cost_usd=0.001, seconds=1.0)
+        job_trace.record('evidence', call_site='extract', subject='job', source='page', verdicts=[
+            {'field': 'location', 'value': 'Gdańsk, Poland', 'quote': 'Gdańsk', 'status': 'regex',
+             'span': [0, 6], 'evidence': 'Gdańsk', 'detail': ''}])
+        job_trace.record('extract', fields={'title': 'T', 'location': 'Gdańsk, Poland',
+                                            'quotes': {'location': 'Gdańsk'}, 'evidence': {'location': 'regex'}})
+        job_trace.record('hard_rule', rule='stale', fired=False, date_posted='3 days ago')
+        job_trace.record('rating', triage=None, result={'rating': 4}, raw_rating=4, capped_rating=3,
+                         cap_reason='hybrid', seconds=1.0)
+        job_trace.record('notification', text='3/5 EXACT TELEGRAM TEXT', sent=True)
+    finally:
+        job_trace.finish(token)
+    script = Path(__file__).parent.parent / 'scripts' / 'job_trace_report.py'
+    spec = importlib.util.spec_from_file_location('job_trace_report', script)
+    report = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(report)
+    out = report.build('4476053167', '2026-10-16', tmp_path / 'audit.pdf', trace)
+    text = ''.join(page.extract_text() for page in pypdf.PdfReader(out).pages)
+    for expected in ('Decision path', 'stale', 'hybrid', 'rate_with_openrouter', 'EXACT TELEGRAM TEXT',
+                     'The Job Trace'):
+        assert expected in text, expected
+    # Long lines are folded, so a word pair may straddle a line break; whitespace is not content.
+    assert ' '.join(text.split()).count('FULL PROMPT') == 400, 'the prompt is printed whole, never cut'

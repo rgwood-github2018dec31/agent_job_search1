@@ -118,6 +118,8 @@ python main.py -n        # Run in non-interactive mode
 python main.py -n --audit # Non-interactive + re-rate gate-killed jobs to detect false negatives (diagnostic)
 python main.py -n --audit-opus 2  # Non-interactive + re-rate 2 un-surfaced jobs per pool with Opus (diagnostic)
 python main.py -n --no-version-check  # Skip the startup check for a newer @playwright/mcp than the pin
+python main.py -n --job-audit 4480376713  # Render the end-of-run Job Audit PDF for this job (default: a random rated one)
+python main.py -n --no-job-audit       # Skip the end-of-run Job Audit PDF
 
 # Tests
 uv run pytest                          # Run all tests; each marked group self-skips if unavailable
@@ -144,6 +146,8 @@ src/agentic_job_search/
   snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
   evidence.py                     # Verify Source Reference: a prediction stands only on a citation found in its input
+  job_trace.py                    # Job Trace: every step of one Stage 2 job, recorded via a ContextVar
+  job_audit.py                    # Write Job Audit: choose one rated job per run, render its trace as a PDF
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
@@ -163,6 +167,7 @@ tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
   test_evidence.py                # Citation matching, LLM relocation, rejection
+  test_job_audit.py               # Job choice, render failure, report rendering (with reportlab)
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
   requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)
@@ -177,7 +182,7 @@ run_dir/
   salary_cache.yaml               # Cached salary reading per salary string (kind/bounds/currency/period)
   fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
-  raw_postings/                   # Per job: .html page archive (JS-free) + .txt text the extractor read; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
+  raw_postings/                   # Per job: .html page archive (JS-free) + .txt text the extractor read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
@@ -185,6 +190,8 @@ run_dir/
   eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error (EVAL_ERROR_MAX_RELEASES)
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
+  job_audits/                     # One Job Audit PDF per run: every step that decided one job's rating
+  replays/                        # scripts/replay_evidence.py reports
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
 ```
 

@@ -20,6 +20,7 @@ from agentic_job_search import (
     evidence,
     extract_openrouter,
     fx,
+    job_trace,
     linkedin_page,
     location,
     location_review,
@@ -5722,6 +5723,21 @@ async def test_one_role_posted_in_two_countries_notifies_once_and_lists_the_repe
     assert len(notifications) == 2
     assert 'Also posted (same role' in notifications[1] and 'first: job 4480376713' in notifications[1]
     assert funnel['duplicate_role_suppressed'] == 1
+
+
+async def test_every_stage_2_job_leaves_a_job_trace_of_each_step(monkeypatch):
+    '''The Job Audit is rendered from this file, so a missing step is a missing audit section.'''
+    _stage2_stubs(monkeypatch, _make_extract())
+    candidate = _make_candidate(job_id='4480376713')
+    await agent.evaluate_all_candidates(
+        [candidate], {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', _stage2_stats())
+    steps = job_trace.load(tools.job_trace_path(candidate))
+    kinds = [s['kind'] for s in steps]
+    for kind in ('origin', 'extract', 'evidence', 'classified', 'hard_rule', 'rating', 'saved', 'notification'):
+        assert kind in kinds, kind
+    rules = [s['rule'] for s in steps if s['kind'] == 'hard_rule']
+    assert rules == ['blacklist', 'closed', 'stale', 'sponsorship', 'language', 'location', 'relocation', 'degree']
+    assert job_trace.current() is None, 'the trace is closed when Stage 2 ends'
 
 
 def test_role_key_ignores_case_punctuation_and_copy_markers():

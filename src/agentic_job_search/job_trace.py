@@ -10,6 +10,7 @@ steps that led to it.
 import contextvars
 import json
 import logging
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -65,6 +66,16 @@ def record(kind: str, **data: Any) -> None:
     trace = _current.get()
     if trace is not None:
         trace.add(kind, data)
+
+
+def caller_name(depth: int = 2) -> str:
+    """The function `depth` frames up: who made an LLM call, for a trace step's `call_site`.
+
+    Read from the stack so the shared wrappers (`chat_openrouter`, `generate_local`) need no new
+    parameter at their ~20 call sites. Depth 2 is the wrapper's own caller.
+    """
+    frame = sys._getframe(depth)
+    return frame.f_code.co_name if frame is not None else '?'
 
 
 def load(path: Path) -> list[dict]:

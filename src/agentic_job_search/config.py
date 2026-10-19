@@ -793,3 +793,7 @@ EXTRACT_CITED_FIELDS = (
     'sponsorship_note', 'language_requirement', 'posting_language', 'stated_working_language',
     'residency_scope', 'relocation', 'education_requirement', 'is_agency', 'end_client',
 )
+# Write Job Audit (job_audit.py): one job per run rendered as a PDF, on unless --no-job-audit.
+JOB_AUDIT_ENABLED = True
+# The render runs `uv run --with reportlab`; the first run on a machine also installs reportlab.
+JOB_AUDIT_RENDER_TIMEOUT_SECONDS = 300
