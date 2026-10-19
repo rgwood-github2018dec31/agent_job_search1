@@ -26,6 +26,7 @@ from agentic_job_search.config import (
     LLM_LOCAL_PURPOSE_TRIAGE,
     LLM_LOCAL_SERVICE_NAME,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
+    LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     LOCAL_LLM_TEMPERATURE,
     LOG_SNIPPET_MAX_CHARS,
@@ -193,7 +194,8 @@ def _field(data: dict, key: str, kinds: type | tuple[type, ...], raw: str) -> An
 
 
 async def chat_openrouter(
-    prompt: str, system: str = '', model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, max_tokens: int | None = None
+    prompt: str, system: str = '', model: str = OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, max_tokens: int | None = None,
+    timeout_seconds: float = LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
 ) -> ChatReply:
     """One completion via the OpenRouter MCP server, with who served it (ChatReply).
 
@@ -215,7 +217,7 @@ async def chat_openrouter(
     args = {'messages': messages, 'model': model}
     if max_tokens is not None:
         args['max_tokens'] = max_tokens
-    raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+    raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=timeout_seconds)
     try:
         data = json.loads(raw)
     except ValueError as ex:

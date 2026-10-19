@@ -1640,15 +1640,19 @@ async def test_build_reference_summary_openrouter_first(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         calls.append('openrouter')
+        timeouts.append(timeout_seconds)
         return chat_reply('Ideal role: senior AI engineering.', 0.001)
 
+    timeouts = []
     monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
     stats = agent.new_stage_stats()
     block = await agent.build_reference_summary(stats)
 
     assert calls == ['openrouter']
+    # A ~160k-char prompt: it keeps the long cap, not the single-turn one.
+    assert timeouts == [config.LLM_MCP_CALL_TIMEOUT_SECONDS]
     assert 'Ideal role: senior AI engineering.' in block
     assert 'IDEAL ROLE PROFILE' in block
     assert stats['cost'] == pytest.approx(0.001)
@@ -1659,7 +1663,7 @@ async def test_build_reference_summary_falls_back_to_local(tmp_path, monkeypatch
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         calls.append('openrouter')
         raise RuntimeError('server down')
 
@@ -1680,7 +1684,7 @@ async def test_build_reference_summary_falls_back_to_anthropic(tmp_path, monkeyp
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         calls.append('openrouter')
         raise RuntimeError('server down')
 
@@ -1722,7 +1726,7 @@ async def test_build_reference_summary_cache_hit_skips_llm(tmp_path, monkeypatch
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = []
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         calls.append('openrouter')
         return chat_reply('Summary v1.', 0.001)
 
@@ -1750,7 +1754,7 @@ async def test_reference_summary_within_the_limit_is_never_cut(tmp_path, monkeyp
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     body = 'y' * agent.REFERENCE_SUMMARY_LIMIT_CHARS
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         return chat_reply(body, 0.001)
 
     monkeypatch.setattr(agent, 'chat_openrouter', fake_openrouter)
@@ -1767,7 +1771,7 @@ async def test_reference_summary_over_the_limit_is_re_summarized_by_the_same_pro
     long_summary = _over_limit()
     prompts: list[str] = []
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         prompts.append(prompt)
         return chat_reply(*((long_summary, 0.001) if len(prompts) == 1 else ('SHORT PROFILE', 0.001)))
 
@@ -1787,7 +1791,7 @@ async def test_reference_summary_stops_the_run_when_re_summarizing_fails(tmp_pat
     calls = 0
     sent: list[str] = []
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -1813,7 +1817,7 @@ async def test_reference_summary_stops_when_the_retry_is_still_over_the_limit(tm
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     sent: list[str] = []
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         return chat_reply(_over_limit(), 0.001)
 
     async def fake_notify(text):
@@ -1835,7 +1839,7 @@ async def test_reference_summary_stops_when_the_retry_returns_nothing(tmp_path, 
     monkeypatch.setattr(agent, 'REFERENCE_SUMMARY_CACHE_PATH', tmp_path / 'ref_cache.yaml')
     calls = 0
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         nonlocal calls
         calls += 1
         return chat_reply(*((_over_limit(), 0.001) if calls == 1 else ('   \n  ', 0.001)))
@@ -1862,7 +1866,7 @@ async def test_reference_summary_cache_over_the_limit_is_regenerated(tmp_path, m
         'provider': 'openrouter', 'summary': _over_limit()}), encoding='utf-8')
     calls = 0
 
-    async def fake_openrouter(prompt, system='', model='', max_tokens=0):
+    async def fake_openrouter(prompt, system='', model='', max_tokens=0, timeout_seconds=None):
         nonlocal calls
         calls += 1
         return chat_reply('FRESH PROFILE', 0.001)
@@ -2061,6 +2065,26 @@ async def test_openrouter_loop_happy_path(monkeypatch):
     user = chat_requests[0]['messages'][1]
     assert user['role'] == 'user' and 'PAGE TEXT FROM CODE' in user['content']
     assert [t['function']['name'] for t in chat_requests[0]['tools']] == ['submit_job_extract']
+
+
+async def test_openrouter_loop_returns_none_on_a_chat_timeout_so_the_fallback_runs(monkeypatch, caplog):
+    '''A raised timeout escaped to the Stage 2 error handler and dropped the job (2026-10-16).'''
+    timeouts = []
+
+    async def timing_out_call_mcp_tool(url, tool_name, args, timeout_seconds=None):
+        timeouts.append(timeout_seconds)
+        raise RuntimeError("MCP tool 'chat' at http://127.0.0.1:8006/mcp timed out after 180.0s")
+
+    monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', timing_out_call_mcp_tool)
+    with caplog.at_level(logging.WARNING):
+        assert await _run_loop() is None
+    assert timeouts == [config.LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS]
+    assert any('timed out after' in r.getMessage() and 'RuntimeError' in r.getMessage() for r in caplog.records)
+
+
+async def test_openrouter_loop_returns_none_on_a_non_json_reply(monkeypatch):
+    _wire_openrouter_loop(monkeypatch, ['<html>502 Bad Gateway</html>'], [])
+    assert await _run_loop() is None
 
 
 async def test_openrouter_loop_rejects_an_unknown_tool(monkeypatch):
@@ -9229,14 +9253,17 @@ def test_every_python_module_is_tracked_by_git():
 
 
 def test_llm_mcp_call_sites_pass_long_timeout():
-    """Every chat/generate call through call_mcp_tool must pass LLM_MCP_CALL_TIMEOUT_SECONDS.
+    """Every chat/generate call through call_mcp_tool must pass one of the LLM timeouts.
 
     The shared client's 30s default silently cut off healthy LLM calls on 2026-09-14 (4 of 6
-    queries lost). A site that falls back to the default fails here.
+    queries lost). A site that falls back to the default fails here. `timeout_seconds` is
+    chat_openrouter's own parameter, which defaults to LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS.
     """
     import ast
 
     assert config.LLM_MCP_CALL_TIMEOUT_SECONDS >= 120
+    assert config.LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS >= 120
+    allowed = {'LLM_MCP_CALL_TIMEOUT_SECONDS', 'LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS', 'timeout_seconds'}
     src_dir = Path(config.__file__).parent
     llm_sites = []
     missing = []
@@ -9250,10 +9277,10 @@ def test_llm_mcp_call_sites_pass_long_timeout():
                 continue
             llm_sites.append(f'{path.name}:{node.lineno}')
             kw = {k.arg: k.value for k in node.keywords}
-            if getattr(kw.get('timeout_seconds'), 'id', None) != 'LLM_MCP_CALL_TIMEOUT_SECONDS':
+            if getattr(kw.get('timeout_seconds'), 'id', None) not in allowed:
                 missing.append(f'{path.name}:{node.lineno}')
     assert len(llm_sites) >= 5, f'expected at least 5 LLM call_mcp_tool sites, found {llm_sites}'
-    assert not missing, f'LLM call_mcp_tool sites without timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS: {missing}'
+    assert not missing, f'LLM call_mcp_tool sites without an LLM timeout ({sorted(allowed)}): {missing}'
 
 
 
@@ -9435,6 +9462,26 @@ async def test_browser_server_stop_tolerates_an_exited_process():
     browser = agent.BrowserServer('headless')
     browser.proc = _ExitedProc()
     await browser.stop()   # must not raise
+
+
+async def test_browser_recycle_moves_mcp_to_a_fresh_server_without_spending_a_restart(monkeypatch):
+    '''Stage 2 gets a fresh heap (node OOMs 2026-10-13..16); the crash-restart budget stays whole.'''
+    ports = iter([4001, 4002])
+    started = []
+
+    async def fake_start_playwright_server(port, browser_mode):
+        started.append(port)
+        return _ExitedProc()
+
+    monkeypatch.setattr(agent, 'find_free_port', lambda: next(ports))
+    monkeypatch.setattr(agent, 'start_playwright_server', fake_start_playwright_server)
+    browser = agent.BrowserServer('headless')
+    await browser.start()
+    mcp = browser.mcp
+    await browser.recycle('test')
+    assert started == [4001, 4002]
+    assert mcp is browser.mcp and mcp['url'] == 'http://localhost:4002/mcp'
+    assert browser.restarts == 0
 
 
 class _FakeBrowser:
@@ -9718,14 +9765,21 @@ def test_parse_posting_date_relative_beats_a_trailing_viewed_date(raw):
     assert date.today() - timedelta(days=1) <= parsed <= date.today()
 
 
-@pytest.mark.parametrize('raw', [
-    '2026-09-20 (4 days ago)',
-    '2026-09-20 (posted 4 days ago)',
-    '2026-09-20 (reposted 3 hours ago)',
-    '2026-09-20 (1 day ago)',
+@pytest.mark.parametrize(('raw', 'days_ago'), [
+    # The 2026-10-16 incident: the extractor prefixed the wrong year to a 17-hour-old posting.
+    ('2025-10-14 (posted 16-17 hours ago)', 0),
+    ('2026-09-20 (4 days ago)', 4),
+    ('2026-09-20 (posted 4 days ago)', 4),
+    ('2026-09-20 (1 day ago)', 1),
 ])
-def test_parse_posting_date_leading_iso_date_wins(raw):
-    assert tools.parse_posting_date(raw) == date(2026, 9, 20)
+def test_parse_posting_date_relative_beats_a_leading_iso_date(raw, days_ago):
+    parsed = tools.parse_posting_date(raw)
+    assert date.today() - timedelta(days=days_ago + 1) <= parsed <= date.today() - timedelta(days=days_ago)
+
+
+async def test_hard_rules_do_not_call_a_fresh_posting_stale_over_a_wrong_leading_year():
+    extract = _make_extract(date_posted='2025-10-14 (posted 16-17 hours ago)')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
 @pytest.mark.parametrize('raw', ['last Tuesday', 'Reposted recently', '12345 (Requisition ID)'])

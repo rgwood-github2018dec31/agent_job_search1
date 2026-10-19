@@ -16,7 +16,7 @@ from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 from agentic_job_search.config import (
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
-    LLM_MCP_CALL_TIMEOUT_SECONDS,
+    LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
     LOG_TITLE_MAX_CHARS,
     MODEL_NAME_EXTRACTOR,
@@ -164,12 +164,28 @@ async def extract_job_page_openrouter(
     total_cost = 0.0
     started = time.monotonic()
     for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
-        raw = await call_mcp_tool(
-            LLM_OPENROUTER_MCP_URL, 'chat',
-            {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS},
-            timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS,
-        )
-        data = json.loads(raw)
+        # A timeout or transport failure raises rather than returning ok=false. Until 2026-10-18 it
+        # escaped to the Stage 2 error handler, skipping the Haiku fallback and dropping the job.
+        try:
+            raw = await call_mcp_tool(
+                LLM_OPENROUTER_MCP_URL, 'chat',
+                {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS},
+                timeout_seconds=LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
+            )
+        except Exception as ex:
+            logger.warning(
+                f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
+                f"chat with {MODEL_NAME_EXTRACTOR} failed (iteration {iteration + 1}): {type(ex).__name__}: {ex}"
+            )
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as ex:
+            logger.warning(
+                f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
+                f"chat with {MODEL_NAME_EXTRACTOR} returned invalid JSON ({ex}): {snippet(raw)}"
+            )
+            return None
         if not data.get('ok'):
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "

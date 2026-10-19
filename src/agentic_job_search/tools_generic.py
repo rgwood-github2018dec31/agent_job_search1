@@ -1814,8 +1814,11 @@ DAYS_PER_MONTH_APPROX = 30
 def parse_posting_date(date_posted: str | None) -> date | None:
     """Parse an absolute (YYYY-MM-DD) or relative ('4 days ago') posting date.
 
-    A leading YYYY-MM-DD wins; otherwise the first "N units ago" anywhere in the string, so
-    prefixes ("Reposted") and trailing notes ("(viewed 2026-09-24)") are tolerated.
+    The first "N units ago" anywhere in the string wins, so prefixes ("Reposted") and trailing
+    notes ("(viewed 2026-09-24)") are tolerated; otherwise a leading YYYY-MM-DD. The relative
+    phrase is what LinkedIn shows; a calendar date beside it is the extractor's own arithmetic,
+    and on 2026-10-16 '2025-10-14 (posted 16-17 hours ago)' got a 17-hour-old job hard-rated 1
+    as stale.
 
     None when no date was given. Raises ValueError for a non-empty string in no known format, so
     the caller, which knows the job, decides how to report it.
@@ -1823,17 +1826,17 @@ def parse_posting_date(date_posted: str | None) -> date | None:
     if not date_posted:
         return None
     s = date_posted.strip().lower()
-    if iso := _LEADING_ISO_DATE_RE.match(s):
-        try:
-            return date.fromisoformat(iso.group('iso'))
-        except ValueError as ex:
-            raise ValueError(f'posting date {date_posted!r} looks ISO but is not a real date: {ex}') from ex
     m = _RELATIVE_DATE_RE.search(s)
     if m:
         n, unit = int(m.group('count')), m.group('unit')
         deltas = {'minute': timedelta(minutes=n), 'hour': timedelta(hours=n), 'day': timedelta(days=n),
                   'week': timedelta(weeks=n), 'month': timedelta(days=n * DAYS_PER_MONTH_APPROX)}
         return (datetime.now() - deltas[unit]).date()
+    if iso := _LEADING_ISO_DATE_RE.match(s):
+        try:
+            return date.fromisoformat(iso.group('iso'))
+        except ValueError as ex:
+            raise ValueError(f'posting date {date_posted!r} looks ISO but is not a real date: {ex}') from ex
     if s in _JUST_POSTED_PHRASES:
         return date.today()
     raise ValueError(

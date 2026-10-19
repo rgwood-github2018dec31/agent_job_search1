@@ -62,6 +62,7 @@ from agentic_job_search.config import (
     JOB_STALE_AGE_DAYS,
     LISTING_ESTIMATE_HISTORY_RUNS,
     LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY,
+    LLM_MCP_CALL_TIMEOUT_SECONDS,
     LOCATION_GUESS_REASON_MAX_CHARS,
     MAX_REFERENCE_JOBS,
     MAX_SEARCH_QUERIES,
@@ -1112,7 +1113,7 @@ class ReferenceSummaryTooLongError(RuntimeError):
 async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict | None) -> str:
     """One provider's answer to `prompt`. Raises whatever the provider raised."""
     if provider == 'openrouter':
-        reply = await chat_openrouter(prompt)
+        reply = await chat_openrouter(prompt, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
         if stage_stats is not None:
             stage_stats['cost'] += reply.cost_usd
         logger.debug(f'Reference summary from OpenRouter: {reply.describe()}')
@@ -4706,6 +4707,20 @@ class BrowserServer:
         logger.info(f'{PLAYWRIGHT_MCP_PACKAGE} restarted on port {self.port} in '
                     f'{time.monotonic() - restart_started:.0f}s')
 
+    async def recycle(self, reason: str) -> None:
+        """Replace a live server with a fresh one; not a crash, so not counted in ``restarts``.
+
+        @playwright/mcp leaks V8 heap over the process's life: 4 of the 6 runs of 2026-10-13..16
+        died of a node OOM 84-115 minutes in, every one during Stage 2, with one process serving
+        Stage 1b and 2. A fresh process for Stage 2 starts it with an empty heap.
+        """
+        recycle_started = time.monotonic()
+        old_port = self.port
+        await self.stop()
+        await self.start()
+        logger.info(f'{PLAYWRIGHT_MCP_PACKAGE} recycled ({reason}): port {old_port} -> {self.port} in '
+                    f'{time.monotonic() - recycle_started:.0f}s')
+
     async def stop(self) -> None:
         # terminate() on an already-exited process raises ProcessLookupError. On 2026-09-21 that
         # escaped this cleanup and cost the run its summary, audit log and notification.
@@ -4959,6 +4974,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                     'kind': 'local_model_missing', 'query': '(all)', 'region': '(all)',
                     'detail': preflight_problem})
 
+        await browser.recycle('fresh heap for Stage 2')
         await evaluate_all_candidates(
             candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats,
             funnel=funnel, audit=audit, triage_enabled=triage_enabled, browser=browser,

@@ -95,6 +95,12 @@ LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY = 'reference-summary'
 # regularly takes longer, and 2026-09-14 lost 4 of 6 queries plus most of Stage 2 to
 # "timed out after 30.0s". 300s matches the SSE read bound the previous in-repo client had.
 LLM_MCP_CALL_TIMEOUT_SECONDS = 300.0
+# Cap for one single-turn call (extract, rate, repost check, salary, classifiers). Those run 5-60s
+# and reached ~235s at the slowest success in 2026-10; the 300s cap above was sized for Stage 1b's
+# long conversations, and on 2026-10-16 four glm-5.3-flash hangs each burned the full 300s of a
+# 75-minute Stage 2. Every such call has a fallback, so a slow reply cut here just falls through.
+# The reference summary (a ~160k-char prompt) keeps the longer cap.
+LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS = 180.0
 # Machine-local Ollama tag for Stage 2c triage (one cheap 1-5 JSON score, free and fast —
 # deliberately NOT sized to a 20-35B tier): granite4.1:3b measures 65.9 tok/s / 3.9s cold start /
 # 2.1GB on this machine and advertises structured JSON output as a first-class capability.
