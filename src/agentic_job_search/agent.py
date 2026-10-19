@@ -2486,6 +2486,16 @@ _COUNTRY_ONLY_RE = re.compile(
 RESIDENCY_SCOPES = ('country_only', 'area_wide')
 
 
+def regex_source_text(extract: dict) -> str:
+    """The text a derive_* regex fallback reads: the page the extract was made from.
+
+    Until 2026-10-19 these read the model's condensed `description`, so a regex 'confirming' a
+    field was reading the same model's paraphrase, not independent evidence. The condensed text
+    is used only when no page was kept (an extract built outside Stage 2, e.g. in a test).
+    """
+    return str(extract.get('page_text') or extract.get('description') or '')
+
+
 def derive_residency_scope(extract: dict) -> str:
     """'country_only' | 'area_wide' | '' -- where the posting says the holder must actually LIVE.
 
@@ -2510,10 +2520,7 @@ def derive_residency_scope(extract: dict) -> str:
     if explicit not in RESIDENCY_SCOPES:
         explicit = ''
 
-    haystack = (
-        f"{extract.get('location', '')}\n{extract.get('relocation', '')}\n"
-        f"{extract.get('description', '')}"
-    )
+    haystack = f"{extract.get('location', '')}\n{extract.get('relocation', '')}\n{regex_source_text(extract)}"
     if explicit == 'country_only' or _COUNTRY_ONLY_RE.search(haystack):
         return 'country_only'
     if explicit == 'area_wide' or _AREA_WIDE_RE.search(haystack):
@@ -2536,7 +2543,7 @@ def derive_workplace_type(extract: dict) -> str:
     if explicit in {'on-site', 'on site', 'in-office', 'in office'}:
         return 'onsite'
 
-    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')}"
+    haystack = f"{extract.get('location', '')}\n{regex_source_text(extract)}"
     if _HYBRID_RE.search(haystack):
         return 'hybrid'
     if _ONSITE_RE.search(haystack):
@@ -2596,7 +2603,7 @@ def derive_education_requirement(extract: dict) -> str:
         if _MASTERS_RE.search(explicit) or explicit in {'master', 'ms', 'ma'}:
             return 'master'
 
-    haystack = f"{extract.get('location', '')}\n{extract.get('description', '')}"
+    haystack = f"{extract.get('location', '')}\n{regex_source_text(extract)}"
     for sentence in _SENTENCE_SPLIT_RE.split(haystack):
         if not _DEGREE_REQUIRED_RE.search(sentence):
             continue
@@ -2675,7 +2682,7 @@ def derive_agency_posting(extract: dict) -> bool:
         return bool(explicit)
     if _AGENCY_COMPANY_RE.search(str(extract.get('company') or '')):
         return True
-    return bool(_AGENCY_PHRASE_RE.search(str(extract.get('description') or '')))
+    return bool(_AGENCY_PHRASE_RE.search(regex_source_text(extract)))
 
 
 # The structure line in the extract text the rater reads. `range` is absent on purpose: a complete
