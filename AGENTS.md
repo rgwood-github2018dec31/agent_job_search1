@@ -46,6 +46,13 @@ anything a rule covers.
 - **The model chooses actions and code moves data.** A tool argument must be a decision, never
   something code could have read itself. See Anti-fabrication in
   [docs/requirements.md](docs/requirements.md#non-functional-requirements).
+- **An LLM prediction stands only on a citation found in its input.** Every call that predicts a
+  fact about its input also returns the words of that input it stands on; `evidence.verify_claims`
+  looks them up by regex, asks `MODEL_NAME_EVIDENCE` to relocate only what regex missed, and
+  accepts a relocated passage only when regex then finds it too. Not found: rejected as a
+  hallucination and treated as absent. A new LLM call either cites or is marked exempt in code
+  with its reason. See Verify Source Reference in
+  [docs/requirements.md](docs/requirements.md#use-cases).
 - **A structural fact is never left to a model's discretion.** Caps, gates, and alerts are
   decided in code. See the first non-functional requirement in
   [docs/requirements.md](docs/requirements.md#non-functional-requirements).
@@ -136,6 +143,7 @@ src/agentic_job_search/
   scrape_openrouter.py            # Stage 1b: OpenRouter function-calling scraper loop (default path)
   snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
+  evidence.py                     # Verify Source Reference: a prediction stands only on a citation found in its input
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
@@ -149,9 +157,12 @@ scripts/
   migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
   backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
+  replay_evidence.py              # Re-extracts retained pages live; per-field citation outcomes (costs cents)
+  job_trace_report.py             # Job Audit PDF for one job (uv run --with reportlab)
 tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
+  test_evidence.py                # Citation matching, LLM relocation, rejection
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
   requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)
