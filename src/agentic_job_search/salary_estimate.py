@@ -173,6 +173,8 @@ def _estimate_from_entry(entry: dict[str, Any], source: str) -> dict[str, Any] |
     }
 
 
+# Verify Source Reference: exempt — an estimate is shown labelled `model estimate` only when the posting states no figure,
+# and reaches no rater, cap, gate or warning.
 async def estimate_salary(
     candidate: dict, extract: dict, page_text: str = '', stage_stats: dict | None = None
 ) -> dict[str, Any] | None:

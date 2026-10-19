@@ -392,6 +392,8 @@ async def _ground(text: str, result: dict[str, Any], use_llm: bool = True) -> di
     in the input is the word it was derived FROM. A name with nothing to point at is a name the
     text never implied, and a place_name is what can exempt a job from the geographic gate.
     `use_llm=False` grounds by regex alone, for an entry served while the model is unreachable.
+    `likely_spoken_languages` is exempt: it is a prior about a place, not a fact the text states,
+    and it only ever feeds a labelled warning.
     """
     grounding = result.get('grounding') or {}
     # A name with no grounding words is first looked for as itself: 'Germany' needs no citation in

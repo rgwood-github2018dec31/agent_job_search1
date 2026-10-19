@@ -1071,9 +1071,23 @@ def test_build_reference_block_caps_at_max_pdfs(monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_categorize_pdf_text_saved_jd(monkeypatch):
-    _make_sdk_mock(monkeypatch, {'category': 'saved_jd'})
+    _make_sdk_mock(monkeypatch, {'category': 'saved_jd', 'quote': 'job posting text'})
     result = await tools._categorize_pdf_text('job posting text', 'acme_job.pdf')
     assert result == 'saved_jd'
+
+
+async def test_a_category_that_cites_nothing_in_the_file_leaves_it_uncategorized(monkeypatch):
+    _make_sdk_mock(monkeypatch, {'category': 'resume', 'quote': 'Curriculum Vitae'})
+    assert await tools._categorize_pdf_text('job posting text', 'acme_job.pdf') is None
+
+
+async def test_applied_metadata_drops_a_field_the_file_does_not_state():
+    out = await tools._grounded_applied_metadata(
+        {'company_name': 'Shopify', 'company_name_quote': 'Shopify', 'job_title': 'Staff ML Engineer',
+         'job_title_quote': 'Principal Engineer', 'is_recruiting_agency': True, 'is_recruiting_agency_quote': '',
+         'end_client_name': ''},
+        'shopify_swe.pdf\nShopify is hiring a Staff Engineer.', 'shopify_swe.pdf')
+    assert (out['company_name'], out['job_title'], out['is_recruiting_agency']) == ('Shopify', '', False)
 
 
 async def test_categorize_pdf_text_returns_none_when_tool_not_called(monkeypatch):

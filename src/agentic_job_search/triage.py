@@ -378,7 +378,8 @@ TRIAGE_INSTRUCTIONS = '''You are a fast job-fit triage filter. Score how well th
 
 Be conservative: when unsure, score HIGHER so a stronger model takes a closer look. Only score 1-2 when the mismatch is obvious.
 
-Respond with ONLY a JSON object: {"score": <1-5>, "reason": "<one sentence>", "quote": "<words of the job posting that support the score, copied as written>"}'''
+Respond with ONLY a JSON object:
+{"score": <1-5>, "reason": "<one sentence>", "quote": "<words of the job posting that support the score, copied as written>"}'''
 
 
 async def triage_job_fit(job_text: str, profile_block: str) -> dict | None:

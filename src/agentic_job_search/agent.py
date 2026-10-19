@@ -917,6 +917,7 @@ QUERY_JSON_INSTRUCTIONS = (
 )
 
 
+# Verify Source Reference: exempt — a search query is a generated choice of what to look for, not a fact about the input.
 async def _generate_queries_openrouter(prompt: str, stage_stats: dict | None) -> list[str]:
     '''Query generation via the OpenRouter MCP server. Raises on any failure.'''
     reply = await chat_openrouter(f'{prompt}\n\n{QUERY_JSON_INSTRUCTIONS}', model=MODEL_NAME_QUERY)
@@ -1111,6 +1112,7 @@ class ReferenceSummaryTooLongError(RuntimeError):
     '''
 
 
+# Verify Source Reference: exempt — a summary is a condensation that feeds the rater a profile, never a gate or a figure.
 async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict | None) -> str:
     """One provider's answer to `prompt`. Raises whatever the provider raised."""
     if provider == 'openrouter':
@@ -3137,6 +3139,7 @@ def reset_location_guesses() -> None:
     _location_guesses.clear()
 
 
+# Verify Source Reference: exempt — a guess about the user's preference, labelled as a guess and gating nothing.
 async def resolve_location_guesses(stage_stats: dict | None = None) -> list[tuple[str, str, str]]:
     '''Ask about each queued country, record the answers, return (place, guess, reason) rows.
 
@@ -3871,7 +3874,7 @@ def format_job_notification(
 
 
 def _cited_items(items: object) -> list[tuple[str, str]]:
-    """(text, quote) for each pro or warning a rater returned; a bare string has no quote."""
+    '''(text, quote) for each pro or warning a rater returned; a bare string has no quote.'''
     pairs = []
     for item in items if isinstance(items, list) else []:
         if isinstance(item, dict):
@@ -3900,11 +3903,11 @@ async def verified_rating_items(candidate: dict, kind: str, items: object, extra
 
 
 async def triage_is_grounded(candidate: dict, triage_result: dict, extract_text: str, stage_stats: dict) -> bool:
-    """Whether a triage score that would reject the job stands on words of the posting.
+    '''Whether a triage score that would reject the job stands on words of the posting.
 
     Checked only for a rejecting score, the one that gates anything: a low score whose reason cites
     nothing found in the posting is treated like a triage outage, and the job goes to the rater.
-    """
+    '''
     claim = Claim('score', triage_result['score'], triage_result.get('quote') or '')
     verdicts = await evidence.verify_claims(
         'triage', f"job {candidate.get('job_id')} {candidate.get('company')}", [claim], extract_text,
@@ -4442,6 +4445,7 @@ async def evaluate_all_candidates(
     )
 
 
+# Verify Source Reference: exempt — the audit reads only the rating and reasoning, both judgments.
 async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
     '''One non-agentic Opus rating call — the reference standard for audits only.'''
     options = ClaudeAgentOptions(

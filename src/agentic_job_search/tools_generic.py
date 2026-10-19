@@ -249,6 +249,23 @@ def _raise_if_result_error(msg: ResultMessage, context: str) -> None:
     raise AgentApiError(detail, api_error_status=status)
 
 
+_APPLIED_METADATA_CITED_FIELDS = ('company_name', 'job_title', 'is_recruiting_agency', 'end_client_name')
+
+
+async def _grounded_applied_metadata(out: dict, source: str, filename: str) -> dict:
+    '''Verify Source Reference for an applied-job PDF: each field stands only on words of the
+    file (its name included, which usually carries the company and title). A rejected field is
+    left empty, so it neither blocklists a company nor marks the poster an agency.'''
+    quotes = evidence.quotes_from(out, _APPLIED_METADATA_CITED_FIELDS)
+    claims = [evidence.Claim(field, out.get(field), quotes[field]) for field in _APPLIED_METADATA_CITED_FIELDS
+              if out.get(field) is True or (isinstance(out.get(field), str) and out[field].strip())]
+    verdicts = await evidence.verify_claims('applied_pdf_metadata', filename, claims, source, filename)
+    for field, verdict in verdicts.items():
+        if not verdict.accepted:
+            out[field] = False if field == 'is_recruiting_agency' else ''
+    return out
+
+
 async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
     """Extract company, title, and recruiter-agency signal from an applied-job PDF's text.
 
@@ -282,6 +299,7 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
                         'type': 'string',
                         'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
                     },
+                    **evidence.quote_properties(_APPLIED_METADATA_CITED_FIELDS),
                 },
                 'required': ['company_name', 'job_title', 'is_recruiting_agency', 'end_client_name'],
             },
@@ -292,7 +310,8 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
         f'Filename: {filename}\n\n'
         f'Job posting text:\n{text}\n\n'
         'Identify the organization posting this job, the job title, whether the poster is a '
-        'recruiting agency/aggregator rather than the hiring employer, and the end client if named.'
+        'recruiting agency/aggregator rather than the hiring employer, and the end client if named. '
+        + evidence.CITATION_INSTRUCTION
     )
     async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
         async for msg in stream:
@@ -300,7 +319,7 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
                 continue
             _raise_if_result_error(msg, f'Applied-job metadata extraction failed for {filename}')
             if msg.structured_output:
-                out = msg.structured_output
+                out = await _grounded_applied_metadata(dict(msg.structured_output), f'{filename}\n{text}', filename)
                 return {
                     'company': out.get('company_name', ''),
                     'job_title': out.get('job_title', ''),
@@ -974,14 +993,19 @@ async def _categorize_pdf_text(text: str, filename: str) -> str | None:
                             'such as "resume", "contract", "invoice", "article".'
                         ),
                     },
+                    'quote': {
+                        'type': 'string',
+                        'description': 'Words of the filename or content that show the category, copied as written',
+                    },
                 },
-                'required': ['category'],
+                'required': ['category', 'quote'],
             },
         },
         cwd=str(PROJECT_DIR),
     )
     prompt = f'Filename: {filename}\n\nContent:\n{text}'
     category: str | None = None
+    quote = ''
     async with aclosing(sdk_query(prompt=prompt, options=options)) as stream:
         async for msg in stream:
             if not isinstance(msg, ResultMessage):
@@ -989,7 +1013,15 @@ async def _categorize_pdf_text(text: str, filename: str) -> str | None:
             _raise_if_result_error(msg, f'PDF categorization failed for {filename}')
             if msg.structured_output:
                 category = msg.structured_output.get('category', '')
+                quote = str(msg.structured_output.get('quote') or '')
     if category is not None:
+        # Verify Source Reference: a category stands only on words of the file. One that cannot be
+        # grounded leaves the file uncategorized (logged by verify_claims), to be asked next run.
+        verdict = (await evidence.verify_claims(
+            'pdf_categorize', filename, [evidence.Claim('category', category, quote)],
+            f'{filename}\n{text}', filename))['category']
+        if not verdict.accepted:
+            return None
         return underscorify(category) or 'other'
     logger.warning(f'No structured output categorizing {filename}; leaving uncategorized')
     console.print(f'[yellow]Warning: no structured output for {filename}[/yellow]')

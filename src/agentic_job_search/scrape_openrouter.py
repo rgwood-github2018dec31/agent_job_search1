@@ -416,6 +416,7 @@ def parse_evaluate_result(raw: str) -> dict | None:
     return None
 
 
+# Verify Source Reference: exempt — the scraper model takes decisions only; every listing it harvests is read by code.
 class ScrapeSession:
     """One query's scraping run: holds the browser, the harvest, and the conversation.
 
