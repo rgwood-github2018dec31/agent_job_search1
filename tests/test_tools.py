@@ -4525,7 +4525,7 @@ async def test_resolve_salary_escalates_only_what_the_rules_cannot_read(monkeypa
     async def _fake(prompt, model=None):
         calls.append(prompt)
         return chat_reply('{"kind": "single", "minimum": 5014.3, "maximum": null, '
-                '"currency": "EUR", "period": "month"}', 0.000123)
+                '"currency": "EUR", "period": "month", "quote": "EUR 5,014.30 gross/month"}', 0.000123)
 
     monkeypatch.setattr(salary, 'chat_openrouter', _fake)
     extract = {'salary': 'EUR 5,014.30 gross/month (full-time 40h/week, 14 times per year)',
@@ -4575,7 +4575,8 @@ async def test_resolve_salary_shows_the_model_the_compensation_lines_when_the_fi
 
     async def _fake(prompt, model=None):
         prompts.append(prompt)
-        return chat_reply('{"kind": "range", "minimum": 180000, "maximum": 220000, "currency": "CAD"}', 0.0)
+        return chat_reply('{"kind": "range", "minimum": 180000, "maximum": 220000, "currency": "CAD", '
+                          '"quote": "CAD 180,000 - 220,000"}', 0.0)
 
     monkeypatch.setattr(salary, 'chat_openrouter', _fake)
     extract = {
@@ -4587,6 +4588,27 @@ async def test_resolve_salary_shows_the_model_the_compensation_lines_when_the_fi
     assert facts['kind'] == 'range'
     assert 'CAD 180,000 - 220,000' in prompts[0]
     assert 'Python and Kubernetes' not in prompts[0], 'only the money sentences are sent'
+
+
+@pytest.mark.parametrize('reply, why', [
+    ('{"kind": "range", "minimum": 90000, "maximum": 120000, "currency": "EUR", "quote": "EUR 90,000 - 120,000"}',
+     'the cited words are not in the text'),
+    ('{"kind": "range", "minimum": 90000, "maximum": 120000, "currency": "EUR", "quote": "between 80 and 100k EUR"}',
+     'the bounds are not amounts the cited words state'),
+    ('{"kind": "range", "minimum": 80000, "maximum": 100000, "currency": "EUR"}', 'nothing was cited'),
+])
+async def test_resolve_salary_rejects_bounds_the_text_does_not_state(monkeypatch, reply, why):
+    '''Verify Source Reference: the classifier's bounds stand only on words found in its input.'''
+    async def _fake(prompt, model=None):
+        return chat_reply(reply, 0.0)
+
+    async def finds_nothing(call_site, subject, claims, source, stage_stats):
+        return {}, 'fake relocation reply'
+
+    monkeypatch.setattr(salary, 'chat_openrouter', _fake)
+    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
+    facts = await salary.resolve_salary({'salary': 'between 80 and 100k EUR, plus bonus', 'description': ''})
+    assert (facts['kind'], facts['source']) == ('unclassified', 'rejected'), why
 
 
 @pytest.mark.parametrize('salary_text, expected', [

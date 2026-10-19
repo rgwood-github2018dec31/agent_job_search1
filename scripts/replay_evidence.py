@@ -32,8 +32,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from agentic_job_search import evidence  # noqa: E402
-from agentic_job_search.agent import (  # noqa: E402
+from agentic_job_search import evidence
+from agentic_job_search.agent import (
     PAGE_EXTRACTOR_INSTRUCTIONS,
     derive_agency_posting,
     derive_education_requirement,
@@ -42,7 +42,7 @@ from agentic_job_search.agent import (  # noqa: E402
     new_stage_stats,
     verify_extract,
 )
-from agentic_job_search.extract_openrouter import extract_job_page_openrouter  # noqa: E402
+from agentic_job_search.extract_openrouter import extract_job_page_openrouter
 
 logger = logging.getLogger('replay_evidence')
 
@@ -144,7 +144,7 @@ async def main() -> int:
         print(f'[{number}/{len(paths)}] {path.name}', flush=True)
         results.append(await replay_one(path))
     text = report(results)
-    out = RUN_DIR / 'replays' / f"evidence-{datetime.now():%Y%m%d-%H%M%S}.md"
+    out = RUN_DIR / 'replays' / f'evidence-{datetime.now():%Y%m%d-%H%M%S}.md'
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding='utf-8')
     print(text)

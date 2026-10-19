@@ -44,7 +44,7 @@ from typing import Any
 
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
-from agentic_job_search import cache_io
+from agentic_job_search import cache_io, evidence
 from agentic_job_search.config import (
     MODEL_NAME_SALARY,
     SALARY_CONTEXT_MAX_CHARS,
@@ -63,7 +63,9 @@ SALARY_CACHE_PATH = RUN_DIR / 'salary_cache.yaml'
 # Bumped when a field is added to the contract below. An entry written under an older schema is a
 # MISS and is reclassified: serving it would silently disable whatever the new field feeds, which
 # is the same shape of bug as a mechanism reporting success while doing nothing (location.py:342).
-CACHE_SCHEMA_VERSION = 1
+# 2 (2026-10-19): the model cites the words stating the pay (`quote`); a version-1 answer carries
+# no citation, so it is reclassified rather than served unverified.
+CACHE_SCHEMA_VERSION = 2
 
 # The vocabulary of answers. `unclassified` is not a failure mode to be minimised — it is the
 # honest answer for a string no rule could read, and it is what tier 8 exists to produce rather
@@ -204,7 +206,8 @@ Return ONLY a JSON object, no prose and no code fence:
   "minimum": <number or null>,
   "maximum": <number or null>,
   "currency": "<ISO code such as CAD, EUR, GBP, PLN, or empty>",
-  "period": "<year|month|week|day|hour, or empty>"}}
+  "period": "<year|month|week|day|hour, or empty>",
+  "quote": "<the words of the text above that state the amounts, copied as written>"}}
 
 Rules:
 - `range` ONLY when the text states BOTH a lower and an upper amount. Set both numbers.
@@ -218,6 +221,8 @@ Rules:
 - Write amounts at full magnitude: "75K" is 75000, "€1.2M" is 1200000.
 - A bare "$" is ambiguous. Leave `currency` empty unless the text names one.
 - `period` is the pay period the amounts are quoted per, empty when the text does not say.
+- `quote` is copied from the text above, unchanged. Code checks the amounts against it and
+  discards an answer whose quote it cannot find in the text, so give no amount you cannot quote.
 '''
 
 _cache: dict[str, Any] | None = None
@@ -465,7 +470,8 @@ async def resolve_salary(extract: dict, stage_stats: dict | None = None) -> dict
     )
     try:
         reply = await chat_openrouter(prompt, model=MODEL_NAME_SALARY)
-        result = reply.parse(lambda raw: _coerce(raw, text), f'salary classification of {text!r}')
+        result, quote = reply.parse(lambda raw: (_coerce(raw, text), str(raw.get('quote') or '')),
+                                    f'salary classification of {text!r}')
     except Exception as ex:
         # Fail toward saying less. The deterministic reading is `unclassified`, which warns that
         # the string could not be read — never a silent upgrade to a complete range.
@@ -476,8 +482,11 @@ async def resolve_salary(extract: dict, stage_stats: dict | None = None) -> dict
 
     if stage_stats is not None:
         stage_stats['cost'] = stage_stats.get('cost', 0.0) + reply.cost_usd
+    if not await _cited_bounds_are_stated(result, quote, f'{text}\n{context}', stage_stats):
+        # Not cached: a rejected answer is not an answer, and the next posting asks again.
+        return _facts('unclassified', text, 'rejected')
     cache[key] = {
-        'schema': CACHE_SCHEMA_VERSION, 'kind': result['kind'],
+        'schema': CACHE_SCHEMA_VERSION, 'kind': result['kind'], 'quote': quote,
         'minimum': result['minimum'], 'maximum': result['maximum'],
         'currency': result['currency'], 'period': result['period'],
         'classified_on': date.today().isoformat(), 'model': reply.model, 'provider': reply.provider,
@@ -515,30 +524,58 @@ def salary_digits_are_in_the_source(salary_text: str, raw_text: str) -> bool:
     extract writing 'CA$208,580' state the same number, and a digit-string comparison would call
     that a mismatch and cry wolf on nearly every posting.
     """
-    def amounts(text: str) -> list[float]:
-        parsed = (parse_amount(match) for match in _AMOUNT_RE.findall(str(text or '')))
-        return [value for value in parsed if value is not None]
-
-    def amounts_as_stated(text: str) -> set[float]:
-        """Every amount the page states, each both bare and with its k/m magnitude applied.
-
-        A page writing '80-100K euros' and an extract writing '€80,000 - €100,000' state the
-        same range; the 2026-10-14 run warned on exactly that twice. A range's shared suffix is
-        carried to its low end, so '80-100K' yields 80000 as well as 80.
-        """
-        text = str(text or '')
-        found = set(amounts(text))
-        for match in _AMOUNT_WITH_SUFFIX_RE.finditer(text):
-            if (value := parse_amount(match['digits'], match['suffix'] or '')) is not None:
-                found.add(value)
-        for match in _RANGE_RE.finditer(text):
-            suffix = match['low_suffix'] or match['high_suffix'] or ''
-            if (value := parse_amount(match['low'], suffix)) is not None:
-                found.add(value)
-        return found
-
-    wanted = amounts(salary_text)
+    wanted = _amounts(salary_text)
     if not wanted:
         return True
     present = amounts_as_stated(raw_text)
     return all(value in present for value in wanted)
+
+
+def _amounts(text: str) -> list[float]:
+    parsed = (parse_amount(match) for match in _AMOUNT_RE.findall(str(text or '')))
+    return [value for value in parsed if value is not None]
+
+
+def amounts_as_stated(text: str) -> set[float]:
+    """Every amount a text states, each both bare and with its k/m magnitude applied.
+
+    A page writing '80-100K euros' and an extract writing '€80,000 - €100,000' state the
+    same range; the 2026-10-14 run warned on exactly that twice. A range's shared suffix is
+    carried to its low end, so '80-100K' yields 80000 as well as 80.
+    """
+    text = str(text or '')
+    found = set(_amounts(text))
+    for match in _AMOUNT_WITH_SUFFIX_RE.finditer(text):
+        if (value := parse_amount(match['digits'], match['suffix'] or '')) is not None:
+            found.add(value)
+    for match in _RANGE_RE.finditer(text):
+        suffix = match['low_suffix'] or match['high_suffix'] or ''
+        if (value := parse_amount(match['low'], suffix)) is not None:
+            found.add(value)
+    return found
+
+
+async def _cited_bounds_are_stated(result: dict[str, Any], quote: str, source: str,
+                                   stage_stats: dict | None) -> bool:
+    """Verify Source Reference for the classifier: the cited words must be in the text it read,
+    and every bound it gave must be an amount those words state.
+
+    A citation written in words ('eighty thousand euros') has no digits to compare, so it stands
+    on being found; one with digits must contain each bound, as numbers.
+    """
+    bounds = [b for b in (result['minimum'], result['maximum']) if b is not None]
+    if not bounds:
+        return True
+    claim = evidence.Claim('bounds', '-'.join(f'{b:g}' for b in bounds), quote)
+    verdict = (await evidence.verify_claims(
+        'salary_classify', repr(result['text']), [claim], source, 'salary string + compensation lines',
+        stage_stats))['bounds']
+    if not verdict.accepted:
+        return False
+    stated = amounts_as_stated(verdict.evidence)
+    if not _amounts(verdict.evidence) or all(b in stated for b in bounds):
+        return True
+    evidence.count_rejection('salary_classify', 'bounds_not_in_quote')
+    logger.warning(f'Hallucination rejected (salary_classify, {result["text"]!r}): bounds {bounds} are not '
+                   f'amounts of the cited {verdict.evidence!r} (states {sorted(stated)}) — left unclassified')
+    return False
