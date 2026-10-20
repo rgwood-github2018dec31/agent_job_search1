@@ -1584,6 +1584,15 @@ async def test_the_raters_warnings_reach_the_user_only_when_cited():
     assert kept == ['Hybrid — 3 office days']
 
 
+async def test_raters_warnings_of_the_wrong_type_are_logged_not_silently_dropped(caplog):
+    with caplog.at_level(logging.WARNING, logger=agent.logger.name):
+        kept = await agent.verified_rating_items(_make_candidate(), 'warnings', 'Requires German',
+                                                 'Description: Build agents.', agent.new_stage_stats())
+    assert kept == []
+    assert any("warnings is a str, not a list" in r.getMessage() and 'Requires German' in r.getMessage()
+               for r in caplog.records)
+
+
 async def test_triage_job_fit_fails_open_when_server_down(monkeypatch):
     async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
         raise RuntimeError('connection refused')

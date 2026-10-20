@@ -27,7 +27,7 @@ from agentic_job_search.config import (
 )
 from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
 from agentic_job_search.evidence import CITATION_INSTRUCTION, quote_properties, quotes_from
-from agentic_job_search.text_budget import snippet
+from agentic_job_search.text_budget import quote_for_error, snippet
 
 logger = logging.getLogger(__name__)
 
@@ -203,14 +203,15 @@ async def extract_job_page_openrouter(
         except json.JSONDecodeError as ex:
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
-                f"chat with {MODEL_NAME_EXTRACTOR} returned invalid JSON ({ex}): {snippet(raw)}"
+                f"chat with {MODEL_NAME_EXTRACTOR} (iteration {iteration + 1}) returned invalid JSON ({ex}): "
+                f"{quote_for_error(raw, 'OpenRouter extract reply')}"
             )
             return None
         if not data.get('ok'):
             endpoint_failed(MODEL_NAME_EXTRACTOR, routing, str(data.get('error') or raw))
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
-                f"chat failed: {data.get('error') or snippet(raw)}"
+                f"chat failed (iteration {iteration + 1}): {quote_for_error(raw, 'OpenRouter extract error reply')}"
             )
             return None
         usage = data.get('usage') or {}
@@ -238,7 +239,7 @@ async def extract_job_page_openrouter(
                 logger.warning(
                     f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                     f"{name} called with invalid JSON arguments ({ex}): "
-                    f"{snippet(tool_call['function'].get('arguments'))}"
+                    f"{quote_for_error(tool_call['function'].get('arguments'), 'OpenRouter extract tool arguments')}"
                 )
                 messages.append({
                     'role': 'tool', 'tool_call_id': call_id,

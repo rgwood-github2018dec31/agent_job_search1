@@ -81,7 +81,7 @@ def _register_unicode_fonts() -> bool:
     return True
 
 
-UNICODE_FONTS = _register_unicode_fonts()
+UNICODE_FONTS_REGISTERED = _register_unicode_fonts()
 _GLYPHS = str.maketrans({
     '→': '->', '←': '<-', '≈': '~', '⭐': '[STAR]', '📍': '[LOC]', '💰': '[PAY]',
     '🗓': '[DATE]', '✅': '[OK]', '⚠': '[WARN]', '▶': '>', '·': '.', '\ufe0f': '',
@@ -89,7 +89,7 @@ _GLYPHS = str.maketrans({
 
 
 def _plain(text: str) -> str:
-    if UNICODE_FONTS:
+    if UNICODE_FONTS_REGISTERED:
         return text.replace('\ufe0f', '')
     return text.translate(_GLYPHS).encode('cp1252', 'replace').decode('cp1252')
 
@@ -624,8 +624,8 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
 # --- styles ------------------------------------------------------------------
 
 _sheet = getSampleStyleSheet()
-_SANS = 'TraceSans' if UNICODE_FONTS else 'Helvetica'
-_SANS_BOLD = 'TraceSansBold' if UNICODE_FONTS else 'Helvetica-Bold'
+_SANS = 'TraceSans' if UNICODE_FONTS_REGISTERED else 'Helvetica'
+_SANS_BOLD = 'TraceSansBold' if UNICODE_FONTS_REGISTERED else 'Helvetica-Bold'
 TITLE = ParagraphStyle('T', parent=_sheet['Title'], fontName=_SANS_BOLD, fontSize=17, leading=20, spaceAfter=2,
                        textColor=colors.HexColor('#111111'))
 SUBTITLE = ParagraphStyle('S', parent=_sheet['Normal'], fontName=_SANS, fontSize=9.5, leading=12,
@@ -639,7 +639,7 @@ NOTE = ParagraphStyle('N', parent=BODY, fontSize=8.2, leading=10.6,
                       textColor=colors.HexColor('#666666'), leftIndent=4)
 LABEL = ParagraphStyle('L', parent=BODY, fontSize=8.2, leading=10.4, spaceBefore=4, spaceAfter=1,
                        textColor=colors.HexColor('#7a4a00'))
-VERBATIM = ParagraphStyle('V', parent=_sheet['Code'], fontName='TraceMono' if UNICODE_FONTS else 'Courier',
+VERBATIM = ParagraphStyle('V', parent=_sheet['Code'], fontName='TraceMono' if UNICODE_FONTS_REGISTERED else 'Courier',
                           fontSize=7.0, leading=8.6,
                           backColor=colors.HexColor('#f6f6f4'), borderPadding=3, leftIndent=0)
 

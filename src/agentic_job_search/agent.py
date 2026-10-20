@@ -3932,6 +3932,11 @@ async def verified_rating_items(candidate: dict, kind: str, items: object, extra
     warning is a claim about the posting and reaches the user only when its quote is found in the
     rater's input. A dropped one is logged with its quote by evidence.verify_claims.
     """
+    if items is not None and not isinstance(items, list):
+        logger.warning(
+            f"Rating: job {candidate.get('job_id')} {candidate.get('company')}: the rater's {kind} is a "
+            f"{type(items).__name__}, not a list, so none of it is shown; as returned: {items!r}"
+        )
     pairs = _cited_items(items)
     if not pairs:
         return []
