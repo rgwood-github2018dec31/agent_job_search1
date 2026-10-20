@@ -1589,7 +1589,7 @@ async def test_raters_warnings_of_the_wrong_type_are_logged_not_silently_dropped
         kept = await agent.verified_rating_items(_make_candidate(), 'warnings', 'Requires German',
                                                  'Description: Build agents.', agent.new_stage_stats())
     assert kept == []
-    assert any("warnings is a str, not a list" in r.getMessage() and 'Requires German' in r.getMessage()
+    assert any('warnings is a str, not a list' in r.getMessage() and 'Requires German' in r.getMessage()
                for r in caplog.records)
 
 
