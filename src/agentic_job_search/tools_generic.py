@@ -1,4 +1,5 @@
 
+import asyncio
 import json
 import logging
 import os
@@ -30,10 +31,13 @@ from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 
 import agentic_job_search.preferences as preferences
-from agentic_job_search import location_review
+from agentic_job_search import company_domain, location_review
+from agentic_job_search.company_domain import CompanyIdentity, identities_match
+from agentic_job_search.company_domain import normalize_company_name as _normalize_company
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
+    COMPANY_IDENTITY_LOOKUP_CONCURRENCY,
     EVAL_ERROR_MAX_RELEASES,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
@@ -110,6 +114,11 @@ _processed_jobs: set[tuple[str, str]] = set()
 _candidates: list[dict] = []
 _candidates_per_query: dict[str, int] = {}
 _applied_companies: dict[str, str] = {}  # company_name -> PDF filename
+# company_name -> who it is (domain, parent); resolved once at load, see company_domain.py
+_applied_identities: dict[str, CompanyIdentity] = {}
+# Normalized name -> the LLM name-match verdict, for a name with no identity. Per run, so one
+# name gets one answer: uncached, NTT DATA Europe & Latam got two in one run (2026-10-19).
+_company_match_verdicts: dict[str, str | None] = {}
 # Per-page extracted text of each in-horizon applied job, newest first, for the reference profile.
 # Kept as pages until a prompt serializes it (text_budget.pages_to_prompt), so size is reportable.
 _reference_job_pages: list[list[str]] = []
@@ -315,19 +324,6 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
     return {'company': '', 'job_title': '', 'is_agency': False, 'end_client': ''}
 
 
-def _normalize_company(name: str) -> str:
-    """Strip punctuation and common legal/entity suffixes so 'Datadog, Inc.' == 'Datadog'."""
-    cleaned = re.sub(r'[^a-z0-9 ]+', ' ', name.lower())
-    words = [w for w in cleaned.split() if w not in _COMPANY_NOISE_WORDS]
-    return ' '.join(words)
-
-
-_COMPANY_NOISE_WORDS = {
-    'inc', 'llc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company',
-    'group', 'holdings', 'gmbh', 'sa', 'bv', 'plc', 'the', 'technologies', 'software',
-}
-
-
 def _require_fields(raw: dict, **kinds: type) -> dict:
     '''raw, once each named field has its type; raises ValueError naming the first that does not.
 
@@ -353,12 +349,15 @@ async def _company_matches_openrouter(candidate: str, companies_list: str) -> di
                        f'company match for {candidate!r}')
 
 
-async def company_matches_applied(candidate: str) -> str | None:
+async def company_matches_applied(candidate: str, identity: CompanyIdentity | None = None) -> str | None:
     '''Return the source PDF filename if candidate matches a previously applied-to company, else None.
 
     Tries an exact normalized string match first — that resolves the overwhelming majority of
     listings for free and, more importantly, without a per-listing network round-trip that would
-    otherwise dominate Stage 1b wall-clock. The LLM is only consulted for genuine ambiguity.
+    otherwise dominate Stage 1b wall-clock. Then the companies' identities (domain and parent,
+    company_domain.py), compared in code: `identity` when the caller read it off LinkedIn,
+    else the cached or model-resolved one for the name. Only a name nobody could identify falls
+    back to the LLM name match, and its verdict is kept for the run.
     '''
     if not _applied_companies:
         return None
@@ -369,6 +368,30 @@ async def company_matches_applied(candidate: str) -> str | None:
         logger.debug(f'company_matches_applied: exact normalized match {candidate!r} -> {exact!r} (no LLM call)')
         return _applied_companies[exact]
 
+    if identity is None:
+        try:
+            identity = await company_domain.identity_for_name(candidate)
+        except Exception as ex:
+            logger.warning(f'company_matches_applied: could not identify {candidate!r}, matching by name '
+                           f'instead: {unwrap_exception(ex)}')
+    if identity is not None and identity.source != company_domain.SOURCE_NONE:
+        for name, applied in _applied_identities.items():
+            if identities_match(identity, applied):
+                logger.debug(f'company_matches_applied: {identity.describe()} matches applied '
+                             f'{applied.describe()} (no LLM call)')
+                return _applied_companies[name]
+        return None
+
+    folded = _normalize_company(candidate)
+    if folded in _company_match_verdicts:
+        return _company_match_verdicts[folded]
+    verdict = await _company_matches_by_name(candidate)
+    _company_match_verdicts[folded] = verdict
+    return verdict
+
+
+async def _company_matches_by_name(candidate: str) -> str | None:
+    '''The LLM name match against every applied company: for a name with no identity.'''
     companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
 
     if route_for(MODEL_NAME_COMPANY_MATCH) == 'openrouter':
@@ -1146,7 +1169,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     metadata LLM call only runs for new or changed PDFs. Records applied to longer ago than
     APPLIED_JOBS_HORIZON_DAYS stay on disk but are not read into any global.
     '''
-    global _applied_companies, _reference_job_pages, _applied_jobs
+    global _applied_companies, _applied_identities, _reference_job_pages, _applied_jobs
 
     applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
     index_file = index_path or (applied_to_dir / 'index.yaml')
@@ -1221,6 +1244,8 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         index_file.write_text(yaml.dump(index, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
     _applied_companies = companies
+    _applied_identities = await _identify_applied_companies(companies)
+    _company_match_verdicts.clear()
     # NEWEST first. Consumers cap this at MAX_REFERENCE_JOBS, and taking the OLDEST N meant a
     # newly applied job could never influence the ideal-role profile — it only entered once older
     # records aged out of the horizon, so the rater calibrated against jobs the user had moved on
@@ -1232,6 +1257,32 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         f'Loaded {len(jobs)} applied job(s) within {APPLIED_JOBS_HORIZON_DAYS} days '
         f'({len(companies)} blocklisted companies); {aged_out} of {total} beyond the horizon.'
     )
+
+
+async def _identify_applied_companies(companies: dict[str, str]) -> dict[str, CompanyIdentity]:
+    '''Each applied company's identity, from the cache or one model call each (once, ever).
+
+    A company that cannot be identified keeps its name alone, so it still matches by name; the
+    failure is logged, and the next run asks again.
+    '''
+    semaphore = asyncio.Semaphore(COMPANY_IDENTITY_LOOKUP_CONCURRENCY)
+    failures: list[str] = []
+
+    async def identify(name: str) -> tuple[str, CompanyIdentity]:
+        async with semaphore:
+            try:
+                return name, await company_domain.identity_for_name(name)
+            except Exception as ex:
+                failures.append(f'{name!r}: {unwrap_exception(ex)}')
+                return name, CompanyIdentity(name=name)
+
+    identities = dict(await asyncio.gather(*(identify(name) for name in companies)))
+    if failures:
+        logger.warning(f'Could not identify {len(failures)} of {len(companies)} applied companies, matching '
+                       f'them by name alone this run: {"; ".join(failures)}')
+    known = sum(1 for identity in identities.values() if identity.source != company_domain.SOURCE_NONE)
+    logger.info(f'Applied companies identified: {known} of {len(companies)} by domain or parent')
+    return identities
 
 
 def applied_jobs_summary() -> str:

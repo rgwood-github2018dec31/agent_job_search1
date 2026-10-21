@@ -11,6 +11,7 @@ import agentic_job_search.tools_generic as tools
 import pytest
 from agentic_job_search import (
     agent,
+    company_domain,
     fx,
     linkedin_page,
     location,
@@ -263,6 +264,7 @@ def _no_human_pacing(monkeypatch):
     for name in (
         'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
         'SCRAPER_INTER_QUERY_DELAY_SECONDS',
+        'COMPANY_ABOUT_PAGE_DELAY_SECONDS',
     ):
         monkeypatch.setattr(agent, name, (0.0, 0.0))
     yield
@@ -327,6 +329,24 @@ def _isolated_fx_cache(monkeypatch, tmp_path):
     fx.reset_run_state()
     yield
     fx.reset_run_state()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_company_identities(monkeypatch, tmp_path):
+    '''No test may read or write the real run_dir/company_identities.yaml, or ask the real model.
+
+    The lookup FAILS OVER to the name match, so without the stub an unstubbed test would pass
+    while making a live, paid call. Tests of the lookup patch `chat_openrouter` themselves.
+    The run-scoped match state is cleared too, so one test's identities cannot reach the next.
+    '''
+    async def _no_network(*args, **kwargs):
+        raise AssertionError('a unit test tried to reach the OpenRouter MCP server')
+
+    monkeypatch.setattr(company_domain, 'COMPANY_IDENTITY_CACHE_PATH', tmp_path / 'company_identities.yaml')
+    monkeypatch.setattr(company_domain, '_cache', None)
+    monkeypatch.setattr(company_domain, 'chat_openrouter', _no_network)
+    monkeypatch.setattr(tools, '_applied_identities', {})
+    monkeypatch.setattr(tools, '_company_match_verdicts', {})
 
 
 @pytest.fixture(autouse=True)

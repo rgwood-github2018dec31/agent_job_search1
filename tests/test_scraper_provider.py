@@ -3,6 +3,9 @@
 On 2026-09-23 the six scraper queries cost $0.010-0.022 each; on 2026-09-24 the same queries, with
 the same token counts and cache hit rates, cost $0.19-0.37 — OpenRouter had drawn fp8 providers
 charging 30-40x more for cache reads. The prices below are the live ones from that day.
+
+The RANKING rule now lives in tools_llm_remote_openrouter's `rank_providers`, so the tests here
+cover only the caller's half: the mix and floor the pin asks with, and the per-run fallback state.
 """
 import json
 import logging
@@ -12,7 +15,10 @@ from agentic_job_search import agent
 from agentic_job_search import scrape_openrouter as so
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.config import (
+    SCRAPER_CACHED_PROMPT_SHARE,
+    SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_COST_ALERT_FACTOR,
+    SCRAPER_DROP_SLOWEST_SHARE,
     SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION,
     SCRAPER_MIN_BITS_PER_WEIGHT,
     SCRAPER_PROVIDER_MAX_SWITCHES,
@@ -23,7 +29,7 @@ from agentic_job_search.triage import ProviderUnavailableError
 # Imported at collection time, before conftest's autouse stub replaces it on the module.
 REAL_PIN_SCRAPER_PROVIDER = so.pin_scraper_provider
 
-MODEL = 'deepseek/deepseek-v4-flash-0731'
+MODEL = 'deepseek/deepseek-v4.1-flash-1017'
 MIN_BITS = SCRAPER_MIN_BITS_PER_WEIGHT[MODEL]
 
 
@@ -33,9 +39,30 @@ def _endpoint(tag, prompt, cache, completion, quantization='fp8', bits=8, status
             'status': status, 'supports_tools': tools_ok}
 
 
+def _effective_price(endpoint):
+    '''The server's ranking price, mirrored so the fake answer is ordered like a real one.'''
+    prompt, completion = endpoint['prompt_price'], endpoint['completion_price']
+    if prompt is None or completion is None:
+        return None
+    cache = endpoint['cache_read_price']
+    cache = prompt if cache is None else cache
+    return ((1 - SCRAPER_CACHED_PROMPT_SHARE) * prompt + SCRAPER_CACHED_PROMPT_SHARE * cache
+            + SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN * completion) * 1e6
+
+
 def _listing(*endpoints):
-    return {'ok': True, 'model': MODEL, 'default_quantization': 'fp8', 'closed_weights': False,
-            'endpoints': list(endpoints)}
+    '''A stand-in for the rank_providers answer: usable endpoints, cheapest effective price first.
+
+    The real rule — its unusable-endpoint filtering, its bpw floor and its slowest-share cut — is
+    tested in tools_llm_remote_openrouter. Here it only has to look like the server's answer.
+    '''
+    usable = [e for e in endpoints
+              if e.get('tag') and e.get('status') == 0 and e.get('supports_tools') is True
+              and e.get('bits') is not None and e['bits'] >= MIN_BITS
+              and _effective_price(e) is not None]
+    usable.sort(key=_effective_price)
+    return {'ok': True, 'model': MODEL, 'report': 'stub',
+            'ranked': [{**e, 'effective_price_per_million': _effective_price(e)} for e in usable]}
 
 
 # Live 2026-09-24 prices, per token.
@@ -45,49 +72,7 @@ COREWEAVE = _endpoint('coreweave/fp8', 1.3e-7, 7e-8, 2.8e-7)
 NO_CACHE_PRICE = _endpoint('mancer/fp8', 5e-8, None, 1.6e-7)
 
 
-# --- ranking ---------------------------------------------------------------------------------------
-
-def test_ranking_is_by_the_scrapers_token_mix_not_the_prompt_price():
-    '''NO_CACHE_PRICE has the lowest prompt price, but at 94% cache reads it is the dearest.'''
-    ranked = [e['tag'] for _, e in so.rank_endpoints(_listing(COREWEAVE, NO_CACHE_PRICE, DEEPINFRA, STREAMLAKE), [], MIN_BITS)]
-    assert ranked == ['streamlake/fp8', 'deepinfra/fp8', 'mancer/fp8', 'coreweave/fp8']
-
-
-def test_the_estimate_reproduces_the_expensive_run():
-    """CoreWeave's estimate lands on the $0.2566 the 'AI Architect' query cost on 2026-09-24."""
-    prompt_tokens = 3_471_892
-    estimate = so.effective_price_per_million(COREWEAVE) * prompt_tokens / so.PER_MILLION
-    assert estimate == pytest.approx(0.2566, rel=0.1)
-
-
-def test_a_missing_price_is_never_guessed():
-    assert so.effective_price_per_million({**STREAMLAKE, 'completion_price': None}) is None
-    assert so.effective_price_per_million({**STREAMLAKE, 'prompt_price': None}) is None
-
-
-@pytest.mark.parametrize('unusable', [
-    _endpoint('down/fp8', 1e-9, 1e-10, 1e-9, status=-2),
-    _endpoint('notools/fp8', 1e-9, 1e-10, 1e-9, tools_ok=None),
-    _endpoint('lowbits/fp4', 1e-9, 1e-10, 1e-9, quantization='fp4', bits=4),
-    {**_endpoint('x/fp8', 1e-9, 1e-10, 1e-9), 'tag': None},
-    _endpoint('unknown', 1e-9, 1e-10, 1e-9, quantization='unknown', bits=None),
-])
-def test_unusable_endpoints_are_never_chosen_however_cheap(unusable):
-    ranked = so.rank_endpoints(_listing(unusable, DEEPINFRA), [], MIN_BITS)
-    assert [e['tag'] for _, e in ranked] == ['deepinfra/fp8']
-
-
-def test_a_precision_above_the_servers_default_is_still_a_candidate():
-    '''2026-09-27: the default became bf16 and every fp8 endpoint vanished from the list.'''
-    bf16 = _endpoint('morph/bf16', 1.4e-7, 3.6e-8, 4e-7, quantization='bf16', bits=16)
-    listing = {**_listing(bf16, DEEPINFRA, STREAMLAKE), 'default_quantization': 'bf16'}
-    assert [e['tag'] for _, e in so.rank_endpoints(listing, [], MIN_BITS)] == \
-        ['streamlake/fp8', 'deepinfra/fp8', 'morph/bf16']
-
-
-def test_a_tag_listed_twice_is_one_candidate():
-    assert [e['tag'] for _, e in so.rank_endpoints(_listing(DEEPINFRA, DEEPINFRA), [], MIN_BITS)] == ['deepinfra/fp8']
-
+# --- asking ----------------------------------------------------------------------------------------
 
 def test_a_model_without_a_precision_floor_fails_fast():
     with pytest.raises(KeyError, match='SCRAPER_MIN_BITS_PER_WEIGHT'):
@@ -100,21 +85,55 @@ async def test_pinning_a_model_without_a_precision_floor_raises_rather_than_runn
         await REAL_PIN_SCRAPER_PROVIDER('someone/unlisted-model')
 
 
-def test_failed_endpoints_are_excluded():
-    assert [e['tag'] for _, e in so.rank_endpoints(_listing(STREAMLAKE, DEEPINFRA), ['streamlake/fp8'], MIN_BITS)] == ['deepinfra/fp8']
+async def test_the_pin_asks_for_the_scrapers_mix_floor_and_speed_cut(monkeypatch):
+    '''The caller supplies only its own numbers — the ranking rule stays in the server.'''
+    sent = []
+    _wire(monkeypatch, _listing(STREAMLAKE), sent=sent)
+    await REAL_PIN_SCRAPER_PROVIDER(MODEL)
+    assert sent == [('rank_providers', {
+        'model': MODEL,
+        'min_bits': MIN_BITS,
+        'cached_prompt_share': SCRAPER_CACHED_PROMPT_SHARE,
+        'completion_tokens_per_prompt_token': SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
+        'drop_slowest_share': SCRAPER_DROP_SLOWEST_SHARE,
+        'exclude': [],
+    })]
+
+
+async def test_a_failed_endpoint_is_passed_back_as_an_exclusion(monkeypatch):
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    assert pin.failed == []
+    sent = []
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE), sent=sent)
+    await pin.choose()
+    assert [args['exclude'] for tool, args in sent if tool == 'rank_providers'] == [[]]
+    pin.failed.append('streamlake/fp8')
+    await pin.choose()
+    assert [args['exclude'] for tool, args in sent if tool == 'rank_providers'] == [[], ['streamlake/fp8']]
 
 
 # --- choosing --------------------------------------------------------------------------------------
 
+def _excluding(ranking, exclude):
+    '''The server drops excluded tags from the ranking it returns, so the fakes must too.'''
+    if not ranking.get('ok'):
+        return ranking
+    return {**ranking, 'ranked': [e for e in ranking['ranked'] if e['tag'] not in exclude]}
+
+
 def _wire(monkeypatch, listing, chat_responses=None, sent=None):
-    '''Route call_mcp_tool: list_endpoints -> the listing; chat -> the next canned response.'''
+    '''Route call_mcp_tool: rank_providers -> the ranking; chat -> the next canned response.
+
+    The ranking honours `exclude`, because the real server does the filtering now: a fake that
+    kept returning the failed endpoint would pin it straight back.
+    '''
     chat_responses = list(chat_responses or [])
 
     async def fake_call(url, tool, args, timeout_seconds=None):
         if sent is not None:
             sent.append((tool, json.loads(json.dumps(args))))
-        if tool == 'list_endpoints':
-            return json.dumps(listing)
+        if tool == 'rank_providers':
+            return json.dumps(_excluding(listing, args.get('exclude') or []))
         return chat_responses.pop(0)
 
     monkeypatch.setattr(so, 'call_mcp_tool', fake_call)
@@ -124,7 +143,7 @@ async def test_the_cheapest_usable_endpoint_is_pinned(monkeypatch):
     _wire(monkeypatch, _listing(COREWEAVE, DEEPINFRA, STREAMLAKE))
     pin = await REAL_PIN_SCRAPER_PROVIDER(MODEL)
     assert pin.tag == 'streamlake/fp8'
-    assert pin.estimate_per_million == pytest.approx(so.effective_price_per_million(STREAMLAKE))
+    assert pin.estimate_per_million == pytest.approx(_effective_price(STREAMLAKE))
 
 
 async def test_a_failed_listing_leaves_the_run_unpinned_and_says_so(monkeypatch, caplog):
@@ -281,8 +300,8 @@ async def test_a_chat_timeout_drops_the_pinned_endpoint_and_asks_the_next(monkey
     providers = []
 
     async def fake_call(url, tool, args, timeout_seconds=None):
-        if tool == 'list_endpoints':
-            return json.dumps(_listing(DEEPINFRA, STREAMLAKE))
+        if tool == 'rank_providers':
+            return json.dumps(_excluding(_listing(DEEPINFRA, STREAMLAKE), args.get('exclude') or []))
         providers.append(args['provider'])
         if args['provider'] == 'streamlake/fp8':
             raise RuntimeError(f"MCP tool 'chat' at {url} timed out after {timeout_seconds}s")
@@ -312,7 +331,7 @@ async def test_a_timeout_with_no_endpoint_left_still_fails_the_query(monkeypatch
     pin = await _pinned(monkeypatch, _listing(STREAMLAKE))
 
     async def fake_call(url, tool, args, timeout_seconds=None):
-        if tool == 'list_endpoints':
+        if tool == 'rank_providers':
             return json.dumps(_listing(STREAMLAKE))
         raise RuntimeError(f"MCP tool 'chat' at {url} timed out after {timeout_seconds}s")
 

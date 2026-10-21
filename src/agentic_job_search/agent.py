@@ -51,11 +51,13 @@ from utils_tools_n_agents_common.telegram_client import send_message as telegram
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search import endpoint_pin, fx, location, location_review, scrape_openrouter, system_sleep
+from agentic_job_search import company_domain, endpoint_pin, fx, location, location_review, scrape_openrouter, system_sleep
+from agentic_job_search.company_domain import CompanyIdentity
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
     AUDIT_OPUS_SAMPLE_SIZE,
+    COMPANY_ABOUT_PAGE_DELAY_SECONDS,
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_FALLBACK_MAX_TURNS,
@@ -77,6 +79,7 @@ from agentic_job_search.config import (
     NARRATION_MESSAGE_MAX_LINES,
     NARRATION_WARNING_REPLAY_MAX_CHARS,
     NOTIFICATION_POSTED_MAX_CHARS,
+    NOTIFICATION_RECRUITER_MARKER,
     NOTIFICATION_SALARY_MAX_CHARS,
     PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS,
     PLAYWRIGHT_MAX_RESTARTS_PER_RUN,
@@ -124,7 +127,13 @@ from agentic_job_search.config import (
     should_notify_based_on_rating,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
-from agentic_job_search.linkedin_page import JobPage, read_job_page, strip_saved_page_furniture
+from agentic_job_search.linkedin_page import (
+    JobPage,
+    LinkedInBlockedError,
+    read_company_about,
+    read_job_page,
+    strip_saved_page_furniture,
+)
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search.salary import (
     SALARY_KIND_ABSENT,
@@ -2392,6 +2401,32 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
         return None
 
 
+async def identify_poster(
+    slug: str, candidate: dict, playwright_mcp_url: str, stage_stats: dict
+) -> CompanyIdentity | None:
+    '''The poster's identity from its LinkedIn About page, cached per slug once, ever.
+
+    None — logged here — when the page could not be read; the caller then identifies the company
+    by name. A challenge page raises LinkedInBlockedError, which stops Stage 2.
+    '''
+    if cached := company_domain.cached_identity_for_slug(slug):
+        return cached
+    await _human_pause(COMPANY_ABOUT_PAGE_DELAY_SECONDS, f'the LinkedIn About page of {slug}')
+    try:
+        async with mcp_session(playwright_mcp_url) as call:
+            about = await read_company_about(slug, call)
+    except LinkedInBlockedError:
+        raise
+    except Exception as ex:
+        logger.warning(f"Company identity: the About page of {slug} ({candidate['company']}) could not be "
+                       f'read, identifying the company by name instead: {unwrap_exception(ex)}')
+        return None
+    identity = await company_domain.record_linkedin_identity(
+        slug, about.name, about.website, about.parent_name, about.parent_slug, stage_stats)
+    logger.info(f"Company identity: {candidate['company']} is {identity.describe()} (LinkedIn {slug})")
+    return identity
+
+
 async def extract_job_page_direct(
     candidate: dict, playwright_mcp_url: str, stage_stats: dict, page: JobPage | None = None
 ) -> dict | None:
@@ -2520,7 +2555,11 @@ _AREA_WORDS = (
 # agree on what an area name looks like: when they drifted apart, "remote within our EMEA region"
 # fell through BOTH -- the country branch stopped claiming it and no area branch picked it up.
 _AREA_LEAD = r'(?:the\s+|an?\s+|our\s+|your\s+)?(?:\w+\s+)?'
-_NOT_AREA = r'(?!' + _AREA_LEAD + _AREA_WORDS + r'\b)'
+# A time-zone band is not a country either: "work from anywhere within GMT-1 to GMT+4" read as
+# `country_only` on 2026-10-20, overriding the extractor's `area_wide`. It says nothing about where
+# the holder must live, so it is excluded from the country object and left to the extractor.
+_TIMEZONE_WORDS = r'(?:GMT|UTC|CES?T|EES?T|WES?T|BST|[ECMP][SD]T|time\s*zones?)'
+_NOT_AREA = r'(?!' + _AREA_LEAD + r'(?:' + _AREA_WORDS + r'|' + _TIMEZONE_WORDS + r')\b)'
 
 _AREA_WIDE_RE = re.compile(
     r'\b(?:work|working|remote|based|located|reside|residing|hire[sd]?|employed|eligible)\s+'
@@ -3874,7 +3913,8 @@ def format_job_notification(
 ) -> str:
     '''The Telegram job-match message. Plain text — _send_pipeline_notification sends no
     parse_mode, so this uses bullets and emoji rather than Markdown.'''
-    header = f"⭐ {rating}/5 — {candidate['company']} — {candidate['title']}"
+    recruiter = f'{NOTIFICATION_RECRUITER_MARKER} ' if derive_agency_posting(extract) else ''
+    header = f"⭐ {rating}/5 — {recruiter}{candidate['company']} — {candidate['title']}"
     location = extract.get('location', '').strip()
     workplace_type = derive_workplace_type(extract)
     if location and workplace_type and workplace_type not in location.lower():
@@ -4283,6 +4323,32 @@ async def evaluate_all_candidates(
                     )
                     continue
 
+            # The poster, checked again by who it IS now that its LinkedIn page is known: Stage 1b
+            # had only the name on the card, which missed NTT DATA Europe & Latam against an
+            # application to its parent (2026-10-19). Agencies are skipped, as load_applied_jobs
+            # keeps them out of the blocklist. Here, just before the paid rating, so the About
+            # page is visited for as few companies as possible, each once ever.
+            if page is not None and page.company_slug and not derive_agency_posting(extract):
+                identity = await identify_poster(
+                    page.company_slug, candidate, playwright_mcp['url'], stage_stats['extraction'])
+                matched_pdf = await tools_module.company_matches_applied(candidate['company'], identity)
+                if matched_pdf:
+                    bump('poster_identity_already_applied')
+                    logger.info(f"Already applied by company identity [{index}/{len(candidates)}]: "
+                                f"{candidate['company']} — {candidate['title']}: matches {matched_pdf}")
+                    await _save_and_notify(
+                        candidate, rating=RATING_AUTO_REJECT,
+                        summary=f"already applied to {candidate['company']} (same organization)",
+                        content=(f"# Already applied — {candidate['company']} is the same organization as "
+                                 f"an applied job\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"),
+                        notify=False,
+                    )
+                    tools_module.record_job_outcome(
+                        candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
+                        summary=f"{candidate['company']} matches {matched_pdf} by domain or parent",
+                    )
+                    continue
+
             rating_started = time.monotonic()
             result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
             rating_seconds = time.monotonic() - rating_started
@@ -4383,6 +4449,27 @@ async def evaluate_all_candidates(
             # so a later repost of it that rates 4 must still notify.
             if should_notify_based_on_rating(rating) and is_agency and not repost:
                 tools_module.record_recruiter_notification(candidate, extract)
+        except LinkedInBlockedError as ex:
+            remaining = candidates[index - 1:]
+            not_released = []
+            for unevaluated in remaining:
+                tools_module.record_job_outcome(
+                    unevaluated['site'], unevaluated['job_id'], 'blocked',
+                    summary='not evaluated: LinkedIn showed a challenge page; released for the next run',
+                )
+                try:
+                    tools_module.forget_processed_job(unevaluated['site'], unevaluated['job_id'])
+                except FileNotFoundError as release_ex:
+                    not_released.append(f"{unevaluated['site']}/{unevaluated['job_id']} ({release_ex})")
+            funnel['blocked'] = len(remaining)
+            tools_module._ui_alerts.append({
+                'kind': 'blocked', 'query': '(Stage 2)', 'region': candidate['company'], 'detail': str(ex),
+            })
+            logger.error(f'Stage 2 stopped, not retried: {ex}; {len(remaining)} job(s) not evaluated and '
+                         f'released for the next run'
+                         + (f'; {len(not_released)} could not be released: {"; ".join(not_released)}'
+                            if not_released else ''))
+            break
         except Exception as ex:
             if browser is not None and browser.is_dead():
                 logger.warning(f"Stage 2: browser died while evaluating {candidate['company']} — "

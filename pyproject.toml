@@ -13,6 +13,8 @@ dependencies = [
     "utils-tools-n-agents-common",
     "beautifulsoup4>=4.15.0",
     "lxml>=6.1.3",
+    "tldextract>=5.4.0",
+    "httpx>=0.28.1",
 ]
 
 [tool.uv.sources]

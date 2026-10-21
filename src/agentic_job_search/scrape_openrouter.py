@@ -35,6 +35,7 @@ from agentic_job_search.config import (
     SCRAPER_CACHED_PROMPT_SHARE,
     SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
+    SCRAPER_DROP_SLOWEST_SHARE,
     SCRAPER_FIND_RESULT_MAX_CHARS,
     SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION,
     SCRAPER_MIN_BITS_PER_WEIGHT,
@@ -148,20 +149,10 @@ ACCOUNT_LEVEL_HTTP_STATUSES = frozenset({401, 402, 403})
 PER_MILLION = 1_000_000
 
 
-def effective_price_per_million(endpoint: dict) -> float | None:
-    """What this endpoint charges per million PROMPT tokens of the scraper's token mix.
-
-    None when a price the estimate needs is missing — never guessed. A missing cache-read price
-    counts as no cache discount (the full prompt price), which can only rank it lower.
-    """
-    prompt, completion = endpoint.get('prompt_price'), endpoint.get('completion_price')
-    if prompt is None or completion is None:
-        return None
-    cache_read = endpoint.get('cache_read_price')
-    cache_read = prompt if cache_read is None else cache_read
-    per_token = ((1 - SCRAPER_CACHED_PROMPT_SHARE) * prompt + SCRAPER_CACHED_PROMPT_SHARE * cache_read
-                 + SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN * completion)
-    return per_token * PER_MILLION
+def _price_text(price: float | None) -> str:
+    '''A ranked price for the log lines. The server reports None only when NO endpoint of the
+    model publishes a price, which is then not a number to print.'''
+    return 'n/a' if price is None else f'${price:.4f}/M'
 
 
 def min_bits_for(model: str) -> int:
@@ -175,32 +166,6 @@ def min_bits_for(model: str) -> int:
             f'is acceptable at before running it: without one, the endpoint list could fall to a '
             f'4-bit quantization no one chose.'
         ) from ex
-
-
-def rank_endpoints(listing: dict, exclude: list[str], min_bits: int) -> list[tuple[float, dict]]:
-    """Usable endpoints, cheapest effective price first: the run's ordered fallback list.
-
-    Usable: up (status 0), tool-calling, at a declared precision of at least `min_bits` (an
-    endpoint with unknown bits is excluded, never assumed good), with a tag to pin, not already
-    failed this run. The chat call carries the endpoint's own quantization, so a precision other
-    than the server's default is not refused. A tag listed twice is kept once.
-    """
-    ranked = []
-    seen: set[str] = set()
-    for endpoint in listing.get('endpoints') or []:
-        tag = endpoint.get('tag')
-        if not tag or tag in exclude or tag in seen:
-            continue
-        if endpoint.get('status') != 0 or endpoint.get('supports_tools') is not True:
-            continue
-        bits = endpoint.get('bits')
-        if bits is None or bits < min_bits:
-            continue
-        price = effective_price_per_million(endpoint)
-        if price is not None:
-            seen.add(tag)
-            ranked.append((price, endpoint))
-    return sorted(ranked, key=lambda pair: pair[0])
 
 
 @dataclass
@@ -219,24 +184,32 @@ class ProviderPin:
     switches: int = 0
 
     async def choose(self, announce: bool = True) -> bool:
-        '''Pin the cheapest usable endpoint not yet failed. Raises when the listing fails.'''
-        raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'list_endpoints', {'model': self.model},
-                                  timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
-        listing = json.loads(raw)
-        if not listing.get('ok'):
-            raise RuntimeError(f'list_endpoints failed for {self.model}: {listing.get("error") or snippet(raw)}')
-        ranked = rank_endpoints(listing, self.failed, min_bits_for(self.model))
+        '''Pin the cheapest usable endpoint not yet failed. Raises when the ranking fails.'''
+        raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'rank_providers', {
+            'model': self.model,
+            'min_bits': min_bits_for(self.model),
+            'cached_prompt_share': SCRAPER_CACHED_PROMPT_SHARE,
+            'completion_tokens_per_prompt_token': SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
+            'drop_slowest_share': SCRAPER_DROP_SLOWEST_SHARE,
+            'exclude': self.failed,
+        }, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+        ranking = json.loads(raw)
+        if not ranking.get('ok'):
+            raise RuntimeError(f'rank_providers failed for {self.model}: {ranking.get("error") or snippet(raw)}')
+        # The tool server owns the ranking rule; the pin only walks the list it returns. Each entry
+        # carries the price the server ranked it by, so the estimate and the order cannot disagree.
+        ranked = [(e['effective_price_per_million'], e) for e in ranking.get('ranked') or []]
         if not ranked:
             self.tag, self.quantization, self.estimate_per_million = None, None, None
             return False
         self.estimate_per_million, best = ranked[0]
         self.tag, self.quantization = best['tag'], best.get('quantization')
-        runners_up = [f"{e['tag']} ${price:.4f}/M" for price, e in ranked[1:]]
+        runners_up = [f"{e['tag']} {_price_text(price)}" for price, e in ranked[1:]]
         # A re-choose after a failure is announced by switch()'s own WARNING, which names the new
         # endpoint and its estimate; the pin line beside it said the same thing again.
         logger.log(
             logging.INFO if announce else logging.DEBUG,
-            f'Stage 1b: pinned {self.model} to {self.tag} — est. ${self.estimate_per_million:.4f}/M prompt '
+            f'Stage 1b: pinned {self.model} to {self.tag} — est. {_price_text(self.estimate_per_million)} prompt '
             f'tokens at the scraper\'s token mix (next: {runners_up[0] if runners_up else "none"})'
         )
         logger.debug(f'Stage 1b: all ranked endpoints after {self.tag}: {", ".join(runners_up) or "none"}')
@@ -263,7 +236,7 @@ class ProviderPin:
             logger.warning(f'Stage 1b: {failed_tag} failed and no other usable endpoint is left: {compact_error(error)}')
             return False
         detail = (f'{failed_tag} failed ({compact_error(error)}); switched to {self.tag} '
-                  f'(est. ${self.estimate_per_million:.4f}/M) for the rest of the run')
+                  f'(est. {_price_text(self.estimate_per_million)}) for the rest of the run')
         logger.warning(f'Stage 1b: {detail}')
         tools_generic._ui_alerts.append({'kind': 'provider_switch', 'query': query, 'region': '(all)', 'detail': detail,
                                          'from': failed_tag, 'to': self.tag, 'reason': compact_error(error)})

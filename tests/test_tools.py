@@ -16,6 +16,7 @@ import requests
 import yaml
 from agentic_job_search import (
     agent,
+    company_domain,
     config,
     extract_openrouter,
     fx,
@@ -4521,6 +4522,9 @@ def test_build_deterministic_warnings_flags_salary_text_with_no_figure():
     ('$100/hr', 'single', 100, 100),
     ('$46.50/hour', 'single', 46.5, 46.5),
     ('CAD 220,000', 'single', 220000, 220000),
+    # Base ahead of bonus and OTE: the base is the salary (2026-10-20, Harnham).
+    ('€135,000 base + €15,000 bonus (OTE €150,000) per year', 'single', 135000, 135000),
+    ('£90k basic salary plus 20% bonus', 'single', 90000, 90000),
     # No figure stated. These are the 2026-09-15 lesson and must keep reading as absent.
     ('', 'absent', None, None),
     ('Not specified', 'absent', None, None),
@@ -4786,6 +4790,18 @@ def test_format_job_notification_omits_the_salary_line_when_there_is_no_figure()
     message = agent.format_job_notification(
         _make_candidate(), _make_extract(salary='Competitive salary'), 4, [], ['No salary listed'])
     assert '💰' not in message, 'the warning already says there is no figure'
+
+
+def test_format_job_notification_marks_a_recruiter_in_the_header():
+    '''2026-10-19: the agency bullet comes last in the message, so the header says it first.'''
+    message = agent.format_job_notification(
+        _make_candidate(company='Harnham'), _make_extract(company='Harnham', is_agency=True), 4, [], [])
+    assert message.splitlines()[0] == f'⭐ 4/5 — {agent.NOTIFICATION_RECRUITER_MARKER} Harnham — Staff AI Engineer'
+
+
+def test_format_job_notification_leaves_a_direct_employer_unmarked():
+    message = agent.format_job_notification(_make_candidate(), _make_extract(is_agency=False), 4, [], [])
+    assert agent.NOTIFICATION_RECRUITER_MARKER not in message
 
 
 def test_format_job_notification_shows_the_posting_date():
@@ -5665,6 +5681,91 @@ async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypat
     assert notifications == []
 
 
+def _stub_company_about(monkeypatch, about=None, error: Exception | None = None) -> list[str]:
+    '''Stage 2 sees a job page carrying a company slug; the About page returns `about` (or raises).'''
+    _stub_read_page(monkeypatch, linkedin_page.JobPage(
+        text='Staff Engineer\nAbout the job\nBuild agents.', source='dom', company_slug='example-data-europe'))
+    visits: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_session(url):
+        yield None
+
+    async def fake_read_about(slug, call):
+        visits.append(slug)
+        if error is not None:
+            raise error
+        return about
+
+    monkeypatch.setattr(agent, 'mcp_session', fake_session)
+    monkeypatch.setattr(agent, 'read_company_about', fake_read_about)
+    return visits
+
+
+_SUBSIDIARY_ABOUT = linkedin_page.CompanyAbout(
+    slug='example-data-europe', name='Example Data Europe', parent_name='Example Data, Inc.',
+    parent_slug='example-data-inc')
+
+
+async def test_stage_2_skips_a_subsidiary_of_a_company_already_applied_to(monkeypatch):
+    """2026-10-19: Stage 1b saw only the card's name; the About page names the parent."""
+    notifications, saved = _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
+    monkeypatch.setattr(tools, '_applied_companies', {'Example Data, Inc.': 'example.pdf'})
+    monkeypatch.setattr(tools, '_applied_identities', {
+        'Example Data, Inc.': company_domain.CompanyIdentity('Example Data, Inc.', domain='exampledata.com', source='model')})
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='4459979218', company='Example Data Europe'), funnel)
+
+    assert visits == ['example-data-europe']
+    assert funnel.get('poster_identity_already_applied') == 1
+    assert notifications == []
+    assert saved and saved[0]['rating'] == agent.RATING_AUTO_REJECT
+    assert 'Matched applied-job record: example.pdf' in saved[0]['content']
+
+
+async def test_stage_2_visits_a_company_page_once_ever(monkeypatch):
+    _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
+    monkeypatch.setattr(tools, '_applied_companies', {'Other Co': 'other.pdf'})
+    monkeypatch.setattr(tools, '_applied_identities', {
+        'Other Co': company_domain.CompanyIdentity('Other Co', domain='other.example', source='model')})
+
+    await _run_stage2(_make_candidate(job_id='1', company='Example Data Europe'), {})
+    await _run_stage2(_make_candidate(job_id='2', company='Example Data Europe'), {})
+
+    assert visits == ['example-data-europe']
+
+
+async def test_stage_2_never_visits_the_page_of_an_agency(monkeypatch):
+    '''Agencies are kept out of the blocklist, so there is nothing to look up.'''
+    _stage2_stubs(monkeypatch, _agency_extract())
+    visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
+    monkeypatch.setattr(tools, '_applied_companies', {'Other Co': 'other.pdf'})
+
+    await _run_stage2(_make_candidate(job_id='1', company='Archer Recruitment'), {})
+
+    assert visits == []
+
+
+async def test_stage_2_stops_on_a_challenge_page_and_releases_the_job(monkeypatch):
+    notifications, saved = _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    _stub_company_about(monkeypatch, error=linkedin_page.LinkedInBlockedError('About page shows "captcha"'))
+    monkeypatch.setattr(tools, '_applied_companies', {'Other Co': 'other.pdf'})
+    released = []
+    monkeypatch.setattr(tools, 'forget_processed_job', lambda site, job_id: released.append(job_id))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='7', company='Example Data Europe'), funnel)
+
+    assert released == ['7']
+    assert funnel.get('blocked') == 1
+    assert [a['kind'] for a in tools._ui_alerts] == ['blocked']
+    assert notifications == [] and saved == []
+
+
 async def test_stage_2_compares_against_a_posting_notified_earlier_in_the_same_run(monkeypatch):
     '''Both Sep 09 Archer postings arrived in one run, so within-run recording is load-bearing.'''
     _repost_llm(monkeypatch, '4464637425')
@@ -6411,6 +6512,11 @@ def test_derive_residency_scope_over_real_postings(location, relocation, expecte
     # Only one filler word, deliberately: country_only is the conservative reading of a mixed
     # statement, and widening this makes "Germany or Europe" read as area-wide.
     ('Germany (Remote) — must be based in Germany or Europe', 'country_only'),
+    # A time-zone band is not a country object (2026-10-20, Recrucial).
+    ('Portugal (Remote — work from anywhere within GMT-1 to GMT+4)', 'area_wide'),
+    ('Germany (Remote within the UTC+1 time zone)', ''),
+    ('Germany (Remote — must work within CET hours)', ''),
+    ('Austria (Remote — anywhere within Germany)', 'country_only'),
 ])
 def test_derive_residency_scope_distinguishes_a_country_object_from_an_area_object(location, expected):
     '''Every country-pinning pattern requires an object that is NOT an area name.
@@ -7813,6 +7919,15 @@ def test_the_in_my_network_chip_flapping_is_not_drift(tmp_path, monkeypatch):
     tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network']))
     assert tools.check_fingerprint_drift(_sound_report(chips=structural)) == ''
     assert tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network'])) == ''
+
+
+def test_the_under_10_applicants_chip_flapping_is_not_drift(tmp_path, monkeypatch):
+    '''2026-10-19: gone on the Canada search, back on the EU one, same query, nothing changed.'''
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    structural = ['Jobs', 'Past week', 'Senior', 'Employment type', 'Company']
+    tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'Under 10 applicants']))
+    assert tools.check_fingerprint_drift(_sound_report(chips=structural)) == ''
+    assert tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'Under 10 applicants'])) == ''
 
 
 def test_a_chip_showing_its_chosen_value_is_the_same_chip(tmp_path, monkeypatch):

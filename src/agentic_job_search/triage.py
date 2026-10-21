@@ -223,7 +223,7 @@ async def chat_openrouter(
     try:
         raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=timeout_seconds)
     except Exception as ex:
-        endpoint_failed(model, routing, f'{type(ex).__name__}: {ex}')
+        endpoint_failed(model, routing, ex)
         raise
     try:
         data = json.loads(raw)

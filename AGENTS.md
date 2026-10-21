@@ -132,7 +132,7 @@ src/agentic_job_search/
   agent.py                        # Orchestration, prompts, pipeline stages
   tools_generic.py                # Tool implementations and MCP server factories
   triage.py                       # Local triage and non-Anthropic rating calls (MCP client lives in utils_tools_n_agents_common)
-  endpoint_pin.py                 # Per-run OpenRouter endpoint choice for MODEL_NAME_SINGLE_TURN (speed/price thirds rule)
+  endpoint_pin.py                 # Per-run OpenRouter endpoint choice for MODEL_NAME_SINGLE_TURN (asks the tool server's rank_providers)
   scrape_openrouter.py            # Stage 1b: OpenRouter function-calling scraper loop (default path)
   snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
@@ -140,6 +140,7 @@ src/agentic_job_search/
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
   location.py                     # Cached geographic classifier for a job's location
+  company_domain.py               # Company identity (domain, parent) for already-applied matching; cached, LinkedIn About page first
   salary.py                       # Salary reading: deterministic tiers, cached LLM only for the rest
   fx.py                           # Display-only currency conversion of a salary: daily rate table, fails open
   salary_estimate.py              # Model pay estimate for a notified posting with no salary; cached per job, gates nothing
@@ -166,6 +167,7 @@ run_dir/
   salary_cache.yaml               # Cached salary reading per salary string (kind/bounds/currency/period)
   fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
+  company_identities.yaml         # Company identity per LinkedIn slug and per name (domain/parent/source); hand-editable, `source: manual` is kept
   raw_postings/                   # Per job: .html page archive (JS-free) + .txt text the extractor read; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
@@ -194,6 +196,7 @@ measurements) are in git history: `git show dd14c73:docs/diagnoses/README.md`.
 | Salary parsing, `salary.py`, `fx.py`, `salary_estimate.py`, the `💰` line, raw-posting retention | Classify Salary, Convert Salary Currency, Estimate Pay Range, Retain Raw Posting Text, Check Salary Provenance, Build Deterministic Warnings, Notify User of Match; NFRs A matching rule fails silently permissive, No silent truncation |
 | `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks | NFRs Resilience, Observability |
 | A new `ClaudeAgentOptions` / `sdk_query` site, or an SDK tool schema | NFRs Cost efficiency, Observability, Anti-fabrication |
+| Already-applied matching, `company_domain.py`, LinkedIn company About pages | Resolve Company Identity, Match Applied Company, Deduplicate by Poster Identity; NFR Account safety |
 | Applied-job ingest or the reference profile | [docs/architecture.md](docs/architecture.md); Summarize Reference Jobs |
 | Tests or test fixtures | NFR Tests must be able to fail |
 | `PLAYWRIGHT_MCP_VERSION`, the `mcp` pin, startup checks | Check Browser Toolchain Version; NFR Dependency pinning |

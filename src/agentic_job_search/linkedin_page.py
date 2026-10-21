@@ -39,9 +39,11 @@ from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
+    COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS,
     EXTRACT_PAGE_RENDER_WAIT_SECONDS,
     EXTRACTOR_SNAPSHOT_MAX_CHARS,
     JOB_PAGE_ASSET_FETCH_TIMEOUT_SECONDS,
+    LINKEDIN_COMPANY_ABOUT_URL,
     LINKEDIN_PAGE_CAPTURE_JS,
     LINKEDIN_PAGE_CAPTURE_RETRIES,
     LINKEDIN_PDF_FURNITURE_LINE_PATTERNS,
@@ -51,6 +53,7 @@ from agentic_job_search.config import (
     MODEL_NAME_PAGE_SECTIONS,
     PAGE_SECTION_SAMPLE_MAX_CHARS,
     PAGE_SECTION_SIGNATURE_MAX_WORDS,
+    UI_BLOCK_SIGNATURES,
 )
 from agentic_job_search.salary import mentions_pay
 from agentic_job_search.scrape_openrouter import parse_evaluate_result
@@ -71,6 +74,11 @@ _UNUSUAL_JS_KEYS = ('script_links', 'handler_attrs', 'js_urls')
 _UNUSUAL_ASSET_KEYS = ('fetch_failures',)
 _ABOUT_COMPANY_ID_RE = re.compile(r'^JobDetails_AboutTheCompany_')
 _COMPANY_LOGO_ALT_RE = re.compile(r'^Company logo for,\s*(?P<company>.+?)\.?$')
+_COMPANY_SLUG_RE = re.compile(r'linkedin\.com/company/(?P<slug>[^/?#]+)')
+# The About page's own labels, matched on text: LinkedIn's class names are hashed.
+_ABOUT_WEBSITE_LABEL = 'Website'
+_ABOUT_AFFILIATED_HEADING = 'Affiliated pages'
+_ABOUT_PARENT_RELATION = 'Parent'
 _FOLLOWERS_RE = re.compile(r'^[\d,.]+[KkMm]?\s+followers$')
 # The company card's industry / size line: 'IT Services and IT Consulting • 10001+ employees • ...'.
 _EMPLOYEES_RE = re.compile(r'^[\d,.+\-–]+[KkMm]?\+?\s+employees$')
@@ -97,6 +105,21 @@ class JobPage:
     text: str
     source: str  # 'dom' (de-cluttered page) or 'snapshot' (fallback: budgeted a11y snapshot)
     removed: list[dict] = field(default_factory=list)
+    company_slug: str = ''   # the poster's LinkedIn page, from the About-the-company card; '' if absent
+
+
+@dataclass
+class CompanyAbout:
+    '''What a company's LinkedIn About page states about who it is.'''
+    slug: str
+    name: str
+    website: str = ''
+    parent_name: str = ''
+    parent_slug: str = ''
+
+
+class LinkedInBlockedError(RuntimeError):
+    '''A CAPTCHA, verification or "unusual activity" page. The run must stop, never retry into it.'''
 
 
 def norm(text: str | None) -> str:
@@ -190,6 +213,20 @@ def posting_company(soup: BeautifulSoup) -> str | None:
         if m := _COMPANY_LOGO_ALT_RE.match(norm(img.get('alt', ''))):
             return m.group('company')
     return None
+
+
+def posting_company_slug(soup: BeautifulSoup) -> str:
+    """The poster's LinkedIn company slug, from the About-the-company card ('' when it has none).
+
+    Only that card: the rest of the page links other companies (similar jobs, people's employers).
+    """
+    about_company = soup.find(id=_ABOUT_COMPANY_ID_RE)
+    if about_company is None:
+        return ''
+    for link in about_company.find_all('a', href=True):
+        if m := _COMPANY_SLUG_RE.search(str(link['href'])):
+            return m.group('slug')
+    return ''
 
 
 def localize_assets(soup: BeautifulSoup, company: str | None, html_path: Path) -> dict:
@@ -522,16 +559,16 @@ def page_text(soup: BeautifulSoup) -> str:
 BrowserCall = Callable[[str, dict], Awaitable[str]]
 
 
-async def _capture_dom(call: BrowserCall, job_id: str) -> dict:
+async def _capture_dom(call: BrowserCall, what: str) -> dict:
     '''One read-only serialization of the DOM. Raises with detail when the result is unusable.'''
     raw = await call('browser_evaluate', {'function': LINKEDIN_PAGE_CAPTURE_JS})
     result = parse_evaluate_result(raw)
     if not result or not isinstance(result.get('html'), str):
-        raise RuntimeError(f'job {job_id}: page capture returned no html ({len(raw)} chars of tool output)')
+        raise RuntimeError(f'{what}: page capture returned no html ({len(raw)} chars of tool output)')
     utf16_units = len(result['html'].encode('utf-16-le')) // 2
     if utf16_units != result.get('chars'):
         raise RuntimeError(
-            f'job {job_id}: page capture arrived with {utf16_units} UTF-16 units but the page sent '
+            f'{what}: page capture arrived with {utf16_units} UTF-16 units but the page sent '
             f'{result.get("chars")} — it was altered in transit')
     return result
 
@@ -559,7 +596,7 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     for attempt in range(LINKEDIN_PAGE_CAPTURE_RETRIES + 1):
         await call('browser_wait_for', {'time': EXTRACT_PAGE_RENDER_WAIT_SECONDS})
         try:
-            capture = await _capture_dom(call, job_id)
+            capture = await _capture_dom(call, f'job {job_id}')
         except Exception as ex:
             return await _read_snapshot(candidate, call, f'the DOM capture failed: {type(ex).__name__}: {ex}')
         soup = BeautifulSoup(capture['html'], 'lxml')
@@ -569,6 +606,7 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     else:
         return await _read_snapshot(candidate, call, 'the page has no JobDetails_AboutTheJob_ section')
 
+    company_slug = posting_company_slug(soup)
     js_counts = strip_js(soup)
     company = posting_company(soup) or str(candidate.get('company') or '') or None
     html_path = raw_html_path(candidate)
@@ -597,7 +635,66 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         f"removed {len(removed)} block(s) ({sum(r['chars'] for r in removed):,} chars){unusual}"
     )
     logger.debug(f'Job page {job_id}: removed {removed_summary}; JS {js_counts}; assets {asset_counts}')
-    return JobPage(text=text, source='dom', removed=removed)
+    return JobPage(text=text, source='dom', removed=removed, company_slug=company_slug)
+
+
+def visible_block_signature(soup: BeautifulSoup) -> str:
+    """The UI_BLOCK_SIGNATURES phrase in the page's VISIBLE text, or ''.
+
+    Never the raw HTML: a healthy About page carries 'captcha' and 'security verification' in its
+    inline scripts (both 2026-10-19 captures did), which would read as a block on every visit.
+    """
+    visible = BeautifulSoup(str(soup), 'lxml')
+    for tag in visible.find_all(_NON_CONTENT_TAGS):
+        tag.decompose()
+    text = visible.get_text(' ').lower()
+    return next((phrase for phrase in UI_BLOCK_SIGNATURES if phrase in text), '')
+
+
+def parse_company_about(soup: BeautifulSoup, slug: str) -> CompanyAbout:
+    """The name, Website and Parent an About page states. Raises when the page is not one.
+
+    Website is the `<dd>` link after a `<dt>` reading "Website". Parent is the "Affiliated pages"
+    entry whose last line reads "Parent"; its link gives the parent's own slug.
+    """
+    heading = soup.find('h1')
+    name = norm(heading.get_text(' ')) if heading is not None else ''
+    if not name:
+        raise RuntimeError(f'LinkedIn company {slug}: the page has no <h1> company name, so it is not an '
+                           f'About page (a login wall or an error page?)')
+    about = CompanyAbout(slug=slug, name=name)
+    for term in soup.find_all('dt'):
+        if norm(term.get_text(' ')) != _ABOUT_WEBSITE_LABEL:
+            continue
+        definition = term.find_next_sibling('dd')
+        link = definition.find('a', href=True) if definition is not None else None
+        if link is not None and str(link['href']).startswith(('http://', 'https://')):
+            about.website = str(link['href'])
+        break
+    affiliated = soup.find(string=lambda text: norm(text) == _ABOUT_AFFILIATED_HEADING)
+    section = affiliated.find_parent('section') if affiliated is not None else None
+    for link in (section.find_all('a', href=True) if section is not None else []):
+        lines = [norm(line) for line in link.stripped_strings]
+        m = _COMPANY_SLUG_RE.search(str(link['href']))
+        if m and len(lines) > 1 and lines[-1] == _ABOUT_PARENT_RELATION:
+            about.parent_name, about.parent_slug = lines[0], m.group('slug')
+            break
+    return about
+
+
+async def read_company_about(slug: str, call: BrowserCall) -> CompanyAbout:
+    """Navigate to a company's About page and read it with one read-only DOM capture.
+
+    Raises LinkedInBlockedError on a challenge page, and RuntimeError when the page is not an
+    About page; the caller falls back to the model for the latter and stops for the former.
+    """
+    url = LINKEDIN_COMPANY_ABOUT_URL.format(slug=slug)
+    await call('browser_navigate', {'url': url})
+    await call('browser_wait_for', {'time': COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS})
+    soup = BeautifulSoup((await _capture_dom(call, f'company {slug}'))['html'], 'lxml')
+    if blocked := visible_block_signature(soup):
+        raise LinkedInBlockedError(f'LinkedIn company About page {url} shows "{blocked}"')
+    return parse_company_about(soup, slug)
 
 
 _PDF_FURNITURE_LINE_RE = re.compile('|'.join(f'(?:{p})' for p in LINKEDIN_PDF_FURNITURE_LINE_PATTERNS))

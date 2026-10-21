@@ -175,7 +175,7 @@ async def extract_job_page_openrouter(
                 timeout_seconds=LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
             )
         except Exception as ex:
-            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, f'{type(ex).__name__}: {ex}')
+            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, ex)
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat with {MODEL_NAME_EXTRACTOR} failed (iteration {iteration + 1}): {type(ex).__name__}: {ex}"
