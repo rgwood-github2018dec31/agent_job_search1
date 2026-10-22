@@ -98,6 +98,8 @@ from agentic_job_search.config import (
     REFERENCE_SUMMARY_MAX_CHARS,
     REFERENCE_SUMMARY_RETRY_SHARE,
     REGION_OVERLAP_ALERT_THRESHOLD,
+    REPLAY_NOTIFICATIONS_FILENAME,
+    REPLAY_SUMMARY_FILENAME,
     SALARY_ESTIMATE_ENABLED,
     SALARY_FIELD_DESCRIPTION,
     SALARY_IMPLAUSIBLE_ANNUAL_FLOOR,
@@ -152,12 +154,15 @@ from agentic_job_search.tools_generic import (
     PROJECT_DIR,
     RUN_DIR,
     _requires_current_us_auth,
+    company_matches_applied,
     console,
+    job_url,
     load_processed_jobs,
     log_run_cost,
     make_evaluator_server,
     make_job_search_server,
     parse_posting_date,
+    title_rejection_reason,
 )
 from agentic_job_search.triage import (
     ProviderUnavailableError,
@@ -193,7 +198,17 @@ REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
 
 
 async def _send_pipeline_notification(text: str) -> bool:
-    '''Send one Telegram message. False (after a WARNING) when the send failed; never raises.'''
+    '''Send one Telegram message. False (after a WARNING) when the send failed; never raises.
+
+    In a --job-ids replay nothing is sent: the message is appended to the replay's notifications.md,
+    which is the record of what a real run would have sent.
+    '''
+    if (replay_dir := tools_module._replay_dir) is not None:
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        with (replay_dir / REPLAY_NOTIFICATIONS_FILENAME).open('a', encoding='utf-8') as handle:
+            handle.write(f'{text}\n\n---\n\n')
+        logger.info(f'Replay: notification written to {replay_dir / REPLAY_NOTIFICATIONS_FILENAME}, not sent')
+        return True
     try:
         await telegram_send_message(text)
     except Exception as ex:
@@ -4990,11 +5005,8 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
     return False
 
 
-async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0) -> None:
-    # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
-    # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
-    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
-        scrape_openrouter.min_bits_for(MODEL_NAME_SCRAPER)
+def _reset_run_state() -> None:
+    '''Clear the per-run module state a run accumulates; shared by a normal run and a replay.'''
     tools_module._candidates = []
     tools_module._candidates_per_query = {}
     tools_module._job_extracts = []
@@ -5014,6 +5026,14 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     fx.reset_run_state()
     reset_location_guesses()
     tools_module.prune_raw_postings()
+
+
+async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0) -> None:
+    # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
+    # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
+    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
+        scrape_openrouter.min_bits_for(MODEL_NAME_SCRAPER)
+    _reset_run_state()
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -5278,6 +5298,113 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     })
 
 
+def read_job_ids_file(path: Path) -> list[dict]:
+    '''Parse a --job-ids file: one LinkedIn job per line, `job_id[<TAB>title<TAB>company]`.
+
+    Blank lines and lines starting with `#` are skipped. Title and company are optional: the page
+    extract supplies the real ones, and these only label the job until it is read.
+    '''
+    jobs: list[dict] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), start=1):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        fields = [field.strip() for field in line.split('\t')]
+        job_id = fields[0]
+        if not job_id.isdigit():
+            raise ValueError(f'{path}:{line_number}: expected a numeric LinkedIn job id first, got {line!r}')
+        if job_id in seen:
+            continue
+        seen.add(job_id)
+        title = fields[1] if len(fields) > 1 else ''
+        company = fields[2] if len(fields) > 2 else ''
+        jobs.append({
+            'site': 'linkedin', 'job_id': job_id, 'url': job_url('linkedin', job_id),
+            'title': title or f'(job {job_id})', 'company': company or '(unknown company)',
+            'date_posted': '', 'snippet': '',
+        })
+    return jobs
+
+
+async def run_job_ids_replay(job_ids_path: Path, browser_mode: str = 'headless') -> Path:
+    '''Diagnostic: rate the given LinkedIn jobs through Stage 2 as a real run would, changing nothing.
+
+    Answers "would the pipeline have recommended this job?" for jobs Stage 1 never found, such as
+    the ones LinkedIn recommends by email. Stage 1 is skipped. The title screen and the
+    already-applied check that Stage 1 applies are reported, and those jobs are not opened. Saved
+    postings and the notifications a real run would send go to a new directory under
+    run_dir/replays/; processed_jobs/, eval_error_releases.yaml, recruiter_notifications.yaml and
+    Telegram are untouched (see `tools_generic._replay_dir`). Returns the replay directory.
+    '''
+    jobs = read_job_ids_file(job_ids_path)
+    replay_dir = RUN_DIR / 'replays' / f"job-ids-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    replay_dir.mkdir(parents=True)
+    _reset_run_state()
+    tools_module._replay_dir = replay_dir
+    console.print(f'[bold magenta]Replay of {len(jobs)} job(s) from {job_ids_path} into {replay_dir}[/bold magenta]')
+
+    # Before screening: the already-applied check below makes one model call per company it has
+    # not identified before, and those should go to this run's endpoint like every later call.
+    await endpoint_pin.pin_single_turn_endpoints(MODEL_NAME_SINGLE_TURN)
+    screened: dict[str, str] = {}
+    candidates: list[dict] = []
+    for position, job in enumerate(jobs, start=1):
+        tools_module._listing_records[('linkedin', job['job_id'])] = {
+            'site': 'linkedin', 'job_id': job['job_id'], 'company': job['company'], 'title': job['title'],
+            'date_posted': '', 'check_status': 'replay', 'url': job['url'],
+            'queued': True, 'outcome': 'replay', 'rating': None, 'summary': '',
+        }
+        if reason := title_rejection_reason(job['title']):
+            screened[job['job_id']] = f'queue_skipped: {reason}'
+        elif matched_pdf := await company_matches_applied(job['company']):
+            screened[job['job_id']] = f'already_applied: {matched_pdf}'
+        else:
+            candidates.append(job)
+        # One line per job: an unidentified company costs a model call, so screening 73 jobs took
+        # minutes, and with DEBUG-only logging it looked hung (2026-10-22).
+        verdict = (f'not opened, as Stage 1 would have dropped it — {screened[job["job_id"]]}'
+                   if job['job_id'] in screened else 'queued for Stage 2')
+        logger.info(f"Replay screen [{position}/{len(jobs)}]: job {job['job_id']} {job['company']} — {verdict}")
+
+    stage_stats = {name: new_stage_stats() for name in (
+        'reference_summary', 'extraction', 'rating', 'recruiter_repost', 'salary', 'salary_estimate')}
+    funnel: dict[str, int] = {}
+    try:
+        if candidates:
+            browser = BrowserServer(browser_mode)
+            await browser.start()
+            try:
+                reference_block = await build_reference_summary(stage_stats['reference_summary'])
+                triage_enabled = True
+                if TRIAGE_ENABLED and (preflight_problem := await preflight_local_model()):
+                    triage_enabled = False
+                    logger.error(f'Local triage disabled for this replay: {preflight_problem}')
+                await evaluate_all_candidates(
+                    candidates, browser.mcp, build_evaluator_prompt(reference_block),
+                    build_profile_block(reference_block), stage_stats,
+                    funnel=funnel, triage_enabled=triage_enabled, browser=browser,
+                )
+            finally:
+                await browser.stop()
+    finally:
+        tools_module._replay_dir = None
+
+    rows = ['job_id\ttitle\tcompany\toutcome\trating\tsummary']
+    for job in jobs:
+        record = tools_module._listing_records[('linkedin', job['job_id'])]
+        outcome = screened.get(job['job_id'], record['outcome'])
+        rating = '' if record['rating'] is None else str(record['rating'])
+        rows.append('\t'.join([job['job_id'], job['title'], job['company'], outcome, rating,
+                               ' '.join(str(record['summary']).split())]))
+    summary_path = replay_dir / REPLAY_SUMMARY_FILENAME
+    summary_path.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    total_cost = sum(stats['cost'] for stats in stage_stats.values())
+    logger.info(f'Replay complete: {len(jobs)} job(s), {len(screened)} screened out, '
+                f'{len(candidates)} evaluated, ${total_cost:.4f}; funnel {json.dumps(funnel)}; summary {summary_path}')
+    console.print(f'[bold magenta]Replay summary: {summary_path} (cost ${total_cost:.4f})[/bold magenta]')
+    return replay_dir
+
+
 async def main() -> None:
     # Console + persistent per-run file log (triage/hard-rule rejections, extract sizes,
     # ratings — everything logged via the logging module lands in both). Written to
@@ -5322,13 +5449,20 @@ async def main() -> None:
              'to find jobs the funnel should have delivered',
     )
     parser.add_argument(
+        '--job-ids',
+        type=Path,
+        metavar='FILE',
+        help='Diagnostic: rate the LinkedIn jobs listed in FILE (job_id[<TAB>title<TAB>company] per line) '
+             'through Stage 2 with no search, no Telegram and no dedup records; results go to run_dir/replays/',
+    )
+    parser.add_argument(
         '--audit',
         action='store_true',
         help='Diagnostic: re-rate gate-killed jobs with the strong rater to detect false negatives '
              '(non-interactive mode only; saving/notification behaviour unchanged)',
     )
     args = parser.parse_args()
-    interactive = not args.non_interactive
+    interactive = not (args.non_interactive or args.job_ids)
 
     if args.status:
         console.print(tools_module.describe_run_status())
@@ -5369,7 +5503,9 @@ async def main() -> None:
         await tools_module.ingest_save_dir_applied_pdfs()
         await tools_module.load_applied_jobs()
 
-        if interactive:
+        if args.job_ids:
+            await run_job_ids_replay(args.job_ids, browser_mode=args.browser)
+        elif interactive:
             options = ClaudeAgentOptions(
                 setting_sources=[],
                 strict_mcp_config=True,

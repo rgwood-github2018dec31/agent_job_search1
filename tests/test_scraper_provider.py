@@ -219,6 +219,22 @@ async def test_a_429_on_a_pinned_endpoint_is_that_providers_rate_limit(monkeypat
     assert chats == [('streamlake/fp8', 'fp8'), ('deepinfra/fp8', 'fp8')], 'each call names its endpoint AND its precision'
 
 
+async def test_a_429_skips_the_other_endpoints_of_the_same_provider(monkeypatch):
+    '''2026-10-22: after inference-net/us was throttled upstream, the switch picked inference-net/fp8,
+    the same provider's shared pool, and burned a second failure before reaching GMICloud.'''
+    inet_us = _endpoint('inference-net/us', 5e-8, 1e-9, 1.5e-7)
+    inet_fp8 = _endpoint('inference-net/fp8', 5.1e-8, 1e-9, 1.5e-7)
+    gmi = _endpoint('gmicloud/fp8', 6e-8, 1.5e-8, 1.8e-7)
+    pin = await _pinned(monkeypatch, _listing(inet_us, inet_fp8, gmi))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    sent = []
+    _wire(monkeypatch, _listing(inet_us, inet_fp8, gmi),
+          [_chat(error='429 Client Error: Too Many Requests for url: x'), _chat()], sent)
+    await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+    assert pin.tag == 'gmicloud/fp8'
+    assert [args['provider'] for tool, args in sent if tool == 'chat'] == ['inference-net/us', 'gmicloud/fp8']
+
+
 @pytest.mark.parametrize('status', [401, 402, 403])
 async def test_an_account_failure_never_switches_and_still_aborts(monkeypatch, status):
     pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))

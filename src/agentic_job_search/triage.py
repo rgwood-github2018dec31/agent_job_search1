@@ -12,7 +12,6 @@ agent_stock_trends1.
 
 import json
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -33,20 +32,13 @@ from agentic_job_search.config import (
     OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
 )
-from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
+from agentic_job_search.endpoint_pin import endpoint_failed, http_status_of, routing_for
 from agentic_job_search.text_budget import quote_for_error
 
 logger = logging.getLogger(__name__)
 
 
 PROVIDER_UNAVAILABLE_STATUSES = frozenset({401, 402, 403, 429})
-
-# `requests` renders a raised-for status as "402 Client Error: Payment Required for url: ...";
-# the OpenRouter body itself carries {"error": {"code": 402, ...}}. Both are matched, and the
-# match is on the STATUS, never on the reason phrase -- the phrase is upstream's text and can
-# change without notice, while the code is the contract.
-_HTTP_STATUS_RE = re.compile(r'\b(\d{3})\s+(?:Client|Server)\s+Error\b')
-_JSON_STATUS_RE = re.compile(r'"(?:code|status|status_code)"\s*:\s*(\d{3})\b')
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -84,14 +76,6 @@ class TruncatedResponseError(RuntimeError):
     def __init__(self, message: str, max_tokens: int | None = None):
         super().__init__(message)
         self.max_tokens = max_tokens
-
-
-def http_status_of(error_text: str) -> int | None:
-    '''The HTTP status named in a provider error string, or None if it names none.'''
-    for pattern in (_HTTP_STATUS_RE, _JSON_STATUS_RE):
-        if match := pattern.search(error_text):
-            return int(match.group(1))
-    return None
 
 
 def provider_error(context: str, error_text: str) -> RuntimeError:

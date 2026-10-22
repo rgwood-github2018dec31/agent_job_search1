@@ -16,7 +16,9 @@ Unpinned until `pin_single_turn_endpoints()` runs, so interactive mode and tests
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
+from http import HTTPStatus
 
 import httpx
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
@@ -33,6 +35,33 @@ from agentic_job_search.config import (
 from agentic_job_search.text_budget import snippet
 
 logger = logging.getLogger(__name__)
+
+# `requests` renders a raised-for status as "402 Client Error: Payment Required for url: ...";
+# the OpenRouter body itself carries {"error": {"code": 402, ...}}. Both are matched, and the
+# match is on the STATUS, never on the reason phrase -- the phrase is upstream's text and can
+# change without notice, while the code is the contract.
+_HTTP_STATUS_RE = re.compile(r'\b(\d{3})\s+(?:Client|Server)\s+Error\b')
+_JSON_STATUS_RE = re.compile(r'"(?:code|status|status_code)"\s*:\s*(\d{3})\b')
+
+
+def http_status_of(error_text: str) -> int | None:
+    '''The HTTP status named in a provider error string, or None if it names none.'''
+    for pattern in (_HTTP_STATUS_RE, _JSON_STATUS_RE):
+        if match := pattern.search(error_text):
+            return int(match.group(1))
+    return None
+
+
+def provider_of(tag: str) -> str:
+    '''The provider an endpoint tag belongs to: `inference-net` for `inference-net/us`.'''
+    return tag.split('/', 1)[0]
+
+
+def is_rate_limited(error: str) -> bool:
+    '''True for a 429. On a pinned call (fallbacks off) it is the provider's limit, and it holds for
+    every endpoint of that provider: on 2026-10-22 InferenceNet's shared pool throttled
+    `inference-net/us`, the pin moved to `inference-net/fp8`, and that failed the same way.'''
+    return http_status_of(error) == HTTPStatus.TOO_MANY_REQUESTS
 
 
 def _price_text(price: float | None) -> str:
@@ -57,6 +86,13 @@ class EndpointPin:
         if not self.ranked or self.ranked[0][1]['tag'] != tag:
             return   # already moved on, e.g. by an earlier failure
         self.ranked.pop(0)
+        skipped = []
+        if is_rate_limited(error):
+            skipped = [e['tag'] for _, e in self.ranked if provider_of(e['tag']) == provider_of(tag)]
+            self.ranked = [(p, e) for p, e in self.ranked if provider_of(e['tag']) != provider_of(tag)]
+        if skipped:
+            logger.warning(f'Single-turn pin: {provider_of(tag)} is rate-limited, so its other '
+                           f'endpoint(s) {", ".join(skipped)} are dropped too')
         after = (f"switched to {self.ranked[0][1]['tag']} (est. {_price_text(self.ranked[0][0])})"
                  if self.ranked else 'no endpoint left, so calls go unpinned')
         logger.warning(f'Single-turn pin: {self.model} call on {tag} failed ({snippet(error)}); '

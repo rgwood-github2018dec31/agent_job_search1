@@ -111,6 +111,7 @@ python main.py -n        # Run in non-interactive mode
 python main.py -n --audit # Non-interactive + re-rate gate-killed jobs to detect false negatives (diagnostic)
 python main.py -n --audit-opus 2  # Non-interactive + re-rate 2 un-surfaced jobs per pool with Opus (diagnostic)
 python main.py -n --no-version-check  # Skip the startup check for a newer @playwright/mcp than the pin
+python main.py --job-ids FILE  # Diagnostic: rate the listed LinkedIn job ids (job_id[<TAB>title<TAB>company]) into run_dir/replays/; no dedup records, no Telegram
 
 # Tests
 uv run pytest                          # Run all tests; each marked group self-skips if unavailable
@@ -150,6 +151,8 @@ scripts/
   migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
   backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
+  release_stuck_eval_errors.py    # One-time release of jobs stuck in processed_jobs/ by a pre-2026-10-09 eval_error
+  job_trace_report.py             # Full-trace PDF of one evaluated job from the files a run kept
 tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
@@ -176,6 +179,7 @@ run_dir/
   eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error (EVAL_ERROR_MAX_RELEASES)
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
+  replays/                        # --job-ids output: job-ids-{timestamp}/ with saved postings and the REPLAY_*_FILENAME files
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
 ```
 

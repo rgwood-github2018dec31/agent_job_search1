@@ -125,6 +125,10 @@ _reference_job_pages: list[list[str]] = []
 # In-horizon applied-job records: filename, applied_date, company, job_title, is_agency, end_client
 _applied_jobs: list[dict] = []
 _job_extracts: list[dict] = []           # condensed page extracts captured from the Stage 2 extractor
+# Set by a --job-ids replay: Stage 2 saves into this directory and writes notifications there, and
+# leaves processed_jobs/, eval_error_releases.yaml and recruiter_notifications.yaml untouched, so a
+# diagnostic re-rating of given jobs cannot change what a real run dedups or suppresses.
+_replay_dir: Path | None = None
 # Scraper funnel observability: counts every check_and_record_job outcome this run.
 _check_status_counts: dict[str, int] = {}  # status -> count (new/already_processed/already_applied/too_old/auth_required)
 # Per-listing audit trail: one record per check_and_record_job call, keyed by (site, job_id).
@@ -746,6 +750,9 @@ def record_recruiter_notification(candidate: dict, extract: dict, today: date | 
     '''
     agency = str(extract.get('company') or candidate.get('company') or '').strip()
     job_id = str(candidate.get('job_id') or '')
+    if _replay_dir is not None:
+        logger.info(f'Replay: not recording agency notification for {agency} (job {job_id})')
+        return {}
     entry = {
         # The name as written: folding happens at the comparison, via `agency_key`.
         'agency': agency,
@@ -1717,7 +1724,10 @@ def forget_processed_job(site: str, job_id: str) -> int:
     Stage 1 marks a job processed the moment it is queued. Without this, a job that Stage 2 could
     not reach (on 2026-09-21 a dead browser left 23 of them) is deduped away forever.
     Returns the number of record files removed; raises FileNotFoundError when there were none.
+    A replay never recorded the job, so it removes nothing and returns 0.
     '''
+    if _replay_dir is not None:
+        return 0
     records = list(PROCESSED_JOBS_DIR.glob(f'job_posting-{site}-{job_id}-*.yaml'))
     if not records:
         raise FileNotFoundError(
@@ -1749,6 +1759,8 @@ def release_errored_job(site: str, job_id: str) -> str:
     Raises when the count file cannot be read or written, or the job has no processed record: the
     caller is already reporting an error for this job and adds this one to it.
     '''
+    if _replay_dir is not None:
+        return 'not released: replay run (processed_jobs/ untouched)'
     key = f'{site}/{job_id}'
     releases: dict = {}
     if EVAL_ERROR_RELEASES_PATH.exists():
@@ -1779,7 +1791,7 @@ async def do_save_job_posting(
     company: str, description: str, rating: int, content: str, job_id: str | None = None
 ) -> dict:
     date_str = datetime.now().strftime('%Y%b%d')
-    dir_path = RUN_DIR / f'saved_jobs-{date_str}'
+    dir_path = _replay_dir if _replay_dir is not None else RUN_DIR / f'saved_jobs-{date_str}'
     dir_path.mkdir(parents=True, exist_ok=True)
 
     ts = int(time.time())

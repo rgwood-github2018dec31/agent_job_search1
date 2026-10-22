@@ -507,6 +507,9 @@ SNAPSHOT_RESULT_COUNT_RE = r'\b\d+\+? results?\b'
 
 # Audit configuration
 AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
+# --job-ids replay: what a replay directory under run_dir/replays/ holds besides the saved postings.
+REPLAY_NOTIFICATIONS_FILENAME = 'notifications.md'  # the messages a real run would have sent
+REPLAY_SUMMARY_FILENAME = 'summary.tsv'               # one row per requested job: outcome and rating
 
 # Stage 2 (evaluation) configuration
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10

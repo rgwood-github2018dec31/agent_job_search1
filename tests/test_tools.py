@@ -11183,3 +11183,114 @@ def test_a_silent_search_logs_a_step_line_after_the_progress_interval(caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert len(messages) == 1, 'the line resets the interval'
     assert 'Staff AI Engineer' in messages[0] and 'Canada' in messages[0] and 'browser_click Date posted' in messages[0]
+
+
+# --- --job-ids replay: rates given jobs and changes nothing a real run reads ---
+
+def _replay_on(tmp_path, monkeypatch) -> Path:
+    replay_dir = tmp_path / 'replays' / 'job-ids-test'
+    monkeypatch.setattr(tools, '_replay_dir', replay_dir)
+    return replay_dir
+
+
+async def test_replay_saves_into_the_replay_dir_not_saved_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    replay_dir = _replay_on(tmp_path, monkeypatch)
+    await tools.do_save_job_posting('Acme', 'engineer', 4, 'body', job_id='222')
+    assert [p.name.split('-rating_')[0] for p in replay_dir.glob('*.md')] == ['job_posting-222']
+    assert not list(tmp_path.glob('saved_jobs-*'))
+
+
+async def test_replay_stage_2_error_leaves_processed_jobs_and_release_count_alone(tmp_path, monkeypatch, caplog):
+    '''A replay must not release (delete) a real processed record or spend one of its releases.'''
+    record = _processed_record(tmp_path, monkeypatch, '222')
+    _replay_on(tmp_path, monkeypatch)
+    funnel, errors = await _stage2_with_a_broken_rater(monkeypatch, caplog, '222')
+    assert funnel.get('eval_error') == 1
+    assert record.exists()
+    assert not tools.EVAL_ERROR_RELEASES_PATH.exists()
+    assert 'not released: replay run' in errors[0]
+
+
+def test_replay_does_not_record_recruiter_notifications(tmp_path, monkeypatch):
+    _replay_on(tmp_path, monkeypatch)
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
+    assert not tools.RECRUITER_NOTIFICATIONS_PATH.exists()
+
+
+async def test_replay_writes_notifications_instead_of_sending(tmp_path, monkeypatch):
+    replay_dir = _replay_on(tmp_path, monkeypatch)
+    sent: list[str] = []
+
+    async def fake_send(text):
+        sent.append(text)
+    monkeypatch.setattr(agent, 'telegram_send_message', fake_send)
+
+    assert await agent._send_pipeline_notification('Acme — rating 5') is True
+    assert sent == []
+    assert 'Acme — rating 5' in (replay_dir / config.REPLAY_NOTIFICATIONS_FILENAME).read_text()
+
+
+def test_read_job_ids_file(tmp_path):
+    path = tmp_path / 'ids.tsv'
+    path.write_text('# header\n4464225365\tLead AI Engineer\tAltus Group\n\n4464225365\n4466355340\n')
+    jobs = agent.read_job_ids_file(path)
+    assert [(j['job_id'], j['title'], j['company']) for j in jobs] == [
+        ('4464225365', 'Lead AI Engineer', 'Altus Group'),
+        ('4466355340', '(job 4466355340)', '(unknown company)'),
+    ]
+    assert jobs[0]['url'] == tools.job_url('linkedin', '4464225365')
+
+    path.write_text('Lead AI Engineer\t4464225365\n')
+    with pytest.raises(ValueError, match=r'ids\.tsv:1: expected a numeric LinkedIn job id'):
+        agent.read_job_ids_file(path)
+
+
+async def test_job_ids_replay_screens_like_stage_1_and_summarises(tmp_path, monkeypatch):
+    '''Jobs Stage 1 would drop are reported, not opened; the rest go to Stage 2; the sink is reset.'''
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    path = tmp_path / 'ids.tsv'
+    path.write_text('1\tDirector, AI\tAcme\n2\tStaff AI Engineer\tApplied Co\n3\tStaff AI Engineer\tNewCo\n')
+    monkeypatch.setattr(agent, 'title_rejection_reason', lambda title: 'excluded title' if 'Director' in title else None)
+
+    async def fake_applied(company):
+        return 'applied.pdf' if company == 'Applied Co' else None
+    monkeypatch.setattr(agent, 'company_matches_applied', fake_applied)
+
+    evaluated: list[str] = []
+
+    async def fake_evaluate(candidates, *args, **kwargs):
+        assert tools._replay_dir is not None
+        for candidate in candidates:
+            evaluated.append(candidate['job_id'])
+            tools.record_job_outcome('linkedin', candidate['job_id'], 'saved', rating=4, summary='good\nfit')
+
+    class FakeBrowser:
+        def __init__(self, mode):
+            self.mcp = {}
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    async def fake_none(*args, **kwargs):
+        return None
+    monkeypatch.setattr(agent, 'evaluate_all_candidates', fake_evaluate)
+    monkeypatch.setattr(agent, 'BrowserServer', FakeBrowser)
+    monkeypatch.setattr(agent.endpoint_pin, 'pin_single_turn_endpoints', fake_none)
+    monkeypatch.setattr(agent, 'build_reference_summary', fake_none)
+    monkeypatch.setattr(agent, 'preflight_local_model', fake_none)
+    monkeypatch.setattr(agent, 'build_evaluator_prompt', lambda block: 'prompt')
+    monkeypatch.setattr(agent, 'build_profile_block', lambda block: 'profile')
+    monkeypatch.setattr(agent.tools_module, 'prune_raw_postings', lambda: None)
+
+    replay_dir = await agent.run_job_ids_replay(path)
+
+    assert evaluated == ['3']
+    assert tools._replay_dir is None
+    rows = (replay_dir / config.REPLAY_SUMMARY_FILENAME).read_text().splitlines()
+    assert rows[1].split('\t')[3] == 'queue_skipped: excluded title'
+    assert rows[2].split('\t')[3] == 'already_applied: applied.pdf'
+    assert rows[3].split('\t')[3:] == ['saved', '4', 'good fit']

@@ -51,10 +51,11 @@ from agentic_job_search.config import (
     SECONDS_PER_MINUTE,
     UI_BLOCK_SIGNATURES,
 )
+from agentic_job_search.endpoint_pin import http_status_of, is_rate_limited, provider_of
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.snapshot_prune import drop_job_detail_pane
 from agentic_job_search.text_budget import snippet, truncate_reported
-from agentic_job_search.triage import http_status_of, provider_error
+from agentic_job_search.triage import provider_error
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +182,8 @@ class ProviderPin:
     quantization: str | None = None
     estimate_per_million: float | None = None
     failed: list[str] = field(default_factory=list)
+    # A 429 is the provider's limit, shared by all its endpoints (see endpoint_pin.is_rate_limited).
+    rate_limited_providers: set[str] = field(default_factory=set)
     switches: int = 0
 
     async def choose(self, announce: bool = True) -> bool:
@@ -198,7 +201,8 @@ class ProviderPin:
             raise RuntimeError(f'rank_providers failed for {self.model}: {ranking.get("error") or snippet(raw)}')
         # The tool server owns the ranking rule; the pin only walks the list it returns. Each entry
         # carries the price the server ranked it by, so the estimate and the order cannot disagree.
-        ranked = [(e['effective_price_per_million'], e) for e in ranking.get('ranked') or []]
+        ranked = [(e['effective_price_per_million'], e) for e in ranking.get('ranked') or []
+                  if provider_of(e['tag']) not in self.rate_limited_providers]
         if not ranked:
             self.tag, self.quantization, self.estimate_per_million = None, None, None
             return False
@@ -221,6 +225,8 @@ class ProviderPin:
             return False
         failed_tag = self.tag
         self.failed.append(failed_tag)
+        if is_rate_limited(error):
+            self.rate_limited_providers.add(provider_of(failed_tag))
         if self.switches >= SCRAPER_PROVIDER_MAX_SWITCHES:
             logger.warning(f'Stage 1b: {failed_tag} failed and the {SCRAPER_PROVIDER_MAX_SWITCHES}-switch '
                            f'cap is used up: {compact_error(error)}')

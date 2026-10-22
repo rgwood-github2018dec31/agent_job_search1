@@ -173,3 +173,34 @@ async def test_extract_loop_serves_on_the_pin(monkeypatch):
         candidate, 'text', {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0}, 'sys') is None
     assert sent[0]['provider'] == 'deepinfra/fp8'
     assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8'
+
+
+INFERENCE_NET_429 = ('chat failed: HTTPError: 429 Client Error: Too Many Requests for url: '
+                     'https://openrouter.ai/api/v1/chat/completions — body: {"error":{"message":'
+                     '"Provider returned error","code":429,"metadata":{"provider_name":"InferenceNet",'
+                     '"limit_source":"upstream_provider_shared_pool"}}}')
+
+
+async def test_a_429_drops_every_endpoint_of_that_provider(monkeypatch, caplog):
+    '''2026-10-22: InferenceNet's shared pool throttled inference-net/us, and the pin's next pick,
+    inference-net/fp8, was the same pool and failed the same way.'''
+    ranked = {**RANKED_2026_10_18, 'ranked': [
+        {'tag': 'inference-net/us', 'quantization': 'fp8', 'effective_price_per_million': 2.8e-7},
+        {'tag': 'inference-net/fp8', 'quantization': 'fp8', 'effective_price_per_million': 2.8e-7},
+        {'tag': 'gmicloud/fp8', 'quantization': 'fp8', 'effective_price_per_million': 4.68e-7},
+    ]}
+    await _pin_from(monkeypatch, ranked)
+    endpoint_pin.endpoint_failed('m/1', endpoint_pin.routing_for('m/1'), INFERENCE_NET_429)
+    assert endpoint_pin.routing_for('m/1')['provider'] == 'gmicloud/fp8'
+    assert any('inference-net is rate-limited' in r.getMessage() and 'inference-net/fp8' in r.getMessage()
+               for r in caplog.records)
+
+
+async def test_a_non_429_failure_drops_only_that_endpoint(monkeypatch):
+    ranked = {**RANKED_2026_10_18, 'ranked': [
+        {'tag': 'inference-net/us', 'quantization': 'fp8', 'effective_price_per_million': 2.8e-7},
+        {'tag': 'inference-net/fp8', 'quantization': 'fp8', 'effective_price_per_million': 2.8e-7},
+    ]}
+    await _pin_from(monkeypatch, ranked)
+    endpoint_pin.endpoint_failed('m/1', endpoint_pin.routing_for('m/1'), 'timed out after 180.0s')
+    assert endpoint_pin.routing_for('m/1')['provider'] == 'inference-net/fp8'
