@@ -64,7 +64,7 @@ def is_rate_limited(error: str) -> bool:
     return http_status_of(error) == HTTPStatus.TOO_MANY_REQUESTS
 
 
-def _price_text(price: float | None) -> str:
+def price_text(price: float | None) -> str:
     '''A ranked price for the log lines. The server reports None only when NO endpoint of the
     model publishes a price, which is then not a number to print.'''
     return 'n/a' if price is None else f'${price:.4f}/M'
@@ -93,7 +93,7 @@ class EndpointPin:
         if skipped:
             logger.warning(f'Single-turn pin: {provider_of(tag)} is rate-limited, so its other '
                            f'endpoint(s) {", ".join(skipped)} are dropped too')
-        after = (f"switched to {self.ranked[0][1]['tag']} (est. {_price_text(self.ranked[0][0])})"
+        after = (f"switched to {self.ranked[0][1]['tag']} (est. {price_text(self.ranked[0][0])})"
                  if self.ranked else 'no endpoint left, so calls go unpinned')
         logger.warning(f'Single-turn pin: {self.model} call on {tag} failed ({snippet(error)}); '
                        f'{after} for the rest of the run')

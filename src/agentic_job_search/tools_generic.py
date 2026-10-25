@@ -19,6 +19,7 @@ import pypdf
 import yaml
 from claude_agent_sdk import (
     ClaudeAgentOptions,
+    McpSdkServerConfig,
     ResultMessage,
     create_sdk_mcp_server,
     tool,
@@ -86,7 +87,7 @@ RAW_POSTINGS_DIR = RUN_DIR / 'raw_postings'
 # Functions that touch both take them as separate parameters named `save_dir` and
 # `applied_to_dir`; a function that names only one directory operates only on that one.
 APPLIED_JOBS_DIR = RUN_DIR / 'applied_jobs'
-APPLIED_JOBS_INDEX_PATH = APPLIED_JOBS_DIR / 'index.yaml'
+APPLIED_JOBS_INDEX_NAME = 'index.yaml'
 # Legacy per-path cache from when the corpus lived in ~/Downloads; still read during ingest
 # as a fallback source of applied dates if a file's mtime has drifted.
 LEGACY_DOWNLOADS_CACHE_PATH = RUN_DIR / 'downloads_pdf_cache.yaml'
@@ -1115,7 +1116,7 @@ async def ingest_save_dir_applied_pdfs(
     if not pdfs:
         return 0
 
-    index = _read_yaml_mapping(applied_to_dir / 'index.yaml')
+    index = _read_yaml_mapping(applied_to_dir / APPLIED_JOBS_INDEX_NAME)
     legacy_cache = _read_yaml_mapping(LEGACY_DOWNLOADS_CACHE_PATH)
 
     moved = 0
@@ -1179,7 +1180,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     global _applied_companies, _applied_identities, _reference_job_pages, _applied_jobs
 
     applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
-    index_file = index_path or (applied_to_dir / 'index.yaml')
+    index_file = index_path or (applied_to_dir / APPLIED_JOBS_INDEX_NAME)
 
     index = _read_yaml_mapping(index_file)
     legacy_cache = _read_yaml_mapping(LEGACY_DOWNLOADS_CACHE_PATH)
@@ -2328,7 +2329,7 @@ async def submit_job_extract(args: dict[str, Any]) -> dict:
 
 # --- MCP server factories ---
 
-def make_job_search_server(interactive: bool):
+def make_job_search_server(interactive: bool) -> McpSdkServerConfig:
     '''MCP server for interactive mode.'''
     tools = [check_and_record_job, save_job_posting]
     if interactive:
@@ -2574,7 +2575,7 @@ def region_overlap_report() -> dict[str, float]:
     return overlaps
 
 
-def make_evaluator_server():
+def make_evaluator_server() -> McpSdkServerConfig:
     '''MCP server for stage 2: captures the condensed page extract from the Haiku extractor.'''
     return create_sdk_mcp_server(
         name='job_evaluator', version='1.0.0',

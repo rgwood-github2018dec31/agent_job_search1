@@ -51,10 +51,10 @@ from agentic_job_search.config import (
     SECONDS_PER_MINUTE,
     UI_BLOCK_SIGNATURES,
 )
-from agentic_job_search.endpoint_pin import http_status_of, is_rate_limited, provider_of
+from agentic_job_search.endpoint_pin import http_status_of, is_rate_limited, price_text, provider_of
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.snapshot_prune import drop_job_detail_pane
-from agentic_job_search.text_budget import snippet, truncate_reported
+from agentic_job_search.text_budget import quote_for_error, snippet, truncate_reported
 from agentic_job_search.triage import provider_error
 
 logger = logging.getLogger(__name__)
@@ -150,10 +150,17 @@ ACCOUNT_LEVEL_HTTP_STATUSES = frozenset({401, 402, 403})
 PER_MILLION = 1_000_000
 
 
-def _price_text(price: float | None) -> str:
-    '''A ranked price for the log lines. The server reports None only when NO endpoint of the
-    model publishes a price, which is then not a number to print.'''
-    return 'n/a' if price is None else f'${price:.4f}/M'
+def parse_chat_reply(raw: str, query: str) -> dict:
+    '''The OpenRouter MCP server's `chat` reply as a dict. Raises, naming the query and quoting the reply.'''
+    try:
+        data = json.loads(raw)
+    except ValueError as ex:
+        raise ValueError(f'OpenRouter chat reply for query {query!r} is not JSON ({ex}): '
+                         f'{quote_for_error(raw, "OpenRouter chat reply")!r}') from ex
+    if not isinstance(data, dict):
+        raise ValueError(f'OpenRouter chat reply for query {query!r} is not an object '
+                         f'({type(data).__name__}): {quote_for_error(raw, "OpenRouter chat reply")!r}')
+    return data
 
 
 def min_bits_for(model: str) -> int:
@@ -196,7 +203,14 @@ class ProviderPin:
             'drop_slowest_share': SCRAPER_DROP_SLOWEST_SHARE,
             'exclude': self.failed,
         }, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
-        ranking = json.loads(raw)
+        try:
+            ranking = json.loads(raw)
+        except ValueError as ex:
+            raise ValueError(f'rank_providers reply for {self.model} is not JSON ({ex}): '
+                             f'{quote_for_error(raw, "rank_providers reply")!r}') from ex
+        if not isinstance(ranking, dict):
+            raise ValueError(f'rank_providers reply for {self.model} is {type(ranking).__name__}, '
+                             f'expected an object: {quote_for_error(raw, "rank_providers reply")!r}')
         if not ranking.get('ok'):
             raise RuntimeError(f'rank_providers failed for {self.model}: {ranking.get("error") or snippet(raw)}')
         # The tool server owns the ranking rule; the pin only walks the list it returns. Each entry
@@ -208,12 +222,12 @@ class ProviderPin:
             return False
         self.estimate_per_million, best = ranked[0]
         self.tag, self.quantization = best['tag'], best.get('quantization')
-        runners_up = [f"{e['tag']} {_price_text(price)}" for price, e in ranked[1:]]
+        runners_up = [f"{e['tag']} {price_text(price)}" for price, e in ranked[1:]]
         # A re-choose after a failure is announced by switch()'s own WARNING, which names the new
         # endpoint and its estimate; the pin line beside it said the same thing again.
         logger.log(
             logging.INFO if announce else logging.DEBUG,
-            f'Stage 1b: pinned {self.model} to {self.tag} — est. {_price_text(self.estimate_per_million)} prompt '
+            f'Stage 1b: pinned {self.model} to {self.tag} — est. {price_text(self.estimate_per_million)} prompt '
             f'tokens at the scraper\'s token mix (next: {runners_up[0] if runners_up else "none"})'
         )
         logger.debug(f'Stage 1b: all ranked endpoints after {self.tag}: {", ".join(runners_up) or "none"}')
@@ -242,7 +256,7 @@ class ProviderPin:
             logger.warning(f'Stage 1b: {failed_tag} failed and no other usable endpoint is left: {compact_error(error)}')
             return False
         detail = (f'{failed_tag} failed ({compact_error(error)}); switched to {self.tag} '
-                  f'(est. {_price_text(self.estimate_per_million)}) for the rest of the run')
+                  f'(est. {price_text(self.estimate_per_million)}) for the rest of the run')
         logger.warning(f'Stage 1b: {detail}')
         tools_generic._ui_alerts.append({'kind': 'provider_switch', 'query': query, 'region': '(all)', 'detail': detail,
                                          'from': failed_tag, 'to': self.tag, 'reason': compact_error(error)})
@@ -576,7 +590,7 @@ class ScrapeSession:
                 chat_args['provider'] = self.pin.tag
                 chat_args['quantization'] = self.pin.quantization
             raw = await self._chat(chat_args)
-            data = json.loads(raw)
+            data = parse_chat_reply(raw, self.query)
             if not data.get('ok') and http_status_of(str(data.get('error') or '')) in TRANSIENT_HTTP_STATUSES:
                 # A gateway hiccup is not this query failing. Without a retry one 502 discarded a
                 # query's whole conversation 71 iterations in (2026-09-10), losing its second region.
@@ -585,7 +599,7 @@ class ScrapeSession:
                 await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
                 raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                           timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
-                data = json.loads(raw)
+                data = parse_chat_reply(raw, self.query)
             error = str(data.get('error') or snippet(raw))
             if (not data.get('ok') and 'provider' in chat_args
                     and http_status_of(error) not in ACCOUNT_LEVEL_HTTP_STATUSES
@@ -595,7 +609,7 @@ class ScrapeSession:
                 chat_args['quantization'] = self.pin.quantization
                 raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                           timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
-                data = json.loads(raw)
+                data = parse_chat_reply(raw, self.query)
             if not data.get('ok'):
                 # A 402/401/403/429 is the PROVIDER refusing, not this query failing: every
                 # remaining query would fail identically, so this must reach run_scraper as a

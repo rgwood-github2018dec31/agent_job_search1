@@ -1074,13 +1074,13 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
-    { name = "pillow", marker = "extra == 'images'", specifier = ">=11.0" },
+    { name = "pillow", marker = "extra == 'images'", specifier = ">=12,<13" },
 ]
 provides-extras = ["images"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "pillow", specifier = ">=11.0" },
+    { name = "pillow", specifier = ">=12,<13" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
 ]

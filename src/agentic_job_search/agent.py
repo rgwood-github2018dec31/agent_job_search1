@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, aclosing
 from datetime import date, datetime
 from pathlib import Path
@@ -27,6 +27,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    McpSdkServerConfig,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
@@ -2016,7 +2017,7 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
     return run_pass
 
 
-def make_anthropic_scraper_server(browser_call):
+def make_anthropic_scraper_server(browser_call: Callable[[str, dict], Awaitable[str]]) -> McpSdkServerConfig:
     """The OpenRouter scraper's own tools (scrape_openrouter.LOCAL_TOOL_DEFS), served to the SDK.
 
     Both scrapers read ONE prompt, so they must expose the same tools. From 2026-08-31 the prompt
@@ -2087,7 +2088,8 @@ async def _run_anthropic_scraper_session(playwright_mcp: dict, browser_call, que
                 {'kind': 'scrape_budget', 'query': '(all)', 'region': '(all)', 'detail': str(ex)})
 
 
-async def run_scraper(run_pass, queries: list[str], stage_stats: dict, before_query=None) -> None:
+async def run_scraper(run_pass: Callable[[str], Awaitable[int | None]], queries: list[str], stage_stats: dict,
+                      before_query: Callable[[], Awaitable[None]] | None = None) -> None:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results.
 
     ONE REQUEST PER QUERY, on a SINGLE shared session. Two constraints have to hold at once:
@@ -2133,8 +2135,9 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict, before_qu
         narration.close(unfinished=True)
 
 
-async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNarration,
-                               before_query=None) -> None:
+async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]], queries: list[str],
+                               narration: QueryNarration,
+                               before_query: Callable[[], Awaitable[None]] | None = None) -> None:
     """The per-query loop of `run_scraper`, which owns the narration's lifetime."""
     for i, query in enumerate(queries, 1):
         logger.debug(f'Stage 1b: query {i}/{len(queries)} — "{query}"')

@@ -141,14 +141,15 @@ src/agentic_job_search/
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
   location.py                     # Cached geographic classifier for a job's location
+  location_review.py              # Advisory hygiene check of the country lists in preferences (recommends, never enforces)
   company_domain.py               # Company identity (domain, parent) for already-applied matching; cached, LinkedIn About page first
   salary.py                       # Salary reading: deterministic tiers, cached LLM only for the rest
   fx.py                           # Display-only currency conversion of a salary: daily rate table, fails open
   salary_estimate.py              # Model pay estimate for a notified posting with no salary; cached per job, gates nothing
   text_budget.py                  # Reported truncation: truncate_reported, pages_to_prompt, snippet
+  cache_io.py                     # Fail-open load/save of the YAML-mapping caches (location, salary, salary_estimate, fx)
   system_sleep.py                 # Holds a no-idle-sleep assertion for the run; logs and alerts a sleep it could not stop
 scripts/
-  migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
   backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
   release_stuck_eval_errors.py    # One-time release of jobs stuck in processed_jobs/ by a pre-2026-10-09 eval_error
@@ -156,6 +157,7 @@ scripts/
 tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
+  test_cache_io.py                # cache_io fail-open contract: missing/empty/unreadable/non-mapping loads, unwritable saves
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
   requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)

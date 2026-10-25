@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 import textwrap
@@ -195,6 +196,9 @@ def search_that_surfaced(log_path: Path | None, job_id: str) -> str:
     return ''
 
 
+LOG_LINE_HEAD_CHARS = 80   # how much of a skipped line the warning quotes
+
+
 def log_lines_about(log_path: Path | None, needle: str) -> list[str]:
     if not log_path or not log_path.exists():
         return []
@@ -202,14 +206,30 @@ def log_lines_about(log_path: Path | None, needle: str) -> list[str]:
             if needle in ln]
 
 
+logger = logging.getLogger(__name__)
+
+# (file, 1-based line number) of every cost_log line that was not valid JSON. A set, because
+# stage_cost() re-reads the file once per stage and each bad line must be counted once.
+SKIPPED_LOG_LINES: set[tuple[str, int]] = set()
+
+
 def stage_cost(run_date: str, stage: str) -> str:
     path = RUN_DIR / 'cost_log.jsonl'
     if not path.exists():
         return 'not recorded'
-    for line in reversed(path.read_text(encoding='utf-8').splitlines()):
+    lines = path.read_text(encoding='utf-8').splitlines()
+    for line_number, line in reversed(list(enumerate(lines, 1))):
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except ValueError as ex:
+            # A diagnostic must not die on a half-written last line, nor hide that it skipped one.
+            if (str(path), line_number) not in SKIPPED_LOG_LINES:
+                logger.warning(f'Skipping {path} line {line_number}: not valid JSON ({ex}); '
+                               f'line starts {line[:LOG_LINE_HEAD_CHARS]!r}')
+            SKIPPED_LOG_LINES.add((str(path), line_number))
+            continue
         if str(row.get('timestamp', '')).startswith(run_date):
             stats = (row.get('stage_stats') or {}).get(stage)
             return json.dumps(stats) if stats else 'not recorded'
@@ -468,6 +488,7 @@ VERBATIM = ParagraphStyle('V', parent=_sheet['Code'], fontName='Courier', fontSi
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--job-id', required=True)
@@ -479,6 +500,9 @@ def main() -> None:
     out = args.out or RUN_DIR / f'job-trace-{args.job_id}-{args.date}.pdf'
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f'wrote {build(args.job_id, args.date, out)}')
+    if SKIPPED_LOG_LINES:
+        logger.warning(f'{len(SKIPPED_LOG_LINES)} cost_log line(s) were skipped as invalid JSON, so the cost '
+                       f'figures above may be missing a row: {sorted(SKIPPED_LOG_LINES)}')
 
 
 if __name__ == '__main__':

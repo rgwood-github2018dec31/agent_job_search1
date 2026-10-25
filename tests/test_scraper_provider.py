@@ -389,3 +389,47 @@ async def test_a_query_at_the_estimate_raises_nothing(monkeypatch):
     stats = {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0}
     await agent._openrouter_run_pass(_no_browser, [], stats, {}, pin)('instruction')
     assert tools._ui_alerts == []
+
+
+# --- replies that are not JSON name what was asked and quote what came back ---
+
+def test_parse_chat_reply_names_the_query_and_quotes_a_non_json_reply():
+    with pytest.raises(ValueError, match='not JSON') as raised:
+        so.parse_chat_reply('<html>502 Bad Gateway</html>', 'AI Architect')
+    assert "'AI Architect'" in str(raised.value)
+    assert '502 Bad Gateway' in str(raised.value)
+
+
+def test_parse_chat_reply_rejects_json_that_is_not_an_object():
+    with pytest.raises(ValueError, match='not an object'):
+        so.parse_chat_reply('[1, 2]', 'AI Architect')
+
+
+async def test_a_non_json_chat_reply_fails_the_query_with_its_text(monkeypatch):
+    pin = await _pinned(monkeypatch, _listing(STREAMLAKE))
+
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return 'upstream connect error'
+
+    monkeypatch.setattr(so, 'call_mcp_tool', fake_call)
+    with pytest.raises(ValueError, match='upstream connect error'):
+        await so.ScrapeSession(_no_browser, 'AI Architect', provider_pin=pin).run('sys', 'user', [])
+
+
+async def test_a_non_json_rank_providers_reply_names_the_model_and_leaves_the_run_unpinned(monkeypatch, caplog):
+    '''pin_scraper_provider already falls back to unpinned routing on any choose() failure; keep that.'''
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        return 'Service Unavailable'
+
+    monkeypatch.setattr(so, 'call_mcp_tool', fake_call)
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    model = next(iter(SCRAPER_MIN_BITS_PER_WEIGHT))
+    with pytest.raises(ValueError, match='Service Unavailable') as raised:
+        await so.ProviderPin(model).choose()
+    assert model in str(raised.value)
+    assert 'rank_providers' in str(raised.value)
+
+    with caplog.at_level(logging.WARNING):
+        pin = await REAL_PIN_SCRAPER_PROVIDER(model)
+    assert pin.tag is None
+    assert [a['kind'] for a in tools._ui_alerts] == ['provider_unpinned']

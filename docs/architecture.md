@@ -102,7 +102,7 @@ Key per-job observability is logged via the `logging` module: extract input toke
 | Factory | Used in | Tools provided |
 |---|---|---|
 | `make_job_search_server(interactive)` | Interactive mode | `check_and_record_job`, `save_job_posting`, `update_job_requirements` (if interactive) |
-| `make_scraper_server()` | Stage 1b (**Anthropic fallback only**) | `check_and_record_job`, `queue_candidate`, `report_search` |
+| `make_anthropic_scraper_server(browser_call)` (in `agent.py`) | Stage 1b (**Anthropic fallback only**) | The OpenRouter scraper's own toolset (`scrape_openrouter.LOCAL_TOOL_DEFS`), so both scrapers serve the one prompt. Which tools those are is not listed here; see Pin Scraper Provider in [requirements.md](requirements.md) and `test_every_tool_a_scraper_prompt_names_is_served_by_both_scrapers` |
 | `make_evaluator_server()` | Stage 2a | `submit_job_extract` |
 
 In Stage 2, saving and Telegram notification are plain Python calls (`do_save_job_posting()`, `_send_pipeline_notification()`), not MCP tools.
