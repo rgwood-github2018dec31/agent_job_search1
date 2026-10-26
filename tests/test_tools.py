@@ -2126,6 +2126,42 @@ async def test_openrouter_loop_missing_submit_fields_retries(monkeypatch):
     assert 'missing required field' in chat_requests[1]['messages'][-1]['content']
 
 
+async def test_openrouter_loop_drops_an_endpoint_that_omits_every_optional_field(monkeypatch, caplog):
+    '''inference-net/us returned only title, company and closed, 3 of 3 times on one page
+    (2026-10-26); pinned there, the 2026-10-25 run rated 12 of 12 jobs with no location. Asking
+    that endpoint again does not help, so the pin moves on and the page is asked afresh.'''
+    from agentic_job_search import endpoint_pin
+    model = extract_openrouter.MODEL_NAME_EXTRACTOR
+    monkeypatch.setitem(endpoint_pin._pins, model, endpoint_pin.EndpointPin(model, [
+        (1e-7, {'tag': 'inference-net/us', 'quantization': 'fp8'}),
+        (2e-7, {'tag': 'morph/fp8', 'quantization': 'fp8'}),
+    ]))
+    thin = {**_SUBMIT_ARGS, 'closed': False}
+    full = {**_SUBMIT_ARGS, 'location': 'Cyprus (Remote)', 'workplace_type': 'remote'}
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', thin)]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', full)]),
+    ], chat_requests)
+
+    with caplog.at_level(logging.WARNING):
+        extract = await _run_loop()
+
+    assert extract['location'] == 'Cyprus (Remote)'
+    assert [r['provider'] for r in chat_requests] == ['inference-net/us', 'morph/fp8']
+    assert len(chat_requests[1]['messages']) == 2, 'asked afresh, not shown the defective reply'
+    assert any('carried none of the optional fields' in r.getMessage() for r in caplog.records)
+
+
+async def test_openrouter_loop_keeps_a_thin_extract_when_unpinned(monkeypatch):
+    '''With no pin there is no other endpoint to try, so the extract is kept as before.'''
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [_chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', _SUBMIT_ARGS)])],
+                          chat_requests)
+    assert (await _run_loop())['location'] == ''
+    assert len(chat_requests) == 1
+
+
 async def test_openrouter_loop_stops_at_iteration_cap(monkeypatch):
     from agentic_job_search.config import EXTRACTOR_OPENROUTER_MAX_ITERATIONS
     chat_requests = []
@@ -5222,15 +5258,17 @@ def test_hybrid_in_an_area_wide_posting_is_not_marginal():
     assert _language_bullets(extract) == ['Likely spoken languages: spanish 100% — Madrid, Spain (Hybrid)']
 
 
-def test_a_stated_english_working_language_silences_the_location_guess():
+def test_a_stated_english_working_language_still_warns_the_local_language():
+    """The JD decides the team's language; the place still decides daily life. Silencing the
+    location once the JD stated English hid Lucentive's Portuguese hub (2026-10-26)."""
     extract = _make_extract(
         location='Berlin, Germany (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
         likely_spoken_languages={'german': 1.0}, stated_working_language='english',
     )
-    assert _language_bullets(extract) == []
+    assert _language_bullets(extract) == ['Local language: german 100% — Berlin, Germany (Hybrid)']
     text = agent.format_extract_text(_make_candidate(), extract)
     assert 'Stated working language: english' in text
-    assert 'Likely spoken languages:' not in text
+    assert 'Likely spoken languages: german 100% (local; posting states working language: english)' in text
 
 
 def test_a_stated_foreign_working_language_gets_its_own_bullet():
@@ -5241,14 +5279,86 @@ def test_a_stated_foreign_working_language_gets_its_own_bullet():
     assert _language_bullets(extract) == ['Working language: German (stated in posting)']
 
 
-def test_a_language_requirement_silences_the_location_guess():
+def test_a_language_requirement_turns_the_location_guess_into_a_local_language():
     '''A required language the user lacks is already a hard rejection, so a surviving requirement
-    names only languages the user speaks -- and it is the posting speaking, which wins.'''
+    names only languages the user speaks. The posting has spoken for the team, so the place's
+    language is labelled local, not the team's.'''
     extract = _make_extract(
         location='Paris, France (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
         likely_spoken_languages={'french': 1.0}, language_requirement='english',
     )
+    assert _language_bullets(extract) == ['Local language: french 100% — Paris, France (Hybrid)']
+
+
+def test_lucentive_english_team_at_a_portugal_hub():
+    """Job 4481299924 (2026-10-21): the JD states English, the hub's languages are Portuguese 70%,
+    and the role is remote EU-wide. It warned nothing. Now the local language warns, marked
+    marginal, and the stated English is said outright as a strength."""
+    extract = _make_extract(
+        location='Remote (EU-based; CET overlap; Portugal hub)', workplace_type='remote',
+        description=_NEUTRAL_DESCRIPTION, likely_spoken_languages={'portuguese': 0.7, 'english': 0.3},
+        stated_working_language='english', residency_scope='area_wide',
+    )
+    assert _language_bullets(extract) == [
+        'Local language (marginal — remote across a multilingual area): portuguese 70%, english 30% '
+        '— Remote (EU-based; CET overlap; Portugal hub)'
+    ]
+    assert agent.deterministic_pros(extract) == ['Team works in English (stated in posting)']
+
+
+def test_no_language_pro_where_the_place_speaks_the_users_language():
+    extract = _make_extract(likely_spoken_languages={'english': 1.0}, stated_working_language='english')
+    assert agent.deterministic_pros(extract) == []
     assert _language_bullets(extract) == []
+
+
+def test_no_language_pro_for_a_stated_language_the_user_does_not_speak():
+    extract = _make_extract(location='Paris, France (Hybrid)', workplace_type='hybrid',
+                            likely_spoken_languages={'french': 1.0}, stated_working_language='french')
+    assert agent.deterministic_pros(extract) == []
+    assert _language_bullets(extract) == [
+        'Working language: French (stated in posting)', 'Local language: french 100% — Paris, France (Hybrid)',
+    ]
+
+
+def test_the_language_pro_is_inert_with_no_languages_configured(monkeypatch):
+    monkeypatch.setattr(agent.preferences, 'languages', lambda: ())
+    extract = _make_extract(likely_spoken_languages={'portuguese': 1.0}, stated_working_language='english')
+    assert agent.deterministic_pros(extract) == []
+
+
+def test_deterministic_pros_come_first_and_are_not_repeated():
+    merged = agent.merge_pros(['Team works in English (stated in posting)'],
+                              ['team works in english (stated in posting)', 'Python-first stack'])
+    assert merged == ['Team works in English (stated in posting)', 'Python-first stack']
+
+
+async def test_header_card_location_in_another_country_warns_with_both():
+    """Lucentive: LinkedIn's card said 'Eu, Normandy, France' (its geocoding of "EU"), the body
+    said 'Portugal hub'. Neither can be trusted alone, so both are shown."""
+    extract = _make_extract(location='Remote (EU-based; Portugal hub)')
+    await agent.resolve_listed_location(extract, 'Eu, Normandy, France')
+    assert extract['listed_location_mismatch'] is True
+    assert ('Location mismatch — LinkedIn lists "Eu, Normandy, France"; posting says '
+            '"Remote (EU-based; Portugal hub)"') in agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert 'LinkedIn-listed location: Eu, Normandy, France' in agent.format_extract_text(_make_candidate(), extract)
+
+
+@pytest.mark.parametrize('listed', ['Montreal, Quebec, Canada', 'European Union', ''])
+async def test_no_location_mismatch_for_the_same_country_or_no_country(listed):
+    extract = _make_extract(location='Canada (Remote)')
+    await agent.resolve_listed_location(extract, listed)
+    assert extract['listed_location_mismatch'] is False
+    assert not any('mismatch' in w for w in agent.build_deterministic_warnings(_make_candidate(), extract))
+
+
+async def test_an_empty_extracted_location_is_filled_from_the_header_card():
+    """Evotym (job 4482332200, 2026-10-25): the extractor returned no location, the card said
+    'Cyprus', and the gate, the warnings and the notification all saw none."""
+    extract = _make_extract(location='')
+    await agent.resolve_listed_location(extract, 'Cyprus')
+    assert extract['location'] == 'Cyprus'
+    assert extract['listed_location_mismatch'] is False
 
 
 def test_format_extract_text_marks_a_marginal_working_language():
@@ -5653,19 +5763,21 @@ async def test_stage_2_suppresses_the_notification_for_a_recruiter_repost(monkey
     assert [e['job_id'] for e in tools.load_recruiter_notifications()] == ['4464637425']
 
 
-async def test_stage_2_does_not_check_a_direct_employer(monkeypatch):
-    '''Only recruiters repost one role under many ids; a direct employer must never be compared.'''
-    calls = _repost_llm(monkeypatch, '111')
-    tools.record_recruiter_notification(_make_candidate(job_id='111'), _agency_extract(company='Acme'))
-    notifications, _ = _stage2_stubs(
-        monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000')
+async def test_stage_2_suppresses_a_direct_employer_repost(monkeypatch):
+    '''2026-10-23: Mimica, the employer itself, posted one role once per country; two were notified.'''
+    calls = _repost_llm(monkeypatch, '111', reason='same role, another country')
+    notifications, saved = _stage2_stubs(
+        monkeypatch, _make_extract(company='Mimica', is_agency=False, title='Senior/Lead Machine Learning Engineer')
     )
     funnel: dict = {}
 
-    await _run_stage2(_make_candidate(job_id='222', company='Acme'), funnel)
+    await _run_stage2(_make_candidate(job_id='111', company='Mimica'), funnel)
+    await _run_stage2(_make_candidate(job_id='222', company='Mimica'), funnel)
 
-    assert calls == []
-    assert len(notifications) == 1
+    assert len(notifications) == 1, 'the second posting of the role is withheld'
+    assert len(calls) == 1, 'the first posting had nothing to compare against'
+    assert funnel.get('recruiter_repost_suppressed') == 1
+    assert 'Likely repost of job 111' in saved[1]['content']
 
 
 async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypatch):

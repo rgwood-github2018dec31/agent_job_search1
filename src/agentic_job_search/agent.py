@@ -655,10 +655,13 @@ Also produce:
 notice MUST appear here, even when you still rate the job highly.
 
 ## Language
-Check the `Posting written in:`, `Stated working language:` and `Likely working language:` lines. A posting written in another language, and a workplace whose
+Check the `Posting written in:`, `Stated working language:` and `Likely spoken languages:` lines. A posting written in another language, and a workplace whose
 working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English.
-A `Stated working language:` is what the posting itself says and overrides any guess from the location. A `Likely working language:` marked marginal is a
-remote role across a multi-country area — a minor friction at most.
+A `Stated working language:` is what the posting itself says and decides the working language; a `Likely spoken languages:` line marked `local` is then only
+the language of daily life where the job is anchored — a minor friction at most. A `Likely spoken languages:` line marked marginal is a remote role across a
+multi-country area — also a minor friction at most.
+A `LinkedIn-listed location:` line means LinkedIn's header names a different place from the posting's own `Location:`; when they name different countries,
+assume neither is right.
 Do not write a warning bullet for any of these: they are detected deterministically and added for you.
 
 Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for
@@ -2939,6 +2942,8 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         f"Company: {extract['company']}",
         *([f'Hiring company: {end_client}'] if end_client else []),
         f"Location: {extract['location']}",
+        *([f'LinkedIn-listed location: {listed}']
+          if (listed := extract.get('listed_location')) and listed != extract['location'] else []),
         *([f'Workplace: {workplace_type}'] if workplace_type else []),
         f"Posted: {extract['date_posted'] or candidate['date_posted']}",
         f"URL: {candidate['url']}",
@@ -2964,10 +2969,17 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Posting written in: {extract['posting_language']}")
     if extract.get('stated_working_language'):
         lines.append(f"Stated working language: {extract['stated_working_language']}")
-    # The location's guess is shown only when the posting is silent on language: the JD wins.
-    if (shares := extract.get('likely_spoken_languages')) and not posting_states_working_language(extract):
-        marginal = ' (marginal: remote across a multilingual area)' if working_language_is_marginal(extract) else ''
-        lines.append(f'Likely spoken languages: {language_share_text(shares)}{marginal}')
+    # The JD decides the working language. The location's languages are still shown, marked local,
+    # because they say what daily life there is in (Lucentive, 2026-10-26).
+    if shares := extract.get('likely_spoken_languages'):
+        notes = []
+        if posting_states_working_language(extract):
+            stated = extract.get('stated_working_language') or extract.get('language_requirement')
+            notes.append(f'local; posting states working language: {stated}')
+        if working_language_is_marginal(extract):
+            notes.append('marginal: remote across a multilingual area')
+        suffix = f" ({'; '.join(notes)})" if notes else ''
+        lines.append(f'Likely spoken languages: {language_share_text(shares)}{suffix}')
     # A requirement the user already meets is told to the rater as met, not dropped: the JD still
     # says 'remote within Canada', and the rater does not otherwise know where the user lives.
     if relocation_already_met(extract.get('relocation', '')):
@@ -3139,28 +3151,65 @@ def working_language_is_marginal(extract: dict) -> bool:
     )
 
 
-def working_language_warnings(extract: dict) -> list[str]:
-    """The working-language bullets, in precedence order (Detect Likely Spoken Languages).
-
-    1. The posting states a working language or a required one -> it wins. A stated language the
-       user does not speak gets its own bullet; the location's guess is never shown.
-    2. Otherwise the location's likely spoken languages, when the user's own languages hold less
-       than WORKING_LANGUAGE_MIN_KNOWN_MASS of the distribution -- marked marginal for a remote
-       role across a multi-country area.
-    """
-    if posting_states_working_language(extract):
-        if stated := _unsupported_language(extract.get('stated_working_language', '')):
-            return [f'Working language: {stated.title()} (stated in posting)']
-        return []
+def location_languages_warn(extract: dict) -> bool:
+    """True when the user's own languages hold less than WORKING_LANGUAGE_MIN_KNOWN_MASS of the
+    location's likely spoken languages. False when there are none, or none are configured."""
     shares = extract.get('likely_spoken_languages') or {}
-    if not shares or known_language_mass(shares) >= WORKING_LANGUAGE_MIN_KNOWN_MASS:
-        return []
+    return bool(shares) and known_language_mass(shares) < WORKING_LANGUAGE_MIN_KNOWN_MASS
+
+
+def working_language_warnings(extract: dict) -> list[str]:
+    """The language bullets for the job's workplace and place (Detect Likely Spoken Languages).
+
+    1. A working language the posting states, when the user does not speak it.
+    2. The location's likely spoken languages, when `location_languages_warn`. If the posting
+       states a working language, the bullet reads `Local language:`: the JD has decided the
+       team's language, but the place still decides daily life. This used to stay silent once the
+       JD stated a language, so Lucentive's English team at a Portugal hub, Portuguese 70%, never
+       warned (2026-10-26). Marked marginal for a remote role across a multi-country area.
+    """
+    warnings: list[str] = []
+    stated_by_posting = posting_states_working_language(extract)
+    if stated_by_posting and (stated := _unsupported_language(extract.get('stated_working_language', ''))):
+        warnings.append(f'Working language: {stated.title()} (stated in posting)')
+    if not location_languages_warn(extract):
+        return warnings
     location = extract.get('location') or 'location not stated'
-    spoken = language_share_text(shares)
-    if working_language_is_marginal(extract):
-        return [f'Likely spoken languages (marginal — remote across a multilingual area): '
-                f'{spoken} — {location}']
-    return [f'Likely spoken languages: {spoken} — {location}']
+    spoken = language_share_text(extract['likely_spoken_languages'])
+    label = 'Local language' if stated_by_posting else 'Likely spoken languages'
+    marginal = ' (marginal — remote across a multilingual area)' if working_language_is_marginal(extract) else ''
+    warnings.append(f'{label}{marginal}: {spoken} — {location}')
+    return warnings
+
+
+def deterministic_pros(extract: dict) -> list[str]:
+    """Strengths stated in code, shown before the rater's (Build Deterministic Warnings).
+
+    One so far: the posting says the team works in a language the user speaks, at a place whose
+    own languages warn. The warning alone read as if the job were in Portuguese; the user wants
+    the stated English said outright, as a strength (2026-10-26).
+    """
+    stated = str(extract.get('stated_working_language') or '').strip()
+    if not stated or not preferences.languages() or _unsupported_language(stated) or not location_languages_warn(extract):
+        return []
+    return [f'Team works in {stated.title()} (stated in posting)']
+
+
+def merge_pros(deterministic: list[str], llm_pros: list[str]) -> list[str]:
+    """Deterministic pros first, then the rater's, dropping case-insensitive duplicates."""
+    return _unique_bullets([*deterministic, *llm_pros])
+
+
+def _unique_bullets(items: list[str]) -> list[str]:
+    '''Stripped, non-empty, first occurrence of each case-insensitive text, in order.'''
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            merged.append(text)
+    return merged
 
 
 async def derive_likely_spoken_languages(extract: dict) -> dict[str, float]:
@@ -3185,6 +3234,31 @@ async def derive_likely_spoken_languages(extract: dict) -> dict[str, float]:
     facts = await classify_location(extract.get('location', ''))
     shares = facts.get('likely_spoken_languages')
     return dict(shares) if isinstance(shares, dict) else {}
+
+
+async def resolve_listed_location(extract: dict, listed: str) -> None:
+    """Record LinkedIn's header-card location on the extract and whether it disagrees with the
+    posting's. Fills an empty `location` from it. NO gate reads either field.
+
+    Two failures prompted this (2026-10-26). For Evotym (job 4482332200) the extractor returned no
+    location at all while the card said 'Cyprus', so the gate, the warnings and the notification
+    all saw none. For Lucentive (job 4481299924) the card said 'Eu, Normandy, France' and the body
+    said 'Portugal hub'. Neither source can be trusted alone, so when both name countries and
+    share none, both are shown. A text naming no country ('European Union', 'Remote') is never a
+    mismatch.
+    """
+    extract['listed_location'] = listed
+    extract['listed_location_mismatch'] = False
+    if not listed:
+        return
+    if not str(extract.get('location') or '').strip():
+        logger.info(f"Location: the extract has none; using the header card's {listed!r}")
+        extract['location'] = listed
+        return
+    listed_countries = set((await classify_location(listed)).get('countries') or ())
+    posting_countries = set((await classify_location(extract['location'])).get('countries') or ())
+    extract['listed_location_mismatch'] = bool(
+        listed_countries and posting_countries and not listed_countries & posting_countries)
 
 
 def commute_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
@@ -3651,6 +3725,10 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
             warning += ' (not somewhere you would commute)'
         warnings.append(warning)
 
+    if extract.get('listed_location_mismatch'):
+        warnings.append(f"Location mismatch — LinkedIn lists \"{extract.get('listed_location')}\"; "
+                        f"posting says \"{extract.get('location')}\"")
+
     # Two independent language facts. A posting written in another language gets the first (and a
     # rating cap); an English posting in a non-English workplace gets only the second. The Valtech
     # posting — a French JD the extractor handed back as English prose — was rated 4/5 and
@@ -3832,15 +3910,7 @@ def merge_warnings(
     """
     deterministic, llm_warnings = merge_salary_warning(
         deterministic, llm_warnings, salary_on_target, estimate_on_target)
-    merged: list[str] = []
-    seen: set[str] = set()
-    for warning in [*deterministic, *llm_warnings]:
-        text = str(warning).strip()
-        key = text.lower()
-        if text and key not in seen:
-            seen.add(key)
-            merged.append(text)
-    return merged
+    return _unique_bullets([*deterministic, *llm_warnings])
 
 
 def _bullet_block(heading: str, items: list[str]) -> str:
@@ -4151,6 +4221,8 @@ def format_extract_signal(extract: dict, raw_residency_scope: str) -> str:
     is anything but absent.
     """
     parts = [f'{name}={extract.get(name)!r}' for name in EXTRACT_SIGNAL_FIELDS if extract.get(name)]
+    if extract.get('listed_location_mismatch'):
+        parts.append(f"listed_location={extract.get('listed_location')!r} (country mismatch)")
     derived_residency_scope = str(extract.get('residency_scope') or '')
     if raw_residency_scope != derived_residency_scope:
         parts.append(f'residency_scope={raw_residency_scope!r}->{derived_residency_scope!r}')
@@ -4323,6 +4395,8 @@ async def evaluate_all_candidates(
                                f"{candidate['company']} — {candidate['title']}")
                 continue
             bump('extract_ok')
+            # Before anything reads `location`: it may be filled from the header card here.
+            await resolve_listed_location(extract, page.listed_location if page is not None else '')
             # Resolve the likely spoken languages ONCE, here, and write it back — so
             # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
             # field. Cosmetic only: no gate reads it, by design. `broad_area` rides along from the
@@ -4370,9 +4444,8 @@ async def evaluate_all_candidates(
             # Deliberately NOT extended to the agency's own name: applying once through a staffing
             # firm must never suppress every other company it posts for. That is the whole reason
             # load_applied_jobs() keeps agency names out of _applied_companies
-            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status still
-            # never changes the rating and never rejects on its own; the one thing it now gates is a
-            # REPEAT notification for a role already sent (see recruiter_repost_of below).
+            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status never
+            # changes the rating and never rejects on its own.
             end_client = derive_end_client(extract)
             # nested (not combined) deliberately: a 20-line gate body reads better
             # one level deeper than folded into a single 100-char condition
@@ -4480,24 +4553,25 @@ async def evaluate_all_candidates(
             rated_by = result.get('rated_by') or MODEL_NAME_RATING
             if rated_by != MODEL_NAME_RATING:
                 bump('rating_fallback')
-            pros = [str(p) for p in (result.get('pros') or [])]
+            pros = merge_pros(deterministic_pros(extract), [str(p) for p in (result.get('pros') or [])])
             deterministic = build_deterministic_warnings(candidate, extract)
 
-            # A recruiter re-advertising ONE role under a new job id defeats (site, job_id) dedup,
+            # A poster re-advertising ONE role under a new job id defeats (site, job_id) dedup,
             # which is how six notifications for one pharma programme arrived in nine days
-            # (2026-09-10). Checked only when a notification is about to fire, and only for agency
-            # postings, so it is free on every other job. It withholds the MESSAGE only: the rating,
-            # the saved file and the audit entry are all unchanged, and it fails open.
-            is_agency = derive_agency_posting(extract)
+            # (2026-09-10, an agency) and two for one Mimica role in one run (2026-10-23, the
+            # employer itself, one posting per country). Checked only when a notification is about
+            # to fire, and costs an LLM call only when the same poster already had one notified
+            # inside the window. It withholds the MESSAGE only: the rating, the saved file and the
+            # audit entry are all unchanged, and it fails open.
             repost = None
-            if should_notify_based_on_rating(rating) and is_agency:
+            if should_notify_based_on_rating(rating):
                 repost = await tools_module.recruiter_repost_of(
                     candidate, extract, stage_stats['recruiter_repost']
                 )
             if repost:
                 bump('recruiter_repost_suppressed')
                 logger.info(
-                    f"Recruiter repost: {candidate['company']} — {candidate['title']}: rated "
+                    f"Repost: {candidate['company']} — {candidate['title']}: rated "
                     f"{rating}/5 but NOT notified — same role as job {repost.get('job_id')} "
                     f"notified {repost.get('notified')} ({repost.get('reason') or 'no reason given'})"
                 )
@@ -4554,7 +4628,7 @@ async def evaluate_all_candidates(
                     # Cut, with the cut said: the whole reason is in the saved job file.
                     triage_note += f" ({snippet(triage_result['reason'], TRIAGE_REASON_LOG_MAX_CHARS)})"
             if repost:
-                notify_note = 'not notified (recruiter repost)'
+                notify_note = 'not notified (repost)'
             elif sent is None:
                 notify_note = 'not notified (below the notification rating)'
             else:
@@ -4567,7 +4641,7 @@ async def evaluate_all_candidates(
             )
             # Only what was actually SENT is recorded: a role first rated 3 never reached the user,
             # so a later repost of it that rates 4 must still notify.
-            if should_notify_based_on_rating(rating) and is_agency and not repost:
+            if should_notify_based_on_rating(rating) and not repost:
                 tools_module.record_recruiter_notification(candidate, extract)
         except LinkedInBlockedError as ex:
             remaining = candidates[index - 1:]

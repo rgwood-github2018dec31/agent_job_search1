@@ -32,6 +32,8 @@ COMPANY_BLACKLIST_EXPIRY_DAYS = 180
 # before deciding a new one is the same role. Agencies re-advertise one role under a new LinkedIn
 # job id every few days with a different country and day rate — six notifications for one pharma
 # role between 2026-09-02 and 09-10 — and each new id defeats (site, job_id) deduplication.
+# Since 2026-10-23 the same holds for any poster: Mimica, the employer itself, posted one role once
+# per country, and two of them were notified in one run.
 RECRUITER_REPOST_WINDOW_DAYS = 14
 # ...and how many of those postings the judgement call is shown, newest first. An agency that posts
 # daily would otherwise grow the prompt without bound: every prior carries a description capped at
@@ -764,6 +766,13 @@ COMPANY_ABOUT_PAGE_DELAY_SECONDS = (3.0, 8.0)
 COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS = 3
 # Model lookups for the applied-job companies run together at load; one cheap call each, once ever.
 COMPANY_IDENTITY_LOOKUP_CONCURRENCY = 8
+# Hosts that serve many unrelated organizations' pages, so their domain identifies nobody and is
+# never a company domain. GE Vernova's About page gave https://linktree.com/gevernova (2026-10-23);
+# kept as its domain, any other company on a Linktree page would have "matched" it.
+NON_COMPANY_DOMAINS = frozenset({
+    'linktree.com', 'linktr.ee', 'beacons.ai', 'bio.link', 'carrd.co', 'wixsite.com',
+    'bit.ly', 'lnkd.in', 't.co', 'tinyurl.com',
+})
 
 # LinkedIn job pages are read by CODE, not by the extractor model (2026-09-24). One read-only
 # browser_evaluate serializes the DOM after LinkedIn's own scripts have run; code then removes the

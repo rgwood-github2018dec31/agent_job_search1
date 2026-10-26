@@ -82,6 +82,10 @@ _ABOUT_PARENT_RELATION = 'Parent'
 _FOLLOWERS_RE = re.compile(r'^[\d,.]+[KkMm]?\s+followers$')
 # The company card's industry / size line: 'IT Services and IT Consulting • 10001+ employees • ...'.
 _EMPLOYEES_RE = re.compile(r'^[\d,.+\-–]+[KkMm]?\+?\s+employees$')
+# The header card's separator between the location, the posting age and the applicant count.
+_TOP_CARD_SEPARATOR = '·'
+# Company and title, in that order, before the location.
+_TOP_CARD_MIN_LINES_BEFORE_LOCATION = 2
 _HEADING_TAGS = ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')
 _SECTION_HEADING_TAGS = ('h1', 'h2')
 _NON_CONTENT_TAGS = ('script', 'noscript', 'style', 'template')
@@ -106,6 +110,7 @@ class JobPage:
     source: str  # 'dom' (de-cluttered page) or 'snapshot' (fallback: budgeted a11y snapshot)
     removed: list[dict] = field(default_factory=list)
     company_slug: str = ''   # the poster's LinkedIn page, from the About-the-company card; '' if absent
+    listed_location: str = ''   # the header card's location (listed_location()); '' if absent
 
 
 @dataclass
@@ -363,14 +368,47 @@ def keep_anchors(main: Tag) -> list[Tag]:
     about_job = main.find(id=_ABOUT_JOB_ID_RE)
     if about_job is not None:
         anchors.append(about_job)
-    logo = main.find('img', alt=_COMPANY_LOGO_ALT_RE)
-    if logo is not None and about_job is not None:
-        top = logo
-        while (top.parent is not None and top.parent is not main and not _contains(top.parent, about_job)
-               and top.parent.find(_SECTION_HEADING_TAGS) is None):
-            top = top.parent
+    if (top := top_card(main)) is not None:
         anchors.append(top)
     return anchors + company_card_anchors(main)
+
+
+def top_card(main: Tag) -> Tag | None:
+    """The posting's header card: the largest ancestor of the company logo that holds no section
+    heading and not the description. None when either anchor is missing."""
+    about_job = main.find(id=_ABOUT_JOB_ID_RE)
+    logo = main.find('img', alt=_COMPANY_LOGO_ALT_RE)
+    if logo is None or about_job is None:
+        return None
+    top = logo
+    while (top.parent is not None and top.parent is not main and not _contains(top.parent, about_job)
+           and top.parent.find(_SECTION_HEADING_TAGS) is None):
+        top = top.parent
+    return top
+
+
+def listed_location(soup: BeautifulSoup) -> str:
+    """The location LinkedIn's header card lists for the posting, or '' when it cannot be found.
+
+    Read in code because it is on the page: the extractor reads the body, which can disagree. For
+    Lucentive (job 4481299924) the card said 'Eu, Normandy, France', LinkedIn's geocoding of
+    "EU" to a Normandy town, while the body said 'EU-based ... Portugal hub' (2026-10-21). The card
+    lines run company, title, location, then '·' between the location and the posting age. Matched
+    on that text structure, never on LinkedIn's hashed class names.
+    """
+    main = soup.find('main') or soup.body or soup
+    card = top_card(main)
+    if card is None:
+        return ''
+    # The separator is its own text node on the live page, inline in the text on older markup.
+    text = card.get_text('\n').replace(_TOP_CARD_SEPARATOR, f'\n{_TOP_CARD_SEPARATOR}\n')
+    lines = [norm(line) for line in text.split('\n')]
+    lines = [line for line in lines if line]
+    separator = next((i for i, line in enumerate(lines) if line == _TOP_CARD_SEPARATOR), None)
+    # Company and title come first, so the location is at least the third line.
+    if separator is None or separator - 1 < _TOP_CARD_MIN_LINES_BEFORE_LOCATION:
+        return ''
+    return lines[separator - 1]
 
 
 def company_card_anchors(root: Tag) -> list[Tag]:
@@ -607,6 +645,8 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         return await _read_snapshot(candidate, call, 'the page has no JobDetails_AboutTheJob_ section')
 
     company_slug = posting_company_slug(soup)
+    if not (location := listed_location(soup)):
+        logger.info(f'Job page {job_id}: no location found in the header card (only the location-mismatch check is lost)')
     js_counts = strip_js(soup)
     company = posting_company(soup) or str(candidate.get('company') or '') or None
     html_path = raw_html_path(candidate)
@@ -635,7 +675,8 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         f"removed {len(removed)} block(s) ({sum(r['chars'] for r in removed):,} chars){unusual}"
     )
     logger.debug(f'Job page {job_id}: removed {removed_summary}; JS {js_counts}; assets {asset_counts}')
-    return JobPage(text=text, source='dom', removed=removed, company_slug=company_slug)
+    return JobPage(text=text, source='dom', removed=removed, company_slug=company_slug,
+                   listed_location=location)
 
 
 def visible_block_signature(soup: BeautifulSoup) -> str:

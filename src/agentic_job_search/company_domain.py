@@ -32,7 +32,7 @@ import tldextract
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
 from agentic_job_search import cache_io
-from agentic_job_search.config import MODEL_NAME_COMPANY_IDENTITY
+from agentic_job_search.config import MODEL_NAME_COMPANY_IDENTITY, NON_COMPANY_DOMAINS
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.triage import chat_openrouter
 
@@ -86,8 +86,13 @@ def normalize_company_name(name: str) -> str:
 
 
 def registrable_domain(url_or_host: str) -> str:
-    """'https://us.nttdata.com/en' -> 'nttdata.com'; '' when there is no registrable domain."""
-    return _domain_extractor(url_or_host.strip()).top_domain_under_public_suffix.lower()
+    """'https://us.nttdata.com/en' -> 'nttdata.com'; '' when there is no registrable domain.
+
+    Also '' for a host in NON_COMPANY_DOMAINS (a Linktree page, a link shortener). That covers the
+    About page's Website field, a model's answer, and an entry already cached before the list grew.
+    """
+    domain = _domain_extractor(url_or_host.strip()).top_domain_under_public_suffix.lower()
+    return '' if domain in NON_COMPANY_DOMAINS else domain
 
 
 @dataclass(frozen=True)

@@ -178,7 +178,7 @@ run_dir/
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
-  recruiter_notifications.yaml    # Agency postings already notified (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
+  recruiter_notifications.yaml    # Postings already notified, any poster (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
   eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error (EVAL_ERROR_MAX_RELEASES)
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)

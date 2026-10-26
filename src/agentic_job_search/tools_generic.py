@@ -678,9 +678,9 @@ RECRUITER_NOTIFICATIONS_PATH = RUN_DIR / 'recruiter_notifications.yaml'
 RECRUITER_DESCRIPTION_MAX_CHARS = 8_000
 
 _RECRUITER_NOTIFICATIONS_HEADER = (
-    '# Agency postings the user has been notified about, pruned to the last\n'
-    '# RECRUITER_REPOST_WINDOW_DAYS days. Used ONLY to decide whether a later posting by the same\n'
-    '# agency is the same role re-advertised, and so should not be notified a second time.\n'
+    '# Postings the user has been notified about (agencies and employers alike), pruned to the\n'
+    '# last RECRUITER_REPOST_WINDOW_DAYS days. Used ONLY to decide whether a later posting by the\n'
+    '# same poster is the same role re-advertised, and so should not be notified a second time.\n'
     '#\n'
     '# Gates nothing else: no rating, no rejection. Rewritten by the agent; safe to delete.\n'
 )
@@ -699,7 +699,10 @@ def _parse_iso_date(raw: Any) -> date:
 
 
 def load_recruiter_notifications(today: date | None = None) -> list[dict]:
-    '''Notified agency postings still inside the repost window, newest first.
+    '''Notified postings still inside the repost window, newest first.
+
+    Agency postings only until 2026-10-23, every poster since (see `recruiter_repost_of`); the
+    `recruiter_` names and the `agency` / `agency_key` fields predate that and mean "poster".
 
     Fails open to an empty list on anything unreadable. Deliberately NOT the "skip, never rebuild"
     treatment `location_recommendations.yaml` gets: that file holds decisions the user made by hand,
@@ -713,7 +716,7 @@ def load_recruiter_notifications(today: date | None = None) -> list[dict]:
     except Exception as ex:
         logger.warning(
             f'Could not read {RECRUITER_NOTIFICATIONS_PATH} ({unwrap_exception(ex)}) — treating it '
-            f'as empty, so agency postings notify normally this run.'
+            f'as empty, so postings notify normally this run.'
         )
         return []
     if not isinstance(loaded, list):
@@ -744,7 +747,7 @@ def load_recruiter_notifications(today: date | None = None) -> list[dict]:
 
 
 def record_recruiter_notification(candidate: dict, extract: dict, today: date | None = None) -> dict:
-    '''Record one notified agency posting so a later repost of it can be recognised.
+    '''Record one notified posting so a later repost of it by the same poster can be recognised.
 
     Only postings actually NOTIFIED are recorded. A role first rated 3 was never sent to the user,
     so a later repost that rates 4 must still notify.
@@ -752,7 +755,7 @@ def record_recruiter_notification(candidate: dict, extract: dict, today: date | 
     agency = str(extract.get('company') or candidate.get('company') or '').strip()
     job_id = str(candidate.get('job_id') or '')
     if _replay_dir is not None:
-        logger.info(f'Replay: not recording agency notification for {agency} (job {job_id})')
+        logger.info(f'Replay: not recording the notification for {agency} (job {job_id})')
         return {}
     entry = {
         # The name as written: folding happens at the comparison, via `agency_key`.
@@ -799,18 +802,21 @@ def _repost_match_prompt(new_posting: dict, priors: list[dict]) -> str:
         _posting_block(p, f'--- PRIOR POSTING {i} ---') for i, p in enumerate(priors, start=1)
     )
     return (
-        'A recruitment agency posted the NEW job below. The same agency already advertised the '
-        'PRIOR jobs, and the user was notified about each of those.\n\n'
+        'A company posted the NEW job below. The same poster already advertised the PRIOR jobs, '
+        'and the user was notified about each of those. The poster may be a recruitment agency or '
+        'the hiring employer itself.\n\n'
         f"{_posting_block(new_posting, '--- NEW POSTING ---')}\n\n{prior_blocks}\n\n"
         'Is the NEW posting the SAME ROLE as one of the prior postings — the same position at the '
         'same hiring organization or programme, re-advertised? A different country, a different '
         'day rate, or different wording in the title does NOT make it a different role: agencies '
-        'routinely re-post one role across several countries. A different position, a different '
+        'and employers alike routinely post one role once per country. A different position, a '
+        'different team, a different '
         'client, or a different programme DOES make it a different role.\n\n'
         'Judge it on the BODY: the responsibilities, the requirements, the client named or '
         'described, and concrete details such as a contact address, a rate, or a named programme. '
-        'Being posted by the same agency is NOT evidence — an aggregator advertises many unrelated '
-        'roles — and neither are adjacent job ids, a shared seniority level, or both postings '
+        'Being posted by the same poster is NOT evidence — an aggregator or a large employer '
+        'advertises many unrelated roles — and neither are adjacent job ids, a shared seniority '
+        'level, or both postings '
         'being remote AI engineering jobs.\n\n'
         'If you are not sure, answer with an empty string. The two mistakes are not equal: a match '
         'you miss costs one duplicate notification, while a match you invent hides a real job from '
@@ -834,8 +840,11 @@ async def recruiter_repost_of(
 ) -> dict | None:
     '''The already-notified posting this one re-advertises, or None to notify normally.
 
-    Two steps, and the first is free: unless this agency already had a posting notified inside the
-    window, no LLM call is made at all — which is every job on essentially every run.
+    Two steps, and the first is free: unless this poster already had a posting notified inside the
+    window, no LLM call is made at all — which is most notified jobs on most runs.
+
+    Every poster, not only agencies, since 2026-10-23: Mimica, the employer itself, posted one role
+    once per country, and two of those postings were notified in the same run.
 
     The model only ever picks a `job_id` out of the list it was shown, and an id that is not in that
     list is treated as NO match (see the Anti-fabrication requirement): it chooses, it never
@@ -843,7 +852,7 @@ async def recruiter_repost_of(
 
     Fails OPEN, the opposite of the blacklist confirmation above. A blacklist hit means a name the
     user wrote down already matched, so an outage must not readmit it; here nothing has been
-    established except that the same agency posted before, and an outage must not silence a real
+    established except that the same poster posted before, and an outage must not silence a real
     role.
     '''
     agency = str(extract.get('company') or candidate.get('company') or '').strip()

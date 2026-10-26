@@ -352,3 +352,28 @@ PREMIUM_UPSELL = ('Job search faster with Premium Access company insights like s
 def test_a_zero_price_is_not_pay_wording(text, expected):
     """The Premium upsell kept tripping the pay guard (11 times, 2026-09-24..28) on 'CA$0'."""
     assert lp.mentions_pay(text) is expected
+
+
+def test_listed_location_reads_the_header_card():
+    assert lp.listed_location(_soup()) == 'Toronto, ON'
+
+
+def test_listed_location_reads_a_separator_in_its_own_text_node():
+    """The live markup (Lucentive, 2026-10-21): the location and the '·' are sibling nodes."""
+    page = PAGE.replace('<p>Toronto, ON · 2 days ago · 40 applicants</p>',
+                        '<p><span>Eu, Normandy, France</span><span> </span>·<span> </span><span>1 day ago</span></p>')
+    assert lp.listed_location(BeautifulSoup(page, 'lxml')) == 'Eu, Normandy, France'
+
+
+@pytest.mark.parametrize('replacement', [
+    '<p>Toronto, ON 2 days ago</p>',   # no separator
+    '<p>· 2 days ago</p>',             # separator before any location line
+])
+def test_listed_location_is_empty_when_the_card_does_not_have_the_shape(replacement):
+    page = PAGE.replace('<p>Toronto, ON · 2 days ago · 40 applicants</p>', replacement)
+    assert lp.listed_location(BeautifulSoup(page, 'lxml')) == ''
+
+
+def test_listed_location_is_empty_without_a_header_card():
+    page = PAGE.replace('alt="Company logo for, Acme Corp."', 'alt=""')
+    assert lp.listed_location(BeautifulSoup(page, 'lxml')) == ''

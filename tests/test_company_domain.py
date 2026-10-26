@@ -55,6 +55,8 @@ def model_answers(monkeypatch):
     ('www.ixopay.com', 'ixopay.com'),
     ('careers.bbc.co.uk', 'bbc.co.uk'),
     ('localhost', ''),
+    ('https://linktree.com/gevernova', ''),
+    ('https://bit.ly/3xYz', ''),
     ('', ''),
 ])
 def test_registrable_domain_folds_subdomains(given, expected):
@@ -148,6 +150,26 @@ async def test_a_failed_model_fill_keeps_what_the_page_stated():
     identity = await company_domain.record_linkedin_identity(
         'paygate', 'Paygate', 'https://www.paygate.example.com', '', '')
     assert (identity.domain, identity.source) == ('example.com', 'linkedin')
+
+
+async def test_a_linktree_website_is_no_domain_and_the_model_fills_it(model_answers):
+    '''2026-10-23: GE Vernova's About page Website was https://linktree.com/gevernova.'''
+    answers, _asked = model_answers
+    answers['GE Vernova'] = _identity_reply(domain='gevernova.com')
+    identity = await company_domain.record_linkedin_identity(
+        'gevernova', 'GE Vernova', 'https://linktree.com/gevernova', '', '')
+    assert (identity.domain, identity.source) == ('gevernova.com', 'linkedin+model')
+
+
+def test_a_cached_linktree_domain_matches_nobody():
+    '''An entry cached before NON_COMPANY_DOMAINS existed must not join two companies on linktree.com.'''
+    company_domain.COMPANY_IDENTITY_CACHE_PATH.write_text(yaml.safe_dump({'by_name': {}, 'by_slug': {
+        slug: {'schema': company_domain.CACHE_SCHEMA_VERSION, 'source': 'linkedin', 'name': name,
+               'domain': 'linktree.com'}
+        for slug, name in (('gevernova', 'GE Vernova'), ('acme', 'Acme'))}}))
+    vernova = company_domain.cached_identity_for_slug('gevernova')
+    acme = company_domain.cached_identity_for_slug('acme')
+    assert vernova.domain == '' and not identities_match(vernova, acme)
 
 
 # --- The About page ----------------------------------------------------------------------------
