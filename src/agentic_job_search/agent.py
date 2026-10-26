@@ -16,6 +16,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, aclosing
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, NoReturn
@@ -3777,18 +3778,18 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     return warnings
 
 
-def repost_warning(repost: dict) -> str:
-    '''The warning naming the earlier posting a suppressed repost re-advertises.
+def repost_warning(repost: dict, same_run: bool) -> str:
+    '''The saved job's line naming the earlier posting a repost re-advertises, and where its
+    notification went: into that posting's message (same run) or a follow-up (an earlier run's).
 
     Built in code, like every other deterministic warning, and written into the saved job as well as
-    the audit log: a notification that never arrives is invisible, so the reason it did not has to
-    be somewhere the user can find it later.
+    the audit log, so the grouping can be checked later against the posting it was grouped with.
     '''
     context = ', '.join(str(repost.get(k) or '').strip() for k in ('notified', 'location', 'salary') if repost.get(k))
     return (
         f"Likely repost of job {repost.get('job_id', '')}"
         + (f' (notified {context})' if context else '')
-        + ' — not notified again'
+        + (' — combined into its notification' if same_run else ' — notified as a follow-up')
     )
 
 
@@ -4100,14 +4101,8 @@ def format_job_notification(
 ) -> str:
     '''The Telegram job-match message. Plain text — _send_pipeline_notification sends no
     parse_mode, so this uses bullets and emoji rather than Markdown.'''
-    recruiter = f'{NOTIFICATION_RECRUITER_MARKER} ' if derive_agency_posting(extract) else ''
-    header = f"⭐ {rating}/5 — {recruiter}{candidate['company']} — {candidate['title']}"
-    location = extract.get('location', '').strip()
-    workplace_type = derive_workplace_type(extract)
-    if location and workplace_type and workplace_type not in location.lower():
-        location = f'{location} — {workplace_type}'
-    lines = [header]
-    if location:
+    lines = [_notification_header(candidate, extract, rating)]
+    if location := _location_text(extract):
         lines.append(f'📍 {location}')
     if salary_line := format_salary_line(extract):
         lines.append(salary_line)
@@ -4117,6 +4112,95 @@ def format_job_notification(
         if block:
             sections.append(block)
     sections.append(candidate['url'])
+    return '\n\n'.join(sections)
+
+
+def _notification_header(candidate: dict, extract: dict, rating: int) -> str:
+    recruiter = f'{NOTIFICATION_RECRUITER_MARKER} ' if derive_agency_posting(extract) else ''
+    return f"⭐ {rating}/5 — {recruiter}{candidate['company']} — {candidate['title']}"
+
+
+def _location_text(extract: dict) -> str:
+    '''The location with its workplace type, as the 📍 line shows it; '' when neither is known.'''
+    location = extract.get('location', '').strip()
+    workplace_type = derive_workplace_type(extract)
+    if location and workplace_type and workplace_type not in location.lower():
+        location = f'{location} — {workplace_type}'
+    return location
+
+
+@dataclass
+class QueuedPosting:
+    '''One posting at the notification threshold, held until the end of Stage 2.'''
+    candidate: dict
+    extract: dict
+    rating: int
+    pros: list[str]
+    warnings: list[str]
+
+
+@dataclass
+class NotificationGroup:
+    '''The postings of one role, in the order they were rated, sent as ONE message.
+
+    `prior` is the earlier run's notified posting they re-advertise (a Recruiter Notification
+    Record), or None when the group's first posting is notified this run.
+    '''
+    postings: list[QueuedPosting]
+    prior: dict | None = None
+
+
+def _location_entry(posting: QueuedPosting, lead: QueuedPosting | None) -> str:
+    '''One posting's bullet under 📍 Locations: where it is and its link.
+
+    Against a `lead` (whose rating, salary and warnings head the message) only what differs is
+    added, so a country-specific language warning or day rate is not lost. With no lead, as in a
+    follow-up, each posting is shown in full.
+    '''
+    location = _location_text(posting.extract) or 'Location not shown'
+    rating = f' ({posting.rating}/5)' if lead is None or posting.rating != lead.rating else ''
+    lines = [f"• {location}{rating} — {posting.candidate['url']}"]
+    if lead is None or posting is not lead:
+        own_salary = str(posting.extract.get('salary') or '').strip()
+        if lead is None or own_salary != str(lead.extract.get('salary') or '').strip():
+            # A posting with no figure says so: under a lead's 💰 line, silence would read as the same pay.
+            lines.append(f'   {format_salary_line(posting.extract) or "💰 No salary in this posting"}')
+        lines += [f'   ⚠️ {w}' for w in posting.warnings if lead is None or w not in lead.warnings]
+    return '\n'.join(lines)
+
+
+def format_grouped_notification(group: NotificationGroup) -> str:
+    '''The Telegram message for one role: one posting renders as format_job_notification; several
+    (the same role in several places, judged by Combine Repost Notifications) as one message listing them all.
+
+    The lead is the highest-rated posting, the first rated on a tie. A group with a `prior` is a
+    follow-up to a message sent in an earlier run, which cannot be edited.
+    '''
+    postings = group.postings
+    if group.prior is not None:
+        first = postings[0]
+        prior = group.prior
+        context = ', '.join(str(prior.get(k) or '').strip() for k in ('location', 'salary') if prior.get(k))
+        header = '\n'.join([
+            f"➕ Also posted — {first.candidate['company']} — {first.candidate['title']}",
+            f"Same role as job {prior.get('job_id', '')}, notified {prior.get('notified', '')}"
+            + (f' ({context})' if context else ''),
+        ])
+        entries = '\n'.join(_location_entry(p, None) for p in postings)
+        return f'{header}\n\n📍 Locations ({len(postings)}):\n{entries}'
+    lead = max(postings, key=lambda p: p.rating)
+    if len(postings) == 1:
+        return format_job_notification(lead.candidate, lead.extract, lead.rating, lead.pros, lead.warnings)
+    lines = [_notification_header(lead.candidate, lead.extract, lead.rating)]
+    if salary_line := format_salary_line(lead.extract):
+        lines.append(salary_line)
+    lines.append(format_posted_line(lead.candidate, lead.extract))
+    sections = ['\n'.join(lines)]
+    for block in (_bullet_block('✅ Good:', lead.pros), _bullet_block('⚠️ Warnings:', lead.warnings)):
+        if block:
+            sections.append(block)
+    entries = '\n'.join(_location_entry(p, lead) for p in postings)
+    sections.append(f'📍 Locations ({len(postings)}):\n{entries}')
     return '\n\n'.join(sections)
 
 
@@ -4186,23 +4270,12 @@ async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) 
     raise AssertionError('unreachable: the last rating model returns or raises')
 
 
-async def _save_and_notify(
-    candidate: dict, rating: int, summary: str, content: str, notify: bool = True,
-    extract: dict | None = None, pros: list[str] | None = None, warnings: list[str] | None = None,
-) -> bool | None:
-    '''Save the job, and notify when asked and rated high enough.
-
-    Returns whether the notification was sent, or None when none was attempted.
-    '''
+async def _save_job(candidate: dict, rating: int, summary: str, content: str) -> None:
+    '''Save the job. A notification is queued separately and sent at the end of Stage 2.'''
     await tools_module.do_save_job_posting(
         company=candidate['company'], description=summary, rating=rating,
         content=content, job_id=candidate['job_id'],
     )
-    if notify and should_notify_based_on_rating(rating):
-        return await _send_pipeline_notification(
-            format_job_notification(candidate, extract or {}, rating, pros or [], warnings or [])
-        )
-    return None
 
 
 EXTRACT_SIGNAL_FIELDS = (
@@ -4266,10 +4339,78 @@ def _hard_rule_category(reason: str) -> str:
     return 'hard_ruled_other'
 
 
+class NotificationQueue:
+    '''Stage 2's job-match messages, held until the stage ends so one role posted in several
+    places (judged by Combine Repost Notifications) reaches the user as ONE message listing every location.
+
+    Telegram messages cannot be edited once sent, so a posting matching a role notified in an
+    earlier run is grouped, with the others matching that same posting, into one follow-up.
+    '''
+
+    def __init__(self) -> None:
+        # Keyed by the job id of the posting the group re-advertises: its own first posting for a
+        # group of this run, the earlier run's notified posting for a follow-up.
+        self._this_run: dict[str, NotificationGroup] = {}
+        self._followups: dict[str, NotificationGroup] = {}
+
+    def has_group(self, job_id: str) -> bool:
+        '''Whether `job_id` heads a message queued this run.'''
+        return job_id in self._this_run
+
+    def add(self, posting: QueuedPosting, repost: dict | None) -> None:
+        '''Queue `posting`: on its own, into the message of the queued posting `repost` names, or
+        into the follow-up to the earlier run's posting it names.'''
+        prior_id = str((repost or {}).get('job_id') or '')
+        if repost is None:
+            self._this_run[str(posting.candidate['job_id'])] = NotificationGroup([posting])
+        elif prior_id in self._this_run:
+            self._this_run[prior_id].postings.append(posting)
+        else:
+            self._followups.setdefault(prior_id, NotificationGroup([], prior=repost)).postings.append(posting)
+
+    async def flush(self) -> None:
+        '''Send every queued message, this run's first, then the follow-ups. Never raises: each
+        failed send is logged by _send_pipeline_notification and the rest still go.'''
+        groups = [*self._this_run.values(), *self._followups.values()]
+        self._this_run, self._followups = {}, {}
+        if not groups:
+            return
+        failed = []
+        for group in groups:
+            job_ids = ', '.join(str(p.candidate['job_id']) for p in group.postings)
+            kind = 'follow-up' if group.prior is not None else 'notification'
+            if await _send_pipeline_notification(format_grouped_notification(group)):
+                logger.info(f'Sent the {kind} for job(s) {job_ids}')
+            else:
+                failed.append(job_ids)
+        logger.info(
+            f'Stage 2 notifications: {len(groups) - len(failed)} of {len(groups)} message(s) sent'
+            + (f"; FAILED for job(s) {'; '.join(failed)}" if failed else '')
+        )
+
+
 async def evaluate_all_candidates(
     candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str,
     profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
     triage_enabled: bool = True, browser: BrowserServer | None = None,
+) -> None:
+    '''Stage 2 (see _evaluate_candidates), then its queued notifications — sent even when the
+    stage stops early or raises, so a match already rated is never lost.'''
+    notifications = NotificationQueue()
+    try:
+        await _evaluate_candidates(
+            candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats, funnel=funnel,
+            audit=audit, triage_enabled=triage_enabled, browser=browser, notifications=notifications,
+        )
+    finally:
+        await notifications.flush()
+
+
+async def _evaluate_candidates(
+    candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str,
+    profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
+    triage_enabled: bool = True, browser: BrowserServer | None = None,
+    *, notifications: NotificationQueue,
 ) -> None:
     '''Stage 2: per candidate — Haiku extract, deterministic hard rules, local triage,
     then one configurable-model rating call. All sharing one browser.
@@ -4456,14 +4597,13 @@ async def evaluate_all_candidates(
                         f"Already applied via end client: {candidate['company']} — "
                         f"{candidate['title']}: hiring company {end_client!r} matches {matched_pdf}"
                     )
-                    await _save_and_notify(
+                    await _save_job(
                         candidate, rating=RATING_AUTO_REJECT,
                         summary=f'already applied to end client {end_client}',
                         content=(
                             f"# Already applied — posted by {candidate['company']} on behalf of "
                             f"{end_client}\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"
                         ),
-                        notify=False,
                     )
                     tools_module.record_job_outcome(
                         candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
@@ -4476,9 +4616,9 @@ async def evaluate_all_candidates(
                 bump(_hard_rule_category(hard_rule_reason))
                 logger.info(f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: "
                             f'{RATING_AUTO_REJECT}/5 by hard rule ({hard_rule_reason}) — saved, not notified')
-                await _save_and_notify(
+                await _save_job(
                     candidate, rating=RATING_AUTO_REJECT, summary=f'auto rejected {hard_rule_reason}',
-                    content=f'# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}', notify=False,
+                    content=f'# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}',
                 )
                 tools_module.record_job_outcome(
                     candidate['site'], candidate['job_id'], 'hard_ruled', rating=RATING_AUTO_REJECT, summary=hard_rule_reason
@@ -4495,14 +4635,13 @@ async def evaluate_all_candidates(
                         f"Triaged out [{index}/{len(candidates)}]: {candidate['company']} — "
                         f"{candidate['title']}: score {triage_result['score']} ({triage_result['reason']})"
                     )
-                    await _save_and_notify(
+                    await _save_job(
                         candidate, rating=triage_result['score'],
                         summary=f"triaged out {triage_result['reason']}",
                         content=(
                             f"# Triaged out (local score {triage_result['score']}/5)\n\n"
                             f"Reason: {triage_result['reason']}\n\n{extract_text}"
                         ),
-                        notify=False,
                     )
                     tools_module.record_job_outcome(
                         candidate['site'], candidate['job_id'], 'triaged_out',
@@ -4526,12 +4665,11 @@ async def evaluate_all_candidates(
                     bump('poster_identity_already_applied')
                     logger.info(f"Already applied by company identity [{index}/{len(candidates)}]: "
                                 f"{candidate['company']} — {candidate['title']}: matches {matched_pdf}")
-                    await _save_and_notify(
+                    await _save_job(
                         candidate, rating=RATING_AUTO_REJECT,
                         summary=f"already applied to {candidate['company']} (same organization)",
                         content=(f"# Already applied — {candidate['company']} is the same organization as "
                                  f"an applied job\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"),
-                        notify=False,
                     )
                     tools_module.record_job_outcome(
                         candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
@@ -4561,25 +4699,27 @@ async def evaluate_all_candidates(
             # (2026-09-10, an agency) and two for one Mimica role in one run (2026-10-23, the
             # employer itself, one posting per country). Checked only when a notification is about
             # to fire, and costs an LLM call only when the same poster already had one notified
-            # inside the window. It withholds the MESSAGE only: the rating, the saved file and the
-            # audit entry are all unchanged, and it fails open.
+            # inside the window. It changes the MESSAGE only: a posting of a role queued earlier in
+            # this run joins that role's message, one of a role notified in an earlier run gets a
+            # follow-up. The rating, the saved file and the audit entry are unchanged; it fails open.
             repost = None
             if should_notify_based_on_rating(rating):
                 repost = await tools_module.recruiter_repost_of(
                     candidate, extract, stage_stats['recruiter_repost']
                 )
+            same_run_lead = repost and notifications.has_group(str(repost.get('job_id') or ''))
             if repost:
-                bump('recruiter_repost_suppressed')
+                bump('notification_combined' if same_run_lead else 'repost_followup')
                 logger.info(
-                    f"Repost: {candidate['company']} — {candidate['title']}: rated "
-                    f"{rating}/5 but NOT notified — same role as job {repost.get('job_id')} "
-                    f"notified {repost.get('notified')} ({repost.get('reason') or 'no reason given'})"
+                    f"Repost: {candidate['company']} — {candidate['title']}: rated {rating}/5, "
+                    + ('combined into the message for' if same_run_lead else 'follow-up to')
+                    + f" job {repost.get('job_id')} notified {repost.get('notified')} "
+                    f"({repost.get('reason') or 'no reason given'})"
                 )
-                deterministic.insert(0, repost_warning(repost))
 
             # What the 💰 line adds to the posting's own figure. Only for a job at the
-            # notification threshold (a suppressed repost included: its saved file is the one
-            # place it is seen), and only now, after rating. A failure here costs the extra figure,
+            # notification threshold (a repost included: its 💰 line is in the combined message or
+            # the follow-up), and only now, after rating. A failure here costs the extra figure,
             # never the notification.
             pay_note = ''
             if should_notify_based_on_rating(rating):
@@ -4600,12 +4740,14 @@ async def evaluate_all_candidates(
                 salary_on_target=salary_meets_target(extract) is True,
                 estimate_on_target=estimate_meets_target(extract) is True,
             )
+            # The repost line is for the saved file only: the message itself shows the grouping.
+            saved_warnings = [repost_warning(repost, bool(same_run_lead)), *warnings] if repost else warnings
             pay_lines = format_pay_lines(extract)
             content = (
                 f"# {result['title']} at {result['company']} — rating {rating}/5\n\n"
                 + (f"⚠ rating capped from {result['rating']}: {cap_reason}\n\n" if cap_reason else '')
                 + (_bullet_block('## Good', pros) + '\n\n' if pros else '')
-                + (_bullet_block('## Warnings', warnings) + '\n\n' if warnings else '')
+                + (_bullet_block('## Warnings', saved_warnings) + '\n\n' if saved_warnings else '')
                 + ('\n'.join(pay_lines) + '\n\n' if pay_lines else '')
                 + f"Reasoning: {result['reasoning']}\n"
                 + (f"Triage score (local): {triage_result['score']}\n" if triage_result else '')
@@ -4615,10 +4757,9 @@ async def evaluate_all_candidates(
                 candidate['site'], candidate['job_id'], 'recruiter_repost' if repost else 'rated',
                 rating=rating, summary=result['reasoning'],
             )
-            sent = await _save_and_notify(
-                candidate, rating=rating, summary=result['summary'], content=content,
-                extract=extract, pros=pros, warnings=warnings, notify=not repost,
-            )
+            await _save_job(candidate, rating=rating, summary=result['summary'], content=content)
+            if should_notify_based_on_rating(rating):
+                notifications.add(QueuedPosting(candidate, extract, rating, pros, warnings), repost)
             # The reasoning is in the saved job and audit §4. Triage's reason appears only when
             # the two scores are far enough apart to be worth reading.
             triage_note = ''
@@ -4627,20 +4768,23 @@ async def evaluate_all_candidates(
                 if abs(triage_result['score'] - result['rating']) >= TRIAGE_DISAGREEMENT_LOG_MIN:
                     # Cut, with the cut said: the whole reason is in the saved job file.
                     triage_note += f" ({snippet(triage_result['reason'], TRIAGE_REASON_LOG_MAX_CHARS)})"
-            if repost:
-                notify_note = 'not notified (repost)'
-            elif sent is None:
+            if not should_notify_based_on_rating(rating):
                 notify_note = 'not notified (below the notification rating)'
+            elif same_run_lead:
+                notify_note = f"notification queued, combined with job {repost.get('job_id')}"
+            elif repost:
+                notify_note = f"notification queued as a follow-up to job {repost.get('job_id')}"
             else:
-                notify_note = 'notified' if sent else 'notification FAILED'
+                notify_note = 'notification queued'
             logger.info(
                 f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: {rating}/5 via {rated_by}"
                 + (f' (fallback: {MODEL_NAME_RATING} failed)' if rated_by != MODEL_NAME_RATING else '')
                 + f'{triage_note}, {rating_seconds:.0f}s — saved, {notify_note}'
                 + (f'; pay: {pay_note}' if pay_note else '')
             )
-            # Only what was actually SENT is recorded: a role first rated 3 never reached the user,
-            # so a later repost of it that rates 4 must still notify.
+            # Only what is notified is recorded: a role first rated 3 never reached the user, so a
+            # later repost of it that rates 4 must still notify. Recorded when queued, not when
+            # sent, so a later posting of the role in this same run is compared against it.
             if should_notify_based_on_rating(rating) and not repost:
                 tools_module.record_recruiter_notification(candidate, extract)
         except LinkedInBlockedError as ex:

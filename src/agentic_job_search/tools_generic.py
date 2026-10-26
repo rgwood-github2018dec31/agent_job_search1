@@ -588,9 +588,9 @@ async def company_blacklist_reason(company: str, context: str = '', description:
 # No threshold separates the two cases.
 #
 # So: a free deterministic gate (same agency, notified inside the window), then at most one cheap
-# LLM call that picks a prior job_id out of a list it was shown. It withholds a NOTIFICATION only —
-# the job is still rated, saved and audited — and it fails open, because a duplicate ping costs a
-# glance while a missed one costs a real role.
+# LLM call that picks a prior job_id out of a list it was shown. It changes a NOTIFICATION only —
+# folding it into that role's message or a follow-up; the job is still rated, saved and audited —
+# and it fails open, because a duplicate ping costs a glance while a missed one costs a real role.
 
 def raw_posting_path(candidate: dict, captured_on: date | None = None) -> Path:
     """Where this job's captured page text lives. One file per job per day."""

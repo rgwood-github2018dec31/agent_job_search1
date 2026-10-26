@@ -5633,8 +5633,9 @@ def test_repost_warning_names_the_earlier_posting():
     warning = agent.repost_warning({
         'job_id': '4464637425', 'notified': '2026-09-09',
         'location': 'European Union (Remote)', 'salary': '700-750 EUR/day',
-    })
+    }, same_run=False)
     assert '4464637425' in warning and '2026-09-09' in warning
+    assert 'follow-up' in warning
 
 
 @pytest.mark.live
@@ -5744,7 +5745,7 @@ async def test_stage_2_notifies_and_records_a_first_agency_posting(monkeypatch):
     assert 'recruiter_repost_suppressed' not in funnel
 
 
-async def test_stage_2_suppresses_the_notification_for_a_recruiter_repost(monkeypatch):
+async def test_stage_2_sends_a_follow_up_for_a_repost_of_an_earlier_runs_notification(monkeypatch):
     _repost_llm(monkeypatch, '4464637425')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
     notifications, saved = _stage2_stubs(
@@ -5754,30 +5755,42 @@ async def test_stage_2_suppresses_the_notification_for_a_recruiter_repost(monkey
 
     await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), funnel)
 
-    assert notifications == []
-    assert funnel.get('recruiter_repost_suppressed') == 1
+    assert len(notifications) == 1
+    assert notifications[0].startswith('➕ Also posted')
+    assert 'Same role as job 4464637425' in notifications[0]
+    assert 'Netherlands (Remote)' in notifications[0] and '800-850 EUR/day' in notifications[0]
+    assert funnel.get('repost_followup') == 1
     # A cap it is not: the rating, the saved file and the audit trail are untouched.
     assert saved and saved[0]['rating'] == 5
     assert 'Likely repost of job 4464637425' in saved[0]['content']
-    # The suppressed repost does NOT become the new reference point.
+    # The repost does NOT become the new reference point.
     assert [e['job_id'] for e in tools.load_recruiter_notifications()] == ['4464637425']
 
 
-async def test_stage_2_suppresses_a_direct_employer_repost(monkeypatch):
+async def test_stage_2_combines_one_role_posted_in_several_countries(monkeypatch):
     '''2026-10-23: Mimica, the employer itself, posted one role once per country; two were notified.'''
     calls = _repost_llm(monkeypatch, '111', reason='same role, another country')
     notifications, saved = _stage2_stubs(
         monkeypatch, _make_extract(company='Mimica', is_agency=False, title='Senior/Lead Machine Learning Engineer')
     )
     funnel: dict = {}
+    candidates = [
+        _make_candidate(job_id='111', company='Mimica', url='https://www.linkedin.com/jobs/view/111/'),
+        _make_candidate(job_id='222', company='Mimica', url='https://www.linkedin.com/jobs/view/222/'),
+    ]
 
-    await _run_stage2(_make_candidate(job_id='111', company='Mimica'), funnel)
-    await _run_stage2(_make_candidate(job_id='222', company='Mimica'), funnel)
+    await agent.evaluate_all_candidates(
+        candidates, {'type': 'http', 'url': 'http://localhost:1/mcp'},
+        'prompt', 'profile', _stage2_stats(), funnel=funnel,
+    )
 
-    assert len(notifications) == 1, 'the second posting of the role is withheld'
+    assert len(notifications) == 1, 'one message for the role'
+    assert '📍 Locations (2):' in notifications[0]
+    assert '/jobs/view/111/' in notifications[0] and '/jobs/view/222/' in notifications[0]
     assert len(calls) == 1, 'the first posting had nothing to compare against'
-    assert funnel.get('recruiter_repost_suppressed') == 1
+    assert funnel.get('notification_combined') == 1
     assert 'Likely repost of job 111' in saved[1]['content']
+    assert 'combined into its notification' in saved[1]['content']
 
 
 async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypatch):
@@ -5894,7 +5907,80 @@ async def test_stage_2_compares_against_a_posting_notified_earlier_in_the_same_r
     )
 
     assert len(notifications) == 1, 'the second posting is the same role as the first'
-    assert funnel.get('recruiter_repost_suppressed') == 1
+    assert funnel.get('notification_combined') == 1
+
+
+async def test_stage_2_sends_queued_notifications_when_it_stops_on_a_challenge(monkeypatch):
+    '''A match rated before the stop must still arrive: the queue is flushed on every exit.'''
+    notifications, _ = _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    pages = iter([
+        linkedin_page.JobPage(text='Staff Engineer\nAbout the job\nBuild agents.', source='dom'),
+        linkedin_page.LinkedInBlockedError('job page shows "captcha"'),
+    ])
+
+    async def fake_read_page(candidate, url, stats):
+        page = next(pages)
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+    monkeypatch.setattr(agent, 'read_page', fake_read_page)
+    monkeypatch.setattr(tools, 'forget_processed_job', lambda site, job_id: None)
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    funnel: dict = {}
+
+    await agent.evaluate_all_candidates(
+        [_make_candidate(job_id='1', company='Example Data Europe'),
+         _make_candidate(job_id='2', company='Example Data Europe')],
+        {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', _stage2_stats(), funnel=funnel,
+    )
+
+    assert funnel.get('blocked') == 1
+    assert len(notifications) == 1
+
+
+def _queued(job_id: str, location: str, rating: int = 5, salary: str = '', warnings=()) -> 'agent.QueuedPosting':
+    return agent.QueuedPosting(
+        _make_candidate(job_id=job_id, company='Mimica', url=f'https://www.linkedin.com/jobs/view/{job_id}/'),
+        _make_extract(company='Mimica', location=location, salary=salary),
+        rating, ['Strong ML focus'], list(warnings),
+    )
+
+
+def test_grouped_notification_of_one_posting_is_the_ordinary_message():
+    posting = _queued('1', 'Dublin, Ireland', warnings=['Hybrid'])
+    assert agent.format_grouped_notification(agent.NotificationGroup([posting])) == agent.format_job_notification(
+        posting.candidate, posting.extract, posting.rating, posting.pros, posting.warnings)
+
+
+def test_grouped_notification_lists_every_location_and_only_what_differs():
+    lead = _queued('1', 'Dublin, Ireland', salary='€90k', warnings=['Hybrid'])
+    sibling = _queued('2', 'Stockholm, Sweden', rating=4, salary='SEK 900k',
+                      warnings=['Hybrid', 'Swedish required'])
+    message = agent.format_grouped_notification(agent.NotificationGroup([sibling, lead]))
+
+    assert message.startswith('⭐ 5/5'), 'the highest-rated posting leads'
+    assert '📍 Locations (2):' in message
+    dublin, stockholm = (line for line in message.splitlines() if line.startswith('• ') and 'linkedin' in line)
+    assert 'Stockholm, Sweden' in dublin and '(4/5)' in dublin, 'listed in rating order of arrival'
+    assert '/jobs/view/1/' in stockholm and '(5/5)' not in stockholm
+    assert 'SEK 900k' in message and '   ⚠️ Swedish required' in message
+    assert '   ⚠️ Hybrid' not in message, "the lead's warnings are not repeated per location"
+
+
+def test_grouped_notification_says_when_a_sibling_states_no_salary():
+    message = agent.format_grouped_notification(agent.NotificationGroup(
+        [_queued('1', 'Dublin, Ireland', salary='€90k'), _queued('2', 'Berlin, Germany')]))
+    assert 'No salary in this posting' in message
+
+
+def test_follow_up_names_the_earlier_notification():
+    prior = {'job_id': '111', 'notified': '2026-10-23', 'location': 'Dublin, Ireland'}
+    message = agent.format_grouped_notification(agent.NotificationGroup(
+        [_queued('2', 'Berlin, Germany', rating=4), _queued('3', 'Madrid, Spain')], prior=prior))
+    assert message.startswith('➕ Also posted — Mimica')
+    assert 'Same role as job 111, notified 2026-10-23 (Dublin, Ireland)' in message
+    assert '📍 Locations (2):' in message and '(4/5)' in message and '(5/5)' in message
 
 
 def test_extract_text_surfaces_the_hiring_company():
@@ -10893,8 +10979,8 @@ async def test_stage_2_pays_for_no_estimate_below_the_notification_threshold(mon
     assert saved and 'Estimated salary' not in saved[0]['content']
 
 
-async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repost(monkeypatch):
-    '''The message is withheld; the saved file is the one place the role is still seen.'''
+async def test_stage_2_keeps_the_estimate_for_a_repost_of_an_earlier_runs_notification(monkeypatch):
+    '''A follow-up, not a full message: the saved file still carries everything.'''
     _repost_llm(monkeypatch, '4464637425')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract(salary=''))
     notifications, saved = _stage2_stubs(monkeypatch, _agency_extract(salary=''))
@@ -10902,7 +10988,7 @@ async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repo
 
     await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), {})
 
-    assert notifications == []
+    assert len(notifications) == 1 and notifications[0].startswith('➕ Also posted')
     assert 'Estimated salary: PLN 250k - 320k per year' in saved[0]['content']
 
 
@@ -11149,7 +11235,8 @@ async def test_stage_2_rating_line_says_notified_and_carries_no_reasoning(monkey
     assert len(rating_lines) == 1
     assert rating_lines[0].startswith('Rating [1/1]: job 222: 5/5 via ')
     assert 'Acme' not in rating_lines[0], 'the title and company appear once, on the Extract line'
-    assert rating_lines[0].endswith('— saved, notified')
+    assert rating_lines[0].endswith('— saved, notification queued')
+    assert 'Stage 2 notifications: 1 of 1 message(s) sent' in messages
     assert 'strong fit' not in rating_lines[0], 'the reasoning lives in the saved job and the audit log'
     assert any(m == 'Stage 2: evaluating 1 candidate(s)' for m in messages)
     assert any(m.startswith('Stage 2 complete: 1 of 1 job(s) in ') for m in messages)
@@ -11165,7 +11252,7 @@ async def test_stage_2_rating_line_says_why_nothing_was_sent(monkeypatch, caplog
     assert any(m.endswith('— saved, not notified (below the notification rating)') for m in _stage2_messages(caplog))
 
 
-async def test_stage_2_rating_line_reports_a_failed_send(monkeypatch, caplog):
+async def test_stage_2_reports_a_failed_send(monkeypatch, caplog):
     _repost_llm(monkeypatch, '')
     _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
 
@@ -11174,7 +11261,7 @@ async def test_stage_2_rating_line_reports_a_failed_send(monkeypatch, caplog):
     monkeypatch.setattr(agent, '_send_pipeline_notification', failed_notify)
     with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
         await _run_stage2(_make_candidate(job_id='222', company='Acme'), {})
-    assert any(m.endswith('— saved, notification FAILED') for m in _stage2_messages(caplog))
+    assert 'Stage 2 notifications: 0 of 1 message(s) sent; FAILED for job(s) 222' in _stage2_messages(caplog)
 
 
 async def test_stage_2_rating_line_gives_the_triage_reason_only_on_a_wide_disagreement(monkeypatch, caplog):
