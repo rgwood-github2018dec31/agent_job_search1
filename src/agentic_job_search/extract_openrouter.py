@@ -177,6 +177,7 @@ async def extract_job_page_openrouter(
     ]
     total_cost = 0.0
     started = time.monotonic()
+    retried = False   # a failed chat is asked once more when the pin moved (endpoint_failed)
     for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
         # A timeout or transport failure raises rather than returning ok=false. Until 2026-10-18 it
         # escaped to the Stage 2 error handler, skipping the Haiku fallback and dropping the job.
@@ -188,11 +189,13 @@ async def extract_job_page_openrouter(
                 timeout_seconds=LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
             )
         except Exception as ex:
-            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, ex)
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat with {MODEL_NAME_EXTRACTOR} failed (iteration {iteration + 1}): {type(ex).__name__}: {ex}"
             )
+            if endpoint_failed(MODEL_NAME_EXTRACTOR, routing, ex) and not retried:
+                retried = True
+                continue
             return None
         try:
             data = json.loads(raw)
@@ -203,11 +206,13 @@ async def extract_job_page_openrouter(
             )
             return None
         if not data.get('ok'):
-            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, str(data.get('error') or raw))
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat failed: {data.get('error') or snippet(raw)}"
             )
+            if endpoint_failed(MODEL_NAME_EXTRACTOR, routing, str(data.get('error') or raw)) and not retried:
+                retried = True
+                continue
             return None
         usage = data.get('usage') or {}
         stage_stats['cost'] += float(data.get('cost_usd') or 0.0)

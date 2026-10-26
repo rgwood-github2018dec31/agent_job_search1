@@ -7,7 +7,8 @@ caller's own — the single-turn token mix, the precision floor, and the per-run
 so it and the scraper's pin no longer carry two drifting copies of the same policy.
 
 A call that fails on the pinned endpoint drops it for the rest of the run and the next-cheapest
-survivor takes over; with none left, calls go unpinned (OpenRouter's choice). A failure to reach
+survivor takes over; with none left, calls go unpinned (OpenRouter's choice). The failed call itself
+is asked once of the new endpoint before its caller falls back (`endpoint_failed` returns True). A failure to reach
 the local tool server itself is not the endpoint's and drops nothing: on 2026-10-20 the server
 died mid-run and each refused connection dropped one more endpoint, the whole list in 18 s.
 
@@ -142,18 +143,29 @@ def routing_for(model: str) -> dict:
 _LOCAL_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError)
 
 
-def endpoint_failed(model: str, routing: dict, error: str | BaseException) -> None:
+def endpoint_failed(model: str, routing: dict, error: str | BaseException) -> bool:
     '''Report a failed call made with `routing`; drops that endpoint when it is still the pin,
-    unless `error` is a failure to reach the local tool server.'''
+    unless `error` is a failure to reach the local tool server.
+
+    Returns True when the endpoint was at fault and the model now routes elsewhere, so the caller
+    should ask the same call once more with `routing_for(model)` before falling back. Until
+    2026-10-26 the failed call went straight to its fallback: a 429 on the run's first call moved
+    the pin to morph, yet that call (a company-name match) was answered by Anthropic instead.'''
     if not routing or not (pin := _pins.get(model)):
-        return
+        return False
     if isinstance(error, _LOCAL_TRANSPORT_ERRORS):
         logger.info(f"Single-turn pin: {model} kept on {routing['provider']}: the call failed reaching "
                     f'the tool server, not the endpoint ({type(error).__name__}: {snippet(str(error))})')
-        return
+        return False
     if isinstance(error, BaseException):
         error = f'{type(error).__name__}: {error}'
     pin.drop(routing['provider'], error)
+    now = pin.routing()
+    if now == routing:
+        return False
+    logger.warning(f"Single-turn pin: asking the failed {model} call again on "
+                   f"{now.get('provider') or 'no pin (OpenRouter chooses)'}")
+    return True
 
 
 def reset_pins() -> None:

@@ -10094,6 +10094,21 @@ async def test_main_logs_an_exception_that_ends_the_run(monkeypatch, caplog, tmp
     assert released == [True], 'the run lock must still be released'
 
 
+async def test_main_logs_why_it_did_not_start_when_the_lock_is_held(monkeypatch, caplog):
+    '''2026-10-26: three run logs held only the "Logging to" line; the lock conflict went to the console.'''
+    monkeypatch.setattr(agent.sys, 'argv', ['main.py', '-n', '--no-version-check'])
+    monkeypatch.setattr(agent, 'setup_logging', lambda *args, **kwargs: None)   # keeps caplog attached
+    monkeypatch.setattr(agent.tools_module, 'acquire_run_lock', lambda **kwargs: {
+        'pid': 46680, 'started_at': '2026-10-26T02:54:27', 'mode': 'non-interactive',
+        'argv': 'main.py --job-ids ids.tsv'})
+
+    with caplog.at_level(logging.ERROR, logger=agent.logger.name), pytest.raises(SystemExit):
+        await agent.main()
+
+    assert any('already active' in r.message and '46680' in r.message and 'ids.tsv' in r.message
+               for r in caplog.records)
+
+
 def test_scraper_bad_tool_json_is_logged_and_returned_to_the_model(monkeypatch, caplog):
     '''It used to become {} silently, running the tool with arguments the model never chose.'''
     bad_call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},

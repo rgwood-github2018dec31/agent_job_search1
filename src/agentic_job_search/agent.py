@@ -5659,6 +5659,9 @@ async def main() -> None:
         mode='interactive' if interactive else 'non-interactive', force=args.force,
     )
     if conflict:
+        # Logged as well: the run log is otherwise one line with no reason (2026-10-26).
+        logger.error(f"Not starting: a job search run is already active (pid {conflict['pid']}, started "
+                     f"{conflict['started_at']}, {conflict['mode']}, command {conflict['argv']!r})")
         console.print(
             f"[red]A job search run is already active (pid {conflict['pid']}, started "
             f"{conflict['started_at']}, {conflict['mode']}).[/red]\n"

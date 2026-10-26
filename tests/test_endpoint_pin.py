@@ -71,9 +71,9 @@ async def test_the_pin_asks_for_the_single_turn_mix_and_floor(monkeypatch):
 async def test_a_failure_on_the_pin_moves_to_the_next_cheapest(monkeypatch, caplog):
     await _pin_from(monkeypatch, RANKED_2026_10_18)
     routing = endpoint_pin.routing_for('m/1')
-    endpoint_pin.endpoint_failed('m/1', routing, 'timed out after 180.0s')
+    assert endpoint_pin.endpoint_failed('m/1', routing, 'timed out after 180.0s'), 'the pin moved: ask again'
     assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8'
-    endpoint_pin.endpoint_failed('m/1', routing, 'a late second report of the same failure')
+    assert endpoint_pin.endpoint_failed('m/1', routing, 'a late second report of the same failure')
     assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8', 'a stale report must not drop the new pin'
     assert any('switched to morph/fp8' in r.getMessage() for r in caplog.records)
 
@@ -86,7 +86,7 @@ async def test_a_failure_to_reach_the_tool_server_keeps_the_pin(monkeypatch, err
     '''2026-10-20: the tool server died and each refused connection dropped one more endpoint.'''
     await _pin_from(monkeypatch, RANKED_2026_10_18)
     for _ in range(3):
-        endpoint_pin.endpoint_failed('m/1', endpoint_pin.routing_for('m/1'), error)
+        assert not endpoint_pin.endpoint_failed('m/1', endpoint_pin.routing_for('m/1'), error)
     assert endpoint_pin.routing_for('m/1')['provider'] == 'deepinfra/fp8'
 
 
@@ -108,16 +108,73 @@ async def test_chat_openrouter_keeps_the_pin_when_the_tool_server_is_down(monkey
     assert endpoint_pin.routing_for('m/1')['provider'] == 'deepinfra/fp8'
 
 
-async def test_an_ok_false_reply_drops_the_endpoint(monkeypatch):
+async def test_an_ok_false_reply_drops_the_endpoint_and_asks_the_next_once(monkeypatch):
     await _pin_from(monkeypatch, RANKED_2026_10_18)
+    sent = []
 
     async def refusing(url, tool_name, args, timeout_seconds=None):
+        sent.append(args.get('provider'))
         return json.dumps({'ok': False, 'error': 'provider returned 503'})
 
     monkeypatch.setattr(triage, 'call_mcp_tool', refusing)
     with pytest.raises(RuntimeError, match='provider returned 503'):
         await triage.chat_openrouter('hi', model='m/1')
-    assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8'
+    assert sent == ['deepinfra/fp8', 'morph/fp8'], 'asked once more on the new pin, then the caller falls back'
+    assert endpoint_pin.routing_for('m/1')['provider'] == 'inference-net/fp8'
+
+
+CHAT_OK = {'ok': True, 'content': 'fine', 'cost_usd': 0.0001, 'model': 'm/1', 'provider': 'Morph',
+           'finish_reason': 'stop', 'usage': {}}
+
+
+async def test_a_429_on_the_pin_is_answered_by_the_next_provider(monkeypatch):
+    '''2026-10-26: a 429 on inference-net/us moved the pin to morph, but that call went to the
+    Anthropic fallback instead of being asked of morph.'''
+    ranked = {**RANKED_2026_10_18, 'ranked': [
+        {'tag': 'inference-net/us', 'quantization': 'fp8', 'effective_price_per_million': 2.8e-7},
+        {'tag': 'inference-net/fp8', 'quantization': 'fp8', 'effective_price_per_million': 2.8e-7},
+        {'tag': 'morph/fp8', 'quantization': 'fp8', 'effective_price_per_million': 2.9e-7},
+    ]}
+    await _pin_from(monkeypatch, ranked)
+    sent = []
+
+    async def throttled_then_ok(url, tool_name, args, timeout_seconds=None):
+        sent.append(args.get('provider'))
+        if args.get('provider') == 'inference-net/us':
+            return json.dumps({'ok': False, 'error': INFERENCE_NET_429})
+        return json.dumps(CHAT_OK)
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', throttled_then_ok)
+    reply = await triage.chat_openrouter('hi', model='m/1')
+    assert reply.content == 'fine'
+    assert sent == ['inference-net/us', 'morph/fp8']
+
+
+async def test_a_tool_server_failure_is_not_asked_again(monkeypatch):
+    await _pin_from(monkeypatch, RANKED_2026_10_18)
+    sent = []
+
+    async def refused(url, tool_name, args, timeout_seconds=None):
+        sent.append(args.get('provider'))
+        raise httpx.ConnectError('All connection attempts failed')
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', refused)
+    with pytest.raises(httpx.ConnectError):
+        await triage.chat_openrouter('hi', model='m/1')
+    assert sent == ['deepinfra/fp8']
+
+
+async def test_an_unpinned_failure_is_not_asked_again(monkeypatch):
+    sent = []
+
+    async def refusing(url, tool_name, args, timeout_seconds=None):
+        sent.append(args.get('provider'))
+        return json.dumps({'ok': False, 'error': 'provider returned 503'})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', refusing)
+    with pytest.raises(RuntimeError):
+        await triage.chat_openrouter('hi', model='other/model')
+    assert sent == [None]
 
 
 async def test_a_ranking_failure_leaves_the_model_unpinned(monkeypatch):
@@ -142,7 +199,8 @@ async def test_chat_openrouter_serves_on_the_pin_and_reports_a_timeout(monkeypat
     with pytest.raises(RuntimeError):
         await triage.chat_openrouter('hi', model='m/1')
     assert sent[0]['provider'] == 'deepinfra/fp8' and sent[0]['quantization'] == 'fp8'
-    assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8'
+    assert [a['provider'] for a in sent] == ['deepinfra/fp8', 'morph/fp8']
+    assert endpoint_pin.routing_for('m/1')['provider'] == 'inference-net/fp8'
 
 
 async def test_an_unpinned_model_sends_no_provider(monkeypatch):
@@ -171,8 +229,8 @@ async def test_extract_loop_serves_on_the_pin(monkeypatch):
     candidate = {'job_id': '1', 'company': 'Acme', 'title': 'Eng', 'url': 'u', 'date_posted': '', 'snippet': ''}
     assert await extract_openrouter.extract_job_page_openrouter(
         candidate, 'text', {'cost': 0.0, 'input_tokens': 0, 'output_tokens': 0}, 'sys') is None
-    assert sent[0]['provider'] == 'deepinfra/fp8'
-    assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8'
+    assert [a['provider'] for a in sent] == ['deepinfra/fp8', 'morph/fp8'], 'asked once more on the new pin'
+    assert endpoint_pin.routing_for('m/1')['provider'] == 'inference-net/fp8'
 
 
 INFERENCE_NET_429 = ('chat failed: HTTPError: 429 Client Error: Too Many Requests for url: '

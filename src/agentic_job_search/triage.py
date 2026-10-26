@@ -202,22 +202,29 @@ async def chat_openrouter(
     args = {'messages': messages, 'model': model}
     if max_tokens is not None:
         args['max_tokens'] = max_tokens
-    routing = routing_for(model)
-    args.update(routing)
-    try:
-        raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=timeout_seconds)
-    except Exception as ex:
-        endpoint_failed(model, routing, ex)
-        raise
-    try:
-        data = json.loads(raw)
-    except ValueError as ex:
-        raise ValueError(f'OpenRouter chat reply for {model} is not JSON ({ex}): '
-                         f'{quote_for_error(raw, "OpenRouter chat reply")!r}') from ex
-    if not isinstance(data, dict):
-        raise ValueError(f'OpenRouter chat reply for {model} is not an object: {quote_for_error(raw, "OpenRouter chat reply")!r}')
-    if data.get('ok') is not True:
-        endpoint_failed(model, routing, str(data.get('error') or raw))
+    retried = False
+    while True:
+        routing = routing_for(model)
+        try:
+            raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', {**args, **routing},
+                                      timeout_seconds=timeout_seconds)
+        except Exception as ex:
+            if endpoint_failed(model, routing, ex) and not retried:
+                retried = True
+                continue
+            raise
+        try:
+            data = json.loads(raw)
+        except ValueError as ex:
+            raise ValueError(f'OpenRouter chat reply for {model} is not JSON ({ex}): '
+                             f'{quote_for_error(raw, "OpenRouter chat reply")!r}') from ex
+        if not isinstance(data, dict):
+            raise ValueError(f'OpenRouter chat reply for {model} is not an object: {quote_for_error(raw, "OpenRouter chat reply")!r}')
+        if data.get('ok') is True:
+            break
+        if endpoint_failed(model, routing, str(data.get('error') or raw)) and not retried:
+            retried = True
+            continue
         # The whole reply, not just `error`: the server's other fields say who failed.
         raise provider_error(f'OpenRouter chat failed for {model}', quote_for_error(raw, 'OpenRouter chat failure reply'))
     _field(data, 'content', (str, type(None)), raw)
