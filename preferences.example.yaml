@@ -117,6 +117,11 @@ relocation_note: ''
 # requirement is flagged.
 current_tax_residence: ''
 
+# Countries and areas you may already live and work in without a visa, written as place names
+# (e.g. [Portugal, European Union]). Told to the evaluator, so a posting requiring residence there
+# is not warned about as an eligibility problem. Empty means the evaluator is told nothing.
+right_to_live_and_work_in: []
+
 compensation:
   # Annual base pay you are targeting, and the ISO 4217 currency it is quoted in. When BOTH are set
   # and a posting states a complete annual range in that same currency, code decides the pay

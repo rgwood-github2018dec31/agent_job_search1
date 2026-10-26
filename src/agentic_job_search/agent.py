@@ -279,6 +279,28 @@ def _sponsorship_prompt_section() -> str:
     )
 
 
+def _work_rights_prompt_section() -> str:
+    """Where the user may already live and work without a visa, or '' when none is configured.
+
+    The rater never sees the resume, and the only residence fact it otherwise gets is the tax
+    residence, and only when a posting names it. So "candidates must be based in the UK or Europe"
+    read as a person in Canada being shut out, and it warned "Residency restricted to UK/Europe —
+    Canada-based candidates not listed" to an EU citizen (job 4482482676, 2026-10-22).
+    """
+    places = preferences.right_to_live_and_work_in()
+    if not places:
+        return ''
+    joined = ', '.join(places)
+    return (
+        '\n## Work rights\n'
+        f'The candidate already has the right to live and work in: {joined} — no visa, permit or '
+        'sponsorship needed there. A requirement to reside in, be based in, or work the time zones '
+        'of any of these is NOT an eligibility problem and NOT a reason to lower the rating: do not '
+        'write a warning bullet about it. A residence requirement pinned to one specific country is '
+        'detected for you as a `Relocation required:` line; do not restate it either.\n'
+    )
+
+
 def build_interactive_instructions() -> str:
     '''Interactive-mode system prompt with the configured sponsorship rule injected.'''
     return AGENT_INSTRUCTIONS_INTERACTIVE_TEMPLATE.format(
@@ -610,7 +632,7 @@ Do not rate the job. Extract this one posting, submit it, then stop.
 
 EVALUATOR_INSTRUCTIONS_TEMPLATE = '''You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not
 need to browse anywhere.
-{sponsorship_section}{relocation_section}
+{sponsorship_section}{work_rights_section}{relocation_section}
 ## Workplace type
 Check the `Workplace:` and `Location:` lines. Any requirement to be in an office some days a week is **hybrid**, even if the listing is badged "Remote".
 
@@ -743,6 +765,7 @@ def build_evaluator_instructions() -> str:
 
     return EVALUATOR_INSTRUCTIONS_TEMPLATE.format(
         sponsorship_section=sponsorship_section,
+        work_rights_section=_work_rights_prompt_section(),
         relocation_section=relocation_section,
         hybrid_locations_section=hybrid_locations_section,
     )
@@ -2566,8 +2589,8 @@ _AREA_WORDS = (
 )
 # What may sit between a preposition and an area name: one determiner and one adjective, so
 # "within our EMEA region" and "in the wider Europe" still read as area wording. Deliberately only
-# ONE filler word -- widen it and "based in Germany or Europe" starts reading as area-wide, where
-# country_only is the conservative answer for a mixed statement.
+# ONE filler word: "Germany or Europe" is not read through this filler but through `_OR_AREA`
+# below, which names the "or" it depends on.
 #
 # Shared by both patterns ON PURPOSE. The negative lookahead below and the area patterns must
 # agree on what an area name looks like: when they drifted apart, "remote within our EMEA region"
@@ -2577,13 +2600,29 @@ _AREA_LEAD = r'(?:the\s+|an?\s+|our\s+|your\s+)?(?:\w+\s+)?'
 # `country_only` on 2026-10-20, overriding the extractor's `area_wide`. It says nothing about where
 # the holder must live, so it is excluded from the country object and left to the extractor.
 _TIMEZONE_WORDS = r'(?:GMT|UTC|CES?T|EES?T|WES?T|BST|[ECMP][SD]T|time\s*zones?)'
-_NOT_AREA = r'(?!' + _AREA_LEAD + r'(?:' + _AREA_WORDS + r'|' + _TIMEZONE_WORDS + r')\b)'
+# "the UK or Europe", "Germany/EU": a place OR an area offers at least the whole area, so it is
+# area-wide. Until 2026-10-26 a mixed statement read as `country_only`, the "conservative" answer,
+# and that overrode the extractor's correct `area_wide` for Mimica's "candidates must be based in
+# the UK or Europe" (job 4482482676). Both patterns use this one fragment: the country patterns
+# refuse it as their object and the area pattern claims it, so it cannot fall between them.
+# At most two words before the "or" ('United Kingdom'); "only" ends the statement, so
+# "based in Germany only, or Europe for contractors" is not covered and stays `country_only`.
+_OR_AREA = (
+    r'(?:the\s+)?(?!only\b)[^\W\d_]+(?:\s+(?!only\b)[^\W\d_]+)?(?:\s+or\s+|\s*/\s*)'
+    + _AREA_LEAD + _AREA_WORDS + r'\b'
+)
+_NOT_AREA = (
+    r'(?!' + _AREA_LEAD + r'(?:' + _AREA_WORDS + r'|' + _TIMEZONE_WORDS + r')\b|' + _OR_AREA + r')'
+)
 
 _AREA_WIDE_RE = re.compile(
     r'\b(?:work|working|remote|based|located|reside|residing|hire[sd]?|employed|eligible)\s+'
     r'(?:from|in|within|across|throughout|anywhere\s+in|to)\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
     r'|\banywhere\s+in\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
     r'|\b(?:work|remote|based|hire[sd]?|located)\s+(?:from\s+)?anywhere\b'
+    # Every verb `_COUNTRY_ONLY_RE` pins with, so what it refuses through `_NOT_AREA` lands here.
+    r'|\b(?:work|working|remote|based|located|resident|reside|residing|live|living|hire[sd]?|employed|eligible)'
+    r'\s+(?:from|in|within|across|throughout|to)\s+' + _OR_AREA +
     r'|\bany\s+(?:\w+\s+){0,2}?' + _EUROPE_WORDS + r'(?:\s+\w+){0,2}?\s+country\b'
     r'|\b' + _EUROPE_WORDS + r'\s+(?:or|and)\s+(?:the\s+)?'
     # US/USA stay OUT of `_AREA_WORDS`: alone they name one country, and "must be based in the
@@ -3524,6 +3563,27 @@ def salary_meets_target(extract: dict) -> bool | None:
     return facts['maximum'] >= amount
 
 
+def estimate_meets_target(extract: dict) -> bool | None:
+    """Whether the model estimate shown for a posting with no figure reaches the base target by its
+    UPPER bound -- salary_meets_target's rule; None when code cannot decide.
+
+    Read from the estimate's own figures when it is in the target currency, else from its
+    code-computed conversion into that currency. Annual only. None -- no estimate, no target,
+    another period, no conversion -- keeps the rater's labelled guess visible, so a failure shows
+    more rather than less. Its one use is to DROP that guess (merge_salary_warning); it never adds
+    a warning, a cap or a gate, and it runs after rating, so it never reaches the rater.
+    """
+    target = preferences.salary_target()
+    estimate = extract.get('salary_estimate')
+    if target is None or not estimate or estimate.get('period') != 'year':
+        return None
+    amount, currency = target
+    figures = estimate if estimate.get('currency') == currency else estimate.get('conversion')
+    if not figures or figures.get('currency') != currency or figures.get('maximum') is None:
+        return None
+    return figures['maximum'] >= amount
+
+
 def below_target_salary_warning(extract: dict) -> str | None:
     '''The code-emitted below-target line, or None unless code decided the range falls short.'''
     if salary_meets_target(extract) is not False:
@@ -3702,8 +3762,26 @@ def _drop_trailing_salary_absence(warning: str) -> str:
     return ';'.join([head, *kept]).strip() if len(kept) < len(tails) else warning
 
 
+# Marks the rater's pay judgement where it is folded into a code-decided salary line, so it is
+# never mistaken for the posting's figure or for the separate `model estimate` on the 💰 line. The
+# two used to sit unlabelled side by side and contradict each other (job 4482482676, 2026-10-26).
+RATER_SALARY_GUESS_LABEL = "rater's guess"
+# A leading absence clause cut off a folded guess, up to its separator or 'and': 'No salary
+# stated; EU bands often below target' -> 'EU bands often below target'. The code line already
+# says it.
+_LEADING_SALARY_ABSENCE_CLAUSE_RE = re.compile(
+    _SALARY_ABSENCE_LEAD_RE.pattern + r'[^;:,—–]*?(?:[;:,—–]|\s+and\b)\s*', re.IGNORECASE)
+
+
+def _rater_guess(bullet: str) -> str:
+    """The rater's salary bullet without a leading 'no salary listed' clause, when anything is left."""
+    rest = _LEADING_SALARY_ABSENCE_CLAUSE_RE.sub('', bullet, count=1).strip()
+    return rest or bullet
+
+
 def merge_salary_warning(
-    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False
+    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False,
+    estimate_on_target: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Fold the rater's salary bullets into the one salary line code emitted.
 
@@ -3719,8 +3797,14 @@ def merge_salary_warning(
     `salary_on_target` is code's own verdict that the range reaches the target (see
     salary_meets_target). Then every rater salary bullet is dropped: the pay question is settled,
     and what the rater writes about it is a midpoint or lower-half complaint the user rejected.
+
+    `estimate_on_target` is the same verdict on the model estimate shown for a posting with no
+    figure (see estimate_meets_target). It drops the rater's guess too, leaving the plain code
+    line: two model guesses on pay that disagree help nobody, and the estimate is the one the
+    user sees as a figure (2026-10-26). It can only REMOVE a rater bullet, never add one.
+    Otherwise the folded guess is labelled RATER_SALARY_GUESS_LABEL.
     """
-    if salary_on_target:
+    if salary_on_target or estimate_on_target:
         llm_warnings = [_drop_trailing_salary_absence(str(w)) for w in llm_warnings]
         return deterministic, [w for w in llm_warnings if not _is_salary_bullet(str(w))]
     code_line = next((w for w in deterministic if is_code_emitted_salary_warning(w)), '')
@@ -3732,24 +3816,22 @@ def merge_salary_warning(
     estimate = next((str(w).strip() for w in salary_bullets if _SALARY_JUDGEMENT_RE.search(str(w))), '')
     if not estimate:
         return deterministic, others
-    # An estimate that already leads with the absence replaces the line outright; anything else is
-    # appended, so the code-decided fact keeps the front of the bullet.
-    merged_line = (
-        estimate if code_line == NO_SALARY_WARNING and _SALARY_ABSENCE_LEAD_RE.search(estimate)
-        else f'{code_line} — {estimate}'
-    )
+    # Appended after the code-decided fact, labelled, with any restated absence cut off its front.
+    merged_line = f'{code_line} — {RATER_SALARY_GUESS_LABEL}: {_rater_guess(estimate)}'
     return [merged_line if w == code_line else w for w in deterministic], others
 
 
 def merge_warnings(
-    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False
+    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False,
+    estimate_on_target: bool = False,
 ) -> list[str]:
     """Deterministic warnings first, then the rater's, dropping case-insensitive duplicates.
 
     The rater's salary bullets are folded into the deterministic salary line first (see
     merge_salary_warning), since a paraphrase never matches exactly.
     """
-    deterministic, llm_warnings = merge_salary_warning(deterministic, llm_warnings, salary_on_target)
+    deterministic, llm_warnings = merge_salary_warning(
+        deterministic, llm_warnings, salary_on_target, estimate_on_target)
     merged: list[str] = []
     seen: set[str] = set()
     for warning in [*deterministic, *llm_warnings]:
@@ -3779,30 +3861,47 @@ _SALARY_LINE_SUFFIX_BY_KIND = {
 }
 
 
-def format_amount_bounds(minimum: float | None, maximum: float | None) -> str:
-    """'148,000 - 176,000', or the one amount when only one bound exists or both are equal."""
+_THOUSAND = 1000
+
+
+def _format_amount(amount: float, thousands: bool) -> str:
+    """'148,000', or '148k' with `thousands` -- only for an amount of a thousand or more that a
+    thousand divides to at most one decimal, so '87.5k' but never a rounded '87.6k' for 87,550."""
+    if thousands and amount >= _THOUSAND and float(amount * 10 / _THOUSAND).is_integer():
+        in_thousands = amount / _THOUSAND
+        return f'{int(in_thousands):,}k' if in_thousands.is_integer() else f'{in_thousands:,.1f}k'
+    return f'{int(amount):,}' if float(amount).is_integer() else f'{amount:,}'
+
+
+def format_amount_bounds(minimum: float | None, maximum: float | None, thousands: bool = False) -> str:
+    """'148,000 - 176,000' ('148k - 176k' with `thousands`), or the one amount when only one bound
+    exists or both are equal."""
     amounts = [
-        f'{int(amount):,}' if float(amount).is_integer() else f'{amount:,}'
+        _format_amount(amount, thousands)
         for amount in dict.fromkeys(a for a in (minimum, maximum) if a is not None)
     ]
     return ' - '.join(amounts)
 
 
-def format_salary_conversion(conversion: dict | None) -> str:
+def format_salary_conversion(conversion: dict | None, thousands: bool = False) -> str:
     """'(≈ CAD 148,000 - 176,000)' for a code-computed conversion, or '' when there is none."""
     if not conversion:
         return ''
-    return f"(≈ {conversion['currency']} {format_amount_bounds(conversion['minimum'], conversion['maximum'])})"
+    bounds = format_amount_bounds(conversion['minimum'], conversion['maximum'], thousands)
+    return f"(≈ {conversion['currency']} {bounds})"
 
 
 def format_salary_estimate(estimate: dict) -> str:
-    """'PLN 250,000 - 320,000 per year (≈ CAD 88,000 - 113,000)' — the model's estimate, in its
-    own currency, with the code-computed conversion appended when one applies."""
-    text = (
-        f"{estimate['currency']} {format_amount_bounds(estimate['minimum'], estimate['maximum'])} "
-        f"per {estimate['period']}"
-    )
-    if conversion := format_salary_conversion(estimate.get('conversion')):
+    """'PLN 250k - 320k per year (≈ CAD 88k - 113k)' — the model's estimate, in its own currency,
+    with the code-computed conversion appended when one applies.
+
+    In thousands (2026-10-26, the user's request): an estimate is a model's round guess, so its
+    trailing zeros carry no information and only make the line harder to read. A figure the posting
+    states is never shortened -- it is shown as extracted.
+    """
+    bounds = format_amount_bounds(estimate['minimum'], estimate['maximum'], thousands=True)
+    text = f"{estimate['currency']} {bounds} per {estimate['period']}"
+    if conversion := format_salary_conversion(estimate.get('conversion'), thousands=True):
         text = f'{text} {conversion}'
     return text
 
@@ -3823,7 +3922,7 @@ def format_salary_line(extract: dict) -> str:
     facts = salary_facts_of(extract)
     if facts['kind'] == 'absent' or not facts['text']:
         if estimate := extract.get('salary_estimate'):
-            return f'💰 Not listed — model estimate: {format_salary_estimate(estimate)}'
+            return f'💰 Model estimate: {format_salary_estimate(estimate)}'
         return ''
     text = snippet(facts['text'], NOTIFICATION_SALARY_MAX_CHARS)
     if conversion := format_salary_conversion(extract.get('salary_conversion')):
@@ -4404,11 +4503,6 @@ async def evaluate_all_candidates(
                 )
                 deterministic.insert(0, repost_warning(repost))
 
-            warnings = merge_warnings(
-                deterministic,
-                [str(w) for w in (result.get('warnings') or [])],
-                salary_on_target=salary_meets_target(extract) is True,
-            )
             # What the 💰 line adds to the posting's own figure. Only for a job at the
             # notification threshold (a suppressed repost included: its saved file is the one
             # place it is seen), and only now, after rating. A failure here costs the extra figure,
@@ -4424,6 +4518,14 @@ async def evaluate_all_candidates(
                         f"(job {candidate['job_id']}), notifying without a conversion or estimate: "
                         f'{type(ex).__name__}: {ex}'
                     )
+            # Merged only now, after the pay display: an estimate reaching the target drops the
+            # rater's own pay guess. The estimate still ran after rating, so the rater never saw it.
+            warnings = merge_warnings(
+                deterministic,
+                [str(w) for w in (result.get('warnings') or [])],
+                salary_on_target=salary_meets_target(extract) is True,
+                estimate_on_target=estimate_meets_target(extract) is True,
+            )
             pay_lines = format_pay_lines(extract)
             content = (
                 f"# {result['title']} at {result['company']} — rating {rating}/5\n\n"

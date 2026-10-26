@@ -5875,14 +5875,83 @@ def test_merge_warnings_salary_estimate_replaces_the_code_line_in_place():
     )
     assert merged == [
         'Hybrid — Netherlands',
-        'No salary listed; Poland-market pay likely well below CAD $210K target',
+        "No salary listed — rater's guess: Poland-market pay likely well below CAD $210K target",
         'Posted by a recruiting agency — actual hiring company not named',
     ]
 
 
 def test_merge_warnings_prefixes_an_estimate_that_does_not_state_the_absence():
     merged = agent.merge_warnings(['No salary listed'], ['Poland-market pay likely well below CAD $210K target'])
-    assert merged == ['No salary listed — Poland-market pay likely well below CAD $210K target']
+    assert merged == ["No salary listed — rater's guess: Poland-market pay likely well below CAD $210K target"]
+
+
+def _estimate(maximum_cad: float | None, period: str = 'year') -> dict:
+    conversion = None if maximum_cad is None else {
+        'currency': 'CAD', 'from_currency': 'DKK', 'minimum': 169_000.0, 'maximum': maximum_cad,
+        'rate': 4.7, 'rate_date': '2026-10-22',
+    }
+    return {'currency': 'DKK', 'minimum': 800_000.0, 'maximum': 1_150_000.0, 'period': period,
+            'conversion': conversion}
+
+
+@pytest.mark.parametrize('estimate,expected', [
+    (_estimate(242_000.0), True),
+    (_estimate(TEST_BASE_TARGET - 5_000.0), False),
+    (_estimate(None), None),
+    (_estimate(242_000.0, period='hour'), None),
+    (None, None),
+])
+def test_estimate_meets_target_by_its_converted_upper_bound(salary_target_set, estimate, expected):
+    assert agent.estimate_meets_target(_make_extract(salary_estimate=estimate)) is expected
+
+
+def test_estimate_meets_target_reads_an_estimate_in_the_target_currency(salary_target_set):
+    estimate = {'currency': 'CAD', 'minimum': 180_000.0, 'maximum': 230_000.0, 'period': 'year',
+                'conversion': None}
+    assert agent.estimate_meets_target(_make_extract(salary_estimate=estimate)) is True
+
+
+def test_a_raters_pay_guess_loses_a_leading_absence_joined_by_and():
+    """The 2026-10-26 Proxify replay: 'No pay figure and contractor marketplace rates …'."""
+    merged = agent.merge_warnings(
+        ['No salary listed'],
+        ['No pay figure and contractor marketplace rates likely land below the CAD $210K base target'],
+    )
+    assert merged == [
+        "No salary listed — rater's guess: contractor marketplace rates likely land below the CAD $210K base target"]
+
+
+def test_an_estimate_on_target_drops_the_raters_pay_guess():
+    """Job 4482482676 (2026-10-26): the estimate read ≈ CAD 169k - 242k while the rater's bullet said
+    'EU senior ML bands often below CAD $210K target'. The plain code line stays."""
+    merged = agent.merge_warnings(
+        ['No salary listed'],
+        ['No salary stated; EU senior ML bands often below CAD $210K target', 'Stack is mostly Java'],
+        estimate_on_target=True,
+    )
+    assert merged == ['No salary listed', 'Stack is mostly Java']
+
+
+def test_a_raters_pay_guess_is_labelled_when_the_estimate_does_not_settle_it():
+    merged = agent.merge_warnings(
+        ['No salary listed'], ['No salary stated; EU senior ML bands often below CAD $210K target'],
+    )
+    assert merged == ["No salary listed — rater's guess: EU senior ML bands often below CAD $210K target"]
+
+
+@pytest.mark.parametrize('minimum,maximum,expected', [
+    (800_000.0, 1_150_000.0, '800k - 1,150k'),
+    (87_500.0, 92_000.0, '87.5k - 92k'),
+    (87_550.0, 92_000.0, '87,550 - 92k'),
+    (85.0, 95.0, '85 - 95'),
+])
+def test_format_amount_bounds_in_thousands_never_rounds(minimum, maximum, expected):
+    assert agent.format_amount_bounds(minimum, maximum, thousands=True) == expected
+
+
+def test_a_stated_salary_conversion_keeps_full_figures():
+    conversion = {'currency': 'CAD', 'minimum': 148_000.0, 'maximum': 176_000.0}
+    assert agent.format_salary_conversion(conversion) == '(≈ CAD 148,000 - 176,000)'
 
 
 def test_merge_warnings_keeps_exactly_one_salary_line():
@@ -5890,7 +5959,7 @@ def test_merge_warnings_keeps_exactly_one_salary_line():
         ['No salary listed'],
         ['No salary listed — compensation unknown', 'No salary stated; Spain comp likely below CAD $210K base target'],
     )
-    assert merged == ['No salary stated; Spain comp likely below CAD $210K base target']
+    assert merged == ["No salary listed — rater's guess: Spain comp likely below CAD $210K base target"]
 
 
 @pytest.mark.parametrize('warning', [
@@ -6085,10 +6154,28 @@ def test_sponsorship_prompt_prints_place_names_as_written(monkeypatch):
     assert 'Usa' not in section
 
 
+def test_evaluator_prompt_states_work_rights_as_written(monkeypatch):
+    """The rater never sees the resume, so it read 'must be based in the UK or Europe' as shutting
+    out an EU citizen living in Canada (job 4482482676, 2026-10-22)."""
+    monkeypatch.setattr(preferences, 'right_to_live_and_work_in', lambda: ('Canada', 'European Union'))
+    evaluator = agent.build_evaluator_instructions()
+    assert '## Work rights' in evaluator
+    assert 'right to live and work in: Canada, European Union' in evaluator
+
+
+def test_right_to_live_and_work_in_rejects_a_non_list(monkeypatch):
+    merged = preferences._deep_merge(
+        preferences.load_preferences(), {'right_to_live_and_work_in': 'Canada, European Union'})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    with pytest.raises(ValueError, match='right_to_live_and_work_in'):
+        preferences.right_to_live_and_work_in()
+
+
 def test_prompts_omit_personal_sections_without_preferences(neutral_preferences):
     evaluator = agent.build_evaluator_instructions()
     assert 'visa sponsorship' not in evaluator
     assert 'There is nowhere the candidate would commute to' in evaluator
+    assert '## Work rights' not in evaluator
     assert 'visa sponsorship' not in agent.build_interactive_instructions()
     scraper = agent.build_scraper_instructions()
     assert '&location=' not in scraper, 'no region configured means an unfiltered search'
@@ -6509,9 +6596,15 @@ def test_derive_residency_scope_over_real_postings(location, relocation, expecte
     ('Germany (Remote within our EMEA region)', 'area_wide'),
     # ...but "any" alone is not an area offer. Offices are specific places.
     ('Spain (Remote — based in any of our offices)', ''),
-    # Only one filler word, deliberately: country_only is the conservative reading of a mixed
-    # statement, and widening this makes "Germany or Europe" read as area-wide.
-    ('Germany (Remote) — must be based in Germany or Europe', 'country_only'),
+    # A place OR an area offers at least the whole area (2026-10-26, Mimica, job 4482482676).
+    ('Germany (Remote) — must be based in Germany or Europe', 'area_wide'),
+    ('Denmark (Remote — candidates must be based in the UK or Europe, time zones compatible with '
+     'London, UTC-1 to UTC+3)', 'area_wide'),
+    ('Spain (Remote) — must be based in the United Kingdom or EU', 'area_wide'),
+    ('Poland (Remote) — must live in Poland/EU', 'area_wide'),
+    # ...but "only" closes the statement before the "or".
+    ('Germany (Remote) — must be based in Germany only', 'country_only'),
+    ('Germany (Remote) — must be based in Germany only or Europe', 'country_only'),
     # A time-zone band is not a country object (2026-10-20, Recrucial).
     ('Portugal (Remote — work from anywhere within GMT-1 to GMT+4)', 'area_wide'),
     ('Germany (Remote within the UTC+1 time zone)', ''),
@@ -10553,7 +10646,7 @@ def test_the_salary_line_shows_a_single_figure_conversion_once():
 def test_the_salary_line_labels_an_estimate_as_the_models():
     extract = _make_extract(salary='Competitive salary', salary_estimate=TEST_PLN_ESTIMATE)
     message = agent.format_job_notification(_make_candidate(), extract, 4, [], ['No salary listed'])
-    assert '💰 Not listed — model estimate: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000)\n' in message
+    assert '💰 Model estimate: PLN 250k - 320k per year (≈ CAD 100k - 128k)\n' in message
     assert '• No salary listed' in message, 'the estimate does not replace the warning'
     assert TEST_PLN_ESTIMATE['basis'] not in message, 'model free text stays out of the message'
 
@@ -10561,7 +10654,7 @@ def test_the_salary_line_labels_an_estimate_as_the_models():
 def test_the_salary_line_shows_an_estimate_in_a_kept_currency_unconverted():
     estimate = dict(TEST_PLN_ESTIMATE, currency='EUR', minimum=90_000.0, maximum=110_000.0, conversion=None)
     message = agent.format_job_notification(_make_candidate(), _make_extract(salary_estimate=estimate), 4, [], [])
-    assert '💰 Not listed — model estimate: EUR 90,000 - 110,000 per year\n' in message
+    assert '💰 Model estimate: EUR 90k - 110k per year\n' in message
 
 
 def test_an_estimate_never_displaces_a_figure_the_posting_states():
@@ -10575,7 +10668,7 @@ def test_the_saved_job_records_the_rate_and_the_estimating_model():
     lines = agent.format_pay_lines(_make_extract(salary_conversion=TEST_GBP_CONVERSION, salary_estimate=TEST_PLN_ESTIMATE))
     assert lines == [
         f'Salary conversion: ≈ CAD 160,000 - 190,000 (1 CAD = 0.5 GBP, rate of {TEST_FX_RATE_DATE})',
-        'Estimated salary: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000) — model estimate by '
+        'Estimated salary: PLN 250k - 320k per year (≈ CAD 100k - 128k) — model estimate by '
         'test/estimator, not stated in the posting; basis: Staff-level AI engineering at a Warsaw scale-up',
     ]
     assert agent.format_pay_lines(_make_extract()) == []
@@ -10642,9 +10735,9 @@ async def test_stage_2_estimates_pay_for_a_notified_job_with_no_salary(monkeypat
 
     assert page_texts == ['Staff Engineer\nAbout the job\nBuild agents.'], 'the estimator reads the full page'
     assert len(notifications) == 1
-    assert '💰 Not listed — model estimate: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000)' in notifications[0]
+    assert '💰 Model estimate: PLN 250k - 320k per year (≈ CAD 100k - 128k)' in notifications[0]
     assert '• No salary listed' in notifications[0]
-    assert 'Estimated salary: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000) — model estimate by' in saved[0]['content']
+    assert 'Estimated salary: PLN 250k - 320k per year (≈ CAD 100k - 128k) — model estimate by' in saved[0]['content']
     assert len(rater_inputs) == 1 and '250,000' not in rater_inputs[0], 'the estimate must not reach the rater'
 
 
@@ -10683,7 +10776,7 @@ async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repo
     await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), {})
 
     assert notifications == []
-    assert 'Estimated salary: PLN 250,000 - 320,000 per year' in saved[0]['content']
+    assert 'Estimated salary: PLN 250k - 320k per year' in saved[0]['content']
 
 
 async def test_stage_2_still_notifies_when_the_pay_display_fails(monkeypatch, caplog):

@@ -54,7 +54,8 @@ anything a rule covers.
   the rater's own bullets, which rounded one bound and led with the other. Two things may follow
   the extracted text, each labelled as what it is and neither replacing it: a conversion code
   computed from a published rate (`≈`), and, only when the posting states no figure, a
-  `model estimate`. Neither may reach the rater, a cap, a gate or a warning. See Notify User of
+  `model estimate`. Neither may reach the rater, a cap, a gate or a warning — except that an
+  estimate reaching the base target drops the rater's own pay guess. See Notify User of
   Match, Classify Salary, Convert Salary Currency and Estimate Pay Range in
   [docs/requirements.md](docs/requirements.md#use-cases).
 - **Every `ClaudeAgentOptions` site passes `setting_sources=[]`, `strict_mcp_config=True` and
