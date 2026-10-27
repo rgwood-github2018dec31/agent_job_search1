@@ -172,6 +172,11 @@ _FLOOR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# An amount labelled as the base, ahead of a bonus or on-target figure: '€135,000 base + €15,000
+# bonus (OTE €150,000) per year' states one base salary. Three amounts and no direction marker
+# left it `unclassified` twice, and the model agreed (2026-10-19, 2026-10-20).
+_BASE_LABEL_RE = re.compile(r'\s*(?:base|basic)(?:\s+(?:salary|pay))?\b', re.IGNORECASE)
+
 # Tier 7: a lone amount counts as a salary only when something marks it as money — a currency, a
 # period, or a k/m magnitude. Without one, '12-month contract / Outside IR35' would read as pay.
 _MONETARY_MARKER_RE = re.compile(
@@ -221,6 +226,8 @@ Rules:
 - Write amounts at full magnitude: "75K" is 75000, "€1.2M" is 1200000.
 - A bare "$" is ambiguous. Leave `currency` empty unless the text names one.
 - `period` is the pay period the amounts are quoted per, empty when the text does not say.
+- When the text separates base pay from a bonus, commission or OTE (on-target earnings), report
+  only the base amount(s); never the bonus or the OTE.
 - `quote` is copied from the text above, unchanged. Code checks the amounts against it and
   discards an answer whose quote it cannot find in the text, so give no amount you cannot quote.
 '''
@@ -357,6 +364,11 @@ def classify_salary(text: str) -> dict[str, Any]:
                           currency=currency, period=period)
         if _FLOOR_RE.search(stripped):
             return _facts('floor_only', raw, 'deterministic', minimum=amounts[0],
+                          currency=currency, period=period)
+        first = next(m for m in _AMOUNT_WITH_SUFFIX_RE.finditer(stripped)
+                     if parse_amount(m.group('digits'), m.group('suffix') or '') is not None)
+        if _BASE_LABEL_RE.match(stripped, first.end()) and not _NON_PAY_AMOUNT_RE.search(stripped):
+            return _facts('single', raw, 'deterministic', minimum=amounts[0], maximum=amounts[0],
                           currency=currency, period=period)
         if len(amounts) == 1 and not _NON_PAY_AMOUNT_RE.search(stripped):
             return _facts('single', raw, 'deterministic', minimum=amounts[0], maximum=amounts[0],

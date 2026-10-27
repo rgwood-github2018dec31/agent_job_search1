@@ -61,7 +61,8 @@ anything a rule covers.
   the rater's own bullets, which rounded one bound and led with the other. Two things may follow
   the extracted text, each labelled as what it is and neither replacing it: a conversion code
   computed from a published rate (`≈`), and, only when the posting states no figure, a
-  `model estimate`. Neither may reach the rater, a cap, a gate or a warning. See Notify User of
+  `model estimate`. Neither may reach the rater, a cap, a gate or a warning — except that an
+  estimate reaching the base target drops the rater's own pay guess. See Notify User of
   Match, Classify Salary, Convert Salary Currency and Estimate Pay Range in
   [docs/requirements.md](docs/requirements.md#use-cases).
 - **Every `ClaudeAgentOptions` site passes `setting_sources=[]`, `strict_mcp_config=True` and
@@ -120,6 +121,7 @@ python main.py -n --audit-opus 2  # Non-interactive + re-rate 2 un-surfaced jobs
 python main.py -n --no-version-check  # Skip the startup check for a newer @playwright/mcp than the pin
 python main.py -n --job-audit 4480376713  # Render the end-of-run Job Audit PDF for this job (default: a random rated one)
 python main.py -n --no-job-audit       # Skip the end-of-run Job Audit PDF
+python main.py --job-ids FILE  # Diagnostic: rate the listed LinkedIn job ids (job_id[<TAB>title<TAB>company]) into run_dir/replays/; no dedup records, no Telegram
 
 # Tests
 uv run pytest                          # Run all tests; each marked group self-skips if unavailable
@@ -141,7 +143,7 @@ src/agentic_job_search/
   agent.py                        # Orchestration, prompts, pipeline stages
   tools_generic.py                # Tool implementations and MCP server factories
   triage.py                       # Local triage and non-Anthropic rating calls (MCP client lives in utils_tools_n_agents_common)
-  endpoint_pin.py                 # Per-run OpenRouter endpoint choice for MODEL_NAME_SINGLE_TURN (speed/price thirds rule)
+  endpoint_pin.py                 # Per-run OpenRouter endpoint choice for MODEL_NAME_SINGLE_TURN (asks the tool server's rank_providers)
   scrape_openrouter.py            # Stage 1b: OpenRouter function-calling scraper loop (default path)
   snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
@@ -152,20 +154,25 @@ src/agentic_job_search/
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
   location.py                     # Cached geographic classifier for a job's location
+  location_review.py              # Advisory hygiene check of the country lists in preferences (recommends, never enforces)
+  company_domain.py               # Company identity (domain, parent) for already-applied matching; cached, LinkedIn About page first
   salary.py                       # Salary reading: deterministic tiers, cached LLM only for the rest
   fx.py                           # Display-only currency conversion of a salary: daily rate table, fails open
   salary_estimate.py              # Model pay estimate for a notified posting with no salary; cached per job, gates nothing
   text_budget.py                  # Reported truncation: truncate_reported, pages_to_prompt, snippet
+  cache_io.py                     # Fail-open load/save of the YAML-mapping caches (location, salary, salary_estimate, fx)
   system_sleep.py                 # Holds a no-idle-sleep assertion for the run; logs and alerts a sleep it could not stop
 scripts/
-  migrate_applied_jobs.py         # One-time reviewable move of applied-job PDFs into run_dir
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
   backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
   replay_evidence.py              # Re-extracts retained pages live; per-field citation outcomes (costs cents)
+  release_stuck_eval_errors.py    # One-time release of jobs stuck in processed_jobs/ by a pre-2026-10-09 eval_error
   job_trace_report.py             # Job Audit PDF for one job (uv run --with reportlab)
+  release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
 tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
+  test_cache_io.py                # cache_io fail-open contract: missing/empty/unreadable/non-mapping loads, unwritable saves
   test_evidence.py                # Citation matching, LLM relocation, rejection
   test_job_audit.py               # Job choice, render failure, report rendering (with reportlab)
 docs/
@@ -182,16 +189,17 @@ run_dir/
   salary_cache.yaml               # Cached salary reading per salary string (kind/bounds/currency/period)
   fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
+  company_identities.yaml         # Company identity per LinkedIn slug and per name (domain/parent/source); hand-editable, `source: manual` is kept
   raw_postings/                   # Per job: .html page archive (JS-free) + .txt text the extractor read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
-  recruiter_notifications.yaml    # Agency postings already notified (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
+  recruiter_notifications.yaml    # Postings already notified, any poster (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
   eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error (EVAL_ERROR_MAX_RELEASES)
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
   job_audits/                     # One Job Audit PDF per run: every step that decided one job's rating
-  replays/                        # scripts/replay_evidence.py reports
+  replays/                        # --job-ids output (job-ids-{timestamp}/ with saved postings and the REPLAY_*_FILENAME files) and scripts/replay_evidence.py reports
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
 ```
 
@@ -212,6 +220,7 @@ measurements) are in git history: `git show dd14c73:docs/diagnoses/README.md`.
 | Salary parsing, `salary.py`, `fx.py`, `salary_estimate.py`, the `💰` line, raw-posting retention | Classify Salary, Convert Salary Currency, Estimate Pay Range, Retain Raw Posting Text, Check Salary Provenance, Build Deterministic Warnings, Notify User of Match; NFRs A matching rule fails silently permissive, No silent truncation |
 | `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks | NFRs Resilience, Observability |
 | A new `ClaudeAgentOptions` / `sdk_query` site, or an SDK tool schema | NFRs Cost efficiency, Observability, Anti-fabrication |
+| Already-applied matching, `company_domain.py`, LinkedIn company About pages | Resolve Company Identity, Match Applied Company, Deduplicate by Poster Identity; NFR Account safety |
 | Applied-job ingest or the reference profile | [docs/architecture.md](docs/architecture.md); Summarize Reference Jobs |
 | Tests or test fixtures | NFR Tests must be able to fail |
 | `PLAYWRIGHT_MCP_VERSION`, the `mcp` pin, startup checks | Check Browser Toolchain Version; NFR Dependency pinning |

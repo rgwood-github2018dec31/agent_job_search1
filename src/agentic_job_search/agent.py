@@ -14,8 +14,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, aclosing
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, NoReturn
@@ -27,6 +28,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    McpSdkServerConfig,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
@@ -51,11 +53,24 @@ from utils_tools_n_agents_common.telegram_client import send_message as telegram
 
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
-from agentic_job_search import endpoint_pin, evidence, fx, job_audit, job_trace, location, location_review, scrape_openrouter, system_sleep
+from agentic_job_search import (
+    company_domain,
+    endpoint_pin,
+    evidence,
+    fx,
+    job_audit,
+    job_trace,
+    location,
+    location_review,
+    scrape_openrouter,
+    system_sleep,
+)
+from agentic_job_search.company_domain import CompanyIdentity
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
     AUDIT_OPUS_SAMPLE_SIZE,
+    COMPANY_ABOUT_PAGE_DELAY_SECONDS,
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_CITED_FIELDS,
@@ -78,6 +93,7 @@ from agentic_job_search.config import (
     NARRATION_MESSAGE_MAX_LINES,
     NARRATION_WARNING_REPLAY_MAX_CHARS,
     NOTIFICATION_POSTED_MAX_CHARS,
+    NOTIFICATION_RECRUITER_MARKER,
     NOTIFICATION_SALARY_MAX_CHARS,
     PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS,
     PLAYWRIGHT_MAX_RESTARTS_PER_RUN,
@@ -96,6 +112,8 @@ from agentic_job_search.config import (
     REFERENCE_SUMMARY_MAX_CHARS,
     REFERENCE_SUMMARY_RETRY_SHARE,
     REGION_OVERLAP_ALERT_THRESHOLD,
+    REPLAY_NOTIFICATIONS_FILENAME,
+    REPLAY_SUMMARY_FILENAME,
     SALARY_ESTIMATE_ENABLED,
     SALARY_FIELD_DESCRIPTION,
     SALARY_IMPLAUSIBLE_ANNUAL_FLOOR,
@@ -126,7 +144,14 @@ from agentic_job_search.config import (
 )
 from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim, quote_properties, quotes_from
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
-from agentic_job_search.linkedin_page import JobPage, posted_age_from_page, read_job_page, strip_saved_page_furniture
+from agentic_job_search.linkedin_page import (
+    JobPage,
+    LinkedInBlockedError,
+    posted_age_from_page,
+    read_company_about,
+    read_job_page,
+    strip_saved_page_furniture,
+)
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
 from agentic_job_search.salary import (
     SALARY_KIND_ABSENT,
@@ -144,12 +169,17 @@ from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
     PROJECT_DIR,
     RUN_DIR,
+    _names_us,
     _requires_current_us_auth,
+    _states_no_sponsorship,
+    company_matches_applied,
     console,
+    job_url,
     load_processed_jobs,
     log_run_cost,
     make_job_search_server,
     parse_posting_date,
+    title_rejection_reason,
 )
 from agentic_job_search.triage import (
     ProviderUnavailableError,
@@ -185,7 +215,17 @@ REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
 
 
 async def _send_pipeline_notification(text: str) -> bool:
-    '''Send one Telegram message. False (after a WARNING) when the send failed; never raises.'''
+    '''Send one Telegram message. False (after a WARNING) when the send failed; never raises.
+
+    In a --job-ids replay nothing is sent: the message is appended to the replay's notifications.md,
+    which is the record of what a real run would have sent.
+    '''
+    if (replay_dir := tools_module._replay_dir) is not None:
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        with (replay_dir / REPLAY_NOTIFICATIONS_FILENAME).open('a', encoding='utf-8') as handle:
+            handle.write(f'{text}\n\n---\n\n')
+        logger.info(f'Replay: notification written to {replay_dir / REPLAY_NOTIFICATIONS_FILENAME}, not sent')
+        return True
     try:
         await telegram_send_message(text)
     except Exception as ex:
@@ -252,6 +292,28 @@ def _sponsorship_prompt_section() -> str:
         f'If the job is located in {joined} and the posting does NOT explicitly state that visa '
         'sponsorship is available (e.g., "we sponsor visas", "H-1B sponsorship available", '
         '"willing to sponsor"), rate it **1**.\n'
+    )
+
+
+def _work_rights_prompt_section() -> str:
+    """Where the user may already live and work without a visa, or '' when none is configured.
+
+    The rater never sees the resume, and the only residence fact it otherwise gets is the tax
+    residence, and only when a posting names it. So "candidates must be based in the UK or Europe"
+    read as a person in Canada being shut out, and it warned "Residency restricted to UK/Europe —
+    Canada-based candidates not listed" to an EU citizen (job 4482482676, 2026-10-22).
+    """
+    places = preferences.right_to_live_and_work_in()
+    if not places:
+        return ''
+    joined = ', '.join(places)
+    return (
+        '\n## Work rights\n'
+        f'The candidate already has the right to live and work in: {joined} — no visa, permit or '
+        'sponsorship needed there. A requirement to reside in, be based in, or work the time zones '
+        'of any of these is NOT an eligibility problem and NOT a reason to lower the rating: do not '
+        'write a warning bullet about it. A residence requirement pinned to one specific country is '
+        'detected for you as a `Relocation required:` line; do not restate it either.\n'
     )
 
 
@@ -567,7 +629,7 @@ Do not rate the job. Extract this one posting, submit it, then stop.
 
 EVALUATOR_INSTRUCTIONS_TEMPLATE = '''You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not
 need to browse anywhere.
-{sponsorship_section}{relocation_section}
+{sponsorship_section}{work_rights_section}{relocation_section}
 ## Workplace type
 Check the `Workplace:` and `Location:` lines. Any requirement to be in an office some days a week is **hybrid**, even if the listing is badged "Remote".
 
@@ -590,10 +652,13 @@ Also produce:
 notice MUST appear here, even when you still rate the job highly.
 
 ## Language
-Check the `Posting written in:`, `Stated working language:` and `Likely working language:` lines. A posting written in another language, and a workplace whose
+Check the `Posting written in:`, `Stated working language:` and `Likely spoken languages:` lines. A posting written in another language, and a workplace whose
 working language is not English, are both real frictions — factor them into the rating even when the extract you are reading has been translated into English.
-A `Stated working language:` is what the posting itself says and overrides any guess from the location. A `Likely working language:` marked marginal is a
-remote role across a multi-country area — a minor friction at most.
+A `Stated working language:` is what the posting itself says and decides the working language; a `Likely spoken languages:` line marked `local` is then only
+the language of daily life where the job is anchored — a minor friction at most. A `Likely spoken languages:` line marked marginal is a remote role across a
+multi-country area — also a minor friction at most.
+A `LinkedIn-listed location:` line means LinkedIn's header names a different place from the posting's own `Location:`; when they name different countries,
+assume neither is right.
 Do not write a warning bullet for any of these: they are detected deterministically and added for you.
 
 Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for
@@ -700,6 +765,7 @@ def build_evaluator_instructions() -> str:
 
     return EVALUATOR_INSTRUCTIONS_TEMPLATE.format(
         sponsorship_section=sponsorship_section,
+        work_rights_section=_work_rights_prompt_section(),
         relocation_section=relocation_section,
         hybrid_locations_section=hybrid_locations_section,
     )
@@ -1992,7 +2058,7 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
     return run_pass
 
 
-def make_anthropic_scraper_server(browser_call):
+def make_anthropic_scraper_server(browser_call: Callable[[str, dict], Awaitable[str]]) -> McpSdkServerConfig:
     """The OpenRouter scraper's own tools (scrape_openrouter.LOCAL_TOOL_DEFS), served to the SDK.
 
     Both scrapers read ONE prompt, so they must expose the same tools. From 2026-08-31 the prompt
@@ -2063,7 +2129,8 @@ async def _run_anthropic_scraper_session(playwright_mcp: dict, browser_call, que
                 {'kind': 'scrape_budget', 'query': '(all)', 'region': '(all)', 'detail': str(ex)})
 
 
-async def run_scraper(run_pass, queries: list[str], stage_stats: dict, before_query=None) -> None:
+async def run_scraper(run_pass: Callable[[str], Awaitable[int | None]], queries: list[str], stage_stats: dict,
+                      before_query: Callable[[], Awaitable[None]] | None = None) -> None:
     """Stage 1: haiku scraper collects candidates from LinkedIn search results.
 
     ONE REQUEST PER QUERY, on a SINGLE shared session. Two constraints have to hold at once:
@@ -2109,8 +2176,9 @@ async def run_scraper(run_pass, queries: list[str], stage_stats: dict, before_qu
         narration.close(unfinished=True)
 
 
-async def _run_scraper_queries(run_pass, queries: list[str], narration: QueryNarration,
-                               before_query=None) -> None:
+async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]], queries: list[str],
+                               narration: QueryNarration,
+                               before_query: Callable[[], Awaitable[None]] | None = None) -> None:
     """The per-query loop of `run_scraper`, which owns the narration's lifetime."""
     for i, query in enumerate(queries, 1):
         logger.debug(f'Stage 1b: query {i}/{len(queries)} — "{query}"')
@@ -2335,6 +2403,32 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
         return None
 
 
+async def identify_poster(
+    slug: str, candidate: dict, playwright_mcp_url: str, stage_stats: dict
+) -> CompanyIdentity | None:
+    '''The poster's identity from its LinkedIn About page, cached per slug once, ever.
+
+    None — logged here — when the page could not be read; the caller then identifies the company
+    by name. A challenge page raises LinkedInBlockedError, which stops Stage 2.
+    '''
+    if cached := company_domain.cached_identity_for_slug(slug):
+        return cached
+    await _human_pause(COMPANY_ABOUT_PAGE_DELAY_SECONDS, f'the LinkedIn About page of {slug}')
+    try:
+        async with mcp_session(playwright_mcp_url) as call:
+            about = await read_company_about(slug, call)
+    except LinkedInBlockedError:
+        raise
+    except Exception as ex:
+        logger.warning(f"Company identity: the About page of {slug} ({candidate['company']}) could not be "
+                       f'read, identifying the company by name instead: {unwrap_exception(ex)}')
+        return None
+    identity = await company_domain.record_linkedin_identity(
+        slug, about.name, about.website, about.parent_name, about.parent_slug, stage_stats)
+    logger.info(f"Company identity: {candidate['company']} is {identity.describe()} (LinkedIn {slug})")
+    return identity
+
+
 async def extract_job_page_direct(
     candidate: dict, playwright_mcp_url: str, stage_stats: dict, page: JobPage | None = None
 ) -> dict | None:
@@ -2463,20 +2557,40 @@ _AREA_WORDS = (
 )
 # What may sit between a preposition and an area name: one determiner and one adjective, so
 # "within our EMEA region" and "in the wider Europe" still read as area wording. Deliberately only
-# ONE filler word -- widen it and "based in Germany or Europe" starts reading as area-wide, where
-# country_only is the conservative answer for a mixed statement.
+# ONE filler word: "Germany or Europe" is not read through this filler but through `_OR_AREA`
+# below, which names the "or" it depends on.
 #
 # Shared by both patterns ON PURPOSE. The negative lookahead below and the area patterns must
 # agree on what an area name looks like: when they drifted apart, "remote within our EMEA region"
 # fell through BOTH -- the country branch stopped claiming it and no area branch picked it up.
 _AREA_LEAD = r'(?:the\s+|an?\s+|our\s+|your\s+)?(?:\w+\s+)?'
-_NOT_AREA = r'(?!' + _AREA_LEAD + _AREA_WORDS + r'\b)'
+# A time-zone band is not a country either: "work from anywhere within GMT-1 to GMT+4" read as
+# `country_only` on 2026-10-20, overriding the extractor's `area_wide`. It says nothing about where
+# the holder must live, so it is excluded from the country object and left to the extractor.
+_TIMEZONE_WORDS = r'(?:GMT|UTC|CES?T|EES?T|WES?T|BST|[ECMP][SD]T|time\s*zones?)'
+# "the UK or Europe", "Germany/EU": a place OR an area offers at least the whole area, so it is
+# area-wide. Until 2026-10-26 a mixed statement read as `country_only`, the "conservative" answer,
+# and that overrode the extractor's correct `area_wide` for Mimica's "candidates must be based in
+# the UK or Europe" (job 4482482676). Both patterns use this one fragment: the country patterns
+# refuse it as their object and the area pattern claims it, so it cannot fall between them.
+# At most two words before the "or" ('United Kingdom'); "only" ends the statement, so
+# "based in Germany only, or Europe for contractors" is not covered and stays `country_only`.
+_OR_AREA = (
+    r'(?:the\s+)?(?!only\b)[^\W\d_]+(?:\s+(?!only\b)[^\W\d_]+)?(?:\s+or\s+|\s*/\s*)'
+    + _AREA_LEAD + _AREA_WORDS + r'\b'
+)
+_NOT_AREA = (
+    r'(?!' + _AREA_LEAD + r'(?:' + _AREA_WORDS + r'|' + _TIMEZONE_WORDS + r')\b|' + _OR_AREA + r')'
+)
 
 _AREA_WIDE_RE = re.compile(
     r'\b(?:work|working|remote|based|located|reside|residing|hire[sd]?|employed|eligible)\s+'
     r'(?:from|in|within|across|throughout|anywhere\s+in|to)\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
     r'|\banywhere\s+in\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
     r'|\b(?:work|remote|based|hire[sd]?|located)\s+(?:from\s+)?anywhere\b'
+    # Every verb `_COUNTRY_ONLY_RE` pins with, so what it refuses through `_NOT_AREA` lands here.
+    r'|\b(?:work|working|remote|based|located|resident|reside|residing|live|living|hire[sd]?|employed|eligible)'
+    r'\s+(?:from|in|within|across|throughout|to)\s+' + _OR_AREA +
     r'|\bany\s+(?:\w+\s+){0,2}?' + _EUROPE_WORDS + r'(?:\s+\w+){0,2}?\s+country\b'
     r'|\b' + _EUROPE_WORDS + r'\s+(?:or|and)\s+(?:the\s+)?'
     # US/USA stay OUT of `_AREA_WORDS`: alone they name one country, and "must be based in the
@@ -2839,6 +2953,8 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         f"Company: {extract['company']}",
         *([f'Hiring company: {end_client}'] if end_client else []),
         f"Location: {extract['location']}",
+        *([f'LinkedIn-listed location: {listed}']
+          if (listed := extract.get('listed_location')) and listed != extract['location'] else []),
         *([f'Workplace: {workplace_type}'] if workplace_type else []),
         f"Posted: {extract['date_posted'] or candidate['date_posted']}",
         f"URL: {candidate['url']}",
@@ -2864,10 +2980,17 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Posting written in: {extract['posting_language']}")
     if extract.get('stated_working_language'):
         lines.append(f"Stated working language: {extract['stated_working_language']}")
-    # The location's guess is shown only when the posting is silent on language: the JD wins.
-    if (shares := extract.get('likely_spoken_languages')) and not posting_states_working_language(extract):
-        marginal = ' (marginal: remote across a multilingual area)' if working_language_is_marginal(extract) else ''
-        lines.append(f'Likely spoken languages: {language_share_text(shares)}{marginal}')
+    # The JD decides the working language. The location's languages are still shown, marked local,
+    # because they say what daily life there is in (Lucentive, 2026-10-26).
+    if shares := extract.get('likely_spoken_languages'):
+        notes = []
+        if posting_states_working_language(extract):
+            stated = extract.get('stated_working_language') or extract.get('language_requirement')
+            notes.append(f'local; posting states working language: {stated}')
+        if working_language_is_marginal(extract):
+            notes.append('marginal: remote across a multilingual area')
+        suffix = f" ({'; '.join(notes)})" if notes else ''
+        lines.append(f'Likely spoken languages: {language_share_text(shares)}{suffix}')
     # A requirement the user already meets is told to the rater as met, not dropped: the JD still
     # says 'remote within Canada', and the rater does not otherwise know where the user lives.
     if relocation_already_met(extract.get('relocation', '')):
@@ -2881,6 +3004,20 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append('Status: no longer accepting applications')
     lines.append(f"\n{extract['description']}")
     return '\n'.join(lines)
+
+
+def sponsorship_rejected(location: str, full_text: str) -> bool:
+    '''Return True if the job needs a sponsorship the user requires and the posting does not offer it.'''
+    sponsorship_locations = preferences.sponsorship_required_in()
+    # Folded HERE rather than in the accessor: the preference holds place names, and a name folded
+    # on the way in cannot be unfolded on the way out. This rule is still a substring match, unlike
+    # the two geographic lists -- see AGENTS.md.
+    needs_sponsorship = any(loc.casefold() in location.casefold() for loc in sponsorship_locations)
+    # A demand for current US authorization places the role in the US whatever its location says; a
+    # bare "no sponsorship" names no country and counts only where the user needs it (2026-10-27).
+    us_needs_sponsorship = any(_names_us(loc) for loc in sponsorship_locations)
+    return (needs_sponsorship and (_states_no_sponsorship(full_text) or 'sponsor' not in full_text.lower())) or (
+        us_needs_sponsorship and _requires_current_us_auth(full_text))
 
 
 async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
@@ -2931,18 +3068,11 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     if posted and (date.today() - posted).days > JOB_STALE_AGE_DAYS:
         return fired('stale', f'posting older than {JOB_STALE_AGE_DAYS} days ({posted.isoformat()})', **stale_inputs)
     passed('stale', **stale_inputs)
-    sponsorship_locations = preferences.sponsorship_required_in()
-    # Folded HERE rather than in the accessor: the preference holds place names, and a name folded
-    # on the way in cannot be unfolded on the way out. This rule is still a substring match, unlike
-    # the two geographic lists -- see AGENTS.md.
-    location = extract['location'].casefold()
-    needs_sponsorship = any(loc.casefold() in location for loc in sponsorship_locations)
-    if sponsorship_locations and (
-        _requires_current_us_auth(full_text) or (needs_sponsorship and 'sponsor' not in full_text.lower())
-    ):
-        return fired('sponsorship', 'job without explicit visa sponsorship', location=extract['location'],
-                     sponsorship_required_in=list(sponsorship_locations))
-    passed('sponsorship', location=extract['location'], needs_sponsorship=needs_sponsorship)
+    sponsorship_inputs = {'location': extract['location'],
+                          'sponsorship_required_in': list(preferences.sponsorship_required_in())}
+    if sponsorship_rejected(extract['location'], full_text):
+        return fired('sponsorship', 'job without explicit visa sponsorship', **sponsorship_inputs)
+    passed('sponsorship', **sponsorship_inputs)
     known_languages = preferences.languages()
     if known_languages:
         unsupported = [
@@ -3062,28 +3192,65 @@ def working_language_is_marginal(extract: dict) -> bool:
     )
 
 
-def working_language_warnings(extract: dict) -> list[str]:
-    """The working-language bullets, in precedence order (Detect Likely Spoken Languages).
-
-    1. The posting states a working language or a required one -> it wins. A stated language the
-       user does not speak gets its own bullet; the location's guess is never shown.
-    2. Otherwise the location's likely spoken languages, when the user's own languages hold less
-       than WORKING_LANGUAGE_MIN_KNOWN_MASS of the distribution -- marked marginal for a remote
-       role across a multi-country area.
-    """
-    if posting_states_working_language(extract):
-        if stated := _unsupported_language(extract.get('stated_working_language', '')):
-            return [f'Working language: {stated.title()} (stated in posting)']
-        return []
+def location_languages_warn(extract: dict) -> bool:
+    """True when the user's own languages hold less than WORKING_LANGUAGE_MIN_KNOWN_MASS of the
+    location's likely spoken languages. False when there are none, or none are configured."""
     shares = extract.get('likely_spoken_languages') or {}
-    if not shares or known_language_mass(shares) >= WORKING_LANGUAGE_MIN_KNOWN_MASS:
-        return []
+    return bool(shares) and known_language_mass(shares) < WORKING_LANGUAGE_MIN_KNOWN_MASS
+
+
+def working_language_warnings(extract: dict) -> list[str]:
+    """The language bullets for the job's workplace and place (Detect Likely Spoken Languages).
+
+    1. A working language the posting states, when the user does not speak it.
+    2. The location's likely spoken languages, when `location_languages_warn`. If the posting
+       states a working language, the bullet reads `Local language:`: the JD has decided the
+       team's language, but the place still decides daily life. This used to stay silent once the
+       JD stated a language, so Lucentive's English team at a Portugal hub, Portuguese 70%, never
+       warned (2026-10-26). Marked marginal for a remote role across a multi-country area.
+    """
+    warnings: list[str] = []
+    stated_by_posting = posting_states_working_language(extract)
+    if stated_by_posting and (stated := _unsupported_language(extract.get('stated_working_language', ''))):
+        warnings.append(f'Working language: {stated.title()} (stated in posting)')
+    if not location_languages_warn(extract):
+        return warnings
     location = extract.get('location') or 'location not stated'
-    spoken = language_share_text(shares)
-    if working_language_is_marginal(extract):
-        return [f'Likely spoken languages (marginal — remote across a multilingual area): '
-                f'{spoken} — {location}']
-    return [f'Likely spoken languages: {spoken} — {location}']
+    spoken = language_share_text(extract['likely_spoken_languages'])
+    label = 'Local language' if stated_by_posting else 'Likely spoken languages'
+    marginal = ' (marginal — remote across a multilingual area)' if working_language_is_marginal(extract) else ''
+    warnings.append(f'{label}{marginal}: {spoken} — {location}')
+    return warnings
+
+
+def deterministic_pros(extract: dict) -> list[str]:
+    """Strengths stated in code, shown before the rater's (Build Deterministic Warnings).
+
+    One so far: the posting says the team works in a language the user speaks, at a place whose
+    own languages warn. The warning alone read as if the job were in Portuguese; the user wants
+    the stated English said outright, as a strength (2026-10-26).
+    """
+    stated = str(extract.get('stated_working_language') or '').strip()
+    if not stated or not preferences.languages() or _unsupported_language(stated) or not location_languages_warn(extract):
+        return []
+    return [f'Team works in {stated.title()} (stated in posting)']
+
+
+def merge_pros(deterministic: list[str], llm_pros: list[str]) -> list[str]:
+    """Deterministic pros first, then the rater's, dropping case-insensitive duplicates."""
+    return _unique_bullets([*deterministic, *llm_pros])
+
+
+def _unique_bullets(items: list[str]) -> list[str]:
+    '''Stripped, non-empty, first occurrence of each case-insensitive text, in order.'''
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            merged.append(text)
+    return merged
 
 
 async def derive_likely_spoken_languages(extract: dict) -> dict[str, float]:
@@ -3108,6 +3275,31 @@ async def derive_likely_spoken_languages(extract: dict) -> dict[str, float]:
     facts = await classify_location(extract.get('location', ''))
     shares = facts.get('likely_spoken_languages')
     return dict(shares) if isinstance(shares, dict) else {}
+
+
+async def resolve_listed_location(extract: dict, listed: str) -> None:
+    """Record LinkedIn's header-card location on the extract and whether it disagrees with the
+    posting's. Fills an empty `location` from it. NO gate reads either field.
+
+    Two failures prompted this (2026-10-26). For Evotym (job 4482332200) the extractor returned no
+    location at all while the card said 'Cyprus', so the gate, the warnings and the notification
+    all saw none. For Lucentive (job 4481299924) the card said 'Eu, Normandy, France' and the body
+    said 'Portugal hub'. Neither source can be trusted alone, so when both name countries and
+    share none, both are shown. A text naming no country ('European Union', 'Remote') is never a
+    mismatch.
+    """
+    extract['listed_location'] = listed
+    extract['listed_location_mismatch'] = False
+    if not listed:
+        return
+    if not str(extract.get('location') or '').strip():
+        logger.info(f"Location: the extract has none; using the header card's {listed!r}")
+        extract['location'] = listed
+        return
+    listed_countries = set((await classify_location(listed)).get('countries') or ())
+    posting_countries = set((await classify_location(extract['location'])).get('countries') or ())
+    extract['listed_location_mismatch'] = bool(
+        listed_countries and posting_countries and not listed_countries & posting_countries)
 
 
 def commute_location_is_acceptable(location: str, place_names: Sequence[str] = ()) -> bool:
@@ -3487,6 +3679,27 @@ def salary_meets_target(extract: dict) -> bool | None:
     return facts['maximum'] >= amount
 
 
+def estimate_meets_target(extract: dict) -> bool | None:
+    """Whether the model estimate shown for a posting with no figure reaches the base target by its
+    UPPER bound -- salary_meets_target's rule; None when code cannot decide.
+
+    Read from the estimate's own figures when it is in the target currency, else from its
+    code-computed conversion into that currency. Annual only. None -- no estimate, no target,
+    another period, no conversion -- keeps the rater's labelled guess visible, so a failure shows
+    more rather than less. Its one use is to DROP that guess (merge_salary_warning); it never adds
+    a warning, a cap or a gate, and it runs after rating, so it never reaches the rater.
+    """
+    target = preferences.salary_target()
+    estimate = extract.get('salary_estimate')
+    if target is None or not estimate or estimate.get('period') != 'year':
+        return None
+    amount, currency = target
+    figures = estimate if estimate.get('currency') == currency else estimate.get('conversion')
+    if not figures or figures.get('currency') != currency or figures.get('maximum') is None:
+        return None
+    return figures['maximum'] >= amount
+
+
 def below_target_salary_warning(extract: dict) -> str | None:
     '''The code-emitted below-target line, or None unless code decided the range falls short.'''
     if salary_meets_target(extract) is not False:
@@ -3554,6 +3767,10 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
             warning += ' (not somewhere you would commute)'
         warnings.append(warning)
 
+    if extract.get('listed_location_mismatch'):
+        warnings.append(f"Location mismatch — LinkedIn lists \"{extract.get('listed_location')}\"; "
+                        f"posting says \"{extract.get('location')}\"")
+
     # Two independent language facts. A posting written in another language gets the first (and a
     # rating cap); an English posting in a non-English workplace gets only the second. The Valtech
     # posting — a French JD the extractor handed back as English prose — was rated 4/5 and
@@ -3602,18 +3819,18 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     return warnings
 
 
-def repost_warning(repost: dict) -> str:
-    '''The warning naming the earlier posting a suppressed repost re-advertises.
+def repost_warning(repost: dict, same_run: bool) -> str:
+    '''The saved job's line naming the earlier posting a repost re-advertises, and where its
+    notification went: into that posting's message (same run) or a follow-up (an earlier run's).
 
     Built in code, like every other deterministic warning, and written into the saved job as well as
-    the audit log: a notification that never arrives is invisible, so the reason it did not has to
-    be somewhere the user can find it later.
+    the audit log, so the grouping can be checked later against the posting it was grouped with.
     '''
     context = ', '.join(str(repost.get(k) or '').strip() for k in ('notified', 'location', 'salary') if repost.get(k))
     return (
         f"Likely repost of job {repost.get('job_id', '')}"
         + (f' (notified {context})' if context else '')
-        + ' — not notified again'
+        + (' — combined into its notification' if same_run else ' — notified as a follow-up')
     )
 
 
@@ -3665,8 +3882,26 @@ def _drop_trailing_salary_absence(warning: str) -> str:
     return ';'.join([head, *kept]).strip() if len(kept) < len(tails) else warning
 
 
+# Marks the rater's pay judgement where it is folded into a code-decided salary line, so it is
+# never mistaken for the posting's figure or for the separate `model estimate` on the 💰 line. The
+# two used to sit unlabelled side by side and contradict each other (job 4482482676, 2026-10-26).
+RATER_SALARY_GUESS_LABEL = "rater's guess"
+# A leading absence clause cut off a folded guess, up to its separator or 'and': 'No salary
+# stated; EU bands often below target' -> 'EU bands often below target'. The code line already
+# says it.
+_LEADING_SALARY_ABSENCE_CLAUSE_RE = re.compile(
+    _SALARY_ABSENCE_LEAD_RE.pattern + r'[^;:,—–]*?(?:[;:,—–]|\s+and\b)\s*', re.IGNORECASE)
+
+
+def _rater_guess(bullet: str) -> str:
+    """The rater's salary bullet without a leading 'no salary listed' clause, when anything is left."""
+    rest = _LEADING_SALARY_ABSENCE_CLAUSE_RE.sub('', bullet, count=1).strip()
+    return rest or bullet
+
+
 def merge_salary_warning(
-    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False
+    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False,
+    estimate_on_target: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Fold the rater's salary bullets into the one salary line code emitted.
 
@@ -3682,8 +3917,14 @@ def merge_salary_warning(
     `salary_on_target` is code's own verdict that the range reaches the target (see
     salary_meets_target). Then every rater salary bullet is dropped: the pay question is settled,
     and what the rater writes about it is a midpoint or lower-half complaint the user rejected.
+
+    `estimate_on_target` is the same verdict on the model estimate shown for a posting with no
+    figure (see estimate_meets_target). It drops the rater's guess too, leaving the plain code
+    line: two model guesses on pay that disagree help nobody, and the estimate is the one the
+    user sees as a figure (2026-10-26). It can only REMOVE a rater bullet, never add one.
+    Otherwise the folded guess is labelled RATER_SALARY_GUESS_LABEL.
     """
-    if salary_on_target:
+    if salary_on_target or estimate_on_target:
         llm_warnings = [_drop_trailing_salary_absence(str(w)) for w in llm_warnings]
         return deterministic, [w for w in llm_warnings if not _is_salary_bullet(str(w))]
     code_line = next((w for w in deterministic if is_code_emitted_salary_warning(w)), '')
@@ -3695,33 +3936,23 @@ def merge_salary_warning(
     estimate = next((str(w).strip() for w in salary_bullets if _SALARY_JUDGEMENT_RE.search(str(w))), '')
     if not estimate:
         return deterministic, others
-    # An estimate that already leads with the absence replaces the line outright; anything else is
-    # appended, so the code-decided fact keeps the front of the bullet.
-    merged_line = (
-        estimate if code_line == NO_SALARY_WARNING and _SALARY_ABSENCE_LEAD_RE.search(estimate)
-        else f'{code_line} — {estimate}'
-    )
+    # Appended after the code-decided fact, labelled, with any restated absence cut off its front.
+    merged_line = f'{code_line} — {RATER_SALARY_GUESS_LABEL}: {_rater_guess(estimate)}'
     return [merged_line if w == code_line else w for w in deterministic], others
 
 
 def merge_warnings(
-    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False
+    deterministic: list[str], llm_warnings: list[str], salary_on_target: bool = False,
+    estimate_on_target: bool = False,
 ) -> list[str]:
     """Deterministic warnings first, then the rater's, dropping case-insensitive duplicates.
 
     The rater's salary bullets are folded into the deterministic salary line first (see
     merge_salary_warning), since a paraphrase never matches exactly.
     """
-    deterministic, llm_warnings = merge_salary_warning(deterministic, llm_warnings, salary_on_target)
-    merged: list[str] = []
-    seen: set[str] = set()
-    for warning in [*deterministic, *llm_warnings]:
-        text = str(warning).strip()
-        key = text.lower()
-        if text and key not in seen:
-            seen.add(key)
-            merged.append(text)
-    return merged
+    deterministic, llm_warnings = merge_salary_warning(
+        deterministic, llm_warnings, salary_on_target, estimate_on_target)
+    return _unique_bullets([*deterministic, *llm_warnings])
 
 
 def _bullet_block(heading: str, items: list[str]) -> str:
@@ -3742,30 +3973,47 @@ _SALARY_LINE_SUFFIX_BY_KIND = {
 }
 
 
-def format_amount_bounds(minimum: float | None, maximum: float | None) -> str:
-    """'148,000 - 176,000', or the one amount when only one bound exists or both are equal."""
+_THOUSAND = 1000
+
+
+def _format_amount(amount: float, thousands: bool) -> str:
+    """'148,000', or '148k' with `thousands` -- only for an amount of a thousand or more that a
+    thousand divides to at most one decimal, so '87.5k' but never a rounded '87.6k' for 87,550."""
+    if thousands and amount >= _THOUSAND and float(amount * 10 / _THOUSAND).is_integer():
+        in_thousands = amount / _THOUSAND
+        return f'{int(in_thousands):,}k' if in_thousands.is_integer() else f'{in_thousands:,.1f}k'
+    return f'{int(amount):,}' if float(amount).is_integer() else f'{amount:,}'
+
+
+def format_amount_bounds(minimum: float | None, maximum: float | None, thousands: bool = False) -> str:
+    """'148,000 - 176,000' ('148k - 176k' with `thousands`), or the one amount when only one bound
+    exists or both are equal."""
     amounts = [
-        f'{int(amount):,}' if float(amount).is_integer() else f'{amount:,}'
+        _format_amount(amount, thousands)
         for amount in dict.fromkeys(a for a in (minimum, maximum) if a is not None)
     ]
     return ' - '.join(amounts)
 
 
-def format_salary_conversion(conversion: dict | None) -> str:
+def format_salary_conversion(conversion: dict | None, thousands: bool = False) -> str:
     """'(≈ CAD 148,000 - 176,000)' for a code-computed conversion, or '' when there is none."""
     if not conversion:
         return ''
-    return f"(≈ {conversion['currency']} {format_amount_bounds(conversion['minimum'], conversion['maximum'])})"
+    bounds = format_amount_bounds(conversion['minimum'], conversion['maximum'], thousands)
+    return f"(≈ {conversion['currency']} {bounds})"
 
 
 def format_salary_estimate(estimate: dict) -> str:
-    """'PLN 250,000 - 320,000 per year (≈ CAD 88,000 - 113,000)' — the model's estimate, in its
-    own currency, with the code-computed conversion appended when one applies."""
-    text = (
-        f"{estimate['currency']} {format_amount_bounds(estimate['minimum'], estimate['maximum'])} "
-        f"per {estimate['period']}"
-    )
-    if conversion := format_salary_conversion(estimate.get('conversion')):
+    """'PLN 250k - 320k per year (≈ CAD 88k - 113k)' — the model's estimate, in its own currency,
+    with the code-computed conversion appended when one applies.
+
+    In thousands (2026-10-26, the user's request): an estimate is a model's round guess, so its
+    trailing zeros carry no information and only make the line harder to read. A figure the posting
+    states is never shortened -- it is shown as extracted.
+    """
+    bounds = format_amount_bounds(estimate['minimum'], estimate['maximum'], thousands=True)
+    text = f"{estimate['currency']} {bounds} per {estimate['period']}"
+    if conversion := format_salary_conversion(estimate.get('conversion'), thousands=True):
         text = f'{text} {conversion}'
     return text
 
@@ -3786,7 +4034,7 @@ def format_salary_line(extract: dict) -> str:
     facts = salary_facts_of(extract)
     if facts['kind'] == 'absent' or not facts['text']:
         if estimate := extract.get('salary_estimate'):
-            return f'💰 Not listed — model estimate: {format_salary_estimate(estimate)}'
+            return f'💰 Model estimate: {format_salary_estimate(estimate)}'
         return ''
     text = snippet(facts['text'], NOTIFICATION_SALARY_MAX_CHARS)
     if conversion := format_salary_conversion(extract.get('salary_conversion')):
@@ -3894,13 +4142,8 @@ def format_job_notification(
 ) -> str:
     '''The Telegram job-match message. Plain text — _send_pipeline_notification sends no
     parse_mode, so this uses bullets and emoji rather than Markdown.'''
-    header = f"⭐ {rating}/5 — {candidate['company']} — {candidate['title']}"
-    location = extract.get('location', '').strip()
-    workplace_type = derive_workplace_type(extract)
-    if location and workplace_type and workplace_type not in location.lower():
-        location = f'{location} — {workplace_type}'
-    lines = [header]
-    if location:
+    lines = [_notification_header(candidate, extract, rating)]
+    if location := _location_text(extract):
         lines.append(f'📍 {location}')
     if salary_line := format_salary_line(extract):
         lines.append(salary_line)
@@ -3958,6 +4201,96 @@ async def triage_is_grounded(candidate: dict, triage_result: dict, extract_text:
         'triage', f"job {candidate.get('job_id')} {candidate.get('company')}", [claim], extract_text,
         'the extract text shown to triage', stage_stats)
     return verdicts['score'].accepted
+def _notification_header(candidate: dict, extract: dict, rating: int) -> str:
+    recruiter = f'{NOTIFICATION_RECRUITER_MARKER} ' if derive_agency_posting(extract) else ''
+    return f"⭐ {rating}/5 — {recruiter}{candidate['company']} — {candidate['title']}"
+
+
+def _location_text(extract: dict) -> str:
+    '''The location with its workplace type, as the 📍 line shows it; '' when neither is known.'''
+    location = extract.get('location', '').strip()
+    workplace_type = derive_workplace_type(extract)
+    if location and workplace_type and workplace_type not in location.lower():
+        location = f'{location} — {workplace_type}'
+    return location
+
+
+@dataclass
+class QueuedPosting:
+    '''One posting at the notification threshold, held until the end of Stage 2.'''
+    candidate: dict
+    extract: dict
+    rating: int
+    pros: list[str]
+    warnings: list[str]
+    # The posting's Job Trace: the message is sent after its job has finished, so the send is
+    # recorded into this trace directly rather than into whichever job is current.
+    trace: job_trace.JobTrace | None = None
+
+
+@dataclass
+class NotificationGroup:
+    '''The postings of one role, in the order they were rated, sent as ONE message.
+
+    `prior` is the earlier run's notified posting they re-advertise (a Recruiter Notification
+    Record), or None when the group's first posting is notified this run.
+    '''
+    postings: list[QueuedPosting]
+    prior: dict | None = None
+
+
+def _location_entry(posting: QueuedPosting, lead: QueuedPosting | None) -> str:
+    '''One posting's bullet under 📍 Locations: where it is and its link.
+
+    Against a `lead` (whose rating, salary and warnings head the message) only what differs is
+    added, so a country-specific language warning or day rate is not lost. With no lead, as in a
+    follow-up, each posting is shown in full.
+    '''
+    location = _location_text(posting.extract) or 'Location not shown'
+    rating = f' ({posting.rating}/5)' if lead is None or posting.rating != lead.rating else ''
+    lines = [f"• {location}{rating} — {posting.candidate['url']}"]
+    if lead is None or posting is not lead:
+        own_salary = str(posting.extract.get('salary') or '').strip()
+        if lead is None or own_salary != str(lead.extract.get('salary') or '').strip():
+            # A posting with no figure says so: under a lead's 💰 line, silence would read as the same pay.
+            lines.append(f'   {format_salary_line(posting.extract) or "💰 No salary in this posting"}')
+        lines += [f'   ⚠️ {w}' for w in posting.warnings if lead is None or w not in lead.warnings]
+    return '\n'.join(lines)
+
+
+def format_grouped_notification(group: NotificationGroup) -> str:
+    '''The Telegram message for one role: one posting renders as format_job_notification; several
+    (the same role in several places, judged by Combine Repost Notifications) as one message listing them all.
+
+    The lead is the highest-rated posting, the first rated on a tie. A group with a `prior` is a
+    follow-up to a message sent in an earlier run, which cannot be edited.
+    '''
+    postings = group.postings
+    if group.prior is not None:
+        first = postings[0]
+        prior = group.prior
+        context = ', '.join(str(prior.get(k) or '').strip() for k in ('location', 'salary') if prior.get(k))
+        header = '\n'.join([
+            f"➕ Also posted — {first.candidate['company']} — {first.candidate['title']}",
+            f"Same role as job {prior.get('job_id', '')}, notified {prior.get('notified', '')}"
+            + (f' ({context})' if context else ''),
+        ])
+        entries = '\n'.join(_location_entry(p, None) for p in postings)
+        return f'{header}\n\n📍 Locations ({len(postings)}):\n{entries}'
+    lead = max(postings, key=lambda p: p.rating)
+    if len(postings) == 1:
+        return format_job_notification(lead.candidate, lead.extract, lead.rating, lead.pros, lead.warnings)
+    lines = [_notification_header(lead.candidate, lead.extract, lead.rating)]
+    if salary_line := format_salary_line(lead.extract):
+        lines.append(salary_line)
+    lines.append(format_posted_line(lead.candidate, lead.extract))
+    sections = ['\n'.join(lines)]
+    for block in (_bullet_block('✅ Good:', lead.pros), _bullet_block('⚠️ Warnings:', lead.warnings)):
+        if block:
+            sections.append(block)
+    entries = '\n'.join(_location_entry(p, lead) for p in postings)
+    sections.append(f'📍 Locations ({len(postings)}):\n{entries}')
+    return '\n\n'.join(sections)
 
 
 async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_stats: dict,
@@ -4030,54 +4363,13 @@ async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) 
     raise AssertionError('unreachable: the last rating model returns or raises')
 
 
-# Postings the User was notified about THIS run, by role_key: one employer often advertises one role
-# once per country under separate job ids (2026-10-16: Yuno twice at 5/5, Overstory seven times).
-# Each posting is still rated on its own -- location gates and the rater's location judgment are
-# per posting -- but only the first notification is sent; the rest are listed in one message at
-# the end of Stage 2. Reset at the top of evaluate_all_candidates, once per run.
-_notified_roles: dict[tuple[str, str], dict] = {}
-_duplicate_roles: list[dict] = []
-_COPY_SUFFIX_RE = re.compile(r'\(copy\)', re.IGNORECASE)
-_NON_WORD_RE = re.compile(r'[^\w]+')
-
-
-def role_key(extract: dict) -> tuple[str, str]:
-    """(company, title) folded for comparison: case, punctuation and LinkedIn's '(Copy)' ignored."""
-    title = _NON_WORD_RE.sub(' ', _COPY_SUFFIX_RE.sub(' ', str(extract.get('title') or ''))).casefold()
-    return tools_module._normalize_company(str(extract.get('company') or '')), ' '.join(title.split())
-
-
-def duplicate_roles_message(duplicates: list[dict]) -> str:
-    '''One Telegram message naming every repeat posting of a role already notified this run.'''
-    lines = ['Also posted (same role as a job already notified this run):']
-    for d in duplicates:
-        lines.append(f"• {d['company']} — {d['title']}: {d['location'] or 'location not stated'} — "
-                     f"rated {d['rating']}/5 (first: job {d['first_job_id']})\n  {d['url']}")
-    return '\n'.join(lines)
-
-
-async def _save_and_notify(
-    candidate: dict, rating: int, summary: str, content: str, notify: bool = True,
-    extract: dict | None = None, pros: list[str] | None = None, warnings: list[str] | None = None,
-) -> bool | None:
-    '''Save the job, and notify when asked and rated high enough.
-
-    Returns whether the notification was sent, or None when none was attempted.
-    '''
+async def _save_job(candidate: dict, rating: int, summary: str, content: str) -> None:
+    '''Save the job. A notification is queued separately and sent at the end of Stage 2.'''
     saved = await tools_module.do_save_job_posting(
         company=candidate['company'], description=summary, rating=rating,
         content=content, job_id=candidate['job_id'],
     )
     job_trace.record('saved', rating=rating, summary=summary, content=content, result=saved)
-    if notify and should_notify_based_on_rating(rating):
-        text = format_job_notification(candidate, extract or {}, rating, pros or [], warnings or [])
-        sent = await _send_pipeline_notification(text)
-        job_trace.record('notification', text=text, sent=sent)
-        return sent
-    job_trace.record('notification', text=None, sent=None,
-                     why='withheld (repost or same role)' if should_notify_based_on_rating(rating)
-                     else 'below the notification rating')
-    return None
 
 
 EXTRACT_SIGNAL_FIELDS = (
@@ -4096,6 +4388,8 @@ def format_extract_signal(extract: dict, raw_residency_scope: str) -> str:
     is anything but absent.
     """
     parts = [f'{name}={extract.get(name)!r}' for name in EXTRACT_SIGNAL_FIELDS if extract.get(name)]
+    if extract.get('listed_location_mismatch'):
+        parts.append(f"listed_location={extract.get('listed_location')!r} (country mismatch)")
     derived_residency_scope = str(extract.get('residency_scope') or '')
     if raw_residency_scope != derived_residency_scope:
         parts.append(f'residency_scope={raw_residency_scope!r}->{derived_residency_scope!r}')
@@ -4139,10 +4433,84 @@ def _hard_rule_category(reason: str) -> str:
     return 'hard_ruled_other'
 
 
+class NotificationQueue:
+    '''Stage 2's job-match messages, held until the stage ends so one role posted in several
+    places (judged by Combine Repost Notifications) reaches the user as ONE message listing every location.
+
+    Telegram messages cannot be edited once sent, so a posting matching a role notified in an
+    earlier run is grouped, with the others matching that same posting, into one follow-up.
+    '''
+
+    def __init__(self) -> None:
+        # Keyed by the job id of the posting the group re-advertises: its own first posting for a
+        # group of this run, the earlier run's notified posting for a follow-up.
+        self._this_run: dict[str, NotificationGroup] = {}
+        self._followups: dict[str, NotificationGroup] = {}
+
+    def has_group(self, job_id: str) -> bool:
+        '''Whether `job_id` heads a message queued this run.'''
+        return job_id in self._this_run
+
+    def add(self, posting: QueuedPosting, repost: dict | None) -> None:
+        '''Queue `posting`: on its own, into the message of the queued posting `repost` names, or
+        into the follow-up to the earlier run's posting it names.'''
+        prior_id = str((repost or {}).get('job_id') or '')
+        if repost is None:
+            self._this_run[str(posting.candidate['job_id'])] = NotificationGroup([posting])
+        elif prior_id in self._this_run:
+            self._this_run[prior_id].postings.append(posting)
+        else:
+            self._followups.setdefault(prior_id, NotificationGroup([], prior=repost)).postings.append(posting)
+
+    async def flush(self) -> None:
+        '''Send every queued message, this run's first, then the follow-ups. Never raises: each
+        failed send is logged by _send_pipeline_notification and the rest still go.'''
+        groups = [*self._this_run.values(), *self._followups.values()]
+        self._this_run, self._followups = {}, {}
+        if not groups:
+            return
+        failed = []
+        for group in groups:
+            job_ids = ', '.join(str(p.candidate['job_id']) for p in group.postings)
+            kind = 'follow-up' if group.prior is not None else 'notification'
+            text = format_grouped_notification(group)
+            sent = await _send_pipeline_notification(text)
+            if sent:
+                logger.info(f'Sent the {kind} for job(s) {job_ids}')
+            else:
+                failed.append(job_ids)
+            for posting in group.postings:
+                if posting.trace is not None:
+                    posting.trace.add('notification', {'text': text, 'sent': sent, 'kind': kind,
+                                                       'job_ids': job_ids})
+        logger.info(
+            f'Stage 2 notifications: {len(groups) - len(failed)} of {len(groups)} message(s) sent'
+            + (f"; FAILED for job(s) {'; '.join(failed)}" if failed else '')
+        )
+
+
 async def evaluate_all_candidates(
     candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str,
     profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
     triage_enabled: bool = True, browser: BrowserServer | None = None,
+) -> None:
+    '''Stage 2 (see _evaluate_candidates), then its queued notifications — sent even when the
+    stage stops early or raises, so a match already rated is never lost.'''
+    notifications = NotificationQueue()
+    try:
+        await _evaluate_candidates(
+            candidates, playwright_mcp, evaluator_prompt, profile_block, stage_stats, funnel=funnel,
+            audit=audit, triage_enabled=triage_enabled, browser=browser, notifications=notifications,
+        )
+    finally:
+        await notifications.flush()
+
+
+async def _evaluate_candidates(
+    candidates: list[dict], playwright_mcp: dict, evaluator_prompt: str,
+    profile_block: str, stage_stats: dict, funnel: dict | None = None, audit: bool = False,
+    triage_enabled: bool = True, browser: BrowserServer | None = None,
+    *, notifications: NotificationQueue,
 ) -> None:
     '''Stage 2: per candidate — Haiku extract, deterministic hard rules, local triage,
     then one configurable-model rating call. All sharing one browser.
@@ -4227,8 +4595,6 @@ async def evaluate_all_candidates(
         })
 
     stage_stats.setdefault('evidence', new_stage_stats())
-    _notified_roles.clear()
-    _duplicate_roles.clear()
     trace_token = None
     logger.info(f'Stage 2: evaluating {len(candidates)} candidate(s)')
     stage_started = time.monotonic()
@@ -4283,6 +4649,8 @@ async def evaluate_all_candidates(
                                f"{candidate['company']} — {candidate['title']}")
                 continue
             bump('extract_ok')
+            # Before anything reads `location`: it may be filled from the header card here.
+            await resolve_listed_location(extract, page.listed_location if page is not None else '')
             # Resolve the likely spoken languages ONCE, here, and write it back — so
             # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
             # field. Cosmetic only: no gate reads it, by design. `broad_area` rides along from the
@@ -4336,9 +4704,8 @@ async def evaluate_all_candidates(
             # Deliberately NOT extended to the agency's own name: applying once through a staffing
             # firm must never suppress every other company it posts for. That is the whole reason
             # load_applied_jobs() keeps agency names out of _applied_companies
-            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status still
-            # never changes the rating and never rejects on its own; the one thing it now gates is a
-            # REPEAT notification for a role already sent (see recruiter_repost_of below).
+            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status never
+            # changes the rating and never rejects on its own.
             end_client = derive_end_client(extract)
             # nested (not combined) deliberately: a 20-line gate body reads better
             # one level deeper than folded into a single 100-char condition
@@ -4349,14 +4716,13 @@ async def evaluate_all_candidates(
                         f"Already applied via end client: {candidate['company']} — "
                         f"{candidate['title']}: hiring company {end_client!r} matches {matched_pdf}"
                     )
-                    await _save_and_notify(
+                    await _save_job(
                         candidate, rating=RATING_AUTO_REJECT,
                         summary=f'already applied to end client {end_client}',
                         content=(
                             f"# Already applied — posted by {candidate['company']} on behalf of "
                             f"{end_client}\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"
                         ),
-                        notify=False,
                     )
                     tools_module.record_job_outcome(
                         candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
@@ -4369,9 +4735,9 @@ async def evaluate_all_candidates(
                 bump(_hard_rule_category(hard_rule_reason))
                 logger.info(f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: "
                             f'{RATING_AUTO_REJECT}/5 by hard rule ({hard_rule_reason}) — saved, not notified')
-                await _save_and_notify(
+                await _save_job(
                     candidate, rating=RATING_AUTO_REJECT, summary=f'auto rejected {hard_rule_reason}',
-                    content=f'# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}', notify=False,
+                    content=f'# Auto-rated {RATING_AUTO_REJECT} — {hard_rule_reason}\n\n{extract_text}',
                 )
                 tools_module.record_job_outcome(
                     candidate['site'], candidate['job_id'], 'hard_ruled', rating=RATING_AUTO_REJECT, summary=hard_rule_reason
@@ -4391,14 +4757,13 @@ async def evaluate_all_candidates(
                         f"Triaged out [{index}/{len(candidates)}]: {candidate['company']} — "
                         f"{candidate['title']}: score {triage_result['score']} ({triage_result['reason']})"
                     )
-                    await _save_and_notify(
+                    await _save_job(
                         candidate, rating=triage_result['score'],
                         summary=f"triaged out {triage_result['reason']}",
                         content=(
                             f"# Triaged out (local score {triage_result['score']}/5)\n\n"
                             f"Reason: {triage_result['reason']}\n\n{extract_text}"
                         ),
-                        notify=False,
                     )
                     tools_module.record_job_outcome(
                         candidate['site'], candidate['job_id'], 'triaged_out',
@@ -4406,6 +4771,31 @@ async def evaluate_all_candidates(
                     )
                     await audit_gate(
                         candidate, extract_text, 'triage', f"local score {triage_result['score']}"
+                    )
+                    continue
+
+            # The poster, checked again by who it IS now that its LinkedIn page is known: Stage 1b
+            # had only the name on the card, which missed NTT DATA Europe & Latam against an
+            # application to its parent (2026-10-19). Agencies are skipped, as load_applied_jobs
+            # keeps them out of the blocklist. Here, just before the paid rating, so the About
+            # page is visited for as few companies as possible, each once ever.
+            if page is not None and page.company_slug and not derive_agency_posting(extract):
+                identity = await identify_poster(
+                    page.company_slug, candidate, playwright_mcp['url'], stage_stats['extraction'])
+                matched_pdf = await tools_module.company_matches_applied(candidate['company'], identity)
+                if matched_pdf:
+                    bump('poster_identity_already_applied')
+                    logger.info(f"Already applied by company identity [{index}/{len(candidates)}]: "
+                                f"{candidate['company']} — {candidate['title']}: matches {matched_pdf}")
+                    await _save_job(
+                        candidate, rating=RATING_AUTO_REJECT,
+                        summary=f"already applied to {candidate['company']} (same organization)",
+                        content=(f"# Already applied — {candidate['company']} is the same organization as "
+                                 f"an applied job\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"),
+                    )
+                    tools_module.record_job_outcome(
+                        candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
+                        summary=f"{candidate['company']} matches {matched_pdf} by domain or parent",
                     )
                     continue
 
@@ -4425,50 +4815,37 @@ async def evaluate_all_candidates(
             rated_by = result.get('rated_by') or MODEL_NAME_RATING
             if rated_by != MODEL_NAME_RATING:
                 bump('rating_fallback')
-            pros = await verified_rating_items(candidate, 'pros', result.get('pros'), extract_text,
-                                               stage_stats['evidence'])
+            pros = merge_pros(deterministic_pros(extract),
+                              await verified_rating_items(candidate, 'pros', result.get('pros'), extract_text,
+                                                          stage_stats['evidence']))
             deterministic = build_deterministic_warnings(candidate, extract)
 
-            # A recruiter re-advertising ONE role under a new job id defeats (site, job_id) dedup,
+            # A poster re-advertising ONE role under a new job id defeats (site, job_id) dedup,
             # which is how six notifications for one pharma programme arrived in nine days
-            # (2026-09-10). Checked only when a notification is about to fire, and only for agency
-            # postings, so it is free on every other job. It withholds the MESSAGE only: the rating,
-            # the saved file and the audit entry are all unchanged, and it fails open.
-            is_agency = derive_agency_posting(extract)
+            # (2026-09-10, an agency) and two for one Mimica role in one run (2026-10-23, the
+            # employer itself, one posting per country). Checked only when a notification is about
+            # to fire, and costs an LLM call only when the same poster already had one notified
+            # inside the window. It changes the MESSAGE only: a posting of a role queued earlier in
+            # this run joins that role's message, one of a role notified in an earlier run gets a
+            # follow-up. The rating, the saved file and the audit entry are unchanged; it fails open.
             repost = None
-            if should_notify_based_on_rating(rating) and is_agency:
+            if should_notify_based_on_rating(rating):
                 repost = await tools_module.recruiter_repost_of(
                     candidate, extract, stage_stats['recruiter_repost']
                 )
+            same_run_lead = repost and notifications.has_group(str(repost.get('job_id') or ''))
             if repost:
-                bump('recruiter_repost_suppressed')
+                bump('notification_combined' if same_run_lead else 'repost_followup')
                 logger.info(
-                    f"Recruiter repost: {candidate['company']} — {candidate['title']}: rated "
-                    f"{rating}/5 but NOT notified — same role as job {repost.get('job_id')} "
-                    f"notified {repost.get('notified')} ({repost.get('reason') or 'no reason given'})"
+                    f"Repost: {candidate['company']} — {candidate['title']}: rated {rating}/5, "
+                    + ('combined into the message for' if same_run_lead else 'follow-up to')
+                    + f" job {repost.get('job_id')} notified {repost.get('notified')} "
+                    f"({repost.get('reason') or 'no reason given'})"
                 )
-                deterministic.insert(0, repost_warning(repost))
-            same_role = (_notified_roles.get(role_key(extract))
-                         if should_notify_based_on_rating(rating) and not repost else None)
-            if same_role:
-                bump('duplicate_role_suppressed')
-                logger.info(
-                    f"Same role: {candidate['company']} — {candidate['title']} (job {candidate['job_id']}): rated "
-                    f"{rating}/5, NOT notified — job {same_role['job_id']} ({same_role['location']}) was notified "
-                    f'this run; listed in the end-of-run message'
-                )
-                deterministic.insert(0, f"Same role as job {same_role['job_id']} ({same_role['location']}), "
-                                        'notified earlier this run')
 
-            warnings = merge_warnings(
-                deterministic,
-                await verified_rating_items(candidate, 'warnings', result.get('warnings'), extract_text,
-                                            stage_stats['evidence']),
-                salary_on_target=salary_meets_target(extract) is True,
-            )
             # What the 💰 line adds to the posting's own figure. Only for a job at the
-            # notification threshold (a suppressed repost included: its saved file is the one
-            # place it is seen), and only now, after rating. A failure here costs the extra figure,
+            # notification threshold (a repost included: its 💰 line is in the combined message or
+            # the follow-up), and only now, after rating. A failure here costs the extra figure,
             # never the notification.
             pay_note = ''
             if should_notify_based_on_rating(rating):
@@ -4481,12 +4858,23 @@ async def evaluate_all_candidates(
                         f"(job {candidate['job_id']}), notifying without a conversion or estimate: "
                         f'{type(ex).__name__}: {ex}'
                     )
+            # Merged only now, after the pay display: an estimate reaching the target drops the
+            # rater's own pay guess. The estimate still ran after rating, so the rater never saw it.
+            warnings = merge_warnings(
+                deterministic,
+                await verified_rating_items(candidate, 'warnings', result.get('warnings'), extract_text,
+                                            stage_stats['evidence']),
+                salary_on_target=salary_meets_target(extract) is True,
+                estimate_on_target=estimate_meets_target(extract) is True,
+            )
+            # The repost line is for the saved file only: the message itself shows the grouping.
+            saved_warnings = [repost_warning(repost, bool(same_run_lead)), *warnings] if repost else warnings
             pay_lines = format_pay_lines(extract)
             content = (
                 f"# {extract['title']} at {extract['company']} — rating {rating}/5\n\n"
                 + (f"⚠ rating capped from {result['rating']}: {cap_reason}\n\n" if cap_reason else '')
                 + (_bullet_block('## Good', pros) + '\n\n' if pros else '')
-                + (_bullet_block('## Warnings', warnings) + '\n\n' if warnings else '')
+                + (_bullet_block('## Warnings', saved_warnings) + '\n\n' if saved_warnings else '')
                 + ('\n'.join(pay_lines) + '\n\n' if pay_lines else '')
                 + f"Reasoning: {result['reasoning']}\n"
                 + (f"Triage score (local): {triage_result['score']}\n" if triage_result else '')
@@ -4494,22 +4882,15 @@ async def evaluate_all_candidates(
             )
             tools_module.record_job_outcome(
                 candidate['site'], candidate['job_id'],
-                'recruiter_repost' if repost else 'duplicate_role' if same_role else 'rated',
+                'recruiter_repost' if repost else 'rated',
                 rating=rating, summary=result['reasoning'],
             )
-            sent = await _save_and_notify(
-                candidate, rating=rating, summary=result['summary'], content=content,
-                extract=extract, pros=pros, warnings=warnings, notify=not repost and not same_role,
-            )
-            if sent:
-                _notified_roles[role_key(extract)] = {
-                    'job_id': candidate['job_id'], 'location': str(extract.get('location') or '')}
-            if same_role:
-                _duplicate_roles.append({
-                    'company': extract['company'], 'title': extract['title'],
-                    'location': str(extract.get('location') or ''), 'rating': rating,
-                    'url': candidate.get('url') or '', 'first_job_id': same_role['job_id'],
-                })
+            await _save_job(candidate, rating=rating, summary=result['summary'], content=content)
+            if should_notify_based_on_rating(rating):
+                notifications.add(QueuedPosting(candidate, extract, rating, pros, warnings,
+                                                trace=job_trace.current()), repost)
+            else:
+                job_trace.record('notification', text=None, sent=None, why='below the notification rating')
             # The reasoning is in the saved job and audit §4. Triage's reason appears only when
             # the two scores are far enough apart to be worth reading.
             triage_note = ''
@@ -4518,24 +4899,46 @@ async def evaluate_all_candidates(
                 if abs(triage_result['score'] - result['rating']) >= TRIAGE_DISAGREEMENT_LOG_MIN:
                     # Cut, with the cut said: the whole reason is in the saved job file.
                     triage_note += f" ({snippet(triage_result['reason'], TRIAGE_REASON_LOG_MAX_CHARS)})"
-            if repost:
-                notify_note = 'not notified (recruiter repost)'
-            elif same_role:
-                notify_note = f"not notified (same role as job {same_role['job_id']}, notified this run)"
-            elif sent is None:
+            if not should_notify_based_on_rating(rating):
                 notify_note = 'not notified (below the notification rating)'
+            elif same_run_lead:
+                notify_note = f"notification queued, combined with job {repost.get('job_id')}"
+            elif repost:
+                notify_note = f"notification queued as a follow-up to job {repost.get('job_id')}"
             else:
-                notify_note = 'notified' if sent else 'notification FAILED'
+                notify_note = 'notification queued'
             logger.info(
                 f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: {rating}/5 via {rated_by}"
                 + (f' (fallback: {MODEL_NAME_RATING} failed)' if rated_by != MODEL_NAME_RATING else '')
                 + f'{triage_note}, {rating_seconds:.0f}s — saved, {notify_note}'
                 + (f'; pay: {pay_note}' if pay_note else '')
             )
-            # Only what was actually SENT is recorded: a role first rated 3 never reached the user,
-            # so a later repost of it that rates 4 must still notify.
-            if should_notify_based_on_rating(rating) and is_agency and not repost:
+            # Only what is notified is recorded: a role first rated 3 never reached the user, so a
+            # later repost of it that rates 4 must still notify. Recorded when queued, not when
+            # sent, so a later posting of the role in this same run is compared against it.
+            if should_notify_based_on_rating(rating) and not repost:
                 tools_module.record_recruiter_notification(candidate, extract)
+        except LinkedInBlockedError as ex:
+            remaining = candidates[index - 1:]
+            not_released = []
+            for unevaluated in remaining:
+                tools_module.record_job_outcome(
+                    unevaluated['site'], unevaluated['job_id'], 'blocked',
+                    summary='not evaluated: LinkedIn showed a challenge page; released for the next run',
+                )
+                try:
+                    tools_module.forget_processed_job(unevaluated['site'], unevaluated['job_id'])
+                except FileNotFoundError as release_ex:
+                    not_released.append(f"{unevaluated['site']}/{unevaluated['job_id']} ({release_ex})")
+            funnel['blocked'] = len(remaining)
+            tools_module._ui_alerts.append({
+                'kind': 'blocked', 'query': '(Stage 2)', 'region': candidate['company'], 'detail': str(ex),
+            })
+            logger.error(f'Stage 2 stopped, not retried: {ex}; {len(remaining)} job(s) not evaluated and '
+                         f'released for the next run'
+                         + (f'; {len(not_released)} could not be released: {"; ".join(not_released)}'
+                            if not_released else ''))
+            break
         except Exception as ex:
             if browser is not None and browser.is_dead():
                 logger.warning(f"Stage 2: browser died while evaluating {candidate['company']} — "
@@ -4563,10 +4966,6 @@ async def evaluate_all_candidates(
 
     if trace_token is not None:
         job_trace.finish(trace_token)
-    if _duplicate_roles:
-        sent = await _send_pipeline_notification(duplicate_roles_message(_duplicate_roles))
-        logger.info(f'Same-role postings: {len(_duplicate_roles)} listed in one message '
-                    f"({'sent' if sent else 'send FAILED'})")
     logger.info(
         f'Stage 2 complete: {index} of {len(candidates)} job(s) in '
         f'{(time.monotonic() - stage_started) / SECONDS_PER_MINUTE:.1f} min, '
@@ -5064,12 +5463,8 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
     return False
 
 
-async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0,
-                              job_audit_enabled: bool = JOB_AUDIT_ENABLED, job_audit_job_id: str | None = None) -> None:
-    # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
-    # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
-    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
-        scrape_openrouter.min_bits_for(MODEL_NAME_SCRAPER)
+def _reset_run_state() -> None:
+    '''Clear the per-run module state a run accumulates; shared by a normal run and a replay.'''
     tools_module._candidates = []
     tools_module._candidates_per_query = {}
     tools_module._check_status_counts = {}
@@ -5089,6 +5484,15 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     evidence.reset_rejections()
     reset_location_guesses()
     tools_module.prune_raw_postings()
+
+
+async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0,
+                              job_audit_enabled: bool = JOB_AUDIT_ENABLED, job_audit_job_id: str | None = None) -> None:
+    # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
+    # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
+    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
+        scrape_openrouter.min_bits_for(MODEL_NAME_SCRAPER)
+    _reset_run_state()
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -5360,6 +5764,113 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     })
 
 
+def read_job_ids_file(path: Path) -> list[dict]:
+    '''Parse a --job-ids file: one LinkedIn job per line, `job_id[<TAB>title<TAB>company]`.
+
+    Blank lines and lines starting with `#` are skipped. Title and company are optional: the page
+    extract supplies the real ones, and these only label the job until it is read.
+    '''
+    jobs: list[dict] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), start=1):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        fields = [field.strip() for field in line.split('\t')]
+        job_id = fields[0]
+        if not job_id.isdigit():
+            raise ValueError(f'{path}:{line_number}: expected a numeric LinkedIn job id first, got {line!r}')
+        if job_id in seen:
+            continue
+        seen.add(job_id)
+        title = fields[1] if len(fields) > 1 else ''
+        company = fields[2] if len(fields) > 2 else ''
+        jobs.append({
+            'site': 'linkedin', 'job_id': job_id, 'url': job_url('linkedin', job_id),
+            'title': title or f'(job {job_id})', 'company': company or '(unknown company)',
+            'date_posted': '', 'snippet': '',
+        })
+    return jobs
+
+
+async def run_job_ids_replay(job_ids_path: Path, browser_mode: str = 'headless') -> Path:
+    '''Diagnostic: rate the given LinkedIn jobs through Stage 2 as a real run would, changing nothing.
+
+    Answers "would the pipeline have recommended this job?" for jobs Stage 1 never found, such as
+    the ones LinkedIn recommends by email. Stage 1 is skipped. The title screen and the
+    already-applied check that Stage 1 applies are reported, and those jobs are not opened. Saved
+    postings and the notifications a real run would send go to a new directory under
+    run_dir/replays/; processed_jobs/, eval_error_releases.yaml, recruiter_notifications.yaml and
+    Telegram are untouched (see `tools_generic._replay_dir`). Returns the replay directory.
+    '''
+    jobs = read_job_ids_file(job_ids_path)
+    replay_dir = RUN_DIR / 'replays' / f"job-ids-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    replay_dir.mkdir(parents=True)
+    _reset_run_state()
+    tools_module._replay_dir = replay_dir
+    console.print(f'[bold magenta]Replay of {len(jobs)} job(s) from {job_ids_path} into {replay_dir}[/bold magenta]')
+
+    # Before screening: the already-applied check below makes one model call per company it has
+    # not identified before, and those should go to this run's endpoint like every later call.
+    await endpoint_pin.pin_single_turn_endpoints(MODEL_NAME_SINGLE_TURN)
+    screened: dict[str, str] = {}
+    candidates: list[dict] = []
+    for position, job in enumerate(jobs, start=1):
+        tools_module._listing_records[('linkedin', job['job_id'])] = {
+            'site': 'linkedin', 'job_id': job['job_id'], 'company': job['company'], 'title': job['title'],
+            'date_posted': '', 'check_status': 'replay', 'url': job['url'],
+            'queued': True, 'outcome': 'replay', 'rating': None, 'summary': '',
+        }
+        if reason := title_rejection_reason(job['title']):
+            screened[job['job_id']] = f'queue_skipped: {reason}'
+        elif matched_pdf := await company_matches_applied(job['company']):
+            screened[job['job_id']] = f'already_applied: {matched_pdf}'
+        else:
+            candidates.append(job)
+        # One line per job: an unidentified company costs a model call, so screening 73 jobs took
+        # minutes, and with DEBUG-only logging it looked hung (2026-10-22).
+        verdict = (f'not opened, as Stage 1 would have dropped it — {screened[job["job_id"]]}'
+                   if job['job_id'] in screened else 'queued for Stage 2')
+        logger.info(f"Replay screen [{position}/{len(jobs)}]: job {job['job_id']} {job['company']} — {verdict}")
+
+    stage_stats = {name: new_stage_stats() for name in (
+        'reference_summary', 'extraction', 'rating', 'recruiter_repost', 'salary', 'salary_estimate')}
+    funnel: dict[str, int] = {}
+    try:
+        if candidates:
+            browser = BrowserServer(browser_mode)
+            await browser.start()
+            try:
+                reference_block = await build_reference_summary(stage_stats['reference_summary'])
+                triage_enabled = True
+                if TRIAGE_ENABLED and (preflight_problem := await preflight_local_model()):
+                    triage_enabled = False
+                    logger.error(f'Local triage disabled for this replay: {preflight_problem}')
+                await evaluate_all_candidates(
+                    candidates, browser.mcp, build_evaluator_prompt(reference_block),
+                    build_profile_block(reference_block), stage_stats,
+                    funnel=funnel, triage_enabled=triage_enabled, browser=browser,
+                )
+            finally:
+                await browser.stop()
+    finally:
+        tools_module._replay_dir = None
+
+    rows = ['job_id\ttitle\tcompany\toutcome\trating\tsummary']
+    for job in jobs:
+        record = tools_module._listing_records[('linkedin', job['job_id'])]
+        outcome = screened.get(job['job_id'], record['outcome'])
+        rating = '' if record['rating'] is None else str(record['rating'])
+        rows.append('\t'.join([job['job_id'], job['title'], job['company'], outcome, rating,
+                               ' '.join(str(record['summary']).split())]))
+    summary_path = replay_dir / REPLAY_SUMMARY_FILENAME
+    summary_path.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    total_cost = sum(stats['cost'] for stats in stage_stats.values())
+    logger.info(f'Replay complete: {len(jobs)} job(s), {len(screened)} screened out, '
+                f'{len(candidates)} evaluated, ${total_cost:.4f}; funnel {json.dumps(funnel)}; summary {summary_path}')
+    console.print(f'[bold magenta]Replay summary: {summary_path} (cost ${total_cost:.4f})[/bold magenta]')
+    return replay_dir
+
+
 async def main() -> None:
     # Console + persistent per-run file log (triage/hard-rule rejections, extract sizes,
     # ratings — everything logged via the logging module lands in both). Written to
@@ -5404,6 +5915,13 @@ async def main() -> None:
              'to find jobs the funnel should have delivered',
     )
     parser.add_argument(
+        '--job-ids',
+        type=Path,
+        metavar='FILE',
+        help='Diagnostic: rate the LinkedIn jobs listed in FILE (job_id[<TAB>title<TAB>company] per line) '
+             'through Stage 2 with no search, no Telegram and no dedup records; results go to run_dir/replays/',
+    )
+    parser.add_argument(
         '--audit',
         action='store_true',
         help='Diagnostic: re-rate gate-killed jobs with the strong rater to detect false negatives '
@@ -5418,7 +5936,7 @@ async def main() -> None:
         help='Skip the end-of-run Job Audit PDF (one rated job, every step that decided its rating)',
     )
     args = parser.parse_args()
-    interactive = not args.non_interactive
+    interactive = not (args.non_interactive or args.job_ids)
 
     if args.status:
         console.print(tools_module.describe_run_status())
@@ -5436,6 +5954,9 @@ async def main() -> None:
         mode='interactive' if interactive else 'non-interactive', force=args.force,
     )
     if conflict:
+        # Logged as well: the run log is otherwise one line with no reason (2026-10-26).
+        logger.error(f"Not starting: a job search run is already active (pid {conflict['pid']}, started "
+                     f"{conflict['started_at']}, {conflict['mode']}, command {conflict['argv']!r})")
         console.print(
             f"[red]A job search run is already active (pid {conflict['pid']}, started "
             f"{conflict['started_at']}, {conflict['mode']}).[/red]\n"
@@ -5459,7 +5980,9 @@ async def main() -> None:
         await tools_module.ingest_save_dir_applied_pdfs()
         await tools_module.load_applied_jobs()
 
-        if interactive:
+        if args.job_ids:
+            await run_job_ids_replay(args.job_ids, browser_mode=args.browser)
+        elif interactive:
             options = ClaudeAgentOptions(
                 setting_sources=[],
                 strict_mcp_config=True,

@@ -1,4 +1,5 @@
 
+import asyncio
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ import pypdf
 import yaml
 from claude_agent_sdk import (
     ClaudeAgentOptions,
+    McpSdkServerConfig,
     ResultMessage,
     create_sdk_mcp_server,
     tool,
@@ -30,10 +32,13 @@ from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 
 import agentic_job_search.preferences as preferences
-from agentic_job_search import evidence, job_trace, location_review
+from agentic_job_search import company_domain, evidence, job_trace, location_review
+from agentic_job_search.company_domain import CompanyIdentity, identities_match
+from agentic_job_search.company_domain import normalize_company_name as _normalize_company
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
+    COMPANY_IDENTITY_LOOKUP_CONCURRENCY,
     EVAL_ERROR_MAX_RELEASES,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
@@ -80,7 +85,7 @@ RAW_POSTINGS_DIR = RUN_DIR / 'raw_postings'
 # Functions that touch both take them as separate parameters named `save_dir` and
 # `applied_to_dir`; a function that names only one directory operates only on that one.
 APPLIED_JOBS_DIR = RUN_DIR / 'applied_jobs'
-APPLIED_JOBS_INDEX_PATH = APPLIED_JOBS_DIR / 'index.yaml'
+APPLIED_JOBS_INDEX_NAME = 'index.yaml'
 # Legacy per-path cache from when the corpus lived in ~/Downloads; still read during ingest
 # as a fallback source of applied dates if a file's mtime has drifted.
 LEGACY_DOWNLOADS_CACHE_PATH = RUN_DIR / 'downloads_pdf_cache.yaml'
@@ -108,11 +113,20 @@ _processed_jobs: set[tuple[str, str]] = set()
 _candidates: list[dict] = []
 _candidates_per_query: dict[str, int] = {}
 _applied_companies: dict[str, str] = {}  # company_name -> PDF filename
+# company_name -> who it is (domain, parent); resolved once at load, see company_domain.py
+_applied_identities: dict[str, CompanyIdentity] = {}
+# Normalized name -> the LLM name-match verdict, for a name with no identity. Per run, so one
+# name gets one answer: uncached, NTT DATA Europe & Latam got two in one run (2026-10-19).
+_company_match_verdicts: dict[str, str | None] = {}
 # Per-page extracted text of each in-horizon applied job, newest first, for the reference profile.
 # Kept as pages until a prompt serializes it (text_budget.pages_to_prompt), so size is reportable.
 _reference_job_pages: list[list[str]] = []
 # In-horizon applied-job records: filename, applied_date, company, job_title, is_agency, end_client
 _applied_jobs: list[dict] = []
+# Set by a --job-ids replay: Stage 2 saves into this directory and writes notifications there, and
+# leaves processed_jobs/, eval_error_releases.yaml and recruiter_notifications.yaml untouched, so a
+# diagnostic re-rating of given jobs cannot change what a real run dedups or suppresses.
+_replay_dir: Path | None = None
 # Scraper funnel observability: counts every check_and_record_job outcome this run.
 _check_status_counts: dict[str, int] = {}  # status -> count (new/already_processed/already_applied/too_old/auth_required)
 # Per-listing audit trail: one record per check_and_record_job call, keyed by (site, job_id).
@@ -331,19 +345,6 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
     return {'company': '', 'job_title': '', 'is_agency': False, 'end_client': ''}
 
 
-def _normalize_company(name: str) -> str:
-    """Strip punctuation and common legal/entity suffixes so 'Datadog, Inc.' == 'Datadog'."""
-    cleaned = re.sub(r'[^a-z0-9 ]+', ' ', name.lower())
-    words = [w for w in cleaned.split() if w not in _COMPANY_NOISE_WORDS]
-    return ' '.join(words)
-
-
-_COMPANY_NOISE_WORDS = {
-    'inc', 'llc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company',
-    'group', 'holdings', 'gmbh', 'sa', 'bv', 'plc', 'the', 'technologies', 'software',
-}
-
-
 def _require_fields(raw: dict, **kinds: type) -> dict:
     '''raw, once each named field has its type; raises ValueError naming the first that does not.
 
@@ -369,12 +370,15 @@ async def _company_matches_openrouter(candidate: str, companies_list: str) -> di
                        f'company match for {candidate!r}')
 
 
-async def company_matches_applied(candidate: str) -> str | None:
+async def company_matches_applied(candidate: str, identity: CompanyIdentity | None = None) -> str | None:
     '''Return the source PDF filename if candidate matches a previously applied-to company, else None.
 
     Tries an exact normalized string match first — that resolves the overwhelming majority of
     listings for free and, more importantly, without a per-listing network round-trip that would
-    otherwise dominate Stage 1b wall-clock. The LLM is only consulted for genuine ambiguity.
+    otherwise dominate Stage 1b wall-clock. Then the companies' identities (domain and parent,
+    company_domain.py), compared in code: `identity` when the caller read it off LinkedIn,
+    else the cached or model-resolved one for the name. Only a name nobody could identify falls
+    back to the LLM name match, and its verdict is kept for the run.
     '''
     if not _applied_companies:
         return None
@@ -385,6 +389,30 @@ async def company_matches_applied(candidate: str) -> str | None:
         logger.debug(f'company_matches_applied: exact normalized match {candidate!r} -> {exact!r} (no LLM call)')
         return _applied_companies[exact]
 
+    if identity is None:
+        try:
+            identity = await company_domain.identity_for_name(candidate)
+        except Exception as ex:
+            logger.warning(f'company_matches_applied: could not identify {candidate!r}, matching by name '
+                           f'instead: {unwrap_exception(ex)}')
+    if identity is not None and identity.source != company_domain.SOURCE_NONE:
+        for name, applied in _applied_identities.items():
+            if identities_match(identity, applied):
+                logger.debug(f'company_matches_applied: {identity.describe()} matches applied '
+                             f'{applied.describe()} (no LLM call)')
+                return _applied_companies[name]
+        return None
+
+    folded = _normalize_company(candidate)
+    if folded in _company_match_verdicts:
+        return _company_match_verdicts[folded]
+    verdict = await _company_matches_by_name(candidate)
+    _company_match_verdicts[folded] = verdict
+    return verdict
+
+
+async def _company_matches_by_name(candidate: str) -> str | None:
+    '''The LLM name match against every applied company: for a name with no identity.'''
     companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
 
     if route_for(MODEL_NAME_COMPANY_MATCH) == 'openrouter':
@@ -609,9 +637,9 @@ async def company_blacklist_reason(company: str, context: str = '', description:
 # No threshold separates the two cases.
 #
 # So: a free deterministic gate (same agency, notified inside the window), then at most one cheap
-# LLM call that picks a prior job_id out of a list it was shown. It withholds a NOTIFICATION only —
-# the job is still rated, saved and audited — and it fails open, because a duplicate ping costs a
-# glance while a missed one costs a real role.
+# LLM call that picks a prior job_id out of a list it was shown. It changes a NOTIFICATION only —
+# folding it into that role's message or a follow-up; the job is still rated, saved and audited —
+# and it fails open, because a duplicate ping costs a glance while a missed one costs a real role.
 
 def raw_posting_path(candidate: dict, captured_on: date | None = None) -> Path:
     """Where this job's captured page text lives. One file per job per day."""
@@ -704,9 +732,9 @@ RECRUITER_NOTIFICATIONS_PATH = RUN_DIR / 'recruiter_notifications.yaml'
 RECRUITER_DESCRIPTION_MAX_CHARS = 8_000
 
 _RECRUITER_NOTIFICATIONS_HEADER = (
-    '# Agency postings the user has been notified about, pruned to the last\n'
-    '# RECRUITER_REPOST_WINDOW_DAYS days. Used ONLY to decide whether a later posting by the same\n'
-    '# agency is the same role re-advertised, and so should not be notified a second time.\n'
+    '# Postings the user has been notified about (agencies and employers alike), pruned to the\n'
+    '# last RECRUITER_REPOST_WINDOW_DAYS days. Used ONLY to decide whether a later posting by the\n'
+    '# same poster is the same role re-advertised, and so should not be notified a second time.\n'
     '#\n'
     '# Gates nothing else: no rating, no rejection. Rewritten by the agent; safe to delete.\n'
 )
@@ -725,7 +753,10 @@ def _parse_iso_date(raw: Any) -> date:
 
 
 def load_recruiter_notifications(today: date | None = None) -> list[dict]:
-    '''Notified agency postings still inside the repost window, newest first.
+    '''Notified postings still inside the repost window, newest first.
+
+    Agency postings only until 2026-10-23, every poster since (see `recruiter_repost_of`); the
+    `recruiter_` names and the `agency` / `agency_key` fields predate that and mean "poster".
 
     Fails open to an empty list on anything unreadable. Deliberately NOT the "skip, never rebuild"
     treatment `location_recommendations.yaml` gets: that file holds decisions the user made by hand,
@@ -739,7 +770,7 @@ def load_recruiter_notifications(today: date | None = None) -> list[dict]:
     except Exception as ex:
         logger.warning(
             f'Could not read {RECRUITER_NOTIFICATIONS_PATH} ({unwrap_exception(ex)}) — treating it '
-            f'as empty, so agency postings notify normally this run.'
+            f'as empty, so postings notify normally this run.'
         )
         return []
     if not isinstance(loaded, list):
@@ -770,13 +801,16 @@ def load_recruiter_notifications(today: date | None = None) -> list[dict]:
 
 
 def record_recruiter_notification(candidate: dict, extract: dict, today: date | None = None) -> dict:
-    '''Record one notified agency posting so a later repost of it can be recognised.
+    '''Record one notified posting so a later repost of it by the same poster can be recognised.
 
     Only postings actually NOTIFIED are recorded. A role first rated 3 was never sent to the user,
     so a later repost that rates 4 must still notify.
     '''
     agency = str(extract.get('company') or candidate.get('company') or '').strip()
     job_id = str(candidate.get('job_id') or '')
+    if _replay_dir is not None:
+        logger.info(f'Replay: not recording the notification for {agency} (job {job_id})')
+        return {}
     entry = {
         # The name as written: folding happens at the comparison, via `agency_key`.
         'agency': agency,
@@ -822,18 +856,21 @@ def _repost_match_prompt(new_posting: dict, priors: list[dict]) -> str:
         _posting_block(p, f'--- PRIOR POSTING {i} ---') for i, p in enumerate(priors, start=1)
     )
     return (
-        'A recruitment agency posted the NEW job below. The same agency already advertised the '
-        'PRIOR jobs, and the user was notified about each of those.\n\n'
+        'A company posted the NEW job below. The same poster already advertised the PRIOR jobs, '
+        'and the user was notified about each of those. The poster may be a recruitment agency or '
+        'the hiring employer itself.\n\n'
         f"{_posting_block(new_posting, '--- NEW POSTING ---')}\n\n{prior_blocks}\n\n"
         'Is the NEW posting the SAME ROLE as one of the prior postings — the same position at the '
         'same hiring organization or programme, re-advertised? A different country, a different '
         'day rate, or different wording in the title does NOT make it a different role: agencies '
-        'routinely re-post one role across several countries. A different position, a different '
+        'and employers alike routinely post one role once per country. A different position, a '
+        'different team, a different '
         'client, or a different programme DOES make it a different role.\n\n'
         'Judge it on the BODY: the responsibilities, the requirements, the client named or '
         'described, and concrete details such as a contact address, a rate, or a named programme. '
-        'Being posted by the same agency is NOT evidence — an aggregator advertises many unrelated '
-        'roles — and neither are adjacent job ids, a shared seniority level, or both postings '
+        'Being posted by the same poster is NOT evidence — an aggregator or a large employer '
+        'advertises many unrelated roles — and neither are adjacent job ids, a shared seniority '
+        'level, or both postings '
         'being remote AI engineering jobs.\n\n'
         'If you are not sure, answer with an empty string. The two mistakes are not equal: a match '
         'you miss costs one duplicate notification, while a match you invent hides a real job from '
@@ -857,8 +894,11 @@ async def recruiter_repost_of(
 ) -> dict | None:
     '''The already-notified posting this one re-advertises, or None to notify normally.
 
-    Two steps, and the first is free: unless this agency already had a posting notified inside the
-    window, no LLM call is made at all — which is every job on essentially every run.
+    Two steps, and the first is free: unless this poster already had a posting notified inside the
+    window, no LLM call is made at all — which is most notified jobs on most runs.
+
+    Every poster, not only agencies, since 2026-10-23: Mimica, the employer itself, posted one role
+    once per country, and two of those postings were notified in the same run.
 
     The model only ever picks a `job_id` out of the list it was shown, and an id that is not in that
     list is treated as NO match (see the Anti-fabrication requirement): it chooses, it never
@@ -866,7 +906,7 @@ async def recruiter_repost_of(
 
     Fails OPEN, the opposite of the blacklist confirmation above. A blacklist hit means a name the
     user wrote down already matched, so an outage must not readmit it; here nothing has been
-    established except that the same agency posted before, and an outage must not silence a real
+    established except that the same poster posted before, and an outage must not silence a real
     role.
     '''
     agency = str(extract.get('company') or candidate.get('company') or '').strip()
@@ -1154,7 +1194,7 @@ async def ingest_save_dir_applied_pdfs(
     if not pdfs:
         return 0
 
-    index = _read_yaml_mapping(applied_to_dir / 'index.yaml')
+    index = _read_yaml_mapping(applied_to_dir / APPLIED_JOBS_INDEX_NAME)
     legacy_cache = _read_yaml_mapping(LEGACY_DOWNLOADS_CACHE_PATH)
 
     moved = 0
@@ -1215,10 +1255,10 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     metadata LLM call only runs for new or changed PDFs. Records applied to longer ago than
     APPLIED_JOBS_HORIZON_DAYS stay on disk but are not read into any global.
     '''
-    global _applied_companies, _reference_job_pages, _applied_jobs
+    global _applied_companies, _applied_identities, _reference_job_pages, _applied_jobs
 
     applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
-    index_file = index_path or (applied_to_dir / 'index.yaml')
+    index_file = index_path or (applied_to_dir / APPLIED_JOBS_INDEX_NAME)
 
     index = _read_yaml_mapping(index_file)
     legacy_cache = _read_yaml_mapping(LEGACY_DOWNLOADS_CACHE_PATH)
@@ -1290,6 +1330,8 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         index_file.write_text(yaml.dump(index, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
     _applied_companies = companies
+    _applied_identities = await _identify_applied_companies(companies)
+    _company_match_verdicts.clear()
     # NEWEST first. Consumers cap this at MAX_REFERENCE_JOBS, and taking the OLDEST N meant a
     # newly applied job could never influence the ideal-role profile — it only entered once older
     # records aged out of the horizon, so the rater calibrated against jobs the user had moved on
@@ -1301,6 +1343,32 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         f'Loaded {len(jobs)} applied job(s) within {APPLIED_JOBS_HORIZON_DAYS} days '
         f'({len(companies)} blocklisted companies); {aged_out} of {total} beyond the horizon.'
     )
+
+
+async def _identify_applied_companies(companies: dict[str, str]) -> dict[str, CompanyIdentity]:
+    '''Each applied company's identity, from the cache or one model call each (once, ever).
+
+    A company that cannot be identified keeps its name alone, so it still matches by name; the
+    failure is logged, and the next run asks again.
+    '''
+    semaphore = asyncio.Semaphore(COMPANY_IDENTITY_LOOKUP_CONCURRENCY)
+    failures: list[str] = []
+
+    async def identify(name: str) -> tuple[str, CompanyIdentity]:
+        async with semaphore:
+            try:
+                return name, await company_domain.identity_for_name(name)
+            except Exception as ex:
+                failures.append(f'{name!r}: {unwrap_exception(ex)}')
+                return name, CompanyIdentity(name=name)
+
+    identities = dict(await asyncio.gather(*(identify(name) for name in companies)))
+    if failures:
+        logger.warning(f'Could not identify {len(failures)} of {len(companies)} applied companies, matching '
+                       f'them by name alone this run: {"; ".join(failures)}')
+    known = sum(1 for identity in identities.values() if identity.source != company_domain.SOURCE_NONE)
+    logger.info(f'Applied companies identified: {known} of {len(companies)} by domain or parent')
+    return identities
 
 
 def applied_jobs_summary() -> str:
@@ -1765,7 +1833,10 @@ def forget_processed_job(site: str, job_id: str) -> int:
     Stage 1 marks a job processed the moment it is queued. Without this, a job that Stage 2 could
     not reach (on 2026-09-21 a dead browser left 23 of them) is deduped away forever.
     Returns the number of record files removed; raises FileNotFoundError when there were none.
+    A replay never recorded the job, so it removes nothing and returns 0.
     '''
+    if _replay_dir is not None:
+        return 0
     records = list(PROCESSED_JOBS_DIR.glob(f'job_posting-{site}-{job_id}-*.yaml'))
     if not records:
         raise FileNotFoundError(
@@ -1797,6 +1868,8 @@ def release_errored_job(site: str, job_id: str) -> str:
     Raises when the count file cannot be read or written, or the job has no processed record: the
     caller is already reporting an error for this job and adds this one to it.
     '''
+    if _replay_dir is not None:
+        return 'not released: replay run (processed_jobs/ untouched)'
     key = f'{site}/{job_id}'
     releases: dict = {}
     if EVAL_ERROR_RELEASES_PATH.exists():
@@ -1827,7 +1900,7 @@ async def do_save_job_posting(
     company: str, description: str, rating: int, content: str, job_id: str | None = None
 ) -> dict:
     date_str = datetime.now().strftime('%Y%b%d')
-    dir_path = RUN_DIR / f'saved_jobs-{date_str}'
+    dir_path = _replay_dir if _replay_dir is not None else RUN_DIR / f'saved_jobs-{date_str}'
     dir_path.mkdir(parents=True, exist_ok=True)
 
     ts = int(time.time())
@@ -1876,26 +1949,48 @@ def log_run_cost(record: dict, log_path: Path | None = None) -> None:
 # stay proper); `re.IGNORECASE` below is what makes it match "the us" too.
 _US = r'(?:US|U\.S\.|United States)'
 
-_AUTH_REQUIRED_PATTERNS = [
+# Naming the US makes a phrase evidence that the role is US-based, wherever its location says it is.
+_US_AUTH_REQUIRED_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
         rf'must be (legally )?authorized to work in the {_US}',
+        rf'{_US} citizens? and (lawful )?permanent residents?',
+        rf'currently (legally )?authorized to work in the {_US}',
+    ]
+]
+
+# These name no country, so they count only where the user needs sponsorship. Applied anywhere, they
+# auto-rejected 43 of 48 sponsorship rejections for Canada and EU roles the user may already work in
+# (2026-09-03 to 2026-10-26).
+_NO_SPONSORSHIP_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
         r'no visa sponsorship',
         r'not able to (provide |offer )?sponsor',
         r'cannot (provide |offer )?sponsor',
         r'sponsorship (is )?not (available|provided|offered)',
         r'will not (provide |offer )?sponsor',
         r'unable to (provide |offer )?sponsor',
-        rf'{_US} citizens? and (lawful )?permanent residents?',
-        rf'currently (legally )?authorized to work in the {_US}',
         r"this (position|role|job) (does not|doesn't) (provide|offer|support) (visa )?sponsorship",
         r'employment authorization (without|not requiring) sponsorship',
     ]
 ]
 
 
+_US_PLACE_NAME_RE = re.compile(rf'(?:{_US}|USA|U\.S\.A\.)(?: of America)?', re.IGNORECASE)
+
+
+def _names_us(place: str) -> bool:
+    '''Return True if a place name, as a whole, is the United States.'''
+    return bool(_US_PLACE_NAME_RE.fullmatch(place.strip()))
+
+
 def _requires_current_us_auth(text: str) -> bool:
-    '''Return True if text indicates the job requires current US work authorization (no sponsorship).'''
-    return any(p.search(text) for p in _AUTH_REQUIRED_PATTERNS)
+    '''Return True if text demands current US work authorization, which makes the role US-based.'''
+    return any(p.search(text) for p in _US_AUTH_REQUIRED_PATTERNS)
+
+
+def _states_no_sponsorship(text: str) -> bool:
+    '''Return True if text says no visa sponsorship is offered, in any country.'''
+    return any(p.search(text) for p in _NO_SPONSORSHIP_PATTERNS)
 
 
 # Both are SEARCHED within the string, not matched against all of it. LinkedIn and the extract
@@ -1996,7 +2091,7 @@ async def do_check_and_record_job(
         return _result('too_old')
 
     combined_text = ' '.join(filter(None, [description, content]))
-    if _requires_current_us_auth(combined_text):
+    if any(_names_us(loc) for loc in preferences.sponsorship_required_in()) and _requires_current_us_auth(combined_text):
         console.print(f'[dim]Skipping {company} — requires current US work authorization.[/dim]')
         return _result('auth_required')
 
@@ -2232,7 +2327,7 @@ async def queue_candidate(args: dict[str, Any]) -> dict:
 
 # --- MCP server factories ---
 
-def make_job_search_server(interactive: bool):
+def make_job_search_server(interactive: bool) -> McpSdkServerConfig:
     '''MCP server for interactive mode.'''
     tools = [check_and_record_job, save_job_posting]
     if interactive:

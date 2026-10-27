@@ -31,13 +31,13 @@ search_regions:
     geo_id: '000000'
 
 # Places (written properly — 'Germany', not 'germany') where you would need
-# visa sponsorship. A job there that does not explicitly offer sponsorship is auto-rated 1.
+# visa sponsorship. A job there that does not explicitly offer sponsorship is auto-rejected (RATING_AUTO_REJECT in config.py).
 # Leave empty if you are authorized everywhere you search.
 sponsorship_required_in: []
 
 # Languages you can work in, lowercase. This list drives three separate rules, all of them off
 # while it is empty:
-#   1. A posting that explicitly REQUIRES another language is auto-rated 1 (hard rule).
+#   1. A posting that explicitly REQUIRES another language is auto-rejected, RATING_AUTO_REJECT in config.py (hard rule).
 #   2. A posting WRITTEN IN another language is capped at `foreign_language_rating_cap` below.
 #   3. A job whose location IMPLIES a different working language (English JD in Montreal or
 #      Madrid) gets a warning — never a rejection. That language comes from the location alone,
@@ -47,7 +47,7 @@ languages:
 
 # Highest rating a posting written in a language outside `languages` can receive. Like the hybrid
 # cap this is a ceiling, not a rejection: the job is still saved and auditable, it just cannot
-# reach the notification threshold of 4.
+# reach the notification threshold (RATING_NOTIFICATION_THRESHOLD in config.py).
 foreign_language_rating_cap: 3
 
 # Degree levels that auto-reject when a posting states them as a HARD requirement.
@@ -91,7 +91,7 @@ locations:
 hybrid:
   # Highest rating a hybrid/on-site job OUTSIDE would_commute_here can reach. A ceiling, not a
   # rejection: the job is still saved and auditable, it just cannot reach the notification
-  # threshold of 4. An office means uncompensated travel time and permanently living within reach
+  # threshold (RATING_NOTIFICATION_THRESHOLD in config.py). An office means uncompensated travel time and permanently living within reach
   # of it, so this is a real cost even where the role is good.
   rating_cap: 3
 
@@ -116,6 +116,11 @@ relocation_note: ''
 # a relocation; one naming a region or city inside it still is. Empty means every stated residence
 # requirement is flagged.
 current_tax_residence: ''
+
+# Countries and areas you may already live and work in without a visa, written as place names
+# (e.g. [Portugal, European Union]). Told to the evaluator, so a posting requiring residence there
+# is not warned about as an eligibility problem. Empty means the evaluator is told nothing.
+right_to_live_and_work_in: []
 
 compensation:
   # Annual base pay you are targeting, and the ISO 4217 currency it is quoted in. When BOTH are set
@@ -143,7 +148,7 @@ companies:
   # Also checked against the end client, so a recruiting agency reposting the role does not
   # get around it.
   #
-  # `added` is required for an entry to expire. An entry stops rejecting 180 days after that
+  # `added` is required for an entry to expire. An entry stops rejecting COMPANY_BLACKLIST_EXPIRY_DAYS (config.py) after that
   # date and is then reported at WARNING and in the run audit log — renew it by bumping the
   # date, or delete it. An entry with no valid date stays active and is warned about.
   blacklist: []

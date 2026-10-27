@@ -3,8 +3,9 @@
 `evaluate_all_candidates` opens a trace per candidate (`start`); code anywhere below it calls
 `record(kind, **data)` without being handed the job, because the trace lives in a ContextVar. A
 call outside any job (Stage 1b, the reference summary) records nothing. Each step is appended to
-`run_dir/job_traces/{date}/{site}-{job_id}.jsonl` at once, so a crash mid-job still leaves the
-steps that led to it.
+the job's file (`tools_generic.job_trace_path`, beside its raw posting) at once, so a crash mid-job
+still leaves the steps that led to it. A step made after the job has finished, such as the
+notification sent at the end of Stage 2, is added to the job's `JobTrace` directly.
 '''
 
 import contextvars

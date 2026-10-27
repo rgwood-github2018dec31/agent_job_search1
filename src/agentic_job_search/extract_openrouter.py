@@ -32,6 +32,8 @@ from agentic_job_search.text_budget import quote_for_error, snippet
 logger = logging.getLogger(__name__)
 
 _SUBMIT_TOOL_NAME = 'submit_job_extract'
+# The system prompt and the page; a conversation reset after an endpoint defect keeps only these.
+_INITIAL_MESSAGE_COUNT = 2
 
 
 OPENROUTER_EXTRACT_TOOLS = [
@@ -128,6 +130,17 @@ OPENROUTER_EXTRACT_TOOLS = [
 ]
 
 _SUBMIT_REQUIRED_FIELDS = ('title', 'company', 'description')
+# Every other field, all optional, since a required field the model cannot observe pressures it to
+# make one up (Anti-fabrication). A real page always carries some of these, at least a location.
+# A submit with NONE of them is an endpoint defect, not a page: inference-net/us returned only
+# title, company and closed, 3 of 3 times on one page, while morph and deepinfra filled them
+# (2026-10-26). Pinned there, the 2026-10-25 run rated 12 of 12 jobs with no location, language
+# or salary, so no gate or warning saw them.
+_SUBMIT_OPTIONAL_FIELDS = (
+    'location', 'workplace_type', 'date_posted', 'salary', 'sponsorship_note', 'language_requirement',
+    'posting_language', 'stated_working_language', 'residency_scope', 'relocation',
+    'education_requirement', 'is_agency', 'end_client',
+)
 
 
 def _extract_from_submit_args(args: dict) -> dict:
@@ -171,6 +184,7 @@ async def extract_job_page_openrouter(
     ]
     total_cost = 0.0
     started = time.monotonic()
+    retried = False   # a failed chat is asked once more when the pin moved (endpoint_failed)
     for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
         # A timeout or transport failure raises rather than returning ok=false. Until 2026-10-18 it
         # escaped to the Stage 2 error handler, skipping the Haiku fallback and dropping the job.
@@ -187,11 +201,13 @@ async def extract_job_page_openrouter(
                              model=MODEL_NAME_EXTRACTOR, routing=routing, iteration=iteration + 1,
                              messages=list(messages), error=f'{type(ex).__name__}: {ex}',
                              seconds=round(time.monotonic() - call_started, 2))
-            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, f'{type(ex).__name__}: {ex}')
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat with {MODEL_NAME_EXTRACTOR} failed (iteration {iteration + 1}): {type(ex).__name__}: {ex}"
             )
+            if endpoint_failed(MODEL_NAME_EXTRACTOR, routing, ex) and not retried:
+                retried = True
+                continue
             return None
         # The whole exchange, raw: the tool spec is fixed (OPENROUTER_EXTRACT_TOOLS), so the
         # messages and the server's reply are everything that varied.
@@ -208,11 +224,13 @@ async def extract_job_page_openrouter(
             )
             return None
         if not data.get('ok'):
-            endpoint_failed(MODEL_NAME_EXTRACTOR, routing, str(data.get('error') or raw))
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
                 f"chat failed (iteration {iteration + 1}): {quote_for_error(raw, 'OpenRouter extract error reply')}"
             )
+            if endpoint_failed(MODEL_NAME_EXTRACTOR, routing, str(data.get('error') or raw)) and not retried:
+                retried = True
+                continue
             return None
         usage = data.get('usage') or {}
         stage_stats['cost'] += float(data.get('cost_usd') or 0.0)
@@ -230,6 +248,7 @@ async def extract_job_page_openrouter(
             return None
 
         messages.append({'role': 'assistant', 'content': data.get('content'), 'tool_calls': tool_calls})
+        endpoint_defect = False
         for tool_call in tool_calls:
             name = tool_call['function']['name']
             call_id = tool_call.get('id', '')
@@ -261,6 +280,18 @@ async def extract_job_page_openrouter(
                     'content': f'Error: missing required field(s) {missing}. Call submit_job_extract again with them.',
                 })
                 continue
+            if routing and not any(f in args for f in _SUBMIT_OPTIONAL_FIELDS):
+                # Asking the same endpoint again does not help, so drop it for the run (every
+                # single-turn call moves to the next-ranked endpoint) and ask afresh. Unpinned,
+                # there is no other endpoint to try, so the thin extract is kept as before.
+                defect = f'submit_job_extract carried none of the optional fields {list(_SUBMIT_OPTIONAL_FIELDS)}'
+                logger.warning(
+                    f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
+                    f'{defect} (iteration {iteration + 1}, routing {routing}); dropping the endpoint and asking again'
+                )
+                endpoint_failed(MODEL_NAME_EXTRACTOR, routing, defect)
+                endpoint_defect = True
+                break
             extract = _extract_from_submit_args(args)
             logger.info(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
@@ -271,6 +302,8 @@ async def extract_job_page_openrouter(
                 + f', ${total_cost:.4f}'
             )
             return extract
+        if endpoint_defect:
+            del messages[_INITIAL_MESSAGE_COUNT:]
 
     logger.warning(
         f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "

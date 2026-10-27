@@ -12,7 +12,6 @@ agent_stock_trends1.
 
 import json
 import logging
-import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -35,20 +34,13 @@ from agentic_job_search.config import (
     OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
 )
-from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
+from agentic_job_search.endpoint_pin import endpoint_failed, http_status_of, routing_for
 from agentic_job_search.text_budget import quote_for_error
 
 logger = logging.getLogger(__name__)
 
 
 PROVIDER_UNAVAILABLE_STATUSES = frozenset({401, 402, 403, 429})
-
-# `requests` renders a raised-for status as "402 Client Error: Payment Required for url: ...";
-# the OpenRouter body itself carries {"error": {"code": 402, ...}}. Both are matched, and the
-# match is on the STATUS, never on the reason phrase -- the phrase is upstream's text and can
-# change without notice, while the code is the contract.
-_HTTP_STATUS_RE = re.compile(r'\b(\d{3})\s+(?:Client|Server)\s+Error\b')
-_JSON_STATUS_RE = re.compile(r'"(?:code|status|status_code)"\s*:\s*(\d{3})\b')
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -86,14 +78,6 @@ class TruncatedResponseError(RuntimeError):
     def __init__(self, message: str, max_tokens: int | None = None):
         super().__init__(message)
         self.max_tokens = max_tokens
-
-
-def http_status_of(error_text: str) -> int | None:
-    '''The HTTP status named in a provider error string, or None if it names none.'''
-    for pattern in (_HTTP_STATUS_RE, _JSON_STATUS_RE):
-        if match := pattern.search(error_text):
-            return int(match.group(1))
-    return None
 
 
 def provider_error(context: str, error_text: str) -> RuntimeError:
@@ -240,22 +224,29 @@ async def _chat_openrouter(
     args = {'messages': messages, 'model': model}
     if max_tokens is not None:
         args['max_tokens'] = max_tokens
-    routing = routing_for(model)
-    args.update(routing)
-    try:
-        raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', args, timeout_seconds=timeout_seconds)
-    except Exception as ex:
-        endpoint_failed(model, routing, f'{type(ex).__name__}: {ex}')
-        raise
-    try:
-        data = json.loads(raw)
-    except ValueError as ex:
-        raise ValueError(f'OpenRouter chat reply for {model} is not JSON ({ex}): '
-                         f'{quote_for_error(raw, "OpenRouter chat reply")!r}') from ex
-    if not isinstance(data, dict):
-        raise ValueError(f'OpenRouter chat reply for {model} is not an object: {quote_for_error(raw, "OpenRouter chat reply")!r}')
-    if data.get('ok') is not True:
-        endpoint_failed(model, routing, str(data.get('error') or raw))
+    retried = False
+    while True:
+        routing = routing_for(model)
+        try:
+            raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', {**args, **routing},
+                                      timeout_seconds=timeout_seconds)
+        except Exception as ex:
+            if endpoint_failed(model, routing, ex) and not retried:
+                retried = True
+                continue
+            raise
+        try:
+            data = json.loads(raw)
+        except ValueError as ex:
+            raise ValueError(f'OpenRouter chat reply for {model} is not JSON ({ex}): '
+                             f'{quote_for_error(raw, "OpenRouter chat reply")!r}') from ex
+        if not isinstance(data, dict):
+            raise ValueError(f'OpenRouter chat reply for {model} is not an object: {quote_for_error(raw, "OpenRouter chat reply")!r}')
+        if data.get('ok') is True:
+            break
+        if endpoint_failed(model, routing, str(data.get('error') or raw)) and not retried:
+            retried = True
+            continue
         # The whole reply, not just `error`: the server's other fields say who failed.
         raise provider_error(f'OpenRouter chat failed for {model}', quote_for_error(raw, 'OpenRouter chat failure reply'))
     _field(data, 'content', (str, type(None)), raw)

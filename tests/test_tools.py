@@ -16,6 +16,7 @@ import requests
 import yaml
 from agentic_job_search import (
     agent,
+    company_domain,
     config,
     evidence,
     extract_openrouter,
@@ -334,20 +335,13 @@ async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _requires_current_us_auth
+# _requires_current_us_auth / _states_no_sponsorship
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('text', [
     'Must be authorized to work in the US without sponsorship',
-    'No visa sponsorship available for this role',
-    'We are not able to sponsor work visas',
-    'We cannot sponsor or transfer visas',
-    'Sponsorship is not available for this position',
-    'Will not sponsor applicants for work visas',
     'US citizens and permanent residents only',
     'Currently authorized to work in the United States',
-    'This position does not provide visa sponsorship',
-    'Employment authorization without sponsorship required',
     'must be legally authorized to work in the united states',
     'Must be authorized to work in the U.S.',
     'U.S. citizens and lawful permanent residents only',
@@ -363,9 +357,45 @@ def test_requires_current_us_auth_matches(text):
     'Staff AI Engineer at Shopify',
     'Sponsorship available for the right candidate',
     'Remote role, open to all locations',
+    # Country-neutral refusals say nothing about the US (2026-10-27).
+    'No visa sponsorship available for this role',
+    'FullStack will not sponsor applicants for work visas now or in the future.',
+    'Applicants must be legally authorized to work in Canada at the time of hire.',
 ])
 def test_requires_current_us_auth_no_false_positives(text):
     assert not tools._requires_current_us_auth(text), f'Expected no match for: {text!r}'
+
+
+@pytest.mark.parametrize('text', [
+    'No visa sponsorship available for this role',
+    'We are not able to sponsor work visas',
+    'We cannot sponsor or transfer visas',
+    'Sponsorship is not available for this position',
+    'Will not sponsor applicants for work visas',
+    'This position does not provide visa sponsorship',
+    'Employment authorization without sponsorship required',
+])
+def test_states_no_sponsorship_matches(text):
+    assert tools._states_no_sponsorship(text), f'Expected match for: {text!r}'
+
+
+@pytest.mark.parametrize('text', [
+    'We are open to visa sponsorship for exceptional candidates',
+    'Sponsorship available for the right candidate',
+    'Remote role, open to all locations',
+])
+def test_states_no_sponsorship_no_false_positives(text):
+    assert not tools._states_no_sponsorship(text), f'Expected no match for: {text!r}'
+
+
+@pytest.mark.parametrize('place', ['United States', 'US', 'U.S.', 'USA', 'united states of america'])
+def test_names_us_matches(place):
+    assert tools._names_us(place)
+
+
+@pytest.mark.parametrize('place', ['Canada', 'United Kingdom', 'Russia', 'Austria'])
+def test_names_us_rejects_other_places(place):
+    assert not tools._names_us(place)
 
 
 async def test_check_and_record_job_auth_required(tmp_path, monkeypatch):
@@ -1389,6 +1419,31 @@ async def test_apply_hard_rules_explicit_no_auth_statement():
     assert reason is not None and 'sponsorship' in reason
 
 
+async def test_apply_hard_rules_us_states_no_sponsorship():
+    extract = _make_extract(location='United States (Remote)', description='No visa sponsorship available.')
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'sponsorship' in reason
+
+
+# 2026-10-26: these Canada postings were auto-rated 1 although the user needs sponsorship only in the US.
+@pytest.mark.parametrize('note', [
+    'Applicants must be currently authorized to work in the country of this job posting on a full-time '
+    'basis. FullStack will not sponsor applicants for work visas now or in the future.',
+    'This role does not provide visa sponsorship. Applicants must be legally authorized to work in Canada '
+    'at the time of hire and must not require employer sponsorship for a work visa (current or future).',
+    'Visa sponsorship is not offered for this role.',
+])
+async def test_apply_hard_rules_no_sponsorship_outside_sponsorship_locations_passes(note):
+    extract = _make_extract(location='Canada (Remote)', sponsorship_note=note)
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+async def test_apply_hard_rules_us_auth_ignored_when_us_needs_no_sponsorship(monkeypatch):
+    monkeypatch.setattr(preferences, 'sponsorship_required_in', lambda: ('United Kingdom',))
+    extract = _make_extract(location='Remote', description='Must be authorized to work in the US.')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
 async def test_apply_hard_rules_non_english_language_requirement():
     extract = _make_extract(language_requirement='dutch')
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
@@ -2111,6 +2166,42 @@ async def test_openrouter_loop_missing_submit_fields_retries(monkeypatch):
 
     assert await _run_loop() is not None
     assert 'missing required field' in chat_requests[1]['messages'][-1]['content']
+
+
+async def test_openrouter_loop_drops_an_endpoint_that_omits_every_optional_field(monkeypatch, caplog):
+    '''inference-net/us returned only title, company and closed, 3 of 3 times on one page
+    (2026-10-26); pinned there, the 2026-10-25 run rated 12 of 12 jobs with no location. Asking
+    that endpoint again does not help, so the pin moves on and the page is asked afresh.'''
+    from agentic_job_search import endpoint_pin
+    model = extract_openrouter.MODEL_NAME_EXTRACTOR
+    monkeypatch.setitem(endpoint_pin._pins, model, endpoint_pin.EndpointPin(model, [
+        (1e-7, {'tag': 'inference-net/us', 'quantization': 'fp8'}),
+        (2e-7, {'tag': 'morph/fp8', 'quantization': 'fp8'}),
+    ]))
+    thin = {**_SUBMIT_ARGS, 'closed': False}
+    full = {**_SUBMIT_ARGS, 'location': 'Cyprus (Remote)', 'workplace_type': 'remote'}
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', thin)]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', full)]),
+    ], chat_requests)
+
+    with caplog.at_level(logging.WARNING):
+        extract = await _run_loop()
+
+    assert extract['location'] == 'Cyprus (Remote)'
+    assert [r['provider'] for r in chat_requests] == ['inference-net/us', 'morph/fp8']
+    assert len(chat_requests[1]['messages']) == 2, 'asked afresh, not shown the defective reply'
+    assert any('carried none of the optional fields' in r.getMessage() for r in caplog.records)
+
+
+async def test_openrouter_loop_keeps_a_thin_extract_when_unpinned(monkeypatch):
+    '''With no pin there is no other endpoint to try, so the extract is kept as before.'''
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [_chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', _SUBMIT_ARGS)])],
+                          chat_requests)
+    assert (await _run_loop())['location'] == ''
+    assert len(chat_requests) == 1
 
 
 async def test_openrouter_loop_stops_at_iteration_cap(monkeypatch):
@@ -4558,6 +4649,9 @@ def test_build_deterministic_warnings_flags_salary_text_with_no_figure():
     ('$100/hr', 'single', 100, 100),
     ('$46.50/hour', 'single', 46.5, 46.5),
     ('CAD 220,000', 'single', 220000, 220000),
+    # Base ahead of bonus and OTE: the base is the salary (2026-10-20, Harnham).
+    ('€135,000 base + €15,000 bonus (OTE €150,000) per year', 'single', 135000, 135000),
+    ('£90k basic salary plus 20% bonus', 'single', 90000, 90000),
     # No figure stated. These are the 2026-09-15 lesson and must keep reading as absent.
     ('', 'absent', None, None),
     ('Not specified', 'absent', None, None),
@@ -4845,6 +4939,18 @@ def test_format_job_notification_omits_the_salary_line_when_there_is_no_figure()
     message = agent.format_job_notification(
         _make_candidate(), _make_extract(salary='Competitive salary'), 4, [], ['No salary listed'])
     assert '💰' not in message, 'the warning already says there is no figure'
+
+
+def test_format_job_notification_marks_a_recruiter_in_the_header():
+    '''2026-10-19: the agency bullet comes last in the message, so the header says it first.'''
+    message = agent.format_job_notification(
+        _make_candidate(company='Harnham'), _make_extract(company='Harnham', is_agency=True), 4, [], [])
+    assert message.splitlines()[0] == f'⭐ 4/5 — {agent.NOTIFICATION_RECRUITER_MARKER} Harnham — Staff AI Engineer'
+
+
+def test_format_job_notification_leaves_a_direct_employer_unmarked():
+    message = agent.format_job_notification(_make_candidate(), _make_extract(is_agency=False), 4, [], [])
+    assert agent.NOTIFICATION_RECRUITER_MARKER not in message
 
 
 def test_format_job_notification_shows_the_posting_date():
@@ -5306,15 +5412,17 @@ def test_hybrid_in_an_area_wide_posting_is_not_marginal():
     assert _language_bullets(extract) == ['Likely spoken languages: spanish 100% — Madrid, Spain (Hybrid)']
 
 
-def test_a_stated_english_working_language_silences_the_location_guess():
+def test_a_stated_english_working_language_still_warns_the_local_language():
+    """The JD decides the team's language; the place still decides daily life. Silencing the
+    location once the JD stated English hid Lucentive's Portuguese hub (2026-10-26)."""
     extract = _make_extract(
         location='Berlin, Germany (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
         likely_spoken_languages={'german': 1.0}, stated_working_language='english',
     )
-    assert _language_bullets(extract) == []
+    assert _language_bullets(extract) == ['Local language: german 100% — Berlin, Germany (Hybrid)']
     text = agent.format_extract_text(_make_candidate(), extract)
     assert 'Stated working language: english' in text
-    assert 'Likely spoken languages:' not in text
+    assert 'Likely spoken languages: german 100% (local; posting states working language: english)' in text
 
 
 def test_a_stated_foreign_working_language_gets_its_own_bullet():
@@ -5325,14 +5433,86 @@ def test_a_stated_foreign_working_language_gets_its_own_bullet():
     assert _language_bullets(extract) == ['Working language: German (stated in posting)']
 
 
-def test_a_language_requirement_silences_the_location_guess():
+def test_a_language_requirement_turns_the_location_guess_into_a_local_language():
     '''A required language the user lacks is already a hard rejection, so a surviving requirement
-    names only languages the user speaks -- and it is the posting speaking, which wins.'''
+    names only languages the user speaks. The posting has spoken for the team, so the place's
+    language is labelled local, not the team's.'''
     extract = _make_extract(
         location='Paris, France (Hybrid)', workplace_type='hybrid', description=_NEUTRAL_DESCRIPTION,
         likely_spoken_languages={'french': 1.0}, language_requirement='english',
     )
+    assert _language_bullets(extract) == ['Local language: french 100% — Paris, France (Hybrid)']
+
+
+def test_lucentive_english_team_at_a_portugal_hub():
+    """Job 4481299924 (2026-10-21): the JD states English, the hub's languages are Portuguese 70%,
+    and the role is remote EU-wide. It warned nothing. Now the local language warns, marked
+    marginal, and the stated English is said outright as a strength."""
+    extract = _make_extract(
+        location='Remote (EU-based; CET overlap; Portugal hub)', workplace_type='remote',
+        description=_NEUTRAL_DESCRIPTION, likely_spoken_languages={'portuguese': 0.7, 'english': 0.3},
+        stated_working_language='english', residency_scope='area_wide',
+    )
+    assert _language_bullets(extract) == [
+        'Local language (marginal — remote across a multilingual area): portuguese 70%, english 30% '
+        '— Remote (EU-based; CET overlap; Portugal hub)'
+    ]
+    assert agent.deterministic_pros(extract) == ['Team works in English (stated in posting)']
+
+
+def test_no_language_pro_where_the_place_speaks_the_users_language():
+    extract = _make_extract(likely_spoken_languages={'english': 1.0}, stated_working_language='english')
+    assert agent.deterministic_pros(extract) == []
     assert _language_bullets(extract) == []
+
+
+def test_no_language_pro_for_a_stated_language_the_user_does_not_speak():
+    extract = _make_extract(location='Paris, France (Hybrid)', workplace_type='hybrid',
+                            likely_spoken_languages={'french': 1.0}, stated_working_language='french')
+    assert agent.deterministic_pros(extract) == []
+    assert _language_bullets(extract) == [
+        'Working language: French (stated in posting)', 'Local language: french 100% — Paris, France (Hybrid)',
+    ]
+
+
+def test_the_language_pro_is_inert_with_no_languages_configured(monkeypatch):
+    monkeypatch.setattr(agent.preferences, 'languages', lambda: ())
+    extract = _make_extract(likely_spoken_languages={'portuguese': 1.0}, stated_working_language='english')
+    assert agent.deterministic_pros(extract) == []
+
+
+def test_deterministic_pros_come_first_and_are_not_repeated():
+    merged = agent.merge_pros(['Team works in English (stated in posting)'],
+                              ['team works in english (stated in posting)', 'Python-first stack'])
+    assert merged == ['Team works in English (stated in posting)', 'Python-first stack']
+
+
+async def test_header_card_location_in_another_country_warns_with_both():
+    """Lucentive: LinkedIn's card said 'Eu, Normandy, France' (its geocoding of "EU"), the body
+    said 'Portugal hub'. Neither can be trusted alone, so both are shown."""
+    extract = _make_extract(location='Remote (EU-based; Portugal hub)')
+    await agent.resolve_listed_location(extract, 'Eu, Normandy, France')
+    assert extract['listed_location_mismatch'] is True
+    assert ('Location mismatch — LinkedIn lists "Eu, Normandy, France"; posting says '
+            '"Remote (EU-based; Portugal hub)"') in agent.build_deterministic_warnings(_make_candidate(), extract)
+    assert 'LinkedIn-listed location: Eu, Normandy, France' in agent.format_extract_text(_make_candidate(), extract)
+
+
+@pytest.mark.parametrize('listed', ['Montreal, Quebec, Canada', 'European Union', ''])
+async def test_no_location_mismatch_for_the_same_country_or_no_country(listed):
+    extract = _make_extract(location='Canada (Remote)')
+    await agent.resolve_listed_location(extract, listed)
+    assert extract['listed_location_mismatch'] is False
+    assert not any('mismatch' in w for w in agent.build_deterministic_warnings(_make_candidate(), extract))
+
+
+async def test_an_empty_extracted_location_is_filled_from_the_header_card():
+    """Evotym (job 4482332200, 2026-10-25): the extractor returned no location, the card said
+    'Cyprus', and the gate, the warnings and the notification all saw none."""
+    extract = _make_extract(location='')
+    await agent.resolve_listed_location(extract, 'Cyprus')
+    assert extract['location'] == 'Cyprus'
+    assert extract['listed_location_mismatch'] is False
 
 
 def test_format_extract_text_marks_a_marginal_working_language():
@@ -5607,8 +5787,9 @@ def test_repost_warning_names_the_earlier_posting():
     warning = agent.repost_warning({
         'job_id': '4464637425', 'notified': '2026-09-09',
         'location': 'European Union (Remote)', 'salary': '700-750 EUR/day',
-    })
+    }, same_run=False)
     assert '4464637425' in warning and '2026-09-09' in warning
+    assert 'follow-up' in warning
 
 
 @pytest.mark.live
@@ -5720,23 +5901,9 @@ async def _run_stage2(candidate: dict, funnel: dict) -> None:
     )
 
 
-async def test_one_role_posted_in_two_countries_notifies_once_and_lists_the_repeat(monkeypatch):
-    """2026-10-16: Yuno's role arrived twice at 5/5, one job id per country."""
-    notifications, saved = _stage2_stubs(monkeypatch, _make_extract(title='Staff AI Engineer (Copy)'))
-    funnel: dict = {}
-    await agent.evaluate_all_candidates(
-        [_make_candidate(job_id='4480376713'), _make_candidate(job_id='4480376714')],
-        {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', _stage2_stats(), funnel=funnel,
-    )
-    assert len(saved) == 2, 'each posting is still rated and saved'
-    assert len(notifications) == 2
-    assert 'Also posted (same role' in notifications[1] and 'first: job 4480376713' in notifications[1]
-    assert funnel['duplicate_role_suppressed'] == 1
-
-
 async def test_every_stage_2_job_leaves_a_job_trace_of_each_step(monkeypatch):
     '''The Job Audit is rendered from this file, so a missing step is a missing audit section.'''
-    _stage2_stubs(monkeypatch, _make_extract())
+    notifications, _saved = _stage2_stubs(monkeypatch, _make_extract())
     candidate = _make_candidate(job_id='4480376713')
     await agent.evaluate_all_candidates(
         [candidate], {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', _stage2_stats())
@@ -5746,14 +5913,10 @@ async def test_every_stage_2_job_leaves_a_job_trace_of_each_step(monkeypatch):
         assert kind in kinds, kind
     rules = [s['rule'] for s in steps if s['kind'] == 'hard_rule']
     assert rules == ['blacklist', 'closed', 'stale', 'sponsorship', 'language', 'location', 'relocation', 'degree']
+    # Sent after the job's trace closed (the queue flushes at the end of Stage 2), and still in it.
+    sent = next(s for s in steps if s['kind'] == 'notification')
+    assert notifications and sent['text'] == notifications[0] and sent['sent'] is True
     assert job_trace.current() is None, 'the trace is closed when Stage 2 ends'
-
-
-def test_role_key_ignores_case_punctuation_and_copy_markers():
-    a = agent.role_key({'company': 'Fetch, Inc.', 'title': 'Staff Machine Learning Engineer (Copy) (Copy)'})
-    b = agent.role_key({'company': 'Fetch', 'title': 'staff machine-learning engineer'})
-    c = agent.role_key({'company': 'Fetch', 'title': 'Staff Machine Learning Engineer - Ad Platform'})
-    assert a == b != c
 
 
 async def test_stage_2_notifies_and_records_a_first_agency_posting(monkeypatch):
@@ -5769,7 +5932,7 @@ async def test_stage_2_notifies_and_records_a_first_agency_posting(monkeypatch):
     assert 'recruiter_repost_suppressed' not in funnel
 
 
-async def test_stage_2_suppresses_the_notification_for_a_recruiter_repost(monkeypatch):
+async def test_stage_2_sends_a_follow_up_for_a_repost_of_an_earlier_runs_notification(monkeypatch):
     _repost_llm(monkeypatch, '4464637425')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
     notifications, saved = _stage2_stubs(
@@ -5779,28 +5942,42 @@ async def test_stage_2_suppresses_the_notification_for_a_recruiter_repost(monkey
 
     await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), funnel)
 
-    assert notifications == []
-    assert funnel.get('recruiter_repost_suppressed') == 1
+    assert len(notifications) == 1
+    assert notifications[0].startswith('➕ Also posted')
+    assert 'Same role as job 4464637425' in notifications[0]
+    assert 'Netherlands (Remote)' in notifications[0] and '800-850 EUR/day' in notifications[0]
+    assert funnel.get('repost_followup') == 1
     # A cap it is not: the rating, the saved file and the audit trail are untouched.
     assert saved and saved[0]['rating'] == 5
     assert 'Likely repost of job 4464637425' in saved[0]['content']
-    # The suppressed repost does NOT become the new reference point.
+    # The repost does NOT become the new reference point.
     assert [e['job_id'] for e in tools.load_recruiter_notifications()] == ['4464637425']
 
 
-async def test_stage_2_does_not_check_a_direct_employer(monkeypatch):
-    '''Only recruiters repost one role under many ids; a direct employer must never be compared.'''
-    calls = _repost_llm(monkeypatch, '111')
-    tools.record_recruiter_notification(_make_candidate(job_id='111'), _agency_extract(company='Acme'))
-    notifications, _ = _stage2_stubs(
-        monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000')
+async def test_stage_2_combines_one_role_posted_in_several_countries(monkeypatch):
+    '''2026-10-23: Mimica, the employer itself, posted one role once per country; two were notified.'''
+    calls = _repost_llm(monkeypatch, '111', reason='same role, another country')
+    notifications, saved = _stage2_stubs(
+        monkeypatch, _make_extract(company='Mimica', is_agency=False, title='Senior/Lead Machine Learning Engineer')
     )
     funnel: dict = {}
+    candidates = [
+        _make_candidate(job_id='111', company='Mimica', url='https://www.linkedin.com/jobs/view/111/'),
+        _make_candidate(job_id='222', company='Mimica', url='https://www.linkedin.com/jobs/view/222/'),
+    ]
 
-    await _run_stage2(_make_candidate(job_id='222', company='Acme'), funnel)
+    await agent.evaluate_all_candidates(
+        candidates, {'type': 'http', 'url': 'http://localhost:1/mcp'},
+        'prompt', 'profile', _stage2_stats(), funnel=funnel,
+    )
 
-    assert calls == []
-    assert len(notifications) == 1
+    assert len(notifications) == 1, 'one message for the role'
+    assert '📍 Locations (2):' in notifications[0]
+    assert '/jobs/view/111/' in notifications[0] and '/jobs/view/222/' in notifications[0]
+    assert len(calls) == 1, 'the first posting had nothing to compare against'
+    assert funnel.get('notification_combined') == 1
+    assert 'Likely repost of job 111' in saved[1]['content']
+    assert 'combined into its notification' in saved[1]['content']
 
 
 async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypatch):
@@ -5814,6 +5991,91 @@ async def test_stage_2_does_not_check_a_job_that_would_not_be_notified(monkeypat
 
     assert calls == []
     assert notifications == []
+
+
+def _stub_company_about(monkeypatch, about=None, error: Exception | None = None) -> list[str]:
+    '''Stage 2 sees a job page carrying a company slug; the About page returns `about` (or raises).'''
+    _stub_read_page(monkeypatch, linkedin_page.JobPage(
+        text='Staff Engineer\nAbout the job\nBuild agents.', source='dom', company_slug='example-data-europe'))
+    visits: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def fake_session(url):
+        yield None
+
+    async def fake_read_about(slug, call):
+        visits.append(slug)
+        if error is not None:
+            raise error
+        return about
+
+    monkeypatch.setattr(agent, 'mcp_session', fake_session)
+    monkeypatch.setattr(agent, 'read_company_about', fake_read_about)
+    return visits
+
+
+_SUBSIDIARY_ABOUT = linkedin_page.CompanyAbout(
+    slug='example-data-europe', name='Example Data Europe', parent_name='Example Data, Inc.',
+    parent_slug='example-data-inc')
+
+
+async def test_stage_2_skips_a_subsidiary_of_a_company_already_applied_to(monkeypatch):
+    """2026-10-19: Stage 1b saw only the card's name; the About page names the parent."""
+    notifications, saved = _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
+    monkeypatch.setattr(tools, '_applied_companies', {'Example Data, Inc.': 'example.pdf'})
+    monkeypatch.setattr(tools, '_applied_identities', {
+        'Example Data, Inc.': company_domain.CompanyIdentity('Example Data, Inc.', domain='exampledata.com', source='model')})
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='4459979218', company='Example Data Europe'), funnel)
+
+    assert visits == ['example-data-europe']
+    assert funnel.get('poster_identity_already_applied') == 1
+    assert notifications == []
+    assert saved and saved[0]['rating'] == agent.RATING_AUTO_REJECT
+    assert 'Matched applied-job record: example.pdf' in saved[0]['content']
+
+
+async def test_stage_2_visits_a_company_page_once_ever(monkeypatch):
+    _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
+    monkeypatch.setattr(tools, '_applied_companies', {'Other Co': 'other.pdf'})
+    monkeypatch.setattr(tools, '_applied_identities', {
+        'Other Co': company_domain.CompanyIdentity('Other Co', domain='other.example', source='model')})
+
+    await _run_stage2(_make_candidate(job_id='1', company='Example Data Europe'), {})
+    await _run_stage2(_make_candidate(job_id='2', company='Example Data Europe'), {})
+
+    assert visits == ['example-data-europe']
+
+
+async def test_stage_2_never_visits_the_page_of_an_agency(monkeypatch):
+    '''Agencies are kept out of the blocklist, so there is nothing to look up.'''
+    _stage2_stubs(monkeypatch, _agency_extract())
+    visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
+    monkeypatch.setattr(tools, '_applied_companies', {'Other Co': 'other.pdf'})
+
+    await _run_stage2(_make_candidate(job_id='1', company='Archer Recruitment'), {})
+
+    assert visits == []
+
+
+async def test_stage_2_stops_on_a_challenge_page_and_releases_the_job(monkeypatch):
+    notifications, saved = _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    _stub_company_about(monkeypatch, error=linkedin_page.LinkedInBlockedError('About page shows "captcha"'))
+    monkeypatch.setattr(tools, '_applied_companies', {'Other Co': 'other.pdf'})
+    released = []
+    monkeypatch.setattr(tools, 'forget_processed_job', lambda site, job_id: released.append(job_id))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='7', company='Example Data Europe'), funnel)
+
+    assert released == ['7']
+    assert funnel.get('blocked') == 1
+    assert [a['kind'] for a in tools._ui_alerts] == ['blocked']
+    assert notifications == [] and saved == []
 
 
 async def test_stage_2_compares_against_a_posting_notified_earlier_in_the_same_run(monkeypatch):
@@ -5832,7 +6094,80 @@ async def test_stage_2_compares_against_a_posting_notified_earlier_in_the_same_r
     )
 
     assert len(notifications) == 1, 'the second posting is the same role as the first'
-    assert funnel.get('recruiter_repost_suppressed') == 1
+    assert funnel.get('notification_combined') == 1
+
+
+async def test_stage_2_sends_queued_notifications_when_it_stops_on_a_challenge(monkeypatch):
+    '''A match rated before the stop must still arrive: the queue is flushed on every exit.'''
+    notifications, _ = _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
+    pages = iter([
+        linkedin_page.JobPage(text='Staff Engineer\nAbout the job\nBuild agents.', source='dom'),
+        linkedin_page.LinkedInBlockedError('job page shows "captcha"'),
+    ])
+
+    async def fake_read_page(candidate, url, stats):
+        page = next(pages)
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+    monkeypatch.setattr(agent, 'read_page', fake_read_page)
+    monkeypatch.setattr(tools, 'forget_processed_job', lambda site, job_id: None)
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    funnel: dict = {}
+
+    await agent.evaluate_all_candidates(
+        [_make_candidate(job_id='1', company='Example Data Europe'),
+         _make_candidate(job_id='2', company='Example Data Europe')],
+        {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', _stage2_stats(), funnel=funnel,
+    )
+
+    assert funnel.get('blocked') == 1
+    assert len(notifications) == 1
+
+
+def _queued(job_id: str, location: str, rating: int = 5, salary: str = '', warnings=()) -> 'agent.QueuedPosting':
+    return agent.QueuedPosting(
+        _make_candidate(job_id=job_id, company='Mimica', url=f'https://www.linkedin.com/jobs/view/{job_id}/'),
+        _make_extract(company='Mimica', location=location, salary=salary),
+        rating, ['Strong ML focus'], list(warnings),
+    )
+
+
+def test_grouped_notification_of_one_posting_is_the_ordinary_message():
+    posting = _queued('1', 'Dublin, Ireland', warnings=['Hybrid'])
+    assert agent.format_grouped_notification(agent.NotificationGroup([posting])) == agent.format_job_notification(
+        posting.candidate, posting.extract, posting.rating, posting.pros, posting.warnings)
+
+
+def test_grouped_notification_lists_every_location_and_only_what_differs():
+    lead = _queued('1', 'Dublin, Ireland', salary='€90k', warnings=['Hybrid'])
+    sibling = _queued('2', 'Stockholm, Sweden', rating=4, salary='SEK 900k',
+                      warnings=['Hybrid', 'Swedish required'])
+    message = agent.format_grouped_notification(agent.NotificationGroup([sibling, lead]))
+
+    assert message.startswith('⭐ 5/5'), 'the highest-rated posting leads'
+    assert '📍 Locations (2):' in message
+    dublin, stockholm = (line for line in message.splitlines() if line.startswith('• ') and 'linkedin' in line)
+    assert 'Stockholm, Sweden' in dublin and '(4/5)' in dublin, 'listed in rating order of arrival'
+    assert '/jobs/view/1/' in stockholm and '(5/5)' not in stockholm
+    assert 'SEK 900k' in message and '   ⚠️ Swedish required' in message
+    assert '   ⚠️ Hybrid' not in message, "the lead's warnings are not repeated per location"
+
+
+def test_grouped_notification_says_when_a_sibling_states_no_salary():
+    message = agent.format_grouped_notification(agent.NotificationGroup(
+        [_queued('1', 'Dublin, Ireland', salary='€90k'), _queued('2', 'Berlin, Germany')]))
+    assert 'No salary in this posting' in message
+
+
+def test_follow_up_names_the_earlier_notification():
+    prior = {'job_id': '111', 'notified': '2026-10-23', 'location': 'Dublin, Ireland'}
+    message = agent.format_grouped_notification(agent.NotificationGroup(
+        [_queued('2', 'Berlin, Germany', rating=4), _queued('3', 'Madrid, Spain')], prior=prior))
+    assert message.startswith('➕ Also posted — Mimica')
+    assert 'Same role as job 111, notified 2026-10-23 (Dublin, Ireland)' in message
+    assert '📍 Locations (2):' in message and '(4/5)' in message and '(5/5)' in message
 
 
 def test_extract_text_surfaces_the_hiring_company():
@@ -5900,14 +6235,83 @@ def test_merge_warnings_salary_estimate_replaces_the_code_line_in_place():
     )
     assert merged == [
         'Hybrid — Netherlands',
-        'No salary listed; Poland-market pay likely well below CAD $210K target',
+        "No salary listed — rater's guess: Poland-market pay likely well below CAD $210K target",
         'Posted by a recruiting agency — actual hiring company not named',
     ]
 
 
 def test_merge_warnings_prefixes_an_estimate_that_does_not_state_the_absence():
     merged = agent.merge_warnings(['No salary listed'], ['Poland-market pay likely well below CAD $210K target'])
-    assert merged == ['No salary listed — Poland-market pay likely well below CAD $210K target']
+    assert merged == ["No salary listed — rater's guess: Poland-market pay likely well below CAD $210K target"]
+
+
+def _estimate(maximum_cad: float | None, period: str = 'year') -> dict:
+    conversion = None if maximum_cad is None else {
+        'currency': 'CAD', 'from_currency': 'DKK', 'minimum': 169_000.0, 'maximum': maximum_cad,
+        'rate': 4.7, 'rate_date': '2026-10-22',
+    }
+    return {'currency': 'DKK', 'minimum': 800_000.0, 'maximum': 1_150_000.0, 'period': period,
+            'conversion': conversion}
+
+
+@pytest.mark.parametrize('estimate,expected', [
+    (_estimate(242_000.0), True),
+    (_estimate(TEST_BASE_TARGET - 5_000.0), False),
+    (_estimate(None), None),
+    (_estimate(242_000.0, period='hour'), None),
+    (None, None),
+])
+def test_estimate_meets_target_by_its_converted_upper_bound(salary_target_set, estimate, expected):
+    assert agent.estimate_meets_target(_make_extract(salary_estimate=estimate)) is expected
+
+
+def test_estimate_meets_target_reads_an_estimate_in_the_target_currency(salary_target_set):
+    estimate = {'currency': 'CAD', 'minimum': 180_000.0, 'maximum': 230_000.0, 'period': 'year',
+                'conversion': None}
+    assert agent.estimate_meets_target(_make_extract(salary_estimate=estimate)) is True
+
+
+def test_a_raters_pay_guess_loses_a_leading_absence_joined_by_and():
+    """The 2026-10-26 Proxify replay: 'No pay figure and contractor marketplace rates …'."""
+    merged = agent.merge_warnings(
+        ['No salary listed'],
+        ['No pay figure and contractor marketplace rates likely land below the CAD $210K base target'],
+    )
+    assert merged == [
+        "No salary listed — rater's guess: contractor marketplace rates likely land below the CAD $210K base target"]
+
+
+def test_an_estimate_on_target_drops_the_raters_pay_guess():
+    """Job 4482482676 (2026-10-26): the estimate read ≈ CAD 169k - 242k while the rater's bullet said
+    'EU senior ML bands often below CAD $210K target'. The plain code line stays."""
+    merged = agent.merge_warnings(
+        ['No salary listed'],
+        ['No salary stated; EU senior ML bands often below CAD $210K target', 'Stack is mostly Java'],
+        estimate_on_target=True,
+    )
+    assert merged == ['No salary listed', 'Stack is mostly Java']
+
+
+def test_a_raters_pay_guess_is_labelled_when_the_estimate_does_not_settle_it():
+    merged = agent.merge_warnings(
+        ['No salary listed'], ['No salary stated; EU senior ML bands often below CAD $210K target'],
+    )
+    assert merged == ["No salary listed — rater's guess: EU senior ML bands often below CAD $210K target"]
+
+
+@pytest.mark.parametrize('minimum,maximum,expected', [
+    (800_000.0, 1_150_000.0, '800k - 1,150k'),
+    (87_500.0, 92_000.0, '87.5k - 92k'),
+    (87_550.0, 92_000.0, '87,550 - 92k'),
+    (85.0, 95.0, '85 - 95'),
+])
+def test_format_amount_bounds_in_thousands_never_rounds(minimum, maximum, expected):
+    assert agent.format_amount_bounds(minimum, maximum, thousands=True) == expected
+
+
+def test_a_stated_salary_conversion_keeps_full_figures():
+    conversion = {'currency': 'CAD', 'minimum': 148_000.0, 'maximum': 176_000.0}
+    assert agent.format_salary_conversion(conversion) == '(≈ CAD 148,000 - 176,000)'
 
 
 def test_merge_warnings_keeps_exactly_one_salary_line():
@@ -5915,7 +6319,7 @@ def test_merge_warnings_keeps_exactly_one_salary_line():
         ['No salary listed'],
         ['No salary listed — compensation unknown', 'No salary stated; Spain comp likely below CAD $210K base target'],
     )
-    assert merged == ['No salary stated; Spain comp likely below CAD $210K base target']
+    assert merged == ["No salary listed — rater's guess: Spain comp likely below CAD $210K base target"]
 
 
 @pytest.mark.parametrize('warning', [
@@ -6110,10 +6514,28 @@ def test_sponsorship_prompt_prints_place_names_as_written(monkeypatch):
     assert 'Usa' not in section
 
 
+def test_evaluator_prompt_states_work_rights_as_written(monkeypatch):
+    """The rater never sees the resume, so it read 'must be based in the UK or Europe' as shutting
+    out an EU citizen living in Canada (job 4482482676, 2026-10-22)."""
+    monkeypatch.setattr(preferences, 'right_to_live_and_work_in', lambda: ('Canada', 'European Union'))
+    evaluator = agent.build_evaluator_instructions()
+    assert '## Work rights' in evaluator
+    assert 'right to live and work in: Canada, European Union' in evaluator
+
+
+def test_right_to_live_and_work_in_rejects_a_non_list(monkeypatch):
+    merged = preferences._deep_merge(
+        preferences.load_preferences(), {'right_to_live_and_work_in': 'Canada, European Union'})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+    with pytest.raises(ValueError, match='right_to_live_and_work_in'):
+        preferences.right_to_live_and_work_in()
+
+
 def test_prompts_omit_personal_sections_without_preferences(neutral_preferences):
     evaluator = agent.build_evaluator_instructions()
     assert 'visa sponsorship' not in evaluator
     assert 'There is nowhere the candidate would commute to' in evaluator
+    assert '## Work rights' not in evaluator
     assert 'visa sponsorship' not in agent.build_interactive_instructions()
     scraper = agent.build_scraper_instructions()
     assert '&location=' not in scraper, 'no region configured means an unfiltered search'
@@ -6563,9 +6985,20 @@ def test_derive_residency_scope_over_real_postings(location, relocation, expecte
     ('Germany (Remote within our EMEA region)', 'area_wide'),
     # ...but "any" alone is not an area offer. Offices are specific places.
     ('Spain (Remote — based in any of our offices)', ''),
-    # Only one filler word, deliberately: country_only is the conservative reading of a mixed
-    # statement, and widening this makes "Germany or Europe" read as area-wide.
-    ('Germany (Remote) — must be based in Germany or Europe', 'country_only'),
+    # A place OR an area offers at least the whole area (2026-10-26, Mimica, job 4482482676).
+    ('Germany (Remote) — must be based in Germany or Europe', 'area_wide'),
+    ('Denmark (Remote — candidates must be based in the UK or Europe, time zones compatible with '
+     'London, UTC-1 to UTC+3)', 'area_wide'),
+    ('Spain (Remote) — must be based in the United Kingdom or EU', 'area_wide'),
+    ('Poland (Remote) — must live in Poland/EU', 'area_wide'),
+    # ...but "only" closes the statement before the "or".
+    ('Germany (Remote) — must be based in Germany only', 'country_only'),
+    ('Germany (Remote) — must be based in Germany only or Europe', 'country_only'),
+    # A time-zone band is not a country object (2026-10-20, Recrucial).
+    ('Portugal (Remote — work from anywhere within GMT-1 to GMT+4)', 'area_wide'),
+    ('Germany (Remote within the UTC+1 time zone)', ''),
+    ('Germany (Remote — must work within CET hours)', ''),
+    ('Austria (Remote — anywhere within Germany)', 'country_only'),
 ])
 def test_derive_residency_scope_distinguishes_a_country_object_from_an_area_object(location, expected):
     '''Every country-pinning pattern requires an object that is NOT an area name.
@@ -7989,6 +8422,15 @@ def test_the_in_my_network_chip_flapping_is_not_drift(tmp_path, monkeypatch):
     tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network']))
     assert tools.check_fingerprint_drift(_sound_report(chips=structural)) == ''
     assert tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'In my network'])) == ''
+
+
+def test_the_under_10_applicants_chip_flapping_is_not_drift(tmp_path, monkeypatch):
+    '''2026-10-19: gone on the Canada search, back on the EU one, same query, nothing changed.'''
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    structural = ['Jobs', 'Past week', 'Senior', 'Employment type', 'Company']
+    tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'Under 10 applicants']))
+    assert tools.check_fingerprint_drift(_sound_report(chips=structural)) == ''
+    assert tools.check_fingerprint_drift(_sound_report(chips=[*structural, 'Under 10 applicants'])) == ''
 
 
 def test_a_chip_showing_its_chosen_value_is_the_same_chip(tmp_path, monkeypatch):
@@ -9950,6 +10392,21 @@ async def test_main_logs_an_exception_that_ends_the_run(monkeypatch, caplog, tmp
     assert released == [True], 'the run lock must still be released'
 
 
+async def test_main_logs_why_it_did_not_start_when_the_lock_is_held(monkeypatch, caplog):
+    '''2026-10-26: three run logs held only the "Logging to" line; the lock conflict went to the console.'''
+    monkeypatch.setattr(agent.sys, 'argv', ['main.py', '-n', '--no-version-check'])
+    monkeypatch.setattr(agent, 'setup_logging', lambda *args, **kwargs: None)   # keeps caplog attached
+    monkeypatch.setattr(agent.tools_module, 'acquire_run_lock', lambda **kwargs: {
+        'pid': 46680, 'started_at': '2026-10-26T02:54:27', 'mode': 'non-interactive',
+        'argv': 'main.py --job-ids ids.tsv'})
+
+    with caplog.at_level(logging.ERROR, logger=agent.logger.name), pytest.raises(SystemExit):
+        await agent.main()
+
+    assert any('already active' in r.message and '46680' in r.message and 'ids.tsv' in r.message
+               for r in caplog.records)
+
+
 def test_scraper_bad_tool_json_is_logged_and_returned_to_the_model(monkeypatch, caplog):
     '''It used to become {} silently, running the tool with arguments the model never chose.'''
     bad_call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
@@ -10614,7 +11071,7 @@ def test_the_salary_line_shows_a_single_figure_conversion_once():
 def test_the_salary_line_labels_an_estimate_as_the_models():
     extract = _make_extract(salary='Competitive salary', salary_estimate=TEST_PLN_ESTIMATE)
     message = agent.format_job_notification(_make_candidate(), extract, 4, [], ['No salary listed'])
-    assert '💰 Not listed — model estimate: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000)\n' in message
+    assert '💰 Model estimate: PLN 250k - 320k per year (≈ CAD 100k - 128k)\n' in message
     assert '• No salary listed' in message, 'the estimate does not replace the warning'
     assert TEST_PLN_ESTIMATE['basis'] not in message, 'model free text stays out of the message'
 
@@ -10622,7 +11079,7 @@ def test_the_salary_line_labels_an_estimate_as_the_models():
 def test_the_salary_line_shows_an_estimate_in_a_kept_currency_unconverted():
     estimate = dict(TEST_PLN_ESTIMATE, currency='EUR', minimum=90_000.0, maximum=110_000.0, conversion=None)
     message = agent.format_job_notification(_make_candidate(), _make_extract(salary_estimate=estimate), 4, [], [])
-    assert '💰 Not listed — model estimate: EUR 90,000 - 110,000 per year\n' in message
+    assert '💰 Model estimate: EUR 90k - 110k per year\n' in message
 
 
 def test_an_estimate_never_displaces_a_figure_the_posting_states():
@@ -10636,7 +11093,7 @@ def test_the_saved_job_records_the_rate_and_the_estimating_model():
     lines = agent.format_pay_lines(_make_extract(salary_conversion=TEST_GBP_CONVERSION, salary_estimate=TEST_PLN_ESTIMATE))
     assert lines == [
         f'Salary conversion: ≈ CAD 160,000 - 190,000 (1 CAD = 0.5 GBP, rate of {TEST_FX_RATE_DATE})',
-        'Estimated salary: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000) — model estimate by '
+        'Estimated salary: PLN 250k - 320k per year (≈ CAD 100k - 128k) — model estimate by '
         'test/estimator, not stated in the posting; basis: Staff-level AI engineering at a Warsaw scale-up',
     ]
     assert agent.format_pay_lines(_make_extract()) == []
@@ -10703,9 +11160,9 @@ async def test_stage_2_estimates_pay_for_a_notified_job_with_no_salary(monkeypat
 
     assert page_texts == [_page_stating(extract).text], 'the estimator reads the full page'
     assert len(notifications) == 1
-    assert '💰 Not listed — model estimate: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000)' in notifications[0]
+    assert '💰 Model estimate: PLN 250k - 320k per year (≈ CAD 100k - 128k)' in notifications[0]
     assert '• No salary listed' in notifications[0]
-    assert 'Estimated salary: PLN 250,000 - 320,000 per year (≈ CAD 100,000 - 128,000) — model estimate by' in saved[0]['content']
+    assert 'Estimated salary: PLN 250k - 320k per year (≈ CAD 100k - 128k) — model estimate by' in saved[0]['content']
     assert len(rater_inputs) == 1 and '250,000' not in rater_inputs[0], 'the estimate must not reach the rater'
 
 
@@ -10734,8 +11191,8 @@ async def test_stage_2_pays_for_no_estimate_below_the_notification_threshold(mon
     assert saved and 'Estimated salary' not in saved[0]['content']
 
 
-async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repost(monkeypatch):
-    '''The message is withheld; the saved file is the one place the role is still seen.'''
+async def test_stage_2_keeps_the_estimate_for_a_repost_of_an_earlier_runs_notification(monkeypatch):
+    '''A follow-up, not a full message: the saved file still carries everything.'''
     _repost_llm(monkeypatch, '4464637425')
     tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract(salary=''))
     notifications, saved = _stage2_stubs(monkeypatch, _agency_extract(salary=''))
@@ -10743,8 +11200,8 @@ async def test_stage_2_keeps_the_estimate_in_the_saved_file_of_a_suppressed_repo
 
     await _run_stage2(_make_candidate(job_id='4465094319', company='Archer Recruitment'), {})
 
-    assert notifications == []
-    assert 'Estimated salary: PLN 250,000 - 320,000 per year' in saved[0]['content']
+    assert len(notifications) == 1 and notifications[0].startswith('➕ Also posted')
+    assert 'Estimated salary: PLN 250k - 320k per year' in saved[0]['content']
 
 
 async def test_stage_2_still_notifies_when_the_pay_display_fails(monkeypatch, caplog):
@@ -10990,7 +11447,8 @@ async def test_stage_2_rating_line_says_notified_and_carries_no_reasoning(monkey
     assert len(rating_lines) == 1
     assert rating_lines[0].startswith('Rating [1/1]: job 222: 5/5 via ')
     assert 'Acme' not in rating_lines[0], 'the title and company appear once, on the Extract line'
-    assert rating_lines[0].endswith('— saved, notified')
+    assert rating_lines[0].endswith('— saved, notification queued')
+    assert 'Stage 2 notifications: 1 of 1 message(s) sent' in messages
     assert 'strong fit' not in rating_lines[0], 'the reasoning lives in the saved job and the audit log'
     assert any(m == 'Stage 2: evaluating 1 candidate(s)' for m in messages)
     assert any(m.startswith('Stage 2 complete: 1 of 1 job(s) in ') for m in messages)
@@ -11006,7 +11464,7 @@ async def test_stage_2_rating_line_says_why_nothing_was_sent(monkeypatch, caplog
     assert any(m.endswith('— saved, not notified (below the notification rating)') for m in _stage2_messages(caplog))
 
 
-async def test_stage_2_rating_line_reports_a_failed_send(monkeypatch, caplog):
+async def test_stage_2_reports_a_failed_send(monkeypatch, caplog):
     _repost_llm(monkeypatch, '')
     _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
 
@@ -11015,7 +11473,7 @@ async def test_stage_2_rating_line_reports_a_failed_send(monkeypatch, caplog):
     monkeypatch.setattr(agent, '_send_pipeline_notification', failed_notify)
     with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
         await _run_stage2(_make_candidate(job_id='222', company='Acme'), {})
-    assert any(m.endswith('— saved, notification FAILED') for m in _stage2_messages(caplog))
+    assert 'Stage 2 notifications: 0 of 1 message(s) sent; FAILED for job(s) 222' in _stage2_messages(caplog)
 
 
 async def test_stage_2_rating_line_gives_the_triage_reason_only_on_a_wide_disagreement(monkeypatch, caplog):
@@ -11244,3 +11702,114 @@ def test_a_silent_search_logs_a_step_line_after_the_progress_interval(caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert len(messages) == 1, 'the line resets the interval'
     assert 'Staff AI Engineer' in messages[0] and 'Canada' in messages[0] and 'browser_click Date posted' in messages[0]
+
+
+# --- --job-ids replay: rates given jobs and changes nothing a real run reads ---
+
+def _replay_on(tmp_path, monkeypatch) -> Path:
+    replay_dir = tmp_path / 'replays' / 'job-ids-test'
+    monkeypatch.setattr(tools, '_replay_dir', replay_dir)
+    return replay_dir
+
+
+async def test_replay_saves_into_the_replay_dir_not_saved_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    replay_dir = _replay_on(tmp_path, monkeypatch)
+    await tools.do_save_job_posting('Acme', 'engineer', 4, 'body', job_id='222')
+    assert [p.name.split('-rating_')[0] for p in replay_dir.glob('*.md')] == ['job_posting-222']
+    assert not list(tmp_path.glob('saved_jobs-*'))
+
+
+async def test_replay_stage_2_error_leaves_processed_jobs_and_release_count_alone(tmp_path, monkeypatch, caplog):
+    '''A replay must not release (delete) a real processed record or spend one of its releases.'''
+    record = _processed_record(tmp_path, monkeypatch, '222')
+    _replay_on(tmp_path, monkeypatch)
+    funnel, errors = await _stage2_with_a_broken_rater(monkeypatch, caplog, '222')
+    assert funnel.get('eval_error') == 1
+    assert record.exists()
+    assert not tools.EVAL_ERROR_RELEASES_PATH.exists()
+    assert 'not released: replay run' in errors[0]
+
+
+def test_replay_does_not_record_recruiter_notifications(tmp_path, monkeypatch):
+    _replay_on(tmp_path, monkeypatch)
+    tools.record_recruiter_notification(_make_candidate(job_id='4464637425'), _agency_extract())
+    assert not tools.RECRUITER_NOTIFICATIONS_PATH.exists()
+
+
+async def test_replay_writes_notifications_instead_of_sending(tmp_path, monkeypatch):
+    replay_dir = _replay_on(tmp_path, monkeypatch)
+    sent: list[str] = []
+
+    async def fake_send(text):
+        sent.append(text)
+    monkeypatch.setattr(agent, 'telegram_send_message', fake_send)
+
+    assert await agent._send_pipeline_notification('Acme — rating 5') is True
+    assert sent == []
+    assert 'Acme — rating 5' in (replay_dir / config.REPLAY_NOTIFICATIONS_FILENAME).read_text()
+
+
+def test_read_job_ids_file(tmp_path):
+    path = tmp_path / 'ids.tsv'
+    path.write_text('# header\n4464225365\tLead AI Engineer\tAltus Group\n\n4464225365\n4466355340\n')
+    jobs = agent.read_job_ids_file(path)
+    assert [(j['job_id'], j['title'], j['company']) for j in jobs] == [
+        ('4464225365', 'Lead AI Engineer', 'Altus Group'),
+        ('4466355340', '(job 4466355340)', '(unknown company)'),
+    ]
+    assert jobs[0]['url'] == tools.job_url('linkedin', '4464225365')
+
+    path.write_text('Lead AI Engineer\t4464225365\n')
+    with pytest.raises(ValueError, match=r'ids\.tsv:1: expected a numeric LinkedIn job id'):
+        agent.read_job_ids_file(path)
+
+
+async def test_job_ids_replay_screens_like_stage_1_and_summarises(tmp_path, monkeypatch):
+    '''Jobs Stage 1 would drop are reported, not opened; the rest go to Stage 2; the sink is reset.'''
+    monkeypatch.setattr(agent, 'RUN_DIR', tmp_path)
+    path = tmp_path / 'ids.tsv'
+    path.write_text('1\tDirector, AI\tAcme\n2\tStaff AI Engineer\tApplied Co\n3\tStaff AI Engineer\tNewCo\n')
+    monkeypatch.setattr(agent, 'title_rejection_reason', lambda title: 'excluded title' if 'Director' in title else None)
+
+    async def fake_applied(company):
+        return 'applied.pdf' if company == 'Applied Co' else None
+    monkeypatch.setattr(agent, 'company_matches_applied', fake_applied)
+
+    evaluated: list[str] = []
+
+    async def fake_evaluate(candidates, *args, **kwargs):
+        assert tools._replay_dir is not None
+        for candidate in candidates:
+            evaluated.append(candidate['job_id'])
+            tools.record_job_outcome('linkedin', candidate['job_id'], 'saved', rating=4, summary='good\nfit')
+
+    class FakeBrowser:
+        def __init__(self, mode):
+            self.mcp = {}
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    async def fake_none(*args, **kwargs):
+        return None
+    monkeypatch.setattr(agent, 'evaluate_all_candidates', fake_evaluate)
+    monkeypatch.setattr(agent, 'BrowserServer', FakeBrowser)
+    monkeypatch.setattr(agent.endpoint_pin, 'pin_single_turn_endpoints', fake_none)
+    monkeypatch.setattr(agent, 'build_reference_summary', fake_none)
+    monkeypatch.setattr(agent, 'preflight_local_model', fake_none)
+    monkeypatch.setattr(agent, 'build_evaluator_prompt', lambda block: 'prompt')
+    monkeypatch.setattr(agent, 'build_profile_block', lambda block: 'profile')
+    monkeypatch.setattr(agent.tools_module, 'prune_raw_postings', lambda: None)
+
+    replay_dir = await agent.run_job_ids_replay(path)
+
+    assert evaluated == ['3']
+    assert tools._replay_dir is None
+    rows = (replay_dir / config.REPLAY_SUMMARY_FILENAME).read_text().splitlines()
+    assert rows[1].split('\t')[3] == 'queue_skipped: excluded title'
+    assert rows[2].split('\t')[3] == 'already_applied: applied.pdf'
+    assert rows[3].split('\t')[3:] == ['saved', '4', 'good fit']

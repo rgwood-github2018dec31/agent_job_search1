@@ -70,6 +70,10 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     # requires residence in that country asks for no move, so it carries no relocation warning.
     # Empty = every stated residence requirement is flagged as a relocation.
     'current_tax_residence': '',
+    # Countries and areas the user may already live and work in without a visa, as written
+    # ('European Union'). Told to the rater, so a residence requirement inside one of them is not
+    # read as an eligibility problem. Empty = the rater is told nothing about work rights.
+    'right_to_live_and_work_in': [],
     # Annual base pay a complete salary range must REACH (by its upper bound) to count as on
     # target. Both unset = no code-side comparison; the rater still judges pay on its own.
     'compensation': {
@@ -289,6 +293,24 @@ def current_tax_residence() -> str:
             f'Canada, got {raw!r} ({type(raw).__name__})'
         )
     return ' '.join(raw.split())
+
+
+def right_to_live_and_work_in() -> tuple[str, ...]:
+    """Countries and areas the user may live and work in without a visa, as written; () when unset.
+
+    Proper names, never folded. A value that is not a list of strings raises rather than reading as
+    unset -- an ignored list silently brings back the rater's "candidates in your country are not
+    eligible" warnings on every posting the user is in fact eligible for.
+    """
+    raw = load_preferences()['right_to_live_and_work_in']
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(place, str) for place in raw):
+        raise ValueError(
+            f'{PREFERENCES_PATH}: `right_to_live_and_work_in` must be a list of place names such '
+            f'as [Canada, European Union], got {raw!r} ({type(raw).__name__})'
+        )
+    return tuple(' '.join(place.split()) for place in raw if place.strip())
 
 
 def salary_target() -> tuple[float, str] | None:

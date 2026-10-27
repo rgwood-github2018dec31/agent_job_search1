@@ -46,8 +46,5 @@ Designed for scheduled/cron runs. The agent searches LinkedIn autonomously, rate
 
 ## Tests
 
-```bash
-uv run pytest                            # All tests (skips live tests without API key)
-uv run pytest -m "not live_agent_claude" # Unit tests only
-uv run pytest -m live_agent_claude       # Live agent tests (requires ANTHROPIC_API_KEY)
-```
+The test commands, marker groups, and which of them make paid calls are in [AGENTS.md](AGENTS.md), section
+"Commands" (the authority). A copy here drifted once, and its "unit tests only" command made a paid call.

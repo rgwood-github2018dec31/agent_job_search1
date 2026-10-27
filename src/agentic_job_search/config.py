@@ -32,6 +32,8 @@ COMPANY_BLACKLIST_EXPIRY_DAYS = 180
 # before deciding a new one is the same role. Agencies re-advertise one role under a new LinkedIn
 # job id every few days with a different country and day rate — six notifications for one pharma
 # role between 2026-09-02 and 09-10 — and each new id defeats (site, job_id) deduplication.
+# Since 2026-10-23 the same holds for any poster: Mimica, the employer itself, posted one role once
+# per country, and two of them were notified in one run.
 RECRUITER_REPOST_WINDOW_DAYS = 14
 # ...and how many of those postings the judgement call is shown, newest first. An agency that posts
 # daily would otherwise grow the prompt without bound: every prior carries a description capped at
@@ -271,7 +273,9 @@ UI_BLOCK_SIGNATURES = (
 #
 # 'In my network' is deliberately absent: LinkedIn shows it on some searches and not others, even
 # within one run (gone on one query, back on the next, 2026-09-28), and it flapped in 5 of the 12
-# logged runs 2026-09-21..28. Each flap raised a drift alert about nothing.
+# logged runs 2026-09-21..28. Each flap raised a drift alert about nothing. 'Under 10 applicants'
+# is absent for the same reason: shown only when the result set has such jobs, it went on one
+# region and came back on the next in the runs of 2026-10-14, 10-18 and 10-19.
 #
 # The fingerprint stores the chip, never its chosen value: UI_CHIP_CHOSEN_VALUES folds "Past week"
 # back to "Date posted". Stored as displayed, a page whose filters had not been set (2026-10-02)
@@ -284,7 +288,7 @@ UI_CHIP_CHOSEN_VALUES: dict[str, tuple[str, ...]] = {
 }
 UI_STRUCTURAL_CHIPS = (
     'Jobs', 'Date posted', 'Experience level', 'Employment type', 'Company',
-    'Under 10 applicants', 'Easy Apply',
+    'Easy Apply',
     *(value for values in UI_CHIP_CHOSEN_VALUES.values() for value in values),
 )
 
@@ -375,18 +379,26 @@ MODEL_NAME_SINGLE_TURN = OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH
 SINGLE_TURN_DROP_SLOWEST_SHARE = 1 / 3
 SINGLE_TURN_DROP_PRICIEST_SHARE = 1 / 3
 SINGLE_TURN_COMPLETION_TOKENS_PER_PROMPT_TOKEN = 0.4
+# A single-turn call (and the short extract loop) opens with no prior conversation, so none of its
+# prompt tokens are cache reads: the ranking prices it on the prompt rate alone. Named rather than
+# passed as a bare 0.0 so the mix the pin ranks by sits visibly next to the scraper's 0.94.
+SINGLE_TURN_CACHED_PROMPT_SHARE = 0.0
 # Same floor and reasoning as SCRAPER_MIN_BITS_PER_WEIGHT: never a 4-bit quantization nobody chose.
 SINGLE_TURN_MIN_BITS_PER_WEIGHT = 8
 MODEL_NAME_QUERY = MODEL_NAME_SINGLE_TURN
 MODEL_NAME_COMPANY_MATCH = MODEL_NAME_SINGLE_TURN
+MODEL_NAME_COMPANY_IDENTITY = MODEL_NAME_SINGLE_TURN
 MODEL_NAME_RATING = MODEL_NAME_SINGLE_TURN
 # Asked in order when the MODEL_NAME_RATING call fails or its reply is not a usable rating: a
-# different model rather than the same one again. All three are flash-tier OpenRouter models, so
-# a fallback rating costs about what a normal one does — and an OpenRouter outage fails all of
-# them. Empty turns the fallback off.
-# DeepSeek V4 Flash is always the dated snapshot (OPENROUTER_MODEL_NAME_SCRAPER), never the
-# undated id, which is an older and slower one; a test enforces this for every model constant.
-MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE, OPENROUTER_MODEL_NAME_SCRAPER)
+# different model rather than the same one again, which is why every entry must differ from
+# MODEL_NAME_RATING (a test enforces that, along with distinctness and the route). Flash-tier
+# OpenRouter models, so a fallback rating costs about what a normal one does — and an OpenRouter
+# outage fails all of them. Empty turns the fallback off.
+# This list lost its DeepSeek entry on 2026-10-19: it used to point at
+# OPENROUTER_MODEL_NAME_SCRAPER, and when that const moved to the same snapshot the rating tier
+# already runs on, the entry stopped being a different model at all. The remaining entry is the
+# GLM intelligence default, so a fallback is still a genuinely different model.
+MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,)
 # Reading amounts out of a compensation phrase is a PARSE, not a judgement — the deterministic
 # tiers in salary.py answer all but a few strings, and this only sees what they could not read.
 # Flash tier for that reason, and cached per string so a phrase is parsed once, ever.
@@ -406,9 +418,12 @@ MODEL_NAME_PAGE_SECTIONS = MODEL_NAME_SINGLE_TURN
 # the Haiku bill). 2026-10-19: replaying 26 DeepSeek-era runs' token counts at Haiku 5.5 prices
 # ($0.10/$0.50 per M, 5x above 100K-token prompts) gives $0.38-1.90 a run vs $0.34 actual
 # (typical run ~$0.14), so DeepSeek still wins on a typical run; Haiku 5.5 only beats the bad-endpoint
-# outliers. Do NOT repoint it at the intelligence default: glm-5.2 measured
-# $0.1932/M cache-read (~2x Haiku's rate, costing MORE than what it replaces), as did
-# deepseek-v4-pro and qwen3.8-max. The win is specific to the flash tier. Pointing it at
+# outliers. Do NOT repoint it at the intelligence default. The reason is NOT the old glm-5.2
+# measurement ($0.1932/M cache-read, ~2x Haiku's rate) — that model is no longer the default.
+# The scraper is ~95-98% cache reads and ranks its endpoints at an 8-bpw floor, and at that
+# floor the cheapest glm-5.3-flash endpoint costs MORE than the DeepSeek pin (2026-10-19:
+# $0.194 vs $0.068 a run on the median run's mix). deepseek-v4-pro and qwen3.8-max are out
+# for the same price reason. The win is specific to the flash tier. Pointing it at
 # an ANTHROPIC_MODEL_NAME_* const instead routes Stage 1b through the original
 # ClaudeSDKClient scraper, kept intact as the rollback path.
 MODEL_NAME_SCRAPER = OPENROUTER_MODEL_NAME_SCRAPER
@@ -436,6 +451,14 @@ SCRAPER_PROVIDER_MAX_SWITCHES = 4
 # completion tokens per turn switches the run off it.
 SCRAPER_VERBOSE_MIN_ITERATIONS = 8
 SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION = 800
+# The scraper's endpoint ranking also demotes the slowest share by measured throughput, so the pin
+# cannot land on an endpoint that is cheap only because it is slow. Added 2026-10-19, when the
+# cheapest >=8-bpw endpoints for the candidate models ran at 13 and 23 tok/s (5.8 s and 15.1 s
+# latency) — rank_endpoints had no speed filter at all, and switch() only fires on FAILURE, never on
+# slowness, so such a pin would have been served for a whole run. A quarter is enough to move the
+# head off the outliers while leaving the rest of the ranked list as fallbacks; the cut is taken over
+# the endpoints with measured throughput only, and those demoted stay on the list, last.
+SCRAPER_DROP_SLOWEST_SHARE = 1 / 4
 # Spend ceiling for the Anthropic scraper fallback, per run. The fallback bills Haiku prices on the
 # same ~13M-token scrape the OpenRouter path runs for cents: on 2026-09-28, at Haiku 4.5 prices, it
 # cost ~$4.96 of a $5.30 run (roughly two queries' worth at the cap). Haiku 5.5 would replay that
@@ -450,7 +473,7 @@ SCRAPER_ANTHROPIC_FALLBACK_MAX_COST_USD = 1.50
 # default: a scraper model without an entry here fails fast, before any LinkedIn traffic, rather
 # than silently accepting 4-bit quality.
 SCRAPER_MIN_BITS_PER_WEIGHT: dict[str, int] = {
-    'deepseek/deepseek-v4-flash-0731': 8,
+    'deepseek/deepseek-v4.1-flash-1017': 8,
 }
 # A query whose effective $/M prompt tokens exceeds the chosen endpoint's estimate by this factor
 # raises a run alert: the week this pin fixes cost ~$5-7 extra with nothing flagging it.
@@ -486,6 +509,9 @@ SNAPSHOT_RESULT_COUNT_RE = r'\b\d+\+? results?\b'
 
 # Audit configuration
 AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
+# --job-ids replay: what a replay directory under run_dir/replays/ holds besides the saved postings.
+REPLAY_NOTIFICATIONS_FILENAME = 'notifications.md'  # the messages a real run would have sent
+REPLAY_SUMMARY_FILENAME = 'summary.tsv'               # one row per requested job: outcome and rating
 
 # Stage 2 (evaluation) configuration
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10
@@ -652,6 +678,9 @@ LOG_TITLE_MAX_CHARS = 80
 NOTIFICATION_SALARY_MAX_CHARS = 200
 # An unparseable posting date shown verbatim on the 🗓 line of a Telegram job-match message.
 NOTIFICATION_POSTED_MAX_CHARS = 80
+# Leads the company in a job-match header when a recruiting agency posted it (2026-10-19): the
+# ⚠️ bullet naming the hiring company is the last thing in the message.
+NOTIFICATION_RECRUITER_MARKER = '🧑‍💼 Recruiter:'
 # Compensation sentences of the description handed to the salary classifier, and ONLY when the
 # deterministic tiers found no figure in the salary field itself.
 SALARY_CONTEXT_MAX_CHARS = 1500
@@ -724,6 +753,26 @@ LOCATION_GUESS_REASON_MAX_CHARS = 150
 
 # Stage 2 page read (linkedin_page.read_job_page)
 EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after navigation
+
+# Company identity (company_domain.py, 2026-10-19). Already-applied matching keys a company by its
+# website domain and its parent organization, not its name alone: "NTT DATA Europe & Latam" was
+# skipped as already applied on one query and queued on the next in the same run, because each
+# listing asked a model afresh. The LinkedIn About page is read first (its Website field and its
+# "Affiliated pages" Parent entry); a model is asked only for what that page does not state.
+LINKEDIN_COMPANY_ABOUT_URL = 'https://www.linkedin.com/company/{slug}/about/'
+# Before each About-page visit: a (min, max) range for the same reason as the scraper's delays.
+# Visited once per company slug, ever, and only for a job headed for the paid rating call.
+COMPANY_ABOUT_PAGE_DELAY_SECONDS = (3.0, 8.0)
+COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS = 3
+# Model lookups for the applied-job companies run together at load; one cheap call each, once ever.
+COMPANY_IDENTITY_LOOKUP_CONCURRENCY = 8
+# Hosts that serve many unrelated organizations' pages, so their domain identifies nobody and is
+# never a company domain. GE Vernova's About page gave https://linktree.com/gevernova (2026-10-23);
+# kept as its domain, any other company on a Linktree page would have "matched" it.
+NON_COMPANY_DOMAINS = frozenset({
+    'linktree.com', 'linktr.ee', 'beacons.ai', 'bio.link', 'carrd.co', 'wixsite.com',
+    'bit.ly', 'lnkd.in', 't.co', 'tinyurl.com',
+})
 
 # LinkedIn job pages are read by CODE, not by the extractor model (2026-09-24). One read-only
 # browser_evaluate serializes the DOM after LinkedIn's own scripts have run; code then removes the
