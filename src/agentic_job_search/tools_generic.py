@@ -1850,26 +1850,48 @@ def log_run_cost(record: dict, log_path: Path | None = None) -> None:
 # stay proper); `re.IGNORECASE` below is what makes it match "the us" too.
 _US = r'(?:US|U\.S\.|United States)'
 
-_AUTH_REQUIRED_PATTERNS = [
+# Naming the US makes a phrase evidence that the role is US-based, wherever its location says it is.
+_US_AUTH_REQUIRED_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
         rf'must be (legally )?authorized to work in the {_US}',
+        rf'{_US} citizens? and (lawful )?permanent residents?',
+        rf'currently (legally )?authorized to work in the {_US}',
+    ]
+]
+
+# These name no country, so they count only where the user needs sponsorship. Applied anywhere, they
+# auto-rejected 43 of 48 sponsorship rejections for Canada and EU roles the user may already work in
+# (2026-09-03 to 2026-10-26).
+_NO_SPONSORSHIP_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
         r'no visa sponsorship',
         r'not able to (provide |offer )?sponsor',
         r'cannot (provide |offer )?sponsor',
         r'sponsorship (is )?not (available|provided|offered)',
         r'will not (provide |offer )?sponsor',
         r'unable to (provide |offer )?sponsor',
-        rf'{_US} citizens? and (lawful )?permanent residents?',
-        rf'currently (legally )?authorized to work in the {_US}',
         r"this (position|role|job) (does not|doesn't) (provide|offer|support) (visa )?sponsorship",
         r'employment authorization (without|not requiring) sponsorship',
     ]
 ]
 
 
+_US_PLACE_NAME_RE = re.compile(rf'(?:{_US}|USA|U\.S\.A\.)(?: of America)?', re.IGNORECASE)
+
+
+def _names_us(place: str) -> bool:
+    '''Return True if a place name, as a whole, is the United States.'''
+    return bool(_US_PLACE_NAME_RE.fullmatch(place.strip()))
+
+
 def _requires_current_us_auth(text: str) -> bool:
-    '''Return True if text indicates the job requires current US work authorization (no sponsorship).'''
-    return any(p.search(text) for p in _AUTH_REQUIRED_PATTERNS)
+    '''Return True if text demands current US work authorization, which makes the role US-based.'''
+    return any(p.search(text) for p in _US_AUTH_REQUIRED_PATTERNS)
+
+
+def _states_no_sponsorship(text: str) -> bool:
+    '''Return True if text says no visa sponsorship is offered, in any country.'''
+    return any(p.search(text) for p in _NO_SPONSORSHIP_PATTERNS)
 
 
 # Both are SEARCHED within the string, not matched against all of it. LinkedIn and the extract
@@ -1970,7 +1992,7 @@ async def do_check_and_record_job(
         return _result('too_old')
 
     combined_text = ' '.join(filter(None, [description, content]))
-    if _requires_current_us_auth(combined_text):
+    if any(_names_us(loc) for loc in preferences.sponsorship_required_in()) and _requires_current_us_auth(combined_text):
         console.print(f'[dim]Skipping {company} — requires current US work authorization.[/dim]')
         return _result('auth_required')
 

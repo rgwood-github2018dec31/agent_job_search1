@@ -155,6 +155,7 @@ scripts/
   backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
   release_stuck_eval_errors.py    # One-time release of jobs stuck in processed_jobs/ by a pre-2026-10-09 eval_error
   job_trace_report.py             # Full-trace PDF of one evaluated job from the files a run kept
+  release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
 tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions

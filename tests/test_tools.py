@@ -333,20 +333,13 @@ async def test_check_and_record_job_yaml_content(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _requires_current_us_auth
+# _requires_current_us_auth / _states_no_sponsorship
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('text', [
     'Must be authorized to work in the US without sponsorship',
-    'No visa sponsorship available for this role',
-    'We are not able to sponsor work visas',
-    'We cannot sponsor or transfer visas',
-    'Sponsorship is not available for this position',
-    'Will not sponsor applicants for work visas',
     'US citizens and permanent residents only',
     'Currently authorized to work in the United States',
-    'This position does not provide visa sponsorship',
-    'Employment authorization without sponsorship required',
     'must be legally authorized to work in the united states',
     'Must be authorized to work in the U.S.',
     'U.S. citizens and lawful permanent residents only',
@@ -362,9 +355,45 @@ def test_requires_current_us_auth_matches(text):
     'Staff AI Engineer at Shopify',
     'Sponsorship available for the right candidate',
     'Remote role, open to all locations',
+    # Country-neutral refusals say nothing about the US (2026-10-27).
+    'No visa sponsorship available for this role',
+    'FullStack will not sponsor applicants for work visas now or in the future.',
+    'Applicants must be legally authorized to work in Canada at the time of hire.',
 ])
 def test_requires_current_us_auth_no_false_positives(text):
     assert not tools._requires_current_us_auth(text), f'Expected no match for: {text!r}'
+
+
+@pytest.mark.parametrize('text', [
+    'No visa sponsorship available for this role',
+    'We are not able to sponsor work visas',
+    'We cannot sponsor or transfer visas',
+    'Sponsorship is not available for this position',
+    'Will not sponsor applicants for work visas',
+    'This position does not provide visa sponsorship',
+    'Employment authorization without sponsorship required',
+])
+def test_states_no_sponsorship_matches(text):
+    assert tools._states_no_sponsorship(text), f'Expected match for: {text!r}'
+
+
+@pytest.mark.parametrize('text', [
+    'We are open to visa sponsorship for exceptional candidates',
+    'Sponsorship available for the right candidate',
+    'Remote role, open to all locations',
+])
+def test_states_no_sponsorship_no_false_positives(text):
+    assert not tools._states_no_sponsorship(text), f'Expected no match for: {text!r}'
+
+
+@pytest.mark.parametrize('place', ['United States', 'US', 'U.S.', 'USA', 'united states of america'])
+def test_names_us_matches(place):
+    assert tools._names_us(place)
+
+
+@pytest.mark.parametrize('place', ['Canada', 'United Kingdom', 'Russia', 'Austria'])
+def test_names_us_rejects_other_places(place):
+    assert not tools._names_us(place)
 
 
 async def test_check_and_record_job_auth_required(tmp_path, monkeypatch):
@@ -1428,6 +1457,31 @@ async def test_apply_hard_rules_explicit_no_auth_statement():
     extract = _make_extract(description='Must be authorized to work in the US without sponsorship.')
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
     assert reason is not None and 'sponsorship' in reason
+
+
+async def test_apply_hard_rules_us_states_no_sponsorship():
+    extract = _make_extract(location='United States (Remote)', description='No visa sponsorship available.')
+    reason = await agent.apply_hard_rules(_make_candidate(), extract)
+    assert reason is not None and 'sponsorship' in reason
+
+
+# 2026-10-26: these Canada postings were auto-rated 1 although the user needs sponsorship only in the US.
+@pytest.mark.parametrize('note', [
+    'Applicants must be currently authorized to work in the country of this job posting on a full-time '
+    'basis. FullStack will not sponsor applicants for work visas now or in the future.',
+    'This role does not provide visa sponsorship. Applicants must be legally authorized to work in Canada '
+    'at the time of hire and must not require employer sponsorship for a work visa (current or future).',
+    'Visa sponsorship is not offered for this role.',
+])
+async def test_apply_hard_rules_no_sponsorship_outside_sponsorship_locations_passes(note):
+    extract = _make_extract(location='Canada (Remote)', sponsorship_note=note)
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
+
+
+async def test_apply_hard_rules_us_auth_ignored_when_us_needs_no_sponsorship(monkeypatch):
+    monkeypatch.setattr(preferences, 'sponsorship_required_in', lambda: ('United Kingdom',))
+    extract = _make_extract(location='Remote', description='Must be authorized to work in the US.')
+    assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
 async def test_apply_hard_rules_non_english_language_requirement():

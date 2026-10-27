@@ -155,7 +155,9 @@ from agentic_job_search.tools_generic import (
     JOB_REQUIREMENTS_PATH,
     PROJECT_DIR,
     RUN_DIR,
+    _names_us,
     _requires_current_us_auth,
+    _states_no_sponsorship,
     company_matches_applied,
     console,
     job_url,
@@ -2996,6 +2998,20 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     return '\n'.join(lines)
 
 
+def sponsorship_rejected(location: str, full_text: str) -> bool:
+    '''Return True if the job needs a sponsorship the user requires and the posting does not offer it.'''
+    sponsorship_locations = preferences.sponsorship_required_in()
+    # Folded HERE rather than in the accessor: the preference holds place names, and a name folded
+    # on the way in cannot be unfolded on the way out. This rule is still a substring match, unlike
+    # the two geographic lists -- see AGENTS.md.
+    needs_sponsorship = any(loc.casefold() in location.casefold() for loc in sponsorship_locations)
+    # A demand for current US authorization places the role in the US whatever its location says; a
+    # bare "no sponsorship" names no country and counts only where the user needs it (2026-10-27).
+    us_needs_sponsorship = any(_names_us(loc) for loc in sponsorship_locations)
+    return (needs_sponsorship and (_states_no_sponsorship(full_text) or 'sponsor' not in full_text.lower())) or (
+        us_needs_sponsorship and _requires_current_us_auth(full_text))
+
+
 async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
     '''Auto-reject rules; returns the reason, or None if the job survives.
 
@@ -3030,15 +3046,7 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
         posted = None
     if posted and (date.today() - posted).days > JOB_STALE_AGE_DAYS:
         return f'posting older than {JOB_STALE_AGE_DAYS} days ({posted.isoformat()})'
-    sponsorship_locations = preferences.sponsorship_required_in()
-    # Folded HERE rather than in the accessor: the preference holds place names, and a name folded
-    # on the way in cannot be unfolded on the way out. This rule is still a substring match, unlike
-    # the two geographic lists -- see AGENTS.md.
-    location = extract['location'].casefold()
-    needs_sponsorship = any(loc.casefold() in location for loc in sponsorship_locations)
-    if sponsorship_locations and (
-        _requires_current_us_auth(full_text) or (needs_sponsorship and 'sponsor' not in full_text.lower())
-    ):
+    if sponsorship_rejected(extract['location'], full_text):
         return 'job without explicit visa sponsorship'
     known_languages = preferences.languages()
     if known_languages:
