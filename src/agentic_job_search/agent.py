@@ -147,6 +147,7 @@ from agentic_job_search.extract_openrouter import extract_job_page_openrouter
 from agentic_job_search.linkedin_page import (
     JobPage,
     LinkedInBlockedError,
+    company_page_url,
     posted_age_from_page,
     read_company_about,
     read_job_page,
@@ -2390,9 +2391,16 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
     try:
         async with mcp_session(playwright_mcp_url) as call:
             page = await read_job_page(candidate, call, stage_stats)
+        raw_txt = tools_module.raw_posting_path(candidate)
+        raw_html = raw_txt.with_suffix('.html')
         job_trace.record('page_read', url=candidate.get('url'), source=page.source if page else None,
                          chars=len(page.text) if page else 0, removed=page.removed if page else [],
-                         raw_posting=str(tools_module.raw_posting_path(candidate)), text=page.text if page else '')
+                         dom_chars=page.dom_chars if page else 0, removed_chars=page.removed_chars if page else 0,
+                         posting_company=page.posting_company if page else '',
+                         company_url=company_page_url(page.company_slug) if page else '',
+                         raw_html=str(raw_html), raw_html_bytes=raw_html.stat().st_size if raw_html.exists() else None,
+                         raw_posting=str(raw_txt), raw_posting_bytes=raw_txt.stat().st_size if raw_txt.exists() else None,
+                         text=page.text if page else '')
         return page
     except Exception as ex:
         job_trace.record('page_read', url=candidate.get('url'), error=unwrap_exception(ex))
@@ -2951,6 +2959,7 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
     lines = [
         f"Title: {extract['title']}",
         f"Company: {extract['company']}",
+        *([f"Company LinkedIn page: {extract['posting_company_url']}"] if extract.get('posting_company_url') else []),
         *([f'Hiring company: {end_client}'] if end_client else []),
         f"Location: {extract['location']}",
         *([f'LinkedIn-listed location: {listed}']
@@ -4651,6 +4660,9 @@ async def _evaluate_candidates(
             bump('extract_ok')
             # Before anything reads `location`: it may be filled from the header card here.
             await resolve_listed_location(extract, page.listed_location if page is not None else '')
+            # Read by code off the job page, not predicted: who posted it, and where their page is.
+            if page is not None and page.company_slug:
+                extract['posting_company_url'] = company_page_url(page.company_slug)
             # Resolve the likely spoken languages ONCE, here, and write it back — so
             # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
             # field. Cosmetic only: no gate reads it, by design. `broad_area` rides along from the

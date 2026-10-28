@@ -760,6 +760,7 @@ EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after naviga
 # listing asked a model afresh. The LinkedIn About page is read first (its Website field and its
 # "Affiliated pages" Parent entry); a model is asked only for what that page does not state.
 LINKEDIN_COMPANY_ABOUT_URL = 'https://www.linkedin.com/company/{slug}/about/'
+LINKEDIN_COMPANY_URL = 'https://www.linkedin.com/company/{slug}/'
 # Before each About-page visit: a (min, max) range for the same reason as the scraper's delays.
 # Visited once per company slug, ever, and only for a job headed for the paid rating call.
 COMPANY_ABOUT_PAGE_DELAY_SECONDS = (3.0, 8.0)

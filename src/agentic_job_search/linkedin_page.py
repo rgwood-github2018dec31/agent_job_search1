@@ -44,6 +44,7 @@ from agentic_job_search.config import (
     EXTRACTOR_SNAPSHOT_MAX_CHARS,
     JOB_PAGE_ASSET_FETCH_TIMEOUT_SECONDS,
     LINKEDIN_COMPANY_ABOUT_URL,
+    LINKEDIN_COMPANY_URL,
     LINKEDIN_PAGE_CAPTURE_JS,
     LINKEDIN_PAGE_CAPTURE_RETRIES,
     LINKEDIN_PDF_FURNITURE_LINE_PATTERNS,
@@ -111,6 +112,9 @@ class JobPage:
     removed: list[dict] = field(default_factory=list)
     company_slug: str = ''   # the poster's LinkedIn page, from the About-the-company card; '' if absent
     listed_location: str = ''   # the header card's location (listed_location()); '' if absent
+    posting_company: str = ''   # the poster as the page's logo names it (posting_company()); '' if absent
+    dom_chars: int = 0          # the captured page before scripts and clutter were removed
+    removed_chars: int = 0      # what clutter removal took out of the text
 
 
 @dataclass
@@ -232,6 +236,11 @@ def posting_company(soup: BeautifulSoup) -> str | None:
         if m := _COMPANY_LOGO_ALT_RE.match(norm(img.get('alt', ''))):
             return m.group('company')
     return None
+
+
+def company_page_url(slug: str) -> str:
+    """The poster's LinkedIn company page, or '' when the job page names none."""
+    return LINKEDIN_COMPANY_URL.format(slug=slug) if slug else ''
 
 
 def posting_company_slug(soup: BeautifulSoup) -> str:
@@ -702,7 +711,8 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     )
     logger.debug(f'Job page {job_id}: removed {removed_summary}; JS {js_counts}; assets {asset_counts}')
     return JobPage(text=text, source='dom', removed=removed, company_slug=company_slug,
-                   listed_location=location)
+                   listed_location=location, posting_company=company or '', dom_chars=len(capture['html']),
+                   removed_chars=sum(r['chars'] for r in removed))
 
 
 def visible_block_signature(soup: BeautifulSoup) -> str:

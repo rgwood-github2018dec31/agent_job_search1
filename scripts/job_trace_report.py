@@ -31,6 +31,7 @@ import sys
 import textwrap
 from datetime import date
 from pathlib import Path
+from typing import NamedTuple
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -55,6 +56,8 @@ sys.path.insert(0, str(PROJECT_DIR / 'src'))
 from agentic_job_search import agent as A  # noqa: E402
 from agentic_job_search import config as C  # noqa: E402
 from agentic_job_search import job_trace as T  # noqa: E402
+from agentic_job_search import linkedin_page as LP  # noqa: E402
+from bs4 import BeautifulSoup  # noqa: E402
 
 RUN_DIR = PROJECT_DIR / 'run_dir'
 WRAP = 108
@@ -136,9 +139,21 @@ def rule() -> HRFlowable:
                       spaceBefore=3, spaceAfter=5)
 
 
-def kv_table(rows: list[tuple[str, str]]) -> Table:
+class Link(NamedTuple):
+    '''A kv_table value printed as a clickable link.'''
+    text: str
+    url: str
+
+
+def _markup(value: str | Link) -> str:
+    if isinstance(value, Link):
+        return f'<a href="{_xml(value.url)}" color="#0b5cad"><u>{_xml(value.text)}</u></a>'
+    return _xml(value)
+
+
+def kv_table(rows: list[tuple[str, str | Link]]) -> Table:
     # The tags wrap the escaped key: escaping them too printed a literal '<b>Job</b>'.
-    data = [[Paragraph(f'<b>{_xml(k)}</b>', BODY), Paragraph(_xml(v), BODY)] for k, v in rows]
+    data = [[Paragraph(f'<b>{_xml(k)}</b>', BODY), Paragraph(_markup(v), BODY)] for k, v in rows]
     table = Table(data, colWidths=[42 * mm, None])
     table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
@@ -303,15 +318,6 @@ def _reply_meta(step: dict) -> dict:
 SUMMARY_CHARS = 240   # how much of a prompt or reply the step-by-step table quotes
 
 
-def brief(value: object, call: int | None = None) -> str:
-    '''A one-cell summary of a trace value; a cut is stated, and points at the full text.'''
-    text = ' '.join(as_text(value).split()) if value not in (None, '', [], {}) else '—'
-    if len(text) <= SUMMARY_CHARS:
-        return text
-    where = f' in call #{call} of the Job Trace section' if call else ' in the Job Trace section'
-    return f'{text[:SUMMARY_CHARS]}… [+{len(text) - SUMMARY_CHARS:,} chars; full text{where}]'
-
-
 def found_by(steps: list[dict], log_path: Path | None, job_id: str) -> str:
     '''The search that surfaced the job: query and region from the trace, else the harvest log line.'''
     origin = next((s for s in steps if s['kind'] == 'origin'), {})
@@ -341,16 +347,108 @@ def llm_output(step: dict) -> object:
         if step.get(key) not in (None, ''):
             return step[key]
     raw = step.get('raw_reply') or ''
-    try:
-        reply = json.loads(raw)
-    except (TypeError, ValueError):
-        return raw   # shown as it came; the full reply is in the Job Trace section either way
+    reply = _json_or_none(raw)
     # The extract loop keeps the whole MCP reply; what the model decided is its tool call.
     calls = reply.get('tool_calls') if isinstance(reply, dict) else None
     if calls:
-        return '; '.join(f"{c.get('function', {}).get('name')}({c.get('function', {}).get('arguments')})"
-                         for c in calls if isinstance(c, dict))
+        return {str(c.get('function', {}).get('name')): _json_or_none(c.get('function', {}).get('arguments'))
+                or c.get('function', {}).get('arguments') for c in calls if isinstance(c, dict)}
     return reply.get('content') if isinstance(reply, dict) and reply.get('content') else raw
+
+
+def _json_or_none(text: object) -> object:
+    '''`text` decoded as JSON, or None when it is not JSON (it is then summarised as text).'''
+    if not isinstance(text, str):
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+VALUE_CHARS = 70        # one value inside a summarised object
+LIST_ITEMS_SHOWN = 3    # items of a list shown before "+N more"
+KEY_LINES_SHOWN = 6     # 'Key: value' lines of a prompt named in its summary
+SECTION_MARKER_RE = re.compile(r'^--- (?!END )(.+?) ---$', re.M)
+KEY_LINE_RE = re.compile(r'^([A-Z][A-Za-z /()-]{1,30}): (\S.{0,120})$', re.M)
+
+
+def shorten(text: str, limit: int = VALUE_CHARS) -> str:
+    '''One line of at most `limit` chars, cut at a word with a visible "…".'''
+    text = ' '.join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(' ', 1)[0] + '…'
+
+
+def compact(value: object, limit: int = VALUE_CHARS) -> str:
+    '''A decoded value as one short line: each string shortened, long lists counted, empties dropped.'''
+    if isinstance(value, dict):
+        shown = [f'{k}: {compact(v, limit)}' for k, v in value.items() if v not in (None, '', [], {})]
+        empty = len(value) - len(shown)
+        return '{' + '; '.join(shown) + (f'; {empty} empty' if empty else '') + '}'
+    if isinstance(value, list):
+        items = [compact(v, limit) for v in value[:LIST_ITEMS_SHOWN]]
+        more = len(value) - LIST_ITEMS_SHOWN
+        return '[' + ', '.join(items) + (f', +{more} more' if more > 0 else '') + ']'
+    return shorten(str(value), limit)
+
+
+def size(n_bytes: int | None) -> str:
+    if n_bytes is None:
+        return 'size not recorded'
+    return f'{n_bytes / 1024:,.0f} KB' if n_bytes >= 1024 else f'{n_bytes:,} bytes'
+
+
+def summarise_prompt(step: dict) -> str:
+    '''What the model was given: its parts and their sizes, and the short facts it was asked about.'''
+    text = llm_input(step) or ''
+    system = step.get('system') or next(
+        (m.get('content') for m in step.get('messages') or [] if isinstance(m, dict) and m.get('role') == 'system'), '')
+    parts = [f'instructions ({len(system):,} chars)'] if system else []
+    markers = list(SECTION_MARKER_RE.finditer(text))
+    for marker in markers:
+        end = text.find(f'--- END {marker.group(1)} ---', marker.end())
+        length = (end if end >= 0 else len(text)) - marker.end()
+        parts.append(f'{shorten(marker.group(1), 40)} ({length:,} chars)')
+    head = text[:markers[0].start()] if markers else text
+    if 'CLAIMS:' in head and (claims := _json_or_none(head.split('CLAIMS:', 1)[1].strip())):
+        head = head.split('CLAIMS:', 1)[0]
+        parts.append(f'{len(claims)} claim(s): ' + ', '.join(
+            f"{c.get('field')}={compact(c.get('value'), 30)}" for c in claims if isinstance(c, dict)))
+    keys = KEY_LINE_RE.findall(head)[:KEY_LINES_SHOWN]
+    parts += [f'{k}: {shorten(v, 50)}' for k, v in keys]
+    if not markers and not keys:
+        parts.insert(0, shorten(head.strip().splitlines()[0] if head.strip() else '', 90))
+    return f'{len(text):,} chars — ' + '; '.join(p for p in parts if p)
+
+
+def summarise_reply(step: dict) -> str:
+    out = llm_output(step)
+    if isinstance(out, str):
+        decoded = _json_or_none(out)
+        return compact(decoded) if decoded is not None else shorten(out, SUMMARY_CHARS)
+    return compact(out)
+
+
+def page_read_summary(step: dict) -> str:
+    '''Saved the full page, removed clutter, saved the text the extractor read: files and sizes.'''
+    if step.get('error'):
+        return f"FAILED: {shorten(step['error'], SUMMARY_CHARS)}"
+    if step.get('source') != 'dom':
+        return (f"page capture unavailable, fell back to the accessibility snapshot: {step.get('chars'):,} chars "
+                f"of text → {Path(step.get('raw_posting') or '?').name}")
+    html = Path(step['raw_html']) if step.get('raw_html') else Path(step.get('raw_posting') or '?').with_suffix('.html')
+    html_bytes = step.get('raw_html_bytes') or (html.stat().st_size if html.exists() else None)
+    dom = f"{step['dom_chars']:,} chars captured; " if step.get('dom_chars') else ''
+    removed = step.get('removed') or []
+    removed_chars = step.get('removed_chars') or sum(r.get('chars', 0) for r in removed)
+    text_chars = step.get('chars') or 0
+    txt = Path(step.get('raw_posting') or '?')
+    txt_bytes = step.get('raw_posting_bytes') or (txt.stat().st_size if txt.exists() else None)
+    return (f'{dom}saved the full page, scripts stripped → {html.name} ({size(html_bytes)}); '
+            f'removed {len(removed)} clutter section(s) ({removed_chars:,} chars of text) → '
+            f'{text_chars:,} chars of text; saved it → {txt.name} ({size(txt_bytes)}), exactly what the extractor read')
 
 
 def step_by_step(steps: list[dict], found: str) -> list:
@@ -365,23 +463,21 @@ def step_by_step(steps: list[dict], found: str) -> list:
                    found, f"card: {card.get('title')} — {card.get('company')} — {card.get('snippet')} — "
                           f"posted {card.get('date_posted')}; job {s.get('position')} in Stage 2")
         elif kind == 'page_read':
-            row = ('Read job page', 'code (read-only DOM)', s.get('url'),
-                   f"{s.get('chars')} chars via {s.get('source')}; {len(s.get('removed') or [])} clutter "
-                   f'section(s) removed')
+            row = ('Read job page', 'code (one read-only page capture)', s.get('url'), page_read_summary(s))
         elif kind == 'llm_call':
             call += 1
             served = s.get('provider') or (s.get('routing') or {}).get('provider') or s.get('transport')
             row = (f"LLM call #{call}: {s.get('call_site')}", f"model {s.get('model')} ({served}), "
-                   f"{s.get('seconds')}s", brief(llm_input(s), call), brief(llm_output(s), call))
+                   f"{s.get('seconds')}s", summarise_prompt(s), summarise_reply(s))
         elif kind == 'evidence':
             verdicts = s.get('verdicts') or []
             counts: dict[str, int] = {}
             for v in verdicts:
                 counts[v['status']] = counts.get(v['status'], 0) + 1
-            rejected = [f"{v['field']}={brief(v['value'])}" for v in verdicts if v['status'] == 'rejected']
+            rejected = [f"{v['field']}={compact(v['value'])}" for v in verdicts if v['status'] == 'rejected']
             row = (f"Verify citations: {s.get('call_site')}",
                    'code (regex)' + (' + model relocation' if counts.get('relocated_by_llm') else ''),
-                   f'{len(verdicts)} claim(s) against {s.get("source")}',
+                   f'{len(verdicts)} claim(s) against {Path(s["source"]).name if "/" in str(s.get("source")) else s.get("source")}',
                    ', '.join(f'{k} {v}' for k, v in counts.items())
                    + (f"; REJECTED as hallucination: {'; '.join(rejected)}" if rejected else ''))
         elif kind == 'extract':
@@ -389,7 +485,7 @@ def step_by_step(steps: list[dict], found: str) -> list:
             shown_fields = {k: v for k, v in fields.items()
                             if k not in ('description', 'quotes', 'evidence') and v not in (None, '', False, [])}
             row = ('Extracted fields (accepted)', 'model output after citation check', 'LLM call above',
-                   brief(shown_fields))
+                   compact(shown_fields))
         elif kind == 'classified':
             geo = s.get('geography') or {}
             salary = s.get('salary_facts') or {}
@@ -397,10 +493,10 @@ def step_by_step(steps: list[dict], found: str) -> list:
                    'the accepted extract',
                    f"countries {geo.get('countries')}, regions {geo.get('regions')}; salary {salary.get('kind')} "
                    f"({salary.get('source')}); workplace {s.get('workplace_type') or '—'}; "
-                   f"residency {brief(s.get('residency_scope'))}")
+                   f"residency {compact(s.get('residency_scope'))}")
         elif kind == 'hard_rule':
             inputs = {k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s', 'rule', 'fired', 'reason')}
-            row = (f"Hard rule: {s['rule']}", 'code', brief(inputs),
+            row = (f"Hard rule: {s['rule']}", 'code', compact(inputs),
                    f"FIRED: {s.get('reason')}" if s.get('fired') else 'passed')
         elif kind == 'rating':
             triage = s.get('triage') or {}
@@ -408,19 +504,57 @@ def step_by_step(steps: list[dict], found: str) -> list:
                    f"triage {triage.get('score', 'not run')}; rater {s.get('raw_rating')}/5",
                    f"final {s.get('capped_rating')}/5" + (f"; capped: {s['cap_reason']}" if s.get('cap_reason') else ''))
         elif kind == 'saved':
-            row = ('Saved job', 'code', f"rating {s.get('rating')}", brief(s.get('result')))
+            saved_as = re.search(r'Saved: (\S+)', as_text(s.get('result')))
+            row = ('Saved job', 'code', f"rating {s.get('rating')}, summary {s.get('summary')}",
+                   saved_as.group(1) if saved_as else compact(s.get('result')))
         elif kind == 'notification':
             row = ('Notification', 'code',
-                   brief(s.get('job_ids') or ''),
-                   ('sent' if s.get('sent') else 'SEND FAILED') + f": {brief(s.get('text'))}"
+                   compact(s.get('job_ids') or ''),
+                   ('sent' if s.get('sent') else 'SEND FAILED') + f": {shorten(s.get('text'), SUMMARY_CHARS)}"
                    if s.get('text') else f"not sent: {s.get('why')}")
         else:
-            row = (kind, '?', '', brief({k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s')}))
+            row = (kind, '?', '', compact({k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s')}))
         rows.append((str(n), *row))
     return [h1('Step by step: every prediction and check, in order'), rule(),
-            note('Inputs and outputs are summarised to one cell each; a cut says so and names where the '
-                 'full text is. "code" means no model was involved.'),
+            note('Inputs and outputs are summarised to fit one cell, by code (no model): a prompt by its '
+                 'parts and their sizes, a reply by its fields, with each long value cut at a visible "…". '
+                 'Every call is in full in the Job Trace section at the end. "code" means no model was involved.'),
             grid(rows, col_widths=STEP_TABLE_WIDTHS)]
+
+
+def archived_company_url(page_step: dict) -> str:
+    '''The poster's company page read from the saved .html, for traces from before 2026-10-28 that
+    did not record it; the same reader the run uses (linkedin_page.posting_company_slug).'''
+    html = Path(page_step['raw_html']) if page_step.get('raw_html') else (
+        Path(page_step['raw_posting']).with_suffix('.html') if page_step.get('raw_posting') else None)
+    if html is None or not html.exists():
+        return ''
+    return LP.company_page_url(LP.posting_company_slug(BeautifulSoup(html.read_text(encoding='utf-8'), 'lxml')))
+
+
+def poster_rows(company: str, page_step: dict, fields: dict) -> list[tuple[str, str | Link]]:
+    '''Who posted the job (with its LinkedIn page) and who would employ, which can differ.
+
+    A recruiter or agency posts under its own name; the employer is then its client, named or not.
+    '''
+    poster = page_step.get('posting_company') or fields.get('company') or company
+    poster_url = page_step.get('company_url') or fields.get('posting_company_url') or archived_company_url(page_step)
+    rows: list[tuple[str, str | Link]] = [
+        ('Posted by', Link(f'{poster} — LinkedIn company page', poster_url) if poster_url
+         else f'{poster} (the job page links no company page)')]
+    end_client = fields.get('end_client') or ''
+    is_agency = fields.get('is_agency')
+    if end_client:
+        hiring = f'{end_client} — the poster is recruiting for this client, so it is not the employer'
+    elif is_agency:
+        hiring = 'not named — the poster is an agency or recruiter, so it is not the employer'
+    elif is_agency is False:
+        hiring = f'{poster} itself (the extract found no agency and no client)'
+    else:
+        hiring = ('not established — the extract has no accepted agency or client field; '
+                  'if the poster recruits for a client, the employer is unknown')
+    rows.append(('Hiring company', hiring))
+    return rows
 
 
 def decision_path(steps: list[dict]) -> list:
@@ -549,18 +683,23 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
     extract_text = md.split('\n\n', 1)[1] if '\n\n' in md else ''
 
     found = found_by(steps, log_path, job_id)
+    page_step = next((s for s in steps if s['kind'] == 'page_read'), {})
+    fields = next((s['fields'] for s in steps if s['kind'] == 'extract'), {})
+    job_title = fields.get('title') or re.sub(r'\s+—\s+rating \d/5$', '', title)
     story: list = []
     story += [
-        Paragraph(_xml(f'Full trace — {company} — job {job_id}'), TITLE),
+        Paragraph('Full Trace', TITLE),
+        Paragraph(_xml(f'LinkedIn JD: {job_id}'), TITLE),
+        Paragraph(_xml(f'{company} / {job_title}'), TITLE),
         Paragraph(_xml(f'Every artifact the {run_date} run kept for one evaluated job, verbatim.'),
                   SUBTITLE),
         Spacer(1, 4 * mm),
         kv_table([
-            ('Job', title),
-            ('Company', company),
+            ('Job', job_title),
+            ('Posting', Link(url, url) if url.startswith('http') else url),
+            *poster_rows(company, page_step, fields),
             ('Found by', found),
             ('Rating', f'{rating}/5 (local triage {triage}/5)'),
-            ('URL', url),
             ('Run', f'{run_date}; log {log_path.name if log_path else "?"}; '
                     f'audit {audit_path.name if audit_path else "?"}'),
             ('Saved job', str(saved.relative_to(PROJECT_DIR)) if saved else 'NOT FOUND'),
@@ -763,7 +902,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
     doc = SimpleDocTemplate(
         str(out), pagesize=A4,
         leftMargin=16 * mm, rightMargin=14 * mm, topMargin=15 * mm, bottomMargin=14 * mm,
-        title=f'Full trace — {company} — job {job_id}',
+        title=f'Full Trace — LinkedIn JD: {job_id} — {company} / {job_title}',
         author='agent_job_search',
     )
     doc.build(story)

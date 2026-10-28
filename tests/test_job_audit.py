@@ -74,12 +74,17 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
     try:
         job_trace.record('origin', candidate=candidate,
                          listing={'query': 'Staff AI Engineer', 'region': 'European Union'}, position='1 of 1')
+        job_trace.record('page_read', url=candidate['url'], source='dom', chars=2137, removed=[{'what': '<footer>', 'chars': 900}],
+                         dom_chars=160000, removed_chars=900, posting_company='Acme',
+                         company_url='https://www.linkedin.com/company/acme/',
+                         raw_html=str(tmp_path / 'linkedin-4476053167.html'), raw_html_bytes=152394,
+                         raw_posting=str(tmp_path / 'linkedin-4476053167.txt'), raw_posting_bytes=2359, text='PAGE')
         job_trace.record('llm_call', transport='openrouter', call_site='rate_with_openrouter', model='m',
                          prompt='FULL PROMPT ' * 400, reply='{"rating": 4}', cost_usd=0.001, seconds=1.0)
         job_trace.record('evidence', call_site='extract', subject='job', source='page', verdicts=[
             {'field': 'location', 'value': 'Gdańsk, Poland', 'quote': 'Gdańsk', 'status': 'regex',
              'span': [0, 6], 'evidence': 'Gdańsk', 'detail': ''}])
-        job_trace.record('extract', fields={'title': 'T', 'location': 'Gdańsk, Poland',
+        job_trace.record('extract', fields={'title': 'T', 'location': 'Gdańsk, Poland', 'end_client': 'Globex',
                                             'quotes': {'location': 'Gdańsk'}, 'evidence': {'location': 'regex'}})
         job_trace.record('hard_rule', rule='stale', fired=False, date_posted='3 days ago')
         job_trace.record('rating', triage=None, result={'rating': 4}, raw_rating=4, capped_rating=3,
@@ -94,8 +99,16 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
     out = report.build('4476053167', '2026-10-16', tmp_path / 'audit.pdf', trace)
     text = ''.join(page.extract_text() for page in pypdf.PdfReader(out).pages)
     for expected in ('Decision path', 'stale', 'hybrid', 'rate_with_openrouter', 'EXACT TELEGRAM TEXT',
-                     'The Job Trace', 'Step by step', 'Found by', 'European Union'):
-        assert expected in text, expected
+                     'The Job Trace', 'Step by step', 'Found by', 'European Union',
+                     'Posted by', 'Globex — the poster is recruiting for this client',
+                     'linkedin-4476053167.html (149 KB)', '160,000 chars captured', 'linkedin-4476053167.txt (2 KB)'):
+        assert expected in ' '.join(text.split()), expected
+    first_page_links = [a.get_object()['/A']['/URI'] for a in pypdf.PdfReader(out).pages[0].get('/Annots') or []]
+    assert first_page_links == [candidate['url'], 'https://www.linkedin.com/company/acme/']
+    # The rating is in the Rating row only, not repeated in the Job row.
+    first_page = ' '.join(pypdf.PdfReader(out).pages[0].extract_text().split())
+    assert 'rating 4/5' not in first_page
+    assert first_page.startswith('Full Trace LinkedIn JD: 4476053167 '), first_page[:80]
     # Long lines are folded, so a word pair may straddle a line break; whitespace is not content.
     # The step-by-step table quotes the prompt's head; the verbatim trace section must hold all of it.
     verbatim_section = ' '.join(text.split('The Job Trace — every step, verbatim', 1)[1].split())

@@ -2295,6 +2295,13 @@ def test_format_extract_text_includes_fields():
     assert 'Build agentic AI systems' in text
 
 
+def test_format_extract_text_links_the_posting_company_page_only_when_the_page_had_one():
+    with_page = agent.format_extract_text(
+        _make_candidate(), _make_extract(posting_company_url='https://www.linkedin.com/company/acme/'))
+    assert 'Company LinkedIn page: https://www.linkedin.com/company/acme/' in with_page
+    assert 'Company LinkedIn page' not in agent.format_extract_text(_make_candidate(), _make_extract())
+
+
 def test_format_extract_text_falls_back_to_candidate_date():
     candidate = _make_candidate(date_posted='2 days ago')
     text = agent.format_extract_text(candidate, _make_extract(date_posted=''))
