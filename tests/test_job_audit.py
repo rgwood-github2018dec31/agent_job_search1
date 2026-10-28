@@ -3,7 +3,7 @@
 import importlib.util
 import logging
 import sys
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -48,18 +48,18 @@ def test_a_requested_job_with_no_trace_falls_back_to_a_rated_one(caplog):
     assert any('job 999 was not evaluated' in r.message for r in caplog.records)
 
 
-def test_the_audit_file_name_carries_date_company_title_and_id():
-    path = job_audit.audit_path_for(_candidate('4480376713'), date(2026, 10, 19))
-    assert path.name == '2026-10-19-acme-staff_ai_engineer-4480376713.pdf'
+def test_the_audit_file_name_carries_id_company_title_and_run_start():
+    path = job_audit.audit_path_for(_candidate('4480376713'), datetime(2026, 10, 19, 16, 45, 2))
+    assert path.name == 'linkedin_4480376713-acme-staff_ai_engineer-2026-10-19_164502.pdf'
 
 
 async def test_a_failed_render_is_logged_with_its_output_and_returns_none(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr(job_audit, 'JOB_AUDITS_DIR', tmp_path / 'job_audits')
     # A local command that fails, so the test never reaches uv or the network.
     monkeypatch.setattr(job_audit, 'render_command',
-                        lambda candidate, run_date, out: [sys.executable, '-c', 'import sys; sys.exit("no reportlab")'])
+                        lambda candidate, run_started, out: [sys.executable, '-c', 'import sys; sys.exit("no reportlab")'])
     with caplog.at_level(logging.WARNING):
-        assert await job_audit.render(_candidate('1'), date(2026, 10, 19)) is None
+        assert await job_audit.render(_candidate('1'), datetime(2026, 10, 19, 16, 45, 2)) is None
     assert any('Job audit render failed' in r.message for r in caplog.records)
 
 
@@ -72,7 +72,8 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
     trace = tmp_path / 'linkedin-4476053167.trace.jsonl'
     _trace_obj, token = job_trace.start(trace, 'linkedin', '4476053167')
     try:
-        job_trace.record('origin', candidate=candidate, listing=None)
+        job_trace.record('origin', candidate=candidate,
+                         listing={'query': 'Staff AI Engineer', 'region': 'European Union'}, position='1 of 1')
         job_trace.record('llm_call', transport='openrouter', call_site='rate_with_openrouter', model='m',
                          prompt='FULL PROMPT ' * 400, reply='{"rating": 4}', cost_usd=0.001, seconds=1.0)
         job_trace.record('evidence', call_site='extract', subject='job', source='page', verdicts=[
@@ -93,7 +94,9 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
     out = report.build('4476053167', '2026-10-16', tmp_path / 'audit.pdf', trace)
     text = ''.join(page.extract_text() for page in pypdf.PdfReader(out).pages)
     for expected in ('Decision path', 'stale', 'hybrid', 'rate_with_openrouter', 'EXACT TELEGRAM TEXT',
-                     'The Job Trace'):
+                     'The Job Trace', 'Step by step', 'Found by', 'European Union'):
         assert expected in text, expected
     # Long lines are folded, so a word pair may straddle a line break; whitespace is not content.
-    assert ' '.join(text.split()).count('FULL PROMPT') == 400, 'the prompt is printed whole, never cut'
+    # The step-by-step table quotes the prompt's head; the verbatim trace section must hold all of it.
+    verbatim_section = ' '.join(text.split('The Job Trace — every step, verbatim', 1)[1].split())
+    assert verbatim_section.count('FULL PROMPT') == 400, 'the prompt is printed whole, never cut'

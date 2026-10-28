@@ -720,7 +720,13 @@ async def test_company_matches_applied_rejects_a_company_not_on_the_list(monkeyp
     '''Verify Source Reference: a matched name the model was never shown is a hallucination, not
     an "already applied" — until 2026-10-19 it auto-rejected the job as '<unknown PDF>'.'''
     monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
-    _make_sdk_mock(monkeypatch, {'matches': True, 'matched_company_name': 'Shopify Payments Ltd'})
+    hallucinated = {'matches': True, 'matched_company_name': 'Shopify Payments Ltd'}
+
+    async def openrouter_names_an_unlisted_company(candidate, companies_list):
+        return hallucinated
+
+    monkeypatch.setattr(tools, '_company_matches_openrouter', openrouter_names_an_unlisted_company)
+    _make_sdk_mock(monkeypatch, hallucinated)   # the Anthropic route, if routing sends it there
     assert await tools.company_matches_applied('Shopify Payments') is None
 
 

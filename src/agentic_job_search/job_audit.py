@@ -10,7 +10,7 @@ failed render costs the PDF, never the run.
 import asyncio
 import logging
 import random
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 
 from agentic_job_search import job_trace
@@ -57,28 +57,35 @@ def choose_job(candidates: list[dict], requested_job_id: str | None, seed: int) 
     return chosen
 
 
-def audit_path_for(candidate: dict, run_date: date) -> Path:
+# The run's start, as the run log names it (run-2026-10-28_164502.log), so the two sort together.
+AUDIT_FILE_TIME_FORMAT = '%Y-%m-%d_%H%M%S'
+
+
+def audit_path_for(candidate: dict, run_started: datetime) -> Path:
+    '''{site}_{job_id}-{company}-{title}-{run start}.pdf: the job first, so one job's audits sort together.'''
     name = '-'.join(filter(None, [
-        run_date.isoformat(), tools_module.underscorify(str(candidate.get('company') or '')),
-        tools_module.underscorify(str(candidate.get('title') or '')), str(candidate.get('job_id') or ''),
+        f"{candidate.get('site') or 'linkedin'}_{candidate.get('job_id') or ''}",
+        tools_module.underscorify(str(candidate.get('company') or '')),
+        tools_module.underscorify(str(candidate.get('title') or '')),
+        run_started.strftime(AUDIT_FILE_TIME_FORMAT),
     ]))
     return JOB_AUDITS_DIR / f'{name}.pdf'
 
 
-def render_command(candidate: dict, run_date: date, out: Path) -> list[str]:
+def render_command(candidate: dict, run_started: datetime, out: Path) -> list[str]:
     trace = find_trace(candidate)
     # --date is the capture day, which names the raw posting the report reads beside the trace.
-    capture_day = trace.parent.name if trace else run_date.isoformat()
+    capture_day = trace.parent.name if trace else run_started.date().isoformat()
     return ['uv', 'run', '--with', 'reportlab', 'python', str(RENDER_SCRIPT),
             '--job-id', str(candidate['job_id']), '--date', capture_day, '--out', str(out),
             *(['--trace', str(trace)] if trace else [])]
 
 
-async def render(candidate: dict, run_date: date) -> Path | None:
+async def render(candidate: dict, run_started: datetime) -> Path | None:
     '''Render the Job Audit PDF; None (after a WARNING carrying the command and its output) on failure.'''
-    out = audit_path_for(candidate, run_date)
+    out = audit_path_for(candidate, run_started)
     out.parent.mkdir(parents=True, exist_ok=True)
-    command = render_command(candidate, run_date, out)
+    command = render_command(candidate, run_started, out)
     try:
         process = await asyncio.create_subprocess_exec(
             *command, cwd=str(tools_module.PROJECT_DIR),

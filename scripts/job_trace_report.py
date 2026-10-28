@@ -300,6 +300,129 @@ def _reply_meta(step: dict) -> dict:
             'finish_reason': data.get('finish_reason')} if isinstance(data, dict) else {}
 
 
+SUMMARY_CHARS = 240   # how much of a prompt or reply the step-by-step table quotes
+
+
+def brief(value: object, call: int | None = None) -> str:
+    '''A one-cell summary of a trace value; a cut is stated, and points at the full text.'''
+    text = ' '.join(as_text(value).split()) if value not in (None, '', [], {}) else '—'
+    if len(text) <= SUMMARY_CHARS:
+        return text
+    where = f' in call #{call} of the Job Trace section' if call else ' in the Job Trace section'
+    return f'{text[:SUMMARY_CHARS]}… [+{len(text) - SUMMARY_CHARS:,} chars; full text{where}]'
+
+
+def found_by(steps: list[dict], log_path: Path | None, job_id: str) -> str:
+    '''The search that surfaced the job: query and region from the trace, else the harvest log line.'''
+    origin = next((s for s in steps if s['kind'] == 'origin'), {})
+    listing = origin.get('listing') or {}
+    if listing.get('query') and listing.get('region'):
+        return f'''search "{listing['query']}" / {listing['region']}'''
+    # Traces from before 2026-10-28 carry the query but not the region; the harvest line has both.
+    if surfacing := search_that_surfaced(log_path, job_id):
+        return 'search ' + surfacing.split('Stage 1b:')[-1].split('—')[0].strip()
+    if listing.get('query'):
+        return f'''search "{listing['query']}" / region not recorded'''
+    return 'not recorded'
+
+
+def llm_input(step: dict) -> str:
+    '''What a model was asked, as one line: the user prompt, or the last user message of a loop.'''
+    if step.get('prompt'):
+        return step['prompt']
+    users = [m.get('content') for m in step.get('messages') or [] if isinstance(m, dict) and m.get('role') == 'user']
+    return users[-1] if users else ''
+
+
+def llm_output(step: dict) -> object:
+    if step.get('error'):
+        return f"ERROR: {step['error']}"
+    for key in ('reply', 'structured_output'):
+        if step.get(key) not in (None, ''):
+            return step[key]
+    raw = step.get('raw_reply') or ''
+    try:
+        reply = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw   # shown as it came; the full reply is in the Job Trace section either way
+    # The extract loop keeps the whole MCP reply; what the model decided is its tool call.
+    calls = reply.get('tool_calls') if isinstance(reply, dict) else None
+    if calls:
+        return '; '.join(f"{c.get('function', {}).get('name')}({c.get('function', {}).get('arguments')})"
+                         for c in calls if isinstance(c, dict))
+    return reply.get('content') if isinstance(reply, dict) and reply.get('content') else raw
+
+
+def step_by_step(steps: list[dict], found: str) -> list:
+    '''Every prediction and check in order: who made it (a model, or code), its input and its output.'''
+    rows = [('#', 'Step', 'Made by', 'Input', 'Output')]
+    call = 0
+    for n, s in enumerate(steps, 1):
+        kind = s['kind']
+        if kind == 'origin':
+            card = s.get('candidate') or {}
+            row = ('Found in search', 'Stage 1b scraper (model) + code',
+                   found, f"card: {card.get('title')} — {card.get('company')} — {card.get('snippet')} — "
+                          f"posted {card.get('date_posted')}; job {s.get('position')} in Stage 2")
+        elif kind == 'page_read':
+            row = ('Read job page', 'code (read-only DOM)', s.get('url'),
+                   f"{s.get('chars')} chars via {s.get('source')}; {len(s.get('removed') or [])} clutter "
+                   f'section(s) removed')
+        elif kind == 'llm_call':
+            call += 1
+            served = s.get('provider') or (s.get('routing') or {}).get('provider') or s.get('transport')
+            row = (f"LLM call #{call}: {s.get('call_site')}", f"model {s.get('model')} ({served}), "
+                   f"{s.get('seconds')}s", brief(llm_input(s), call), brief(llm_output(s), call))
+        elif kind == 'evidence':
+            verdicts = s.get('verdicts') or []
+            counts: dict[str, int] = {}
+            for v in verdicts:
+                counts[v['status']] = counts.get(v['status'], 0) + 1
+            rejected = [f"{v['field']}={brief(v['value'])}" for v in verdicts if v['status'] == 'rejected']
+            row = (f"Verify citations: {s.get('call_site')}",
+                   'code (regex)' + (' + model relocation' if counts.get('relocated_by_llm') else ''),
+                   f'{len(verdicts)} claim(s) against {s.get("source")}',
+                   ', '.join(f'{k} {v}' for k, v in counts.items())
+                   + (f"; REJECTED as hallucination: {'; '.join(rejected)}" if rejected else ''))
+        elif kind == 'extract':
+            fields = s.get('fields') or {}
+            shown_fields = {k: v for k, v in fields.items()
+                            if k not in ('description', 'quotes', 'evidence') and v not in (None, '', False, [])}
+            row = ('Extracted fields (accepted)', 'model output after citation check', 'LLM call above',
+                   brief(shown_fields))
+        elif kind == 'classified':
+            geo = s.get('geography') or {}
+            salary = s.get('salary_facts') or {}
+            row = ('Classify location, salary, workplace', 'code + cached/model lookups above',
+                   'the accepted extract',
+                   f"countries {geo.get('countries')}, regions {geo.get('regions')}; salary {salary.get('kind')} "
+                   f"({salary.get('source')}); workplace {s.get('workplace_type') or '—'}; "
+                   f"residency {brief(s.get('residency_scope'))}")
+        elif kind == 'hard_rule':
+            inputs = {k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s', 'rule', 'fired', 'reason')}
+            row = (f"Hard rule: {s['rule']}", 'code', brief(inputs),
+                   f"FIRED: {s.get('reason')}" if s.get('fired') else 'passed')
+        elif kind == 'rating':
+            triage = s.get('triage') or {}
+            row = ('Rating and caps', 'code (caps) on the rater above',
+                   f"triage {triage.get('score', 'not run')}; rater {s.get('raw_rating')}/5",
+                   f"final {s.get('capped_rating')}/5" + (f"; capped: {s['cap_reason']}" if s.get('cap_reason') else ''))
+        elif kind == 'saved':
+            row = ('Saved job', 'code', f"rating {s.get('rating')}", brief(s.get('result')))
+        elif kind == 'notification':
+            row = ('Notification', 'code',
+                   brief(s.get('job_ids') or ''),
+                   ('sent' if s.get('sent') else 'SEND FAILED') + f": {brief(s.get('text'))}"
+                   if s.get('text') else f"not sent: {s.get('why')}")
+        else:
+            row = (kind, '?', '', brief({k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s')}))
+        rows.append((str(n), *row))
+    return [h1('Step by step: every prediction and check, in order'), rule(),
+            note('Inputs and outputs are summarised to one cell each; a cut says so and names where the '
+                 'full text is. "code" means no model was involved.'),
+            grid(rows, col_widths=STEP_TABLE_WIDTHS)]
+
+
 def decision_path(steps: list[dict]) -> list:
     '''The trace boiled down to what decided the rating, each line pointing at its full step.'''
     story: list = [h1('Decision path (from the Job Trace)'), rule()]
@@ -377,10 +500,14 @@ def trace_story(steps: list[dict], trace_path: Path) -> list:
     return story
 
 
-def grid(rows: list[tuple]) -> Table:
+# Column widths of the step-by-step table: number, step, made by, input, output (sums to the frame).
+STEP_TABLE_WIDTHS = [8 * mm, 30 * mm, 30 * mm, 56 * mm, 56 * mm]
+
+
+def grid(rows: list[tuple], col_widths: list[float] | None = None) -> Table:
     '''A header row plus wrapped cells; long cells wrap rather than overflow the page.'''
     data = [[Paragraph(_xml(_plain(str(c))), BODY) for c in row] for row in rows]
-    table = Table(data, repeatRows=1)
+    table = Table(data, repeatRows=1, colWidths=col_widths)
     table.setStyle(TableStyle([
         ('GRID', (0, 0), (-1, -1), 0.3, colors.HexColor('#bbbbbb')),
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#eeeeee')),
@@ -421,6 +548,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
     # Everything after the header block, i.e. the condensed extract the rater read.
     extract_text = md.split('\n\n', 1)[1] if '\n\n' in md else ''
 
+    found = found_by(steps, log_path, job_id)
     story: list = []
     story += [
         Paragraph(_xml(f'Full trace — {company} — job {job_id}'), TITLE),
@@ -430,6 +558,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
         kv_table([
             ('Job', title),
             ('Company', company),
+            ('Found by', found),
             ('Rating', f'{rating}/5 (local triage {triage}/5)'),
             ('URL', url),
             ('Run', f'{run_date}; log {log_path.name if log_path else "?"}; '
@@ -451,7 +580,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
         PageBreak(),
     ]
     if steps:
-        story += [*decision_path(steps), PageBreak()]
+        story += [*step_by_step(steps, found), PageBreak(), *decision_path(steps), PageBreak()]
 
     # 1. Stage 1a
     story += [h1('1. Stage 1a — the queries this run searched with'), rule()]

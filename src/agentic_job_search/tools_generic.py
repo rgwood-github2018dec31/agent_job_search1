@@ -2063,6 +2063,8 @@ async def do_check_and_record_job(
             'date_posted': date_posted, 'check_status': status,
             'url': url or job_url(site, job_id),
             'queued': False, 'outcome': status, 'rating': None, 'summary': '',
+            # The search that surfaced it, for the Job Audit's first line.
+            'query': _current_query, 'region': _current_region,
         }
         # record_listings reports a search's folded outcomes on one line each of its own.
         # A 'new' listing is queued straight after, and queue_candidate logs the same job with its query.

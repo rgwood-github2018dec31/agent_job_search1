@@ -20,6 +20,7 @@ from agentic_job_search import (
     salary,
     salary_estimate,
     scrape_openrouter,
+    triage,
 )
 from agentic_job_search.agent import load_env
 from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
@@ -420,6 +421,29 @@ def _isolated_raw_postings(monkeypatch, tmp_path):
     prune_raw_postings() deletes directories, so a test that forgot would delete real captures.
     """
     monkeypatch.setattr(tools, 'RAW_POSTINGS_DIR', tmp_path / 'raw_postings')
+
+
+# Markers whose tests are meant to reach the local LLM MCP servers.
+LIVE_MARKERS = ('live', 'live_agent_claude', 'network')
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_server(request, monkeypatch):
+    '''No unit test may reach the LLM MCP servers, by any route: every chat_openrouter and
+    generate_local call goes through triage.call_mcp_tool, so it is blocked there.
+
+    The per-module guards above each cover one import of chat_openrouter. On 2026-10-28 a test of
+    the applied-company match got past them all and made a real, paid OpenRouter call whenever
+    :8006 was up; inside the sandbox the call failed instead, and the test passed by accident.
+    Tests that patch triage.call_mcp_tool themselves win over this; live tests are exempt.
+    '''
+    if any(request.node.get_closest_marker(marker) for marker in LIVE_MARKERS):
+        return
+
+    async def _no_network(url, tool_name, *args, **kwargs):
+        raise AssertionError(f'a unit test tried to reach the LLM MCP server: {tool_name} at {url}')
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', _no_network)
 
 
 @pytest.fixture(autouse=True)

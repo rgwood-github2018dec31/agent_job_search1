@@ -5671,7 +5671,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         await browser.stop()
 
     chosen = job_audit.choose_job(candidates, job_audit_job_id, seed=int(start_time)) if job_audit_enabled else None
-    if chosen and (audit_pdf := await job_audit.render(chosen, date.today())):
+    if chosen and (audit_pdf := await job_audit.render(chosen, datetime.fromtimestamp(start_time))):
         funnel['job_audit'] = str(audit_pdf)
 
     elapsed_mins = (time.time() - start_time) / SECONDS_PER_MINUTE
