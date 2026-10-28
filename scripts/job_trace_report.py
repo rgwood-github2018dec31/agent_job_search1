@@ -34,17 +34,20 @@ from pathlib import Path
 from typing import NamedTuple
 
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
     HRFlowable,
+    NextPageTemplate,
     PageBreak,
+    PageTemplate,
     Paragraph,
     Preformatted,
-    SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
@@ -400,126 +403,174 @@ def size(n_bytes: int | None) -> str:
     return f'{n_bytes / 1024:,.0f} KB' if n_bytes >= 1024 else f'{n_bytes:,} bytes'
 
 
-def summarise_prompt(step: dict) -> str:
+def params(pairs: dict | list[tuple[str, object]]) -> str:
+    '''One "name=value" line per parameter; each value shortened by compact().'''
+    items = pairs.items() if isinstance(pairs, dict) else pairs
+    lines = [f'{k}={compact(v)}' for k, v in items if v not in (None, '', [], {})]
+    return '\n'.join(lines) or '—'
+
+
+def prompt_params(step: dict) -> list[tuple[str, object]]:
     '''What the model was given: its parts and their sizes, and the short facts it was asked about.'''
     text = llm_input(step) or ''
     system = step.get('system') or next(
         (m.get('content') for m in step.get('messages') or [] if isinstance(m, dict) and m.get('role') == 'system'), '')
-    parts = [f'instructions ({len(system):,} chars)'] if system else []
+    pairs: list[tuple[str, object]] = [('prompt', f'{len(text):,} chars')]
+    if system:
+        pairs.append(('instructions', f'{len(system):,} chars'))
     markers = list(SECTION_MARKER_RE.finditer(text))
     for marker in markers:
         end = text.find(f'--- END {marker.group(1)} ---', marker.end())
         length = (end if end >= 0 else len(text)) - marker.end()
-        parts.append(f'{shorten(marker.group(1), 40)} ({length:,} chars)')
+        pairs.append((shorten(marker.group(1), 40), f'{length:,} chars'))
     head = text[:markers[0].start()] if markers else text
     if 'CLAIMS:' in head and (claims := _json_or_none(head.split('CLAIMS:', 1)[1].strip())):
         head = head.split('CLAIMS:', 1)[0]
-        parts.append(f'{len(claims)} claim(s): ' + ', '.join(
-            f"{c.get('field')}={compact(c.get('value'), 30)}" for c in claims if isinstance(c, dict)))
+        pairs += [(f"claim {c.get('field')}", f"{compact(c.get('value'))} (cited: {compact(c.get('cited')) or '—'})")
+                  for c in claims if isinstance(c, dict)]
     keys = KEY_LINE_RE.findall(head)[:KEY_LINES_SHOWN]
-    parts += [f'{k}: {shorten(v, 50)}' for k, v in keys]
+    pairs += keys
     if not markers and not keys:
-        parts.insert(0, shorten(head.strip().splitlines()[0] if head.strip() else '', 90))
-    return f'{len(text):,} chars — ' + '; '.join(p for p in parts if p)
+        pairs.append(('asks', shorten(head.strip().splitlines()[0] if head.strip() else '', 90)))
+    return pairs
 
 
-def summarise_reply(step: dict) -> str:
+def reply_params(step: dict) -> list[tuple[str, object]]:
+    '''What the model returned, one field per line; a tool call is named, then its arguments.'''
     out = llm_output(step)
     if isinstance(out, str):
         decoded = _json_or_none(out)
-        return compact(decoded) if decoded is not None else shorten(out, SUMMARY_CHARS)
-    return compact(out)
+        if decoded is None:
+            return [('text', shorten(out, SUMMARY_CHARS))]
+        out = decoded
+    # Only the extract loop's reply is a tool call (llm_output names it); a JSON reply with one key is not.
+    if (step.get('raw_reply') and isinstance(out, dict) and len(out) == 1
+            and isinstance(arguments := next(iter(out.values())), dict)):
+        return [('tool', next(iter(out))), *arguments.items()]
+    return list(out.items()) if isinstance(out, dict) else [('reply', out)]
 
 
-def page_read_summary(step: dict) -> str:
+def page_read_params(step: dict) -> list[tuple[str, object]]:
     '''Saved the full page, removed clutter, saved the text the extractor read: files and sizes.'''
     if step.get('error'):
-        return f"FAILED: {shorten(step['error'], SUMMARY_CHARS)}"
-    if step.get('source') != 'dom':
-        return (f"page capture unavailable, fell back to the accessibility snapshot: {step.get('chars'):,} chars "
-                f"of text → {Path(step.get('raw_posting') or '?').name}")
-    html = Path(step['raw_html']) if step.get('raw_html') else Path(step.get('raw_posting') or '?').with_suffix('.html')
-    html_bytes = step.get('raw_html_bytes') or (html.stat().st_size if html.exists() else None)
-    dom = f"{step['dom_chars']:,} chars captured; " if step.get('dom_chars') else ''
-    removed = step.get('removed') or []
-    removed_chars = step.get('removed_chars') or sum(r.get('chars', 0) for r in removed)
-    text_chars = step.get('chars') or 0
+        return [('FAILED', step['error'])]
     txt = Path(step.get('raw_posting') or '?')
     txt_bytes = step.get('raw_posting_bytes') or (txt.stat().st_size if txt.exists() else None)
-    return (f'{dom}saved the full page, scripts stripped → {html.name} ({size(html_bytes)}); '
-            f'removed {len(removed)} clutter section(s) ({removed_chars:,} chars of text) → '
-            f'{text_chars:,} chars of text; saved it → {txt.name} ({size(txt_bytes)}), exactly what the extractor read')
+    if step.get('source') != 'dom':
+        return [('method', 'page capture unavailable; accessibility snapshot instead'),
+                ('text', f"{step.get('chars') or 0:,} chars → {txt.name} ({size(txt_bytes)})")]
+    html = Path(step['raw_html']) if step.get('raw_html') else txt.with_suffix('.html')
+    html_bytes = step.get('raw_html_bytes') or (html.stat().st_size if html.exists() else None)
+    removed = step.get('removed') or []
+    removed_chars = step.get('removed_chars') or sum(r.get('chars', 0) for r in removed)
+    return [
+        ('captured', f"{step['dom_chars']:,} chars of page" if step.get('dom_chars') else 'size not recorded'),
+        ('1. saved full page', f'{html.name} ({size(html_bytes)}, scripts stripped)'),
+        ('2. removed clutter', f'{len(removed)} section(s), {removed_chars:,} chars of text'),
+        ('3. saved text', f"{txt.name} ({step.get('chars') or 0:,} chars, {size(txt_bytes)}) — what the extractor read"),
+    ]
+
+
+CHARS_PER_TOKEN = 4   # a rough English average, for calls whose provider reports no usage
+
+
+def token_counts(step: dict) -> str:
+    '''Tokens in and out: as the provider reported them, else estimated from characters (marked ≈).'''
+    raw = _json_or_none(step.get('raw_reply'))
+    usage = step.get('usage') or (raw.get('usage') if isinstance(raw, dict) else None)
+    if isinstance(usage, dict) and usage.get('prompt_tokens') is not None:
+        return f"in {usage['prompt_tokens']:,} / out {usage.get('completion_tokens', 0):,} tokens"
+    system = step.get('system') or ''
+    sent = len(system) + len(llm_input(step) or '') if not step.get('messages') else len(as_text(step['messages']))
+    received = len(as_text(llm_output(step)))
+    return f'in ≈{sent // CHARS_PER_TOKEN:,} / out ≈{received // CHARS_PER_TOKEN:,} tokens (estimated)'
+
+
+FOUND_RE = re.compile(r'^search "(?P<query>.+)" / (?P<region>.+)$')
+
+
+def search_params(listing: dict, found: str) -> list[tuple[str, object]]:
+    '''query and region of the search that surfaced the job: from the listing, else from found_by().'''
+    if listing.get('query') and listing.get('region'):
+        return [('query', listing['query']), ('region', listing['region'])]
+    if m := FOUND_RE.match(found):
+        return [('query', m.group('query')), ('region', m.group('region'))]
+    return [('search', found)]
 
 
 def step_by_step(steps: list[dict], found: str) -> list:
     '''Every prediction and check in order: who made it (a model, or code), its input and its output.'''
     rows = [('#', 'Step', 'Made by', 'Input', 'Output')]
-    call = 0
+    call = extractor_call = 0
     for n, s in enumerate(steps, 1):
         kind = s['kind']
         if kind == 'origin':
             card = s.get('candidate') or {}
+            listing = s.get('listing') or {}
             row = ('Found in search', 'Stage 1b scraper (model) + code',
-                   found, f"card: {card.get('title')} — {card.get('company')} — {card.get('snippet')} — "
-                          f"posted {card.get('date_posted')}; job {s.get('position')} in Stage 2")
+                   params(search_params(listing, found)),
+                   params([('title', card.get('title')), ('company', card.get('company')),
+                           ('snippet', card.get('snippet')), ('posted', card.get('date_posted')),
+                           ('Stage 2 position', s.get('position'))]))
         elif kind == 'page_read':
-            row = ('Read job page', 'code (one read-only page capture)', s.get('url'), page_read_summary(s))
+            row = ('Read job page', 'code (one read-only page capture)', params([('url', s.get('url'))]),
+                   params(page_read_params(s)))
         elif kind == 'llm_call':
             call += 1
+            if 'extract' in str(s.get('call_site')):
+                extractor_call = call
             served = s.get('provider') or (s.get('routing') or {}).get('provider') or s.get('transport')
-            row = (f"LLM call #{call}: {s.get('call_site')}", f"model {s.get('model')} ({served}), "
-                   f"{s.get('seconds')}s", summarise_prompt(s), summarise_reply(s))
+            row = (f"LLM call #{call}:\n{s.get('call_site')}\n{token_counts(s)}",
+                   f"model {s.get('model')} ({served}), {s.get('seconds')}s",
+                   params(prompt_params(s)), params(reply_params(s)))
         elif kind == 'evidence':
             verdicts = s.get('verdicts') or []
-            counts: dict[str, int] = {}
-            for v in verdicts:
-                counts[v['status']] = counts.get(v['status'], 0) + 1
-            rejected = [f"{v['field']}={compact(v['value'])}" for v in verdicts if v['status'] == 'rejected']
+            source = str(s.get('source') or '')
             row = (f"Verify citations: {s.get('call_site')}",
-                   'code (regex)' + (' + model relocation' if counts.get('relocated_by_llm') else ''),
-                   f'{len(verdicts)} claim(s) against {Path(s["source"]).name if "/" in str(s.get("source")) else s.get("source")}',
-                   ', '.join(f'{k} {v}' for k, v in counts.items())
-                   + (f"; REJECTED as hallucination: {'; '.join(rejected)}" if rejected else ''))
+                   'code (regex)' + (' + model relocation' if any(v['status'] == 'relocated_by_llm' for v in verdicts) else ''),
+                   params([('source', Path(source).name if '/' in source else source), ('claims', len(verdicts))]),
+                   params([(v['field'], f"{compact(v['value'])} — {v['status'].upper() if v['status'] == 'rejected' else v['status']}")
+                           for v in verdicts]))
         elif kind == 'extract':
             fields = s.get('fields') or {}
-            shown_fields = {k: v for k, v in fields.items()
-                            if k not in ('description', 'quotes', 'evidence') and v not in (None, '', False, [])}
-            row = ('Extracted fields (accepted)', 'model output after citation check', 'LLM call above',
-                   compact(shown_fields))
+            row = ('Extracted fields (accepted)', 'model output after citation check',
+                   params([('from', f'LLM call #{extractor_call}' if extractor_call else 'the extractor')]),
+                   params({k: v for k, v in fields.items()
+                           if k not in ('description', 'quotes', 'evidence') and v is not False}))
         elif kind == 'classified':
             geo = s.get('geography') or {}
             salary = s.get('salary_facts') or {}
             row = ('Classify location, salary, workplace', 'code + cached/model lookups above',
-                   'the accepted extract',
-                   f"countries {geo.get('countries')}, regions {geo.get('regions')}; salary {salary.get('kind')} "
-                   f"({salary.get('source')}); workplace {s.get('workplace_type') or '—'}; "
-                   f"residency {compact(s.get('residency_scope'))}")
+                   params([('from', 'the accepted extract')]),
+                   params([('countries', geo.get('countries')), ('regions', geo.get('regions')),
+                           ('salary', f"{salary.get('kind')} ({salary.get('source')})"),
+                           ('workplace', s.get('workplace_type')), ('residency', s.get('residency_scope')),
+                           ('end_client', s.get('end_client')), ('is_agency', s.get('is_agency'))]))
         elif kind == 'hard_rule':
             inputs = {k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s', 'rule', 'fired', 'reason')}
-            row = (f"Hard rule: {s['rule']}", 'code', compact(inputs),
+            row = (f"Hard rule: {s['rule']}", 'code', params(inputs),
                    f"FIRED: {s.get('reason')}" if s.get('fired') else 'passed')
         elif kind == 'rating':
             triage = s.get('triage') or {}
             row = ('Rating and caps', 'code (caps) on the rater above',
-                   f"triage {triage.get('score', 'not run')}; rater {s.get('raw_rating')}/5",
-                   f"final {s.get('capped_rating')}/5" + (f"; capped: {s['cap_reason']}" if s.get('cap_reason') else ''))
+                   params([('triage', triage.get('score', 'not run')), ('rater', f"{s.get('raw_rating')}/5")]),
+                   params([('final', f"{s.get('capped_rating')}/5"), ('capped by', s.get('cap_reason'))]))
         elif kind == 'saved':
             saved_as = re.search(r'Saved: (\S+)', as_text(s.get('result')))
-            row = ('Saved job', 'code', f"rating {s.get('rating')}, summary {s.get('summary')}",
-                   saved_as.group(1) if saved_as else compact(s.get('result')))
+            row = ('Saved job', 'code', params([('rating', s.get('rating')), ('summary', s.get('summary'))]),
+                   params([('file', saved_as.group(1) if saved_as else s.get('result'))]))
         elif kind == 'notification':
-            row = ('Notification', 'code',
-                   compact(s.get('job_ids') or ''),
-                   ('sent' if s.get('sent') else 'SEND FAILED') + f": {shorten(s.get('text'), SUMMARY_CHARS)}"
-                   if s.get('text') else f"not sent: {s.get('why')}")
+            row = ('Notification', 'code', params([('job_ids', s.get('job_ids'))]),
+                   params([('sent', s.get('sent')), ('text', shorten(s['text'], SUMMARY_CHARS))]) if s.get('text')
+                   else params([('sent', 'no'), ('why', s.get('why'))]))
         else:
-            row = (kind, '?', '', compact({k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s')}))
+            row = (kind, '?', '—', params({k: v for k, v in s.items() if k not in ('kind', 'at', 'elapsed_s')}))
         rows.append((str(n), *row))
     return [h1('Step by step: every prediction and check, in order'), rule(),
-            note('Inputs and outputs are summarised to fit one cell, by code (no model): a prompt by its '
-                 'parts and their sizes, a reply by its fields, with each long value cut at a visible "…". '
+            note('Inputs and outputs are listed one name=value per line and summarised by code (no model): a '
+                 'prompt by its parts and their sizes, a reply by its fields, each long value cut at a visible "…". '
                  'Every call is in full in the Job Trace section at the end. "code" means no model was involved.'),
-            grid(rows, col_widths=STEP_TABLE_WIDTHS)]
+            grid(rows, col_widths=STEP_TABLE_WIDTHS, style=STEP_CELL)]
 
 
 def archived_company_url(page_step: dict) -> str:
@@ -635,12 +686,23 @@ def trace_story(steps: list[dict], trace_path: Path) -> list:
 
 
 # Column widths of the step-by-step table: number, step, made by, input, output (sums to the frame).
-STEP_TABLE_WIDTHS = [8 * mm, 30 * mm, 30 * mm, 56 * mm, 56 * mm]
+STEP_TABLE_WIDTHS = [7 * mm, 38 * mm, 30 * mm, 99 * mm, 99 * mm]   # a landscape A4 frame
 
 
-def grid(rows: list[tuple], col_widths: list[float] | None = None) -> Table:
-    '''A header row plus wrapped cells; long cells wrap rather than overflow the page.'''
-    data = [[Paragraph(_xml(_plain(str(c))), BODY) for c in row] for row in rows]
+PORTRAIT, LANDSCAPE = 'portrait', 'landscape'
+PAGE_MARGIN = 12 * mm
+
+
+def page_template(name: str, page_size: tuple[float, float]) -> PageTemplate:
+    width, height = page_size
+    frame = Frame(PAGE_MARGIN, PAGE_MARGIN, width - 2 * PAGE_MARGIN, height - 2 * PAGE_MARGIN, id=name)
+    return PageTemplate(id=name, frames=[frame], pagesize=page_size)
+
+
+def grid(rows: list[tuple], col_widths: list[float] | None = None, style: ParagraphStyle | None = None) -> Table:
+    '''A header row plus wrapped cells; long cells wrap rather than overflow the page, and a newline
+    in a cell starts a new line.'''
+    data = [[Paragraph(_xml(_plain(str(c))).replace('\n', '<br/>'), style or BODY) for c in row] for row in rows]
     table = Table(data, repeatRows=1, colWidths=col_widths)
     table.setStyle(TableStyle([
         ('GRID', (0, 0), (-1, -1), 0.3, colors.HexColor('#bbbbbb')),
@@ -719,7 +781,10 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
         PageBreak(),
     ]
     if steps:
-        story += [*step_by_step(steps, found), PageBreak(), *decision_path(steps), PageBreak()]
+        # The PageBreak closing the cover page starts the landscape page the step table needs.
+        story.insert(len(story) - 1, NextPageTemplate(LANDSCAPE))
+        story += [*step_by_step(steps, found), NextPageTemplate(PORTRAIT), PageBreak(),
+                  *decision_path(steps), PageBreak()]
 
     # 1. Stage 1a
     story += [h1('1. Stage 1a — the queries this run searched with'), rule()]
@@ -899,9 +964,10 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
                   'generator : scripts/job_trace_report.py',
               ]))]
 
-    doc = SimpleDocTemplate(
+    doc = BaseDocTemplate(
         str(out), pagesize=A4,
         leftMargin=16 * mm, rightMargin=14 * mm, topMargin=15 * mm, bottomMargin=14 * mm,
+        pageTemplates=[page_template(PORTRAIT, A4), page_template(LANDSCAPE, landscape(A4))],
         title=f'Full Trace — LinkedIn JD: {job_id} — {company} / {job_title}',
         author='agent_job_search',
     )
@@ -922,7 +988,8 @@ H1 = ParagraphStyle('H1', parent=_sheet['Heading1'], fontName=_SANS_BOLD, fontSi
                     spaceAfter=1, textColor=colors.HexColor('#0b3d6b'))
 H2 = ParagraphStyle('H2', parent=_sheet['Heading2'], fontName=_SANS_BOLD, fontSize=10.5, leading=13, spaceBefore=4,
                     spaceAfter=1, textColor=colors.HexColor('#333333'))
-BODY = ParagraphStyle('B', parent=_sheet['Normal'], fontName=_SANS, fontSize=8.8, leading=11.4)
+BODY = ParagraphStyle('B', parent=_sheet['Normal'], fontName=_SANS, fontSize=8.0, leading=10.4)
+STEP_CELL = ParagraphStyle('SC', parent=BODY, fontSize=6.6, leading=8.2)
 NOTE = ParagraphStyle('N', parent=BODY, fontSize=8.2, leading=10.6,
                       textColor=colors.HexColor('#666666'), leftIndent=4)
 LABEL = ParagraphStyle('L', parent=BODY, fontSize=8.2, leading=10.4, spaceBefore=4, spaceAfter=1,

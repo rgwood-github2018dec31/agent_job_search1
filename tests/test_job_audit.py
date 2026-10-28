@@ -80,7 +80,8 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
                          raw_html=str(tmp_path / 'linkedin-4476053167.html'), raw_html_bytes=152394,
                          raw_posting=str(tmp_path / 'linkedin-4476053167.txt'), raw_posting_bytes=2359, text='PAGE')
         job_trace.record('llm_call', transport='openrouter', call_site='rate_with_openrouter', model='m',
-                         prompt='FULL PROMPT ' * 400, reply='{"rating": 4}', cost_usd=0.001, seconds=1.0)
+                         prompt='FULL PROMPT ' * 400, reply='{"rating": 4}', cost_usd=0.001, seconds=1.0,
+                         usage={'prompt_tokens': 1234, 'completion_tokens': 56})
         job_trace.record('evidence', call_site='extract', subject='job', source='page', verdicts=[
             {'field': 'location', 'value': 'Gdańsk, Poland', 'quote': 'Gdańsk', 'status': 'regex',
              'span': [0, 6], 'evidence': 'Gdańsk', 'detail': ''}])
@@ -101,7 +102,10 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
     for expected in ('Decision path', 'stale', 'hybrid', 'rate_with_openrouter', 'EXACT TELEGRAM TEXT',
                      'The Job Trace', 'Step by step', 'Found by', 'European Union',
                      'Posted by', 'Globex — the poster is recruiting for this client',
-                     'linkedin-4476053167.html (149 KB)', '160,000 chars captured', 'linkedin-4476053167.txt (2 KB)'):
+                     'query=Staff AI Engineer', 'region=European Union',
+                     '1. saved full page=linkedin-4476053167.html (149 KB', 'captured=160,000 chars',
+                     '2. removed clutter=1 section(s), 900 chars', '3. saved text=linkedin-4476053167.txt (2,137 chars, 2 KB)',
+                     'in 1,234 / out 56 tokens', 'rating=4'):
         assert expected in ' '.join(text.split()), expected
     first_page_links = [a.get_object()['/A']['/URI'] for a in pypdf.PdfReader(out).pages[0].get('/Annots') or []]
     assert first_page_links == [candidate['url'], 'https://www.linkedin.com/company/acme/']
