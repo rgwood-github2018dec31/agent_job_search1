@@ -12,7 +12,8 @@ the reading:
    other image — people's profile photos, other companies' logos, post images — is blanked, never
    downloaded. The stylesheet is stored once per day beside the captures.
 3. Known clutter is removed: `LINKEDIN_REMOVE_TAGS`, `LINKEDIN_REMOVE_SECTION_PHRASES`,
-   `LINKEDIN_REMOVE_ARIA_LABELS` — all matched on text or aria-label, never on class names.
+   `LINKEDIN_REMOVE_ARIA_LABELS`, `LINKEDIN_REMOVE_LINK_HREF_PATTERNS` — matched on text,
+   aria-label or link target, never on class names.
 4. Anything left outside the keep anchors (the top card, the description, the company card) is an
    UNKNOWN block: LinkedIn adds sections from time to time. Its signature is looked up in
    `linkedin_page_sections.yaml`; unseen signatures go to one `MODEL_NAME_PAGE_SECTIONS` call per
@@ -37,7 +38,7 @@ import yaml
 from bs4 import BeautifulSoup, Tag
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
-from agentic_job_search import evidence, tools_generic
+from agentic_job_search import evidence, minimal_archive, tools_generic
 from agentic_job_search.config import (
     COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS,
     EXTRACT_PAGE_RENDER_WAIT_SECONDS,
@@ -54,6 +55,7 @@ from agentic_job_search.config import (
     LINKEDIN_PAGE_CAPTURE_RETRIES,
     LINKEDIN_PDF_FURNITURE_LINE_PATTERNS,
     LINKEDIN_REMOVE_ARIA_LABELS,
+    LINKEDIN_REMOVE_LINK_HREF_PATTERNS,
     LINKEDIN_REMOVE_SECTION_PHRASES,
     LINKEDIN_REMOVE_TAGS,
     LINKEDIN_WORKPLACE_BADGES,
@@ -386,6 +388,12 @@ def remove_known_clutter(soup: BeautifulSoup) -> list[dict]:
             if el.decomposed or _is_protected(el, protected):
                 continue
             removed.append({'what': f'aria-label {label!r}', 'chars': len(norm(el.get_text(' ')))})
+            el.decompose()
+    for pattern in LINKEDIN_REMOVE_LINK_HREF_PATTERNS:
+        for el in soup.find_all('a', href=re.compile(pattern)):
+            if el.decomposed or _is_protected(el, protected):
+                continue
+            removed.append({'what': f'link {pattern!r}', 'chars': len(norm(el.get_text(' ')))})
             el.decompose()
     for phrase in LINKEDIN_REMOVE_SECTION_PHRASES:
         for el in soup.find_all(True):
@@ -760,15 +768,18 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     company = posting_company(soup) or str(candidate.get('company') or '') or None
     html_path = raw_html_path(candidate)
     asset_counts = localize_assets(soup, company, html_path)
-    save_raw_html(candidate, soup, {
+    archive_meta = {
         'url': str(candidate.get('url') or ''), 'job_id': job_id, 'company': company or '',
         'captured': datetime.now().isoformat(timespec='seconds'), 'dom_chars': len(capture['html']),
-    })
+    }
+    save_raw_html(candidate, soup, archive_meta)
 
     removed = remove_known_clutter(soup) + remove_expand_button(soup)
     removed += await decide_unknown_blocks(soup, candidate, stage_stats)
     text = page_text(soup)
     tools_generic.save_raw_posting(candidate, text, 'dom', len(text))
+    # Last: the minimal archive consumes the de-cluttered soup.
+    await minimal_archive.save_minimal_archive(soup, html_path, archive_meta, removed)
     removed_summary = ', '.join(f"{r['what']} ({r['chars']})" for r in removed) or 'nothing'
     # The block list, inline-script count and logo reuse are the same on every page, so INFO
     # carries totals and only what is unusual; DEBUG carries the rest.

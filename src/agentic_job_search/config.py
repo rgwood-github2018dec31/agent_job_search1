@@ -724,6 +724,14 @@ THOUSANDS_GROUP_DIGITS = 3
 # it, short enough that a daily run does not accumulate. Read by nothing in the pipeline — the
 # directory exists so an extracted figure can be checked against the page it came from.
 RAW_POSTINGS_RETENTION_DAYS = 7
+# The minimal archive written beside the full one (<site>-<job_id>.min.html and .min.pdf): the
+# de-cluttered page with only these attributes kept, no icons and no buttons, readable without
+# LinkedIn's stylesheet. ~23x smaller than the full archive (20 pages, 2026-10-29).
+MINIMAL_ARCHIVE_KEEP_ATTRS = ('href', 'src', 'alt', 'colspan', 'rowspan')
+# The PDF is printed by the Chromium headless shell Playwright installs (newest build matching the
+# glob under PLAYWRIGHT_BROWSERS_PATH, else Playwright's default cache); none found skips the PDF.
+PLAYWRIGHT_HEADLESS_SHELL_GLOB = 'chromium_headless_shell-*/*/chrome-headless-shell'
+MINIMAL_ARCHIVE_PDF_TIMEOUT_SECONDS = 60
 
 SECONDS_PER_MINUTE = 60
 # Waiting for a freshly launched @playwright/mcp to answer: this many polls, this far apart. A
@@ -832,6 +840,9 @@ LINKEDIN_REMOVE_SECTION_PHRASES = (
 )
 # Single elements removed by their exact aria-label.
 LINKEDIN_REMOVE_ARIA_LABELS = ('Show more about the company',)
+# Links removed by their href (a regex search): upsells, never the posting. 'Activate Premium for
+# CA$0' sat in the extractor's text and reads like pay (2026-10-29).
+LINKEDIN_REMOVE_LINK_HREF_PATTERNS = (r'linkedin\.com/premium/', r'^/premium/')
 # Page chrome removed whole.
 LINKEDIN_REMOVE_TAGS = ('header', 'footer', 'nav')
 # Retries of the capture when the description has not rendered yet, each after the render wait.

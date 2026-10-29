@@ -151,6 +151,7 @@ src/agentic_job_search/
   job_trace.py                    # Job Trace: every step of one Stage 2 job, recorded via a ContextVar
   job_audit.py                    # Write Job Audit: choose one rated job per run, render its trace as a PDF
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
+  minimal_archive.py              # The de-cluttered page as small self-contained .min.html + .min.pdf beside the full archive
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
   location.py                     # Cached geographic classifier for a job's location
@@ -168,6 +169,7 @@ scripts/
   replay_evidence.py              # Re-extracts retained pages live; per-field citation outcomes (costs cents)
   release_stuck_eval_errors.py    # One-time release of jobs stuck in processed_jobs/ by a pre-2026-10-09 eval_error
   job_trace_report.py             # Job Audit PDF for one job (uv run --with reportlab)
+  minimal_archive_replay.py       # Rebuilds the minimal archive from saved full archives (check a change, or --in-place backfill)
   release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
 tests/
   test_tools.py                   # Unit tests for all tools
@@ -190,7 +192,7 @@ run_dir/
   fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
   company_identities.yaml         # Company identity per LinkedIn slug and per name (domain/parent/source); hand-editable, `source: manual` is kept
-  raw_postings/                   # Per job: .html page archive (JS-free) + .txt text the extractor read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
+  raw_postings/                   # Per job: .html page archive (JS-free) + .min.html/.min.pdf minimal archive + .txt text the extractor read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)

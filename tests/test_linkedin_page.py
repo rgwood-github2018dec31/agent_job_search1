@@ -10,7 +10,7 @@ import logging
 
 import pytest
 import yaml
-from agentic_job_search import evidence
+from agentic_job_search import evidence, minimal_archive
 from agentic_job_search import linkedin_page as lp
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.config import (
@@ -312,6 +312,20 @@ async def test_an_unreadable_decisions_file_is_left_alone(monkeypatch, caplog):
 
 # --- read_job_page -------------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def fake_pdf_printer(monkeypatch, tmp_path):
+    '''No unit test starts Chromium: the printer writes a stub PDF and records what it printed.'''
+    printed = []
+
+    def render(shell, html_path, pdf_path):
+        printed.append(html_path)
+        pdf_path.write_bytes(b'%PDF-stub')
+
+    monkeypatch.setattr(minimal_archive, 'headless_shell', lambda: tmp_path / 'chrome-headless-shell')
+    monkeypatch.setattr(minimal_archive, 'render_pdf', render)
+    return printed
+
+
 def _browser(page_html: str | None, snapshot: str = 'snapshot text', chars_delta: int = 0):
     calls = []
 
@@ -435,3 +449,80 @@ def test_listed_location_is_empty_when_the_card_does_not_have_the_shape(replacem
 def test_listed_location_is_empty_without_a_header_card():
     page = PAGE.replace('alt="Company logo for, Acme Corp."', 'alt=""')
     assert lp.listed_location(BeautifulSoup(page, 'lxml')) == ''
+
+
+# --- minimal archive -------------------------------------------------------------------------------
+
+UPSELL_LINK = '<a href="https://www.linkedin.com/premium/products/?upsellOrderOrigin=x">Activate Premium for CA$0</a>'
+
+
+def test_a_premium_upsell_link_never_reaches_the_extractor():
+    """'Activate Premium for CA$0' reads like pay; it was in the extractor's text (2026-10-29)."""
+    soup = BeautifulSoup(PAGE.replace('<p>Acme Corp</p><p>Staff AI Engineer</p>',
+                                      f'<p>Acme Corp</p><p>Staff AI Engineer</p>{UPSELL_LINK}'), 'lxml')
+    removed = lp.remove_known_clutter(soup)
+    assert 'Activate Premium' not in lp.page_text(soup)
+    assert any(r['what'].startswith('link ') for r in removed)
+    assert 'Staff AI Engineer' in lp.page_text(soup), 'the top card around it stays'
+
+
+def test_minimise_keeps_the_content_and_drops_what_only_linkedins_css_used():
+    soup = BeautifulSoup(
+        '<main><div class="a1"><div class="b2"><img src="logo.png" alt="Company logo for, Acme Corp.">'
+        '<img src="" data-removed="image"><svg><path d="M0"/></svg>'
+        '<p class="x" componentkey="k">Staff AI Engineer</p><button aria-label="Save the job">Save</button>'
+        '</div></div><div><a href="/jobs/view/1/">90K EUR/yr</a><a href="#">Remote</a></div>'
+        '<div><h2>About the job</h2><ul><li>Python</li></ul></div></main>', 'lxml')
+    main = soup.find('main')
+    dropped = minimal_archive.minimise(main)
+    out = str(main)
+    assert [d['what'] for d in dropped] == ["button 'Save'"]
+    assert 'class=' not in out and 'componentkey' not in out and '<svg' not in out and '<button' not in out
+    assert out.count('<img') == 1 and 'src="logo.png"' in out, 'the kept logo stays, the blanked image goes'
+    assert 'href="https://www.linkedin.com/jobs/view/1/"' in out, 'relative links point at LinkedIn'
+    assert '90K EUR/yr</a> · <a>Remote</a>' in out, 'adjacent badges are separated'
+    assert '<li>Python</li>' in out and '<div><div>' not in out
+
+
+async def test_read_job_page_writes_the_minimal_archive_beside_the_full_one(monkeypatch, fake_pdf_printer):
+    monkeypatch.setattr(lp, '_http_get', lambda url: (_ for _ in ()).throw(lp.requests.ConnectionError('offline')))
+    _classifier(monkeypatch, {HARMLESS: True, PAY_SECTION: False, 'Commitments': False}, [])
+    call, _calls = _browser(PAGE)
+
+    page = await lp.read_job_page(_candidate(), call, {'cost': 0.0})
+
+    html_path, pdf_path = minimal_archive.minimal_paths(lp.raw_html_path(_candidate()))
+    minimal = html_path.read_text()
+    assert fake_pdf_printer == [html_path] and pdf_path.read_bytes() == b'%PDF-stub'
+    assert 'Build agentic systems in Python.' in minimal and 'Salary: $150,000 - $180,000' in minimal
+    assert 'More jobs' not in minimal.split('Removed from the archived page')[0]
+    assert 'More jobs' in minimal.split('Removed from the archived page')[1], 'the footer names what went'
+    content = minimal.split('<main>')[1].split('</main>')[0]
+    assert '<script' not in minimal and 'class=' not in content
+    assert JOB_ID in minimal and _candidate()['url'] in minimal, 'provenance line'
+    assert 'More jobs' in lp.raw_html_path(_candidate()).read_text(), 'the full archive is still written'
+    assert 'Build agentic systems in Python.' in page.text
+
+
+async def test_a_failed_pdf_keeps_the_minimal_html_and_the_run_goes_on(monkeypatch, caplog, tmp_path):
+    def broken(shell, html_path, pdf_path):
+        raise RuntimeError('printing x to PDF exited -5')
+
+    monkeypatch.setattr(minimal_archive, 'render_pdf', broken)
+    soup = BeautifulSoup('<main><p>About the job</p></main>', 'lxml')
+    with caplog.at_level(logging.WARNING):
+        html_path, pdf_path = await minimal_archive.save_minimal_archive(
+            soup, tmp_path / 'linkedin-1.html', {'job_id': '1'}, [])
+    assert html_path.exists() and pdf_path is None
+    assert any('exited -5' in r.message and 'without a PDF' in r.message for r in caplog.records)
+
+
+async def test_no_chromium_is_reported_once_per_run(monkeypatch, caplog, tmp_path):
+    monkeypatch.setattr(minimal_archive, 'headless_shell', lambda: None)
+    monkeypatch.setattr(minimal_archive, '_missing_shell_reported', False)
+    with caplog.at_level(logging.WARNING):
+        for job in ('1', '2'):
+            _html, pdf = await minimal_archive.save_minimal_archive(
+                BeautifulSoup('<main><p>x</p></main>', 'lxml'), tmp_path / f'linkedin-{job}.html', {'job_id': job}, [])
+            assert pdf is None
+    assert sum('no PDFs this run' in r.message for r in caplog.records) == 1
