@@ -254,7 +254,7 @@ def stub_evidence_relocation(monkeypatch):
             value = str(claim.value)
             found[str(i)] = value if evidence.find_quote(value, source) else ''
         return found, 'conftest stub relocation'
-    monkeypatch.setattr(evidence, '_relocate', relocate_by_value)
+    monkeypatch.setattr(evidence, '_find_missing_cited_passages', relocate_by_value)
 
 
 @pytest.fixture(autouse=True)

@@ -1371,7 +1371,7 @@ def _make_extract(**overrides) -> dict:
         'title': 'Staff AI Engineer', 'company': 'Acme',
         'description': 'Build agentic AI systems in Python. Remote within Canada.',
         'location': 'Canada (Remote)', 'date_posted': '3 days ago',
-        'closed': False, 'salary': '', 'sponsorship_note': '',
+        'closed': False, 'salary': '',
         'language_requirement': '', 'relocation': '', 'education_requirement': '',
         'posting_language': '', 'likely_spoken_languages': {}, 'residency_scope': '',
     }
@@ -1424,7 +1424,7 @@ async def test_apply_hard_rules_us_no_sponsorship():
 async def test_apply_hard_rules_us_with_sponsorship_passes():
     extract = _make_extract(
         location='United States (Remote)',
-        sponsorship_note='We are willing to sponsor H-1B visas.',
+        description='Build agentic AI systems. We are willing to sponsor H-1B visas.',
     )
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
@@ -1450,7 +1450,7 @@ async def test_apply_hard_rules_us_states_no_sponsorship():
     'Visa sponsorship is not offered for this role.',
 ])
 async def test_apply_hard_rules_no_sponsorship_outside_sponsorship_locations_passes(note):
-    extract = _make_extract(location='Canada (Remote)', sponsorship_note=note)
+    extract = _make_extract(location='Canada (Remote)', description=f'Build agentic AI systems. {note}')
     assert await agent.apply_hard_rules(_make_candidate(), extract) is None
 
 
@@ -2126,7 +2126,7 @@ def _wire_openrouter_loop(monkeypatch, chat_responses: list, chat_requests: list
     monkeypatch.setattr(extract_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
 
 
-async def _run_loop(page_text='About the job\nBuild agents.'):
+async def _run_loop(page_text='Toronto, ON\nRemote\nAbout the job\nBuild agents.'):
     return await extract_openrouter.extract_job_page_openrouter(
         _make_candidate(), page_text, agent.new_stage_stats(), 'sys')
 
@@ -2231,6 +2231,36 @@ async def test_openrouter_loop_sends_back_a_field_filled_without_its_quote_once(
     assert extract['quotes']['location'] == 'Germany' and extract['is_agency'] is False
 
 
+async def test_openrouter_loop_sends_back_a_quote_the_page_does_not_contain(monkeypatch, caplog):
+    '''2026-10-29: a quote regex cannot find is sent back in the extractor's own conversation,
+    which holds the page, instead of a separate passage-finding call.'''
+    wrong = {**_SUBMIT_ARGS, 'is_agency': True, 'is_agency_quote': 'a next-gen staffing platform'}
+    fixed = {**_SUBMIT_ARGS, 'is_agency': True, 'is_agency_quote': 'the next-gen staffing platform'}
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', wrong)]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', fixed)]),
+    ], chat_requests)
+
+    with caplog.at_level(logging.INFO):
+        extract = await _run_loop('Toronto, ON\nRemote\nAbout the job\nWe are the next-gen staffing platform.')
+
+    reply = chat_requests[1]['messages'][-1]['content']
+    assert reply.startswith('Not accepted yet: the quote for is_agency is not in the PAGE TEXT')
+    assert 'location' not in reply, 'a quote found on the page is not sent back'
+    assert extract['quotes']['is_agency'] == 'the next-gen staffing platform'
+    assert any("is_agency='a next-gen staffing platform'" in r.getMessage() for r in caplog.records)
+
+
+async def test_openrouter_loop_accepts_quotes_found_in_the_page_at_once(monkeypatch):
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', _SUBMIT_ARGS)]),
+    ], chat_requests)
+    assert (await _run_loop())['location'] == 'Toronto, ON (Remote)'
+    assert len(chat_requests) == 1
+
+
 async def test_openrouter_loop_asks_for_quotes_only_once(monkeypatch):
     unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)', 'location_quote': ''}
     chat_requests = []
@@ -2258,7 +2288,7 @@ async def test_openrouter_loop_keeps_the_first_submit_when_the_quote_request_fai
 
 
 async def test_openrouter_loop_does_not_send_back_when_switched_off(monkeypatch):
-    monkeypatch.setattr(extract_openrouter, 'EXTRACT_RESUBMIT_UNQUOTED', False)
+    monkeypatch.setattr(extract_openrouter, 'EXTRACT_RESUBMIT_UNGROUNDED', False)
     chat_requests = []
     _wire_openrouter_loop(monkeypatch, [
         _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', {**_SUBMIT_ARGS, 'location': 'Germany'})]),
@@ -2304,7 +2334,7 @@ async def test_openrouter_loop_drops_an_endpoint_that_omits_every_optional_field
     ], chat_requests)
 
     with caplog.at_level(logging.WARNING):
-        extract = await _run_loop()
+        extract = await _run_loop('Cyprus\nRemote\nAbout the job\nBuild agents.')
 
     assert extract['location'] == 'Cyprus (Remote)'
     assert [r['provider'] for r in chat_requests] == ['inference-net/us', 'morph/fp8']
@@ -4909,7 +4939,7 @@ async def test_resolve_salary_rejects_bounds_the_text_does_not_state(monkeypatch
         return {}, 'fake relocation reply'
 
     monkeypatch.setattr(salary, 'chat_openrouter', _fake)
-    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
+    monkeypatch.setattr(evidence, '_find_missing_cited_passages', finds_nothing)
     facts = await salary.resolve_salary({'salary': 'between 80 and 100k EUR, plus bonus', 'description': ''})
     assert (facts['kind'], facts['source']) == ('unclassified', 'rejected'), why
 
@@ -5227,7 +5257,7 @@ def no_relocation(monkeypatch):
     '''Evidence relocation finds nothing: only what regex finds in the page stands.'''
     async def finds_nothing(call_site, subject, claims, source, stage_stats):
         return {}, 'fake relocation reply'
-    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
+    monkeypatch.setattr(evidence, '_find_missing_cited_passages', finds_nothing)
 
 
 async def test_verify_extract_reads_the_date_from_the_page_not_the_model(no_relocation):
@@ -5257,6 +5287,18 @@ async def test_verify_extract_keeps_a_cited_field(no_relocation):
     statuses = await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats())
     assert extract['workplace_type'] == 'remote'
     assert statuses['workplace_type'] == evidence.STATUS_REGEX
+
+
+async def test_verify_extract_without_the_llm_rejects_what_regex_misses(monkeypatch):
+    '''After the extractor's own conversation sent its misses back, no passage-finding call is made.'''
+    async def must_not_be_called(*args):
+        raise AssertionError('passage-finding call made for an extract already sent back')
+    monkeypatch.setattr(evidence, '_find_missing_cited_passages', must_not_be_called)
+    extract = _make_extract(workplace_type='remote', relocation='United Kingdom', page_text=OVERSTORY_PAGE_TEXT,
+                            quotes={'workplace_type': 'Remote', 'relocation': 'Based in the United Kingdom'})
+    statuses = await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats(), use_llm=False)
+    assert (extract['workplace_type'], extract['relocation']) == ('remote', '')
+    assert (statuses['workplace_type'], statuses['relocation']) == (evidence.STATUS_REGEX, evidence.STATUS_REJECTED)
 
 
 async def test_verify_extract_reads_the_header_fields_off_the_page_card(no_relocation):
@@ -6006,6 +6048,16 @@ def _page_stating(extract: dict) -> linkedin_page.JobPage:
     return linkedin_page.JobPage(text='\n'.join([*lines, 'About the job', extract.get('description', '')]), source='dom')
 
 
+def _quoting_itself(extract: dict) -> dict:
+    '''`extract` with each cited field quoting the line _page_stating writes for it, as the OpenRouter
+    extractor's own loop leaves it: its quotes are then checked by regex alone (2026-10-29).'''
+    quotes = {field: str(value) for field, value in extract.items()
+              if field in config.EXTRACT_CITED_FIELDS and isinstance(value, str) and value}
+    if extract.get('is_agency'):
+        quotes['is_agency'] = 'is_agency: True'
+    return {**extract, 'quotes': {**quotes, **(extract.get('quotes') or {})}}
+
+
 def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, list]:
     '''Everything around the repost check stubbed: extraction, triage, rating, saving, Telegram.'''
     notifications: list[str] = []
@@ -6014,7 +6066,7 @@ def _stage2_stubs(monkeypatch, extract: dict, rating: int = 5) -> tuple[list, li
     monkeypatch.setattr(agent, 'MODEL_NAME_EXTRACTOR', OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC)
 
     async def fake_extract(candidate, page_text, stats, system_prompt):
-        return dict(extract)
+        return _quoting_itself(extract)
 
     async def fake_triage(extract_text, profile_block):
         return None
@@ -6855,7 +6907,7 @@ async def test_an_ungrounded_place_name_is_dropped_and_cannot_exempt_a_job(monke
     monkeypatch.setattr(location, 'LOCATION_CACHE_PATH', tmp_path / 'location_cache.yaml')
     monkeypatch.setattr(location, '_cache', {})
     monkeypatch.setattr(location, 'chat_openrouter', fake_chat)
-    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
+    monkeypatch.setattr(evidence, '_find_missing_cited_passages', finds_nothing)
     facts = await location.classify_location('Berlin, Germany (Hybrid)')
     assert facts['countries'] == ['Germany']
     assert facts['place_names'] == ['Berlin', 'Brandenburg'], 'containment grounded in "Berlin" stays'

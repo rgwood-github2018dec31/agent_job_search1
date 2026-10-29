@@ -74,6 +74,7 @@ from agentic_job_search.config import (
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_CITED_FIELDS,
+    EXTRACT_RESUBMIT_UNGROUNDED,
     FAILED_QUERIES_NAMED_MAX,
     JOB_AUDIT_ENABLED,
     JOB_STALE_AGE_DAYS,
@@ -2847,7 +2848,7 @@ def read_header_fields(candidate: dict, extract: dict) -> dict[str, str]:
     return sources
 
 
-async def verify_extract(candidate: dict, extract: dict, stage_stats: dict) -> dict[str, str]:
+async def verify_extract(candidate: dict, extract: dict, stage_stats: dict, use_llm: bool = True) -> dict[str, str]:
     """Verify Source Reference for an extract: every cited field stands only on text found in the
     page it was made from (`extract['page_text']`). Rejected fields are reset to absent in place.
     Returns, and stores as `extract['evidence']`, field -> how it was grounded.
@@ -2857,6 +2858,9 @@ async def verify_extract(candidate: dict, extract: dict, stage_stats: dict) -> d
     numbers (salary_digits_are_in_the_source), whatever its quote says: the page the extractor
     read is retained word for word since 2026-09-24, so a figure absent from it was invented, and
     a rejected salary now reads as absent instead of as an `unverified` figure.
+
+    `use_llm=False` when the extractor's own conversation already sent back every quote regex could
+    not find (EXTRACT_RESUBMIT_UNGROUNDED): a miss is then rejected rather than looked for again.
     """
     page_text = extract.get('page_text') or ''
     subject = f"job {candidate.get('job_id')} {candidate.get('company')}"
@@ -2869,7 +2873,8 @@ async def verify_extract(candidate: dict, extract: dict, stage_stats: dict) -> d
         if field not in statuses
         and evidence.is_filled(extract.get(field))
     ]
-    verdicts = await evidence.verify_claims('extract', subject, claims, page_text, source_label, stage_stats)
+    verdicts = await evidence.verify_claims('extract', subject, claims, page_text, source_label, stage_stats,
+                                            use_llm=use_llm)
     for field, verdict in verdicts.items():
         statuses[field] = verdict.status
         if not verdict.accepted:
@@ -2953,8 +2958,6 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f'Salary structure: {structure}')
     if (on_target := salary_meets_target(extract)) is not None:
         lines.append(f'Salary vs target: {_SALARY_VS_TARGET_NOTE[on_target]}')
-    if extract['sponsorship_note']:
-        lines.append(f"Sponsorship/authorization note: {extract['sponsorship_note']}")
     if extract.get('language_requirement'):
         lines.append(f"Language requirement: {extract['language_requirement']}")
     if extract.get('posting_language'):
@@ -4611,11 +4614,13 @@ async def _evaluate_candidates(
                     candidate, page.text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS)
                 if extract is not None:
                     attach_page(candidate, extract, page)
+            # The OpenRouter conversation already sent back any quote regex could not find.
+            resubmitted = extract is not None and EXTRACT_RESUBMIT_UNGROUNDED
             if extract is None:
                 extract = await extract_job_page_direct(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)
             if extract is not None:
-                await verify_extract(candidate, extract, stage_stats['evidence'])
+                await verify_extract(candidate, extract, stage_stats['evidence'], use_llm=not resubmitted)
                 job_trace.record('extract', fields={k: v for k, v in extract.items() if k != 'page_text'})
             if extract is None and browser is not None and await browser.confirm_dead():
                 index -= 1   # the browser, not the page, failed: retry this job after the restart

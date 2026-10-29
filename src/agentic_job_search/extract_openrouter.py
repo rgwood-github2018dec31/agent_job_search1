@@ -17,7 +17,7 @@ from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 from agentic_job_search import job_trace
 from agentic_job_search.config import (
     EXTRACT_CITED_FIELDS,
-    EXTRACT_RESUBMIT_UNQUOTED,
+    EXTRACT_RESUBMIT_UNGROUNDED,
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
     LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
@@ -27,7 +27,7 @@ from agentic_job_search.config import (
     STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
 )
 from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
-from agentic_job_search.evidence import CITATION_INSTRUCTION, QUOTE_SUFFIX, quotes_from, unquoted_fields, with_quotes
+from agentic_job_search.evidence import CITATION_INSTRUCTION, QUOTE_SUFFIX, quotes_from, ungrounded_fields, with_quotes
 from agentic_job_search.text_budget import quote_for_error, snippet
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,6 @@ EXTRACT_PROPERTIES = with_quotes({
         '"remote", "hybrid" or "onsite", when the page states it. Any required office days ("2-3 days '
         'onsite") is "hybrid", even when a badge says Remote')},
     'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
-    'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
     'language_requirement': {'type': 'string', 'description': (
         'Languages the posting REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german"')},
     'posting_language': {'type': 'string', 'description': (
@@ -76,7 +75,8 @@ EXTRACT_PROPERTIES = with_quotes({
         'True if the poster is a staffing firm, recruiting agency or job aggregator posting for another '
         'company that would actually hire')},
     'end_client': {'type': 'string', 'description': (
-        'That hiring company, if the posting names it; empty when anonymous ("our client, a leading fintech")')},
+        'Only when is_agency: the company that would actually hire, if the posting names it; empty for '
+        'a direct posting and when anonymous ("our client, a leading fintech")')},
 }, EXTRACT_CITED_FIELDS)
 
 OPENROUTER_EXTRACT_TOOLS = [
@@ -101,7 +101,7 @@ _SUBMIT_REQUIRED_FIELDS = EXTRACT_REQUIRED_FIELDS
 # (2026-10-26). Pinned there, the 2026-10-25 run rated 12 of 12 jobs with no location, language
 # or salary, so no gate or warning saw them.
 _SUBMIT_OPTIONAL_FIELDS = (
-    'workplace_type', 'salary', 'sponsorship_note', 'language_requirement',
+    'workplace_type', 'salary', 'language_requirement',
     'posting_language', 'stated_working_language', 'residency_scope', 'relocation',
     'education_requirement', 'is_agency', 'end_client',
 )
@@ -111,7 +111,6 @@ def extract_from_args(args: dict) -> dict:
     '''The extract from submit_job_extract's arguments, or from the fallback's structured output.'''
     return {
         'location': args.get('location', ''), 'salary': args.get('salary', ''),
-        'sponsorship_note': args.get('sponsorship_note', ''),
         'language_requirement': args.get('language_requirement', ''),
         'posting_language': str(args.get('posting_language') or '').strip().lower(),
         'stated_working_language': str(args.get('stated_working_language') or '').strip().lower(),
@@ -134,8 +133,10 @@ async def extract_job_page_openrouter(
     """Extract one posting's facts from its page text via submit_job_extract. Returns the extract dict, or None
     on failure (the caller falls back to the deterministic Haiku path).
 
-    A submit that fills a cited field without its quote is sent back once (EXTRACT_RESUBMIT_UNQUOTED);
-    that first submit is kept and returned if the loop then fails."""
+    A submit with a cited field whose quote is missing or not in the page is sent back once
+    (EXTRACT_RESUBMIT_UNGROUNDED), so the extract needs no separate passage-finding call
+    (agent.verify_extract checks it by regex only). That first submit is kept and returned if the
+    loop then fails."""
     messages = [
         {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': (
@@ -255,20 +256,27 @@ async def extract_job_page_openrouter(
                 endpoint_failed(MODEL_NAME_EXTRACTOR, routing, defect)
                 endpoint_defect = True
                 break
-            unquoted = unquoted_fields(args, EXTRACT_CITED_FIELDS) if EXTRACT_RESUBMIT_UNQUOTED and kept is None else []
-            if unquoted:
+            ungrounded = (ungrounded_fields(args, EXTRACT_CITED_FIELDS, page_text)
+                          if EXTRACT_RESUBMIT_UNGROUNDED and kept is None else [])
+            if ungrounded:
                 kept = extract_from_args(args)
+                quotes = quotes_from(args, EXTRACT_CITED_FIELDS)
+                unquoted = [f for f in ungrounded if not quotes[f]]
+                not_found = [f for f in ungrounded if quotes[f]]
                 logger.info(
                     f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
-                    f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: {len(unquoted)} field(s) filled without "
-                    f'a quote ({", ".join(unquoted)}); asking once more'
+                    f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: {len(ungrounded)} field(s) not grounded "
+                    f'(no quote: {", ".join(unquoted) or "none"}; quote not in the page: '
+                    f'{", ".join(f"{f}={quotes[f]!r}" for f in not_found) or "none"}); asking once more'
                 )
+                problems = ([f'{", ".join(unquoted)} filled without the matching <field>{QUOTE_SUFFIX}'] if unquoted else []) + (
+                    [f'the quote for {", ".join(not_found)} is not in the PAGE TEXT'] if not_found else [])
                 messages.append({
                     'role': 'tool', 'tool_call_id': call_id,
-                    'content': (f'Not accepted yet: {", ".join(unquoted)} filled without the matching '
-                                f'<field>{QUOTE_SUFFIX}. Call submit_job_extract again with every field. For each '
-                                'of these, copy the words of the PAGE TEXT that state it into its quote, '
-                                'or leave the field empty if the page does not state it.'),
+                    'content': (f'Not accepted yet: {"; ".join(problems)}. Call submit_job_extract again with '
+                                'every field. For each of these, copy into its quote the words of the PAGE TEXT '
+                                'that state it, exactly as written there, or leave the field empty if the page '
+                                'does not state it.'),
                 })
                 continue
             extract = extract_from_args(args)

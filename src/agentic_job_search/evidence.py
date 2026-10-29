@@ -136,7 +136,7 @@ def _grounded(claim: Claim, source: str, min_chars: int) -> tuple[int, int] | No
     return find_quote(claim.quote, source)
 
 
-_RELOCATE_PROMPT = '''Below is a SOURCE text and a list of CLAIMS another model made about it. Each
+_FIND_PASSAGES_PROMPT = '''Below is a SOURCE text and a list of CLAIMS another model made about it. Each
 claim has a field, the value predicted, and the words it cited (which may be wrong, paraphrased,
 translated or empty).
 
@@ -145,7 +145,7 @@ is written in the SOURCE: same language, same words, no paraphrase, at most two 
 SOURCE does not state the claim, give an empty string. Never invent a passage.
 
 Return ONLY a JSON object, no prose and no code fence:
-{{"spans": {{"<claim id>": "<passage copied from the SOURCE, or empty>", ...}}}}
+{{"passages": {{"<claim id>": "<passage copied from the SOURCE, or empty>", ...}}}}
 
 CLAIMS:
 {claims}
@@ -156,25 +156,26 @@ CLAIMS:
 '''
 
 
-async def _relocate(call_site: str, subject: str, claims: list[Claim], source: str,
-                    stage_stats: dict | None) -> tuple[dict[str, str], str]:
-    '''Ask MODEL_NAME_EVIDENCE for the source span behind each claim. Returns (id -> span, reply note).'''
+async def _find_missing_cited_passages(call_site: str, subject: str, claims: list[Claim], source: str,
+                                       stage_stats: dict | None) -> tuple[dict[str, str], str]:
+    '''Ask MODEL_NAME_EVIDENCE for the source passage behind each claim regex could not ground.
+    Returns (claim id -> passage, '' when the source does not state it; reply note).'''
     listed = json.dumps(
         [{'id': str(i), 'field': c.field, 'value': c.value, 'cited': c.quote} for i, c in enumerate(claims)],
         ensure_ascii=False, indent=1, default=str,
     )
-    reply = await chat_openrouter(_RELOCATE_PROMPT.format(claims=listed, source=source), model=MODEL_NAME_EVIDENCE)
+    reply = await chat_openrouter(_FIND_PASSAGES_PROMPT.format(claims=listed, source=source), model=MODEL_NAME_EVIDENCE)
     if stage_stats is not None:
         stage_stats['cost'] = stage_stats.get('cost', 0.0) + reply.cost_usd
 
     def coerce(obj: dict) -> dict[str, str]:
-        spans = obj['spans']
-        if not isinstance(spans, dict):
-            raise TypeError(f'"spans" is {type(spans).__name__}, not an object')
-        return {str(k): str(v or '') for k, v in spans.items()}
+        passages = obj['passages']
+        if not isinstance(passages, dict):
+            raise TypeError(f'"passages" is {type(passages).__name__}, not an object')
+        return {str(k): str(v or '') for k, v in passages.items()}
 
-    spans = reply.parse(coerce, what=f'evidence relocation for {call_site} ({subject})')
-    return spans, reply.describe()
+    passages = reply.parse(coerce, what=f'finding cited passages for {call_site} ({subject})')
+    return passages, reply.describe()
 
 
 async def verify_claims(
@@ -198,7 +199,7 @@ async def verify_claims(
 
     if missed and use_llm:
         try:
-            spans, reply_note = await _relocate(call_site, subject, missed, source, stage_stats)
+            spans, reply_note = await _find_missing_cited_passages(call_site, subject, missed, source, stage_stats)
         except Exception as ex:
             spans, reply_note = {}, f'relocation call failed: {type(ex).__name__}: {ex}'
             logger.warning(f'Evidence ({call_site}, {subject}): {reply_note}; '
@@ -265,10 +266,14 @@ def is_filled(value: object) -> bool:
     return value is True or (isinstance(value, str) and bool(value.strip()))
 
 
-def unquoted_fields(args: dict, fields: tuple[str, ...]) -> list[str]:
-    '''The cited fields a model filled in `args` without their `<field>_quote`.'''
+def ungrounded_fields(args: dict, fields: tuple[str, ...], source: str,
+                      min_chars: int = EVIDENCE_MIN_QUOTE_CHARS) -> list[str]:
+    '''The cited fields a model filled in `args` whose `<field>_quote` is missing or not found in
+    `source` by regex, the first step of verify_claims. A caller that can ask the same model again
+    sends these back instead of paying for _find_missing_cited_passages.'''
     quotes = quotes_from(args, fields)
-    return [name for name in fields if is_filled(args.get(name)) and not quotes[name]]
+    return [name for name in fields if is_filled(args.get(name))
+            and _grounded(Claim(name, args.get(name), quotes[name]), source, min_chars) is None]
 
 
 def quotes_from(args: dict, fields: tuple[str, ...]) -> dict[str, str]:

@@ -517,11 +517,13 @@ REPLAY_SUMMARY_FILENAME = 'summary.tsv'               # one row per requested jo
 
 # Stage 2 (evaluation) configuration
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10
-# Send a submit_job_extract that fills a cited field without its <field>_quote back to the model
-# once, asking for the quote or an empty field. Without it a missing quote costs an LLM relocation
-# call (Hyra, 2026-10-28: 4,759 output tokens, 32 s) or a false rejection. The first submit is kept
-# if the second never arrives.
-EXTRACT_RESUBMIT_UNQUOTED = True
+# Send a submit_job_extract back to the model once when a cited field's <field>_quote is missing or
+# not found in the page by regex, asking for the page's words or an empty field. Without it a
+# missing quote costs a separate passage-finding call (evidence._find_missing_cited_passages; Hyra,
+# 2026-10-28: 4,759 output tokens, 32 s) or a false rejection; with it the extract is verified by
+# regex only (2026-10-29), as the conversation already holds the page. The first submit is kept if
+# the second never arrives.
+EXTRACT_RESUBMIT_UNGROUNDED = True
 # Budget for the a11y snapshot on the FALLBACK path only (linkedin_page._read_snapshot, used when
 # the DOM capture fails or the description is missing). The normal path sends de-cluttered text,
 # measured 3-9K chars, and never needs a cut. One LinkedIn snapshot once lost 34,797 chars from
@@ -870,7 +872,7 @@ MODEL_NAME_EVIDENCE = MODEL_NAME_SINGLE_TURN
 # (agent.read_header_fields) and the model is no longer asked for them (2026-10-28).
 EXTRACT_CITED_FIELDS = (
     'location', 'workplace_type', 'salary',
-    'sponsorship_note', 'language_requirement', 'posting_language', 'stated_working_language',
+    'language_requirement', 'posting_language', 'stated_working_language',
     'residency_scope', 'relocation', 'education_requirement', 'is_agency', 'end_client',
 )
 # Write Job Audit (job_audit.py): one job per run rendered as a PDF, on unless --no-job-audit.

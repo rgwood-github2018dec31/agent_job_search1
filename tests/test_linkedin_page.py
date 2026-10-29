@@ -242,7 +242,7 @@ async def test_a_removal_whose_quote_is_not_in_the_block_is_kept(monkeypatch):
     async def finds_nothing(call_site, subject, claims, source, stage_stats):
         return {}, 'fake relocation reply'
 
-    monkeypatch.setattr(evidence, '_relocate', finds_nothing)
+    monkeypatch.setattr(evidence, '_find_missing_cited_passages', finds_nothing)
     _classifier(monkeypatch, {HARMLESS: True, PAY_SECTION: False, 'Commitments': False}, [],
                 quote=lambda sig: 'Try Premium for free')
     soup = _cleaned()
