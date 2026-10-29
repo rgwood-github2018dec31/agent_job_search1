@@ -700,6 +700,21 @@ async def decide_unknown_blocks(soup: BeautifulSoup, candidate: dict, stage_stat
     return removed
 
 
+def apply_cached_section_decisions(soup: BeautifulSoup) -> list[dict]:
+    '''decide_unknown_blocks without the model, for replaying saved pages: a block is removed only on
+    a cached `remove` verdict and only without pay wording; an unseen one is kept.'''
+    main = soup.find('main')
+    decisions = load_section_decisions() or {}
+    removed = []
+    for block in unknown_blocks(main) if main is not None else []:
+        sig = block_signature(block)
+        text = norm(block.get_text(' '))
+        if (decisions.get(sig) or {}).get('decision') == 'remove' and not mentions_pay(text):
+            removed.append({'what': f'section {sig!r}', 'chars': len(text)})
+            block.decompose()
+    return removed
+
+
 def page_text(soup: BeautifulSoup) -> str:
     '''The visible text of <main>, one non-empty line per line.'''
     root = soup.find('main') or soup.body or soup

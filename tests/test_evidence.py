@@ -108,3 +108,29 @@ async def test_verdicts_are_recorded_into_the_current_job_trace(tmp_path, monkey
     [step] = job_trace.load(tmp_path / 'linkedin-1.jsonl')
     assert step['kind'] == 'evidence'
     assert step['verdicts'][0]['status'] == evidence.STATUS_REJECTED
+
+
+MARKDOWN_PAGE = '''## About the job
+**Requirements**
+- 5+ years of Python
+- Fluent **German** required
+**Nice to have**
+- A master's degree'''
+PLAIN_PAGE = MARKDOWN_PAGE.replace('## ', '').replace('**', '').replace('- ', '')
+
+
+@pytest.mark.parametrize('quote', [
+    "**Nice to have**\n- A master's degree",
+    'Fluent **German** required',
+    '## About the job',
+    '- 5+ years of Python',
+    'Requirements 5+ years of Python',
+])
+@pytest.mark.parametrize('source', [MARKDOWN_PAGE, PLAIN_PAGE], ids=['markdown', 'plain'])
+def test_a_quote_copied_from_markdown_or_plain_text_is_found_in_either(quote, source):
+    assert evidence.find_quote(quote, source) is not None
+
+
+def test_markdown_folding_leaves_letters_digits_and_order_alone():
+    assert evidence.find_quote('Fluent German **not** required', MARKDOWN_PAGE) is None
+    assert evidence.find_quote('Python 5+ years', PLAIN_PAGE) is None

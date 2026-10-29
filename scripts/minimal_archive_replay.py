@@ -56,20 +56,6 @@ def archive_meta(soup: BeautifulSoup, path: Path) -> dict:
     return meta
 
 
-def remove_cached_sections(soup: BeautifulSoup) -> list[dict]:
-    '''Unknown blocks whose cached verdict is remove; unseen ones are kept, never sent to a model.'''
-    main = soup.find('main')
-    decisions = linkedin_page.load_section_decisions() or {}
-    removed = []
-    for block in linkedin_page.unknown_blocks(main) if main is not None else []:
-        sig = linkedin_page.block_signature(block)
-        text = linkedin_page.norm(block.get_text(' '))
-        if (decisions.get(sig) or {}).get('decision') == 'remove' and not linkedin_page.mentions_pay(text):
-            removed.append({'what': f'section {sig!r}', 'chars': len(text)})
-            block.decompose()
-    return removed
-
-
 def text_lines(text: str) -> list[str]:
     return [line for line in (linkedin_page.norm(line) for line in text.splitlines()) if line]
 
@@ -88,7 +74,7 @@ def process(path: Path, out_dir: Path, shell: Path) -> dict:
     soup = BeautifulSoup(path.read_text(encoding='utf-8'), 'lxml')
     meta = archive_meta(soup, path)
     removed = linkedin_page.remove_known_clutter(soup) + linkedin_page.remove_expand_button(soup)
-    removed += remove_cached_sections(soup)
+    removed += linkedin_page.apply_cached_section_decisions(soup)
     main = soup.find('main') or soup.body
     if main is None:
         raise RuntimeError(f'{path}: the archive has neither <main> nor <body>')

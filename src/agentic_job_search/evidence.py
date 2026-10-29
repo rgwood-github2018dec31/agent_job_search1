@@ -43,14 +43,22 @@ _DASHES = dict.fromkeys(map(ord, '‐‑‒–—―−'), '-')
 _QUOTES = {**dict.fromkeys(map(ord, '‘’‚‛′'), "'"),
            **dict.fromkeys(map(ord, '“”„‟″'), '"')}
 _WHITESPACE_RE = re.compile(r'\s+')
+# Markdown markers a model may copy from a Markdown page (minimal_archive.to_markdown): a heading or
+# `*` bullet at a line start, and bold. Folded out of both sides, so a quote matches either form.
+_MARKDOWN_LINE_MARKER_RE = re.compile(r'^[ \t]*(?:#{1,6}|\*)[ \t]+', re.MULTILINE)
+_MARKDOWN_BOLD_RE = re.compile(r'\*\*|__')
+# A free-standing dash: a `- ` bullet, or a separator ('Remote - Germany') a quote may wrap at.
+_DASH_SEPARATOR_RE = re.compile(r'(^|\s)-+(?=\s|$)', re.MULTILINE)
 _ELLIPSIS_RE = re.compile(r'\s*(?:…|\.{3,})\s*')
 _EDGE_CHARS = ' \t\n.,;:!?"\'()[]{}*-'
 
 
 def normalize_for_match(text: object) -> str:
     '''Fold what a faithful citation may legitimately differ in: case, width, whitespace, dash and
-    quote styles. Letters, digits and word order are left alone.'''
+    quote styles, and Markdown markers. Letters, digits and word order are left alone.'''
     folded = unicodedata.normalize('NFKC', str(text or '')).translate(_DASHES).translate(_QUOTES)
+    folded = _MARKDOWN_BOLD_RE.sub('', _MARKDOWN_LINE_MARKER_RE.sub('', folded))
+    folded = _DASH_SEPARATOR_RE.sub(r'\1', folded)
     return _WHITESPACE_RE.sub(' ', folded.casefold()).strip()
 
 

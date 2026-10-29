@@ -528,3 +528,14 @@ async def test_no_chromium_is_reported_once_per_run(monkeypatch, caplog, tmp_pat
                 BeautifulSoup('<main><p>x</p></main>', 'lxml'), tmp_path / f'linkedin-{job}.html', {'job_id': job}, [])
             assert pdf is None
     assert sum('no PDFs this run' in r.message for r in caplog.records) == 1
+
+
+def test_markdown_carries_the_structure_and_folds_to_the_extractors_text():
+    soup = _cleaned()
+    soup.find(id=f'JobDetails_AboutTheJob_{JOB_ID}').find('p').insert_before(
+        BeautifulSoup('<p><strong>What you will do</strong></p><ul><li>Ship <strong>agents</strong></li></ul>', 'lxml').body)
+    markdown = minimal_archive.to_markdown(soup.find('main'))
+    assert '## About the job' in markdown.splitlines()
+    assert '**What you will do**' in markdown.splitlines() and '- Ship' in markdown.splitlines()
+    assert evidence.normalize_for_match(markdown) == evidence.normalize_for_match(lp.page_text(soup))
+    assert '<strong>' in str(soup), 'the soup it read is left as it was'

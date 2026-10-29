@@ -17,7 +17,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from agentic_job_search.config import (
     MINIMAL_ARCHIVE_KEEP_ATTRS,
@@ -36,6 +36,11 @@ _PLAYWRIGHT_DEFAULT_CACHE = Path.home() / 'Library' / 'Caches' / 'ms-playwright'
 _BUILD_NUMBER_RE = re.compile(r'\d+')
 _KEEP_EMPTY_TAGS = ('img', 'br', 'hr')
 _FLATTEN_TAGS = ('div', 'section')
+_MARKDOWN_HEADING_LEVELS = {'h1': 1, 'h2': 2, 'h3': 3, 'h4': 4, 'h5': 5, 'h6': 6}
+_MARKDOWN_BOLD_TAGS = ('strong', 'b')
+_MARKDOWN_BOLD = '**'
+_MARKDOWN_BULLET = '- '
+_EDGE_WHITESPACE_RE = re.compile(r'^(\s*)(.*?)(\s*)$', re.DOTALL)
 # Logged once per run, not once per page.
 _missing_shell_reported = False
 STYLE = '''
@@ -106,6 +111,32 @@ def minimise(main: Tag) -> list[dict]:
         if isinstance(link.next_sibling, Tag) and link.next_sibling.name == 'a':
             link.insert_after(BADGE_SEPARATOR)
     return removed
+
+
+def _text_nodes(el: Tag) -> list[NavigableString]:
+    return [s for s in el.find_all(string=True) if s.strip()]
+
+
+def to_markdown(root: Tag) -> str:
+    '''The visible text of root as Markdown: headings as `#`, list items as `- `, bold as `**`.
+
+    Line for line the same text as linkedin_page.page_text, with markers added, so that
+    evidence.normalize_for_match folds both to the same string and a quote copied from either is
+    found in either. Links keep their text only. root is not modified.
+    '''
+    copy = BeautifulSoup(str(root), 'lxml')
+    root = copy.find(root.name) or copy
+    for bold in root.find_all(_MARKDOWN_BOLD_TAGS):
+        for node in _text_nodes(bold):
+            lead, text, trail = _EDGE_WHITESPACE_RE.match(str(node)).groups()
+            node.replace_with(f'{lead}{_MARKDOWN_BOLD}{text}{_MARKDOWN_BOLD}{trail}')
+    for el in root.find_all([*_MARKDOWN_HEADING_LEVELS, 'li']):
+        nodes = _text_nodes(el)
+        if nodes:
+            prefix = '#' * _MARKDOWN_HEADING_LEVELS[el.name] + ' ' if el.name in _MARKDOWN_HEADING_LEVELS else _MARKDOWN_BULLET
+            nodes[0].replace_with(prefix + str(nodes[0]).lstrip())
+    lines = (_norm(line) for line in root.get_text('\n').splitlines())
+    return '\n'.join(line for line in lines if line)
 
 
 def page_html(main: Tag, meta: dict, removed: list[dict]) -> str:
