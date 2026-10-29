@@ -554,7 +554,11 @@ STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION = (
     '"our working language is English" or "international English-speaking team". Leave empty '
     'unless the posting states it; never infer it from the location.'
 )
-TRIAGE_ENABLED = True
+# Off since 2026-10-29. Triage could only skip the rater at a score <= TRIAGE_THRESHOLD, and in 288
+# ratings from 2026-10-20 to -29 it skipped none; skipping saves about $0.001 of rating per job,
+# while the triage model (OLLAMA_MODEL_NAME_TRIAGE, a 3B model) broke its JSON on 2 of 10 jobs on
+# 2026-10-28. To be turned back on with a stronger model, and then TRIAGE_THRESHOLD raised to 2.
+TRIAGE_ENABLED = False
 TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (clear low fits)
 # A job whose Stage 2 evaluation errored is released for a later run at most this many times;
 # past it the error is terminal, so one posting that always fails cannot be re-read every run.

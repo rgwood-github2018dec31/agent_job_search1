@@ -11713,7 +11713,20 @@ async def test_stage_2_reports_a_failed_send(monkeypatch, caplog):
     assert 'Stage 2 notifications: 0 of 1 message(s) sent; FAILED for job(s) 222' in _stage2_messages(caplog)
 
 
+async def test_stage_2_skips_triage_while_it_is_switched_off(monkeypatch):
+    '''TRIAGE_ENABLED is off since 2026-10-29: every job past the hard rules goes to the rater.'''
+    _repost_llm(monkeypatch, '')
+    _, saved = _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+
+    async def must_not_triage(extract_text, profile_block):
+        raise AssertionError('triage called while TRIAGE_ENABLED is off')
+    monkeypatch.setattr(agent, 'triage_job_fit', must_not_triage)
+    await _run_stage2(_make_candidate(job_id='221', company='Acme'), {})
+    assert [s['rating'] for s in saved] == [5]
+
+
 async def test_stage_2_rating_line_gives_the_triage_reason_only_on_a_wide_disagreement(monkeypatch, caplog):
+    monkeypatch.setattr(agent, 'TRIAGE_ENABLED', True)
     _repost_llm(monkeypatch, '')
     _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
     scores = iter([5, 5 - agent.TRIAGE_DISAGREEMENT_LOG_MIN])
