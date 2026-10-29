@@ -1619,12 +1619,27 @@ def test_hard_rule_category_buckets_education():
 # ---------------------------------------------------------------------------
 
 async def test_triage_job_fit_parses_score(monkeypatch):
-    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug='', output_format=None):
         return 'Sure! {"score": 2, "reason": "wrong domain", "quote": "Senior Accountant"}'
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
     result = await triage.triage_job_fit('job text', 'profile')
     assert result == {'score': 2, 'reason': 'wrong domain', 'quote': 'Senior Accountant'}
+
+
+async def test_triage_asks_the_local_server_for_its_reply_schema(monkeypatch):
+    '''Asked only in words, the triage model left a stray quote after a long cited passage on 7 of
+    24 replies (2026-10-29); the schema constrains decoding so the reply always parses.'''
+    sent = []
+
+    async def capture(url, tool, args, timeout_seconds=None):
+        sent.append(args)
+        return json.dumps({'response': '{"score": 4, "reason": "fit", "quote": "agents"}', 'done': True})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', capture)
+    assert (await triage.triage_job_fit('job text', 'profile'))['score'] == 4
+    assert sent[0]['output_format'] == triage.TRIAGE_OUTPUT_SCHEMA
+    assert sent[0]['output_format']['required'] == ['score', 'reason', 'quote']
 
 
 async def test_a_rejecting_triage_score_must_cite_the_posting():
@@ -1656,7 +1671,7 @@ async def test_raters_warnings_of_the_wrong_type_are_logged_not_silently_dropped
 
 
 async def test_triage_job_fit_fails_open_when_server_down(monkeypatch):
-    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug='', output_format=None):
         raise RuntimeError('connection refused')
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
@@ -1664,7 +1679,7 @@ async def test_triage_job_fit_fails_open_when_server_down(monkeypatch):
 
 
 async def test_triage_job_fit_fails_open_on_garbage(monkeypatch):
-    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug='', output_format=None):
         return 'I cannot help with that.'
 
     monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
@@ -2477,7 +2492,7 @@ async def test_generate_local_sends_caller_identity_to_the_server(monkeypatch):
 async def test_each_local_call_site_passes_its_own_purpose(monkeypatch):
     purposes = []
 
-    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug=''):
+    async def fake_generate_local(prompt, system='', model='', max_tokens=0, purpose_slug='', output_format=None):
         purposes.append(purpose_slug)
         return '{"score": 3, "reason": "x", "rating": 3, "reasoning": "x"}'
 

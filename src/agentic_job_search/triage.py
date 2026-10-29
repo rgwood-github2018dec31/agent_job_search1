@@ -32,6 +32,8 @@ from agentic_job_search.config import (
     LOCAL_LLM_TEMPERATURE,
     LOG_SNIPPET_MAX_CHARS,
     MODEL_NAME_SINGLE_TURN,
+    RATING_MAX,
+    RATING_MIN,
     RATING_TEMPERATURE,
     TRIAGE_THRESHOLD,
 )
@@ -325,12 +327,14 @@ async def generate_local(
     max_tokens: int | None = None,
     *,
     purpose_slug: str,
+    output_format: dict | None = None,
 ) -> str:
     '''One local completion, recorded in the current Job Trace in full (see _generate_local).'''
     call_site = job_trace.caller_name()
     started = time.monotonic()
     try:
-        response = await _generate_local(prompt, system, model, max_tokens, purpose_slug=purpose_slug)
+        response = await _generate_local(prompt, system, model, max_tokens, purpose_slug=purpose_slug,
+                                         output_format=output_format)
     except Exception as ex:
         job_trace.record('llm_call', transport='ollama', call_site=call_site, model=model, system=system,
                          prompt=prompt, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
@@ -347,8 +351,11 @@ async def _generate_local(
     max_tokens: int | None,
     *,
     purpose_slug: str,
+    output_format: dict | None = None,
 ) -> str:
     """One completion via the local Ollama MCP server. Returns the response text.
+
+    `output_format`, a JSON schema, constrains decoding so the reply always parses as it.
 
     `purpose_slug` (why this call is made — one of the LLM_LOCAL_PURPOSE_* constants) is required,
     and is sent with LLM_LOCAL_SERVICE_NAME so the server's call log can trace a model loading in
@@ -365,6 +372,8 @@ async def _generate_local(
         }
         if max_tokens is not None:
             args['max_tokens'] = max_tokens
+        if output_format is not None:
+            args['output_format'] = output_format
         raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'generate', args, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
     except Exception as ex:
         if _looks_like_missing_model(unwrap_exception(ex)):
@@ -422,12 +431,27 @@ Respond with ONLY a JSON object:
 {"score": <1-5>, "reason": "<one sentence>", "quote": "<words of the job posting that support the score, copied as written>"}'''
 
 
+# The reply's shape, enforced by the local server (output_format). Asked only in words, the triage
+# model left a stray quote after a long cited passage on 7 of 24 replies to the 2026-10-28 run's
+# prompts, failing triage open on 2 of its 10 jobs; with the schema, 0 of 24.
+TRIAGE_OUTPUT_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'score': {'type': 'integer', 'minimum': RATING_MIN, 'maximum': RATING_MAX},
+        'reason': {'type': 'string'},
+        'quote': {'type': 'string'},
+    },
+    'required': ['score', 'reason', 'quote'],
+}
+
+
 async def triage_job_fit(job_text: str, profile_block: str) -> dict | None:
     """Score a job extract 1-5 with the local LLM. Returns {'score', 'reason'},
     or None if the local server is unavailable or the response is unusable (fail open)."""
     prompt = f'{profile_block}\n\n--- JOB POSTING ---\n{job_text}\n--- END JOB POSTING ---'
     try:
-        response = await generate_local(prompt, system=TRIAGE_INSTRUCTIONS, purpose_slug=LLM_LOCAL_PURPOSE_TRIAGE)
+        response = await generate_local(prompt, system=TRIAGE_INSTRUCTIONS, purpose_slug=LLM_LOCAL_PURPOSE_TRIAGE,
+                                        output_format=TRIAGE_OUTPUT_SCHEMA)
         result = extract_json_object(response)
         score = int(result['score'])
     except Exception as ex:
