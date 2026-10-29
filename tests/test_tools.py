@@ -11713,6 +11713,13 @@ async def test_stage_2_reports_a_failed_send(monkeypatch, caplog):
     assert 'Stage 2 notifications: 0 of 1 message(s) sent; FAILED for job(s) 222' in _stage2_messages(caplog)
 
 
+def test_the_rater_is_not_asked_for_company_or_title():
+    '''Code reads both off the page header; nothing read the rater's copies (2026-10-29).'''
+    from agentic_job_search.triage import RATING_JSON_INSTRUCTIONS
+    assert not {'company', 'title'} & set(agent.RATING_OUTPUT_SCHEMA['properties'])
+    assert '"company"' not in RATING_JSON_INSTRUCTIONS and '"title"' not in RATING_JSON_INSTRUCTIONS
+
+
 async def test_stage_2_skips_triage_while_it_is_switched_off(monkeypatch):
     '''TRIAGE_ENABLED is off since 2026-10-29: every job past the hard rules goes to the rater.'''
     _repost_llm(monkeypatch, '')

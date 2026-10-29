@@ -764,12 +764,12 @@ _CITED_ITEM_SCHEMA = {
     'required': ['text', 'quote'],
 }
 
+# No company or title (2026-10-29): code reads both off the page header and nothing read the
+# rater's copies back, so asking for them only invited a restatement of data code already has.
 RATING_OUTPUT_SCHEMA = {
     'type': 'object',
     'properties': {
         'rating': {'type': 'integer', 'description': 'Job fit rating, 1-5'},
-        'company': {'type': 'string', 'description': 'Hiring company'},
-        'title': {'type': 'string', 'description': 'Job title'},
         'reasoning': {'type': 'string', 'description': '2-3 sentences on the fit'},
         'summary': {'type': 'string', 'description': 'Short label for the job, used in the saved filename'},
         'pros': {
@@ -781,7 +781,7 @@ RATING_OUTPUT_SCHEMA = {
             'description': '0-4 short bullet phrases naming anything conflicting with the requirements, each citing the posting',
         },
     },
-    'required': ['rating', 'company', 'title', 'reasoning', 'summary', 'pros', 'warnings'],
+    'required': ['rating', 'reasoning', 'summary', 'pros', 'warnings'],
 }
 
 

@@ -468,7 +468,7 @@ def triage_rejects(triage_result: dict | None) -> bool:
 
 RATING_JSON_INSTRUCTIONS = (
     'Respond with ONLY a JSON object: '
-    '{"rating": <1-5>, "company": "<hiring company>", "title": "<job title>", '
+    '{"rating": <1-5>, '
     '"reasoning": "<2-3 sentences on the fit>", "summary": "<short snake_case-friendly label for the job>", '
     '"pros": [{"text": "<short phrase naming a concrete strength>", "quote": "<words of the posting that show it>"}, ...], '
     '"warnings": [{"text": "<short phrase naming anything conflicting with the requirements>", '
