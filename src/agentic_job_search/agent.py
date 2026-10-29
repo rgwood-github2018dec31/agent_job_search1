@@ -642,8 +642,8 @@ A `LinkedIn-listed location:` line means LinkedIn's header names a different pla
 assume neither is right.
 Do not write a warning bullet for any of these: they are detected deterministically and added for you.
 
-Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and added for
-you, and repeating it just duplicates the bullet in different words. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
+Do NOT write a warning about the poster being a recruiting agency or the hiring company being undisclosed — that is detected deterministically and shown in
+the notification header, so a bullet would only repeat it. Being posted by an agency is **not** a reason to lower the rating; judge the role itself.
 
 ## Detected for you
 Three more facts are detected deterministically and added for you. Factor each into the rating, but do not write a warning bullet that only restates it —
@@ -3789,17 +3789,6 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if warning := implausible_salary_warning(extract):
         warnings.append(warning)
 
-    # Who is actually hiring changes how you apply, and the rater reports it only by luck: on the
-    # 2026-08-11 run it flagged CyberCoders and Jobgether but not Hire Feed or Genius Innovation
-    # Lab — 2 of the 4 agency postings that triggered a notification said nothing. Same reasoning
-    # as the hybrid warning: a structural fact cannot be left to the rater's discretion.
-    if derive_agency_posting(extract):
-        end_client = derive_end_client(extract)
-        warnings.append(
-            f'Posted by a recruiting agency — hiring company: {end_client}' if end_client
-            else 'Posted by a recruiting agency — actual hiring company not named'
-        )
-
     return warnings
 
 
@@ -4186,8 +4175,15 @@ async def triage_is_grounded(candidate: dict, triage_result: dict, extract_text:
         'the extract text shown to triage', stage_stats)
     return verdicts['score'].accepted
 def _notification_header(candidate: dict, extract: dict, rating: int) -> str:
-    recruiter = f'{NOTIFICATION_RECRUITER_MARKER} ' if derive_agency_posting(extract) else ''
-    return f"⭐ {rating}/5 — {recruiter}{candidate['company']} — {candidate['title']}"
+    # Who is actually hiring changes how you apply, and the rater reports it only by luck: on the
+    # 2026-08-11 run it flagged CyberCoders and Jobgether but not Hire Feed or Genius Innovation
+    # Lab. So code says it, here and only here: a ⚠️ bullet saying the same thing repeated this
+    # header (2026-10-28).
+    if not derive_agency_posting(extract):
+        return f"⭐ {rating}/5 — {candidate['company']} — {candidate['title']}"
+    end_client = derive_end_client(extract)
+    hiring_for = f', hiring for {end_client}' if end_client else ''
+    return f"⭐ {rating}/5 — {NOTIFICATION_RECRUITER_MARKER} {candidate['company']}{hiring_for} — {candidate['title']}"
 
 
 def _location_text(extract: dict) -> str:

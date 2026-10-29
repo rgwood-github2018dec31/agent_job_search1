@@ -686,8 +686,8 @@ LOG_TITLE_MAX_CHARS = 80
 NOTIFICATION_SALARY_MAX_CHARS = 200
 # An unparseable posting date shown verbatim on the 🗓 line of a Telegram job-match message.
 NOTIFICATION_POSTED_MAX_CHARS = 80
-# Leads the company in a job-match header when a recruiting agency posted it (2026-10-19): the
-# ⚠️ bullet naming the hiring company is the last thing in the message.
+# Leads the company in a job-match header when a recruiting agency posted it (2026-10-19). The
+# header also names the hiring company when the posting does; no ⚠️ bullet repeats it (2026-10-28).
 NOTIFICATION_RECRUITER_MARKER = '🧑‍💼 Recruiter:'
 # Compensation sentences of the description handed to the salary classifier, and ONLY when the
 # deterministic tiers found no figure in the salary field itself.

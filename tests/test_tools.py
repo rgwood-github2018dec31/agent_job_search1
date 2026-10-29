@@ -5063,6 +5063,14 @@ def test_format_job_notification_marks_a_recruiter_in_the_header():
     assert message.splitlines()[0] == f'⭐ 4/5 — {agent.NOTIFICATION_RECRUITER_MARKER} Harnham — Staff AI Engineer'
 
 
+def test_format_job_notification_names_the_hiring_company_after_the_recruiter():
+    message = agent.format_job_notification(
+        _make_candidate(company='CyberCoders'),
+        _make_extract(company='CyberCoders', is_agency=True, end_client='Automotive Martech Inc'), 4, [], [])
+    assert message.splitlines()[0] == (
+        f'⭐ 4/5 — {agent.NOTIFICATION_RECRUITER_MARKER} CyberCoders, hiring for Automotive Martech Inc — Staff AI Engineer')
+
+
 def test_format_job_notification_leaves_a_direct_employer_unmarked():
     message = agent.format_job_notification(_make_candidate(), _make_extract(is_agency=False), 4, [], [])
     assert agent.NOTIFICATION_RECRUITER_MARKER not in message
@@ -5700,19 +5708,12 @@ def test_derive_agency_posting_fallback_does_not_overmatch(extract_kwargs):
     assert agent.derive_agency_posting(_make_extract(**extract_kwargs)) is False
 
 
-def test_agency_warning_names_the_end_client_when_known():
-    extract = _make_extract(company='CyberCoders', is_agency=True,
-                            end_client='Automotive Martech Inc', salary='CAD 250,000')
-    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
-    assert 'Posted by a recruiting agency — hiring company: Automotive Martech Inc' in warnings
-
-
-def test_agency_warning_says_so_when_the_client_is_anonymous():
-    """The common case: agencies anonymise. CyberCoders' real posting said 'undisclosed automotive
-    martech firm', and 0 of 10 agency-posted applied records named a client."""
-    extract = _make_extract(company='CyberCoders', is_agency=True, end_client='', salary='CAD 250,000')
-    warnings = agent.build_deterministic_warnings(_make_candidate(), extract)
-    assert 'Posted by a recruiting agency — actual hiring company not named' in warnings
+def test_no_agency_warning_for_an_agency_posting():
+    '''2026-10-28: the header already says 🧑‍💼 Recruiter, so a ⚠️ bullet saying so only repeated it
+    (job 4482926577, Jobgether).'''
+    for end_client in ('', 'Automotive Martech Inc'):
+        extract = _make_extract(company='CyberCoders', is_agency=True, end_client=end_client, salary='CAD 250,000')
+        assert not any('agency' in w.lower() for w in agent.build_deterministic_warnings(_make_candidate(), extract))
 
 
 def test_no_agency_warning_for_a_direct_employer():
@@ -6372,13 +6373,13 @@ def test_merge_warnings_drops_a_restated_missing_salary():
 
 def test_merge_warnings_salary_estimate_replaces_the_code_line_in_place():
     merged = agent.merge_warnings(
-        ['Hybrid — Netherlands', 'No salary listed', 'Posted by a recruiting agency — actual hiring company not named'],
+        ['Hybrid — Netherlands', 'No salary listed', 'Contract role — full-time preferred'],
         ['No salary listed; Poland-market pay likely well below CAD $210K target'],
     )
     assert merged == [
         'Hybrid — Netherlands',
         "No salary listed — rater's guess: Poland-market pay likely well below CAD $210K target",
-        'Posted by a recruiting agency — actual hiring company not named',
+        'Contract role — full-time preferred',
     ]
 
 
