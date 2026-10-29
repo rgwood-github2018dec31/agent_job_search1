@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
+from utils_tools_n_agents_common.models import OLLAMA_MODEL_NAME_TRIAGE
 
 from agentic_job_search import job_trace
 from agentic_job_search.config import (
@@ -31,7 +32,6 @@ from agentic_job_search.config import (
     LOCAL_LLM_TEMPERATURE,
     LOG_SNIPPET_MAX_CHARS,
     MODEL_NAME_SINGLE_TURN,
-    OLLAMA_MODEL_NAME_TRIAGE,
     TRIAGE_THRESHOLD,
 )
 from agentic_job_search.endpoint_pin import endpoint_failed, http_status_of, routing_for
@@ -309,7 +309,7 @@ async def _describe_missing_model(model: str) -> str:
     return (
         f'Local model {model!r} is not installed on the Ollama server behind '
         f'{LLM_LOCAL_MCP_URL}. Installed models: {listed}. '
-        f'Set OLLAMA_MODEL_NAME_TRIAGE in config.py to one of these, or pull the missing model.'
+        f'Point OLLAMA_MODEL_NAME_TRIAGE (utils_tools_n_agents_common.models) at one of these, or pull the missing model.'
     )
 
 

@@ -39,6 +39,7 @@ from fakes import chat_reply
 from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_LOW,
     ANTHROPIC_MODEL_NAME_MEDIUM,
+    OLLAMA_MODEL_NAME_TRIAGE,
     OPENROUTER_MODEL_NAME_DEFAULT_AGENTIC,
     OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
     OPENROUTER_MODEL_NAME_SCRAPER,
@@ -1948,7 +1949,7 @@ async def test_rate_job_dispatches_to_openrouter(monkeypatch):
 
 
 async def test_rate_job_dispatches_to_ollama(monkeypatch):
-    monkeypatch.setattr(agent, 'MODEL_NAME_RATING', config.OLLAMA_MODEL_NAME_TRIAGE)
+    monkeypatch.setattr(agent, 'MODEL_NAME_RATING', OLLAMA_MODEL_NAME_TRIAGE)
 
     async def fake_rate(system_prompt, user_prompt, model=''):
         return {'rating': 3, 'company': 'Acme', 'title': 'Engineer', 'reasoning': 'ok', 'summary': 'acme_engineer'}
@@ -2507,7 +2508,7 @@ async def test_preflight_local_model_is_silent_when_server_is_down(monkeypatch):
 
 async def test_configured_local_model_is_a_concrete_tag():
     '''`:latest` is the tag that vanished on a re-pull; pin a concrete one.'''
-    assert not config.OLLAMA_MODEL_NAME_TRIAGE.endswith(':latest')
+    assert not OLLAMA_MODEL_NAME_TRIAGE.endswith(':latest')
 
 
 def test_local_model_missing_alert_reaches_run_health():
@@ -2605,7 +2606,7 @@ async def test_generate_local_live():
     _require_llm_server(8002)
     # config.OLLAMA_MODEL_NAME_TRIAGE, never a hardcoded copy: this test's whole job is to catch that tag
     # going stale, and a test carrying its own duplicate of the value tracks nothing.
-    response = await triage.generate_local('Reply with exactly: OK', model=config.OLLAMA_MODEL_NAME_TRIAGE, max_tokens=500, purpose_slug='test-live')
+    response = await triage.generate_local('Reply with exactly: OK', model=OLLAMA_MODEL_NAME_TRIAGE, max_tokens=500, purpose_slug='test-live')
     assert response.strip() != ''
 
 

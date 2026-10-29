@@ -103,16 +103,18 @@ LLM_MCP_CALL_TIMEOUT_SECONDS = 300.0
 # The reference summary (a ~160k-char prompt) keeps the longer cap.
 LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS = 180.0
 # Machine-local Ollama tag for Stage 2c triage (one cheap 1-5 JSON score, free and fast —
-# deliberately NOT sized to a 20-35B tier): granite4.1:3b measures 65.9 tok/s / 3.9s cold start /
-# 2.1GB on this machine and advertises structured JSON output as a first-class capability.
+# deliberately NOT sized to a 20-35B tier).
 #
-# This is a MACHINE-LOCAL Ollama tag and it can vanish without warning: `qwen3.6:latest` sat here
+# Defined once in utils_tools_n_agents_common.models (OLLAMA_MODEL_NAME_TRIAGE) — the single
+# place any project may define a model value, so every consumer references
+# the same tag and a swap is one reviewable edit. The 2026-10-28 evaluation that picked the
+# current model (and rejected LFM2.5-2.6B / qwen3.5:9b / ministral-3:3b, with probe numbers)
+# is recorded on the const in that file.
+#
+# The tag is machine-local and can vanish without warning: `qwen3.6:latest` sat here
 # until a re-pull replaced it with `qwen3.6:27b-mlx`/`35b-mlx`, and Stage 2c triage then failed open
 # on every job for ten days while the run log said only "unhandled errors in a TaskGroup". That is
 # what preflight_local_model() in triage.py now catches, once per run, naming what IS installed.
-# The OLLAMA_ prefix is the one place that says "machine-local tag" — unlike the OpenRouter-routed
-# consts from utils_tools_n_agents_common.models, this value is defined here and nowhere else.
-OLLAMA_MODEL_NAME_TRIAGE = 'granite4.1:3b'
 # Single-call OpenRouter tasks and the extract loop use MODEL_NAME_SINGLE_TURN, defined below
 # (2026-10-18: a project choice, no longer the shared glm default); scraping uses the shared
 # OPENROUTER_MODEL_NAME_SCRAPER from utils_tools_n_agents_common.models.
