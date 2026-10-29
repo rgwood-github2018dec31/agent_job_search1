@@ -32,6 +32,7 @@ from agentic_job_search.config import (
     LOCAL_LLM_TEMPERATURE,
     LOG_SNIPPET_MAX_CHARS,
     MODEL_NAME_SINGLE_TURN,
+    RATING_TEMPERATURE,
     TRIAGE_THRESHOLD,
 )
 from agentic_job_search.endpoint_pin import endpoint_failed, http_status_of, routing_for
@@ -182,14 +183,14 @@ def _field(data: dict, key: str, kinds: type | tuple[type, ...], raw: str) -> An
 
 async def chat_openrouter(
     prompt: str, system: str = '', model: str = MODEL_NAME_SINGLE_TURN, max_tokens: int | None = None,
-    timeout_seconds: float = LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
+    timeout_seconds: float = LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS, temperature: float | None = None,
 ) -> ChatReply:
     '''One completion via the OpenRouter MCP server, recorded in the current Job Trace in full:
     prompt, reply or error, who served it, tokens, cost and latency (see _chat_openrouter).'''
     call_site = job_trace.caller_name()
     started = time.monotonic()
     try:
-        reply = await _chat_openrouter(prompt, system, model, max_tokens, timeout_seconds)
+        reply = await _chat_openrouter(prompt, system, model, max_tokens, timeout_seconds, temperature)
     except Exception as ex:
         job_trace.record('llm_call', transport='openrouter', call_site=call_site, model=model, system=system,
                          prompt=prompt, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
@@ -203,6 +204,7 @@ async def chat_openrouter(
 
 async def _chat_openrouter(
     prompt: str, system: str, model: str, max_tokens: int | None, timeout_seconds: float,
+    temperature: float | None = None,
 ) -> ChatReply:
     """One completion via the OpenRouter MCP server, with who served it (ChatReply).
 
@@ -224,6 +226,9 @@ async def _chat_openrouter(
     args = {'messages': messages, 'model': model}
     if max_tokens is not None:
         args['max_tokens'] = max_tokens
+    # None is not sent: the provider's default applies.
+    if temperature is not None:
+        args['temperature'] = temperature
     retried = False
     while True:
         routing = routing_for(model)
@@ -481,11 +486,12 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
     '''
     prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}'
     try:
-        reply = await chat_openrouter(prompt, system=system_prompt, model=model)
+        reply = await chat_openrouter(prompt, system=system_prompt, model=model, temperature=RATING_TEMPERATURE)
     except TruncatedResponseError as ex:
         logger.warning(f'Rating call truncated, retrying once with max_tokens={_TRUNCATION_RETRY_MAX_TOKENS}: {ex}')
         reply = await chat_openrouter(
-            prompt, system=system_prompt, model=model, max_tokens=_TRUNCATION_RETRY_MAX_TOKENS
+            prompt, system=system_prompt, model=model, max_tokens=_TRUNCATION_RETRY_MAX_TOKENS,
+            temperature=RATING_TEMPERATURE,
         )
     try:
         return parse_rating_reply(reply.content), reply.cost_usd

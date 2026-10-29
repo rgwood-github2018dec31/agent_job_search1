@@ -834,6 +834,9 @@ PAGE_SECTION_SIGNATURE_MAX_WORDS = 8
 
 # Local LLM sampling: low for the 1-5 triage score and JSON answers, which should be repeatable.
 LOCAL_LLM_TEMPERATURE = 0.2
+# OpenRouter rating calls. Unset, the provider's default applied, and the same job given twice
+# changed its rating on 17 of 60 jobs and its notify decision on 8 (2026-10-28).
+RATING_TEMPERATURE = 0.0
 
 # The run's sleep watcher (system_sleep.py) ticks this often and reports a wall-clock step longer
 # than the tick by at least SLEEP_GAP_MIN_SECONDS: on 2026-10-14 a closed lid stopped the run for

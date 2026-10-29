@@ -8119,8 +8119,11 @@ async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
     scored 5 was lost that way on 2026-09-03.'''
     attempts = []
 
-    async def fake_chat(prompt, system='', model='', max_tokens=None):
+    temperatures = []
+
+    async def fake_chat(prompt, system='', model='', max_tokens=None, temperature=None):
         attempts.append(max_tokens)
+        temperatures.append(temperature)
         if len(attempts) == 1:
             raise triage.TruncatedResponseError('truncated', max_tokens=None)
         return chat_reply('{"rating": 5, "reasoning": "great"}', 0.002)
@@ -8130,6 +8133,23 @@ async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
     assert result['rating'] == 5
     assert len(attempts) == 2, 'exactly one retry'
     assert attempts[0] is None and attempts[1] == triage._TRUNCATION_RETRY_MAX_TOKENS
+    assert temperatures == [triage.RATING_TEMPERATURE] * 2, 'the retry rates as steadily as the first try'
+
+
+async def test_chat_openrouter_sends_a_temperature_only_when_given(monkeypatch):
+    '''Unset, the provider's default applied to every rating, and the same job given twice
+    changed its notify decision on 8 of 60 jobs (2026-10-28).'''
+    sent = []
+
+    async def capture(url, tool, args, timeout_seconds=None):
+        sent.append(args)
+        return json.dumps({'ok': True, 'content': 'x', 'cost_usd': 0.0, 'finish_reason': 'stop'})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', capture)
+    await triage.chat_openrouter('hi')
+    await triage.chat_openrouter('hi', temperature=0.0)
+    assert 'temperature' not in sent[0]
+    assert sent[1]['temperature'] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -11683,7 +11703,7 @@ UNCLOSED_ARRAY_REPLY = '{"rating": 5, "reasoning": "near-perfect", "warnings": [
 
 
 async def test_rate_with_openrouter_names_a_malformed_reply_and_does_not_repair_it(monkeypatch):
-    async def fake_chat(prompt, system='', model='', max_tokens=None):
+    async def fake_chat(prompt, system='', model='', max_tokens=None, temperature=None):
         return chat_reply(UNCLOSED_ARRAY_REPLY, 0.002)
 
     monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
@@ -11710,7 +11730,7 @@ def _rating_models(monkeypatch, replies: dict[str, str]) -> list[str]:
     monkeypatch.setattr(agent, 'MODEL_NAME_RATING_FALLBACKS', ('vendor/second', 'vendor/third'))
     monkeypatch.setattr(agent, 'route_for', lambda model: 'openrouter')
 
-    async def fake_chat(prompt, system='', model='', max_tokens=None):
+    async def fake_chat(prompt, system='', model='', max_tokens=None, temperature=None):
         asked.append(model)
         return chat_reply(replies[model], 0.002)
 
