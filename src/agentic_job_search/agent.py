@@ -47,6 +47,7 @@ from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_HIGH,
     ANTHROPIC_MODEL_NAME_LOW,
     ANTHROPIC_MODEL_NAME_MEDIUM,
+    OLLAMA_MODEL_NAME_TRIAGE,
     route_for,
 )
 from utils_tools_n_agents_common.telegram_client import send_message as telegram_send_message
@@ -62,6 +63,7 @@ from agentic_job_search import (
     job_trace,
     location,
     location_review,
+    rating_inputs,
     scrape_openrouter,
     system_sleep,
 )
@@ -109,6 +111,7 @@ from agentic_job_search.config import (
     PLAYWRIGHT_STOP_TIMEOUT_SECONDS,
     PROCESS_RSS_PROBE_TIMEOUT_SECONDS,
     RATING_AUTO_REJECT,
+    RATING_TEMPERATURE,
     REFERENCE_JOB_PROMPT_MAX_CHARS,
     REFERENCE_SUMMARY_LIMIT_CHARS,
     REFERENCE_SUMMARY_MAX_CHARS,
@@ -221,6 +224,8 @@ BROWSER_PROFILE_DIR = Path.home() / '.linkedin-agent-profile'
 # Playwright MCP snapshot/screenshot output — kept out of the repo tree
 PLAYWRIGHT_OUTPUT_DIR = Path(tempfile.gettempdir()) / 'linkedin-agent-playwright-output'
 REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
+# Every input of the rating call, saved once per version for the Job Trace to link (rating_inputs.py).
+RATING_INPUTS_DIR = RUN_DIR / 'rating_inputs'
 
 
 async def _send_pipeline_notification(text: str) -> bool:
@@ -1072,6 +1077,11 @@ def _reference_job_texts() -> list[str]:
     ]
 
 
+def reference_job_files() -> list[str]:
+    '''The applied-jobs file names behind _reference_job_texts(), in the same order.'''
+    return tools_module._reference_job_files[:MAX_REFERENCE_JOBS]
+
+
 def build_reference_block() -> str:
     texts = _reference_job_texts()
     if not texts:
@@ -1120,21 +1130,22 @@ class ReferenceSummaryTooLongError(RuntimeError):
 
 
 # Verify Source Reference: exempt — a summary is a condensation that feeds the rater a profile, never a gate or a figure.
-async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict | None) -> str:
-    """One provider's answer to `prompt`. Raises whatever the provider raised."""
+async def _reference_summary_from(provider: str, prompt: str, stage_stats: dict | None) -> tuple[str, str]:
+    """One provider's answer to `prompt` and the model that gave it. Raises whatever the provider raised."""
     if provider == 'openrouter':
         reply = await chat_openrouter(prompt, timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
         if stage_stats is not None:
             stage_stats['cost'] += reply.cost_usd
         logger.debug(f'Reference summary from OpenRouter: {reply.describe()}')
-        return reply.content
+        return reply.content, f'{reply.model} ({reply.provider})'
     if provider == 'ollama':
-        return await generate_local(prompt, purpose_slug=LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY)
-    return await _summarize_references_anthropic(prompt, stage_stats)
+        return (await generate_local(prompt, purpose_slug=LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY),
+                OLLAMA_MODEL_NAME_TRIAGE)
+    return await _summarize_references_anthropic(prompt, stage_stats), ANTHROPIC_MODEL_NAME_LOW
 
 
-async def _ask_reference_providers(prompt: str, stage_stats: dict | None) -> tuple[str, str]:
-    """(summary, provider) from the first provider that answers; ('', '') when all three fail.
+async def _ask_reference_providers(prompt: str, stage_stats: dict | None) -> tuple[str, str, str]:
+    """(summary, provider, model) from the first provider that answers; ('', '', '') when all three fail.
 
     Provider chain: OpenRouter MCP -> local Ollama MCP -> Anthropic Haiku. Kept as a chain rather
     than a loop so the retry below can re-ask the SAME provider that produced the over-long answer.
@@ -1142,12 +1153,13 @@ async def _ask_reference_providers(prompt: str, stage_stats: dict | None) -> tup
     last: Exception | None = None
     for provider in ('openrouter', 'ollama', 'anthropic'):
         try:
-            return await _reference_summary_from(provider, prompt, stage_stats), provider
+            summary, model = await _reference_summary_from(provider, prompt, stage_stats)
+            return summary, provider, model
         except Exception as ex:
             last = ex
             logger.warning(f'Reference summary via {provider} failed: {ex}')
     logger.error(f'Reference summary failed on all providers, using full reference block: {last}')
-    return '', ''
+    return '', '', ''
 
 
 async def _stop_over_long_reference_summary(length: int, provider: str, reason: str) -> NoReturn:
@@ -1221,7 +1233,7 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
         f'not as prose about each individual job.'
     )
 
-    summary, provider = await _ask_reference_providers(prompt, stage_stats)
+    summary, provider, model = await _ask_reference_providers(prompt, stage_stats)
     summary = summary.strip()
     if not summary:
         return build_reference_block()
@@ -1241,7 +1253,8 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
             f'rewritten profile only, with no preamble.'
         )
         try:
-            shorter = (await _reference_summary_from(provider, retry_prompt, stage_stats)).strip()
+            shorter, model = await _reference_summary_from(provider, retry_prompt, stage_stats)
+            shorter = shorter.strip()
         except Exception as ex:
             await _stop_over_long_reference_summary(
                 len(summary), provider, f'failed ({unwrap_exception(ex)})')
@@ -1255,7 +1268,10 @@ async def build_reference_summary(stage_stats: dict | None = None) -> str:
     logger.info(f'Reference summary: {len(combined)} chars → {len(summary)} chars via {provider}')
     REFERENCE_SUMMARY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     REFERENCE_SUMMARY_CACHE_PATH.write_text(
-        yaml.dump({'hash': corpus_hash_md5, 'provider': provider, 'summary': summary}, default_flow_style=False),
+        # How it was made, for Record Rating Inputs: the cache alone said only `openrouter` until 2026-10-29.
+        yaml.dump({'hash': corpus_hash_md5, 'provider': provider, 'model': model,
+                   'generated_on': date.today().isoformat(), 'asked_chars': REFERENCE_SUMMARY_MAX_CHARS,
+                   'sources': reference_job_files(), 'summary': summary}, default_flow_style=False, allow_unicode=True),
         encoding='utf-8',
     )
     return _wrap_reference_summary(summary, len(texts))
@@ -4276,6 +4292,36 @@ def format_grouped_notification(group: NotificationGroup) -> str:
     return '\n\n'.join(sections)
 
 
+def record_rating_inputs(candidate: dict, evaluator_prompt: str, extract_text: str) -> None:
+    '''Job Trace step `rating_inputs`: where each input of the coming rating call is saved, and the rater's settings.
+
+    A failure to save costs the links, not the job, so it is logged and recorded instead of raised.
+    '''
+    posting_path = tools_module.rater_posting_path(candidate)
+    try:
+        saved = rating_inputs.save_run_inputs(evaluator_prompt, RATING_INPUTS_DIR, REFERENCE_SUMMARY_CACHE_PATH)
+        posting_path.parent.mkdir(parents=True, exist_ok=True)
+        posting_path.write_text(extract_text, encoding='utf-8')
+    except Exception as ex:
+        logger.warning(f"Rating inputs for job {candidate.get('job_id')} not all saved ({RATING_INPUTS_DIR}, "
+                       f'{posting_path}): {type(ex).__name__}: {ex}')
+        saved = {'error': f'{type(ex).__name__}: {ex}'}
+    job_trace.record(
+        'rating_inputs', **saved,
+        job_posting={'path': str(posting_path), 'chars': len(extract_text),
+                     'cut_from': str(tools_module.raw_posting_path(candidate))},
+        user_message_chars=len(rating_user_message(extract_text)),
+        rater={'models': list(dict.fromkeys((MODEL_NAME_RATING, *MODEL_NAME_RATING_FALLBACKS))),
+               'temperature': RATING_TEMPERATURE, 'output_fields': RATING_OUTPUT_SCHEMA['required']},
+    )
+
+
+def rating_user_message(extract_text: str) -> str:
+    '''The rater's user message: the posting between markers, like triage's, so the Job Audit can
+    name it as the JOB POSTING section (2026-10-29: unmarked, it showed as one anonymous message).'''
+    return f'Evaluate this job posting:\n\n--- JOB POSTING ---\n{extract_text}\n--- END JOB POSTING ---'
+
+
 async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_stats: dict,
                                model: str = ANTHROPIC_MODEL_NAME_MEDIUM) -> dict:
     options = ClaudeAgentOptions(
@@ -4291,7 +4337,7 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
         cwd=str(PROJECT_DIR),
     )
     structured: dict | None = None
-    async with aclosing(sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options)) as stream:
+    async with aclosing(sdk_query(prompt=rating_user_message(extract_text), options=options)) as stream:
         async for msg in stream:
             if isinstance(msg, ResultMessage):
                 cost_delta = accumulate_stage_stats(stage_stats, msg)
@@ -4299,7 +4345,7 @@ async def _rate_with_anthropic(evaluator_prompt: str, extract_text: str, stage_s
                 if msg.structured_output:
                     structured = msg.structured_output
     job_trace.record('llm_call', transport='claude_agent_sdk', call_site='_rate_with_anthropic', model=model,
-                     system=evaluator_prompt, prompt=f'Evaluate this job posting:\n\n{extract_text}',
+                     system=evaluator_prompt, prompt=rating_user_message(extract_text),
                      structured_output=structured)
     if structured is None:
         raise RuntimeError('Anthropic rating call returned no structured output')
@@ -4311,12 +4357,12 @@ async def _rate_with(model: str, evaluator_prompt: str, extract_text: str, stage
     route = route_for(model)
     if route == 'openrouter':
         result, cost_usd = await rate_with_openrouter(
-            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=model)
+            evaluator_prompt, rating_user_message(extract_text), model=model)
         stage_stats['cost'] += cost_usd
         return result
     if route == 'ollama':
         return await rate_with_ollama(
-            evaluator_prompt, f'Evaluate this job posting:\n\n{extract_text}', model=model)
+            evaluator_prompt, rating_user_message(extract_text), model=model)
     return await _rate_with_anthropic(evaluator_prompt, extract_text, stage_stats, model=model)
 
 
@@ -4787,6 +4833,7 @@ async def _evaluate_candidates(
                     )
                     continue
 
+            record_rating_inputs(candidate, evaluator_prompt, extract_text)
             rating_started = time.monotonic()
             result = await rate_job(evaluator_prompt, extract_text, stage_stats['rating'])
             rating_seconds = time.monotonic() - rating_started
@@ -4992,7 +5039,7 @@ async def _rate_with_opus(evaluator_prompt: str, extract_text: str, stage_stats:
         },
         cwd=str(PROJECT_DIR),
     )
-    async with aclosing(sdk_query(prompt=f'Evaluate this job posting:\n\n{extract_text}', options=options)) as stream:
+    async with aclosing(sdk_query(prompt=rating_user_message(extract_text), options=options)) as stream:
         async for msg in stream:
             if isinstance(msg, ResultMessage):
                 accumulate_stage_stats(stage_stats, msg)

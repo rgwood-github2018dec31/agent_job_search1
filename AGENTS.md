@@ -150,6 +150,7 @@ src/agentic_job_search/
   evidence.py                     # Verify Source Reference: a prediction stands only on a citation found in its input
   job_trace.py                    # Job Trace: every step of one Stage 2 job, recorded via a ContextVar
   job_audit.py                    # Write Job Audit: choose one rated job per run, render its trace as a PDF
+  rating_inputs.py                # Record Rating Inputs: save each part of the rater's input once, for the trace to link
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
   minimal_archive.py              # The de-cluttered page as small self-contained .min.html + .min.pdf beside the full archive
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
@@ -192,7 +193,7 @@ run_dir/
   fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
   company_identities.yaml         # Company identity per LinkedIn slug and per name (domain/parent/source); hand-editable, `source: manual` is kept
-  raw_postings/                   # Per job: .html page archive (JS-free) + .min.html/.min.pdf minimal archive + .txt text the extractor read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
+  raw_postings/                   # Per job: .html page archive (JS-free) + .min.html/.min.pdf minimal archive + .txt text the extractor read + .rater_posting.txt the posting the rater read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
@@ -201,6 +202,7 @@ run_dir/
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
   job_audits/                     # One Job Audit PDF per run: every step that decided one job's rating
+  rating_inputs/                  # The rater's JOB_REQUIREMENTS.md, ideal-role profile (with provenance), instructions and system message, one file per md5
   replays/                        # --job-ids output (job-ids-{timestamp}/ with saved postings and the REPLAY_*_FILENAME files) and scripts/replay_evidence.py reports
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
 ```

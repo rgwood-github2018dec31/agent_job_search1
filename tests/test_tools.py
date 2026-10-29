@@ -10714,6 +10714,14 @@ def test_scraper_evaluate_result_over_the_shared_cap_still_warns(monkeypatch, ca
     assert any('Truncating browser_evaluate result' in m for m in _warnings(caplog))
 
 
+def test_parse_posting_date_counts_back_from_when_the_page_was_read():
+    '''The Job Audit shows a week-old trace's "1 day ago" as the day before the page read, not yesterday.'''
+    read_at = datetime(2026, 10, 29, 0, 14)
+    assert tools.parse_posting_date('1 day ago', as_of=read_at) == date(2026, 10, 28)
+    assert tools.parse_posting_date('Reposted 3 weeks ago', as_of=read_at) == date(2026, 10, 8)
+    assert tools.parse_posting_date('just now', as_of=read_at) == date(2026, 10, 29)
+
+
 def test_parse_posting_date_raises_on_an_unknown_format():
     assert tools.parse_posting_date('') is None
     assert tools.parse_posting_date('2026-09-01') == date(2026, 9, 1)
@@ -11718,6 +11726,20 @@ def test_the_rater_is_not_asked_for_company_or_title():
     from agentic_job_search.triage import RATING_JSON_INSTRUCTIONS
     assert not {'company', 'title'} & set(agent.RATING_OUTPUT_SCHEMA['properties'])
     assert '"company"' not in RATING_JSON_INSTRUCTIONS and '"title"' not in RATING_JSON_INSTRUCTIONS
+
+
+async def test_stage_2_traces_every_input_of_the_rating_call(monkeypatch):
+    '''Record Rating Inputs: the trace links each part the rater received, saved as sent.'''
+    from agentic_job_search import job_trace
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+    candidate = _make_candidate(job_id='220', company='Acme')
+    await _run_stage2(candidate, {})
+    step = next(s for s in job_trace.load(tools.job_trace_path(candidate)) if s['kind'] == 'rating_inputs')
+    for kind in ('evaluator_instructions', 'system_message', 'job_posting'):
+        assert Path(step[kind]['path']).exists(), kind
+    assert 'Acme' in Path(step['job_posting']['path']).read_text(encoding='utf-8')
+    assert step['rater']['output_fields'] == agent.RATING_OUTPUT_SCHEMA['required']
 
 
 async def test_stage_2_skips_triage_while_it_is_switched_off(monkeypatch):

@@ -423,6 +423,14 @@ def _isolated_raw_postings(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, 'RAW_POSTINGS_DIR', tmp_path / 'raw_postings')
 
 
+@pytest.fixture(autouse=True)
+def _isolated_rating_inputs(monkeypatch, tmp_path):
+    """No test may write the rater's inputs into the developer's real run_dir/rating_inputs/."""
+    from agentic_job_search import agent, rating_inputs
+    monkeypatch.setattr(agent, 'RATING_INPUTS_DIR', tmp_path / 'rating_inputs')
+    monkeypatch.setattr(rating_inputs, '_saved', {})
+
+
 # Markers whose tests are meant to reach the local LLM MCP servers.
 LIVE_MARKERS = ('live', 'live_agent_claude', 'network')
 

@@ -121,6 +121,9 @@ _company_match_verdicts: dict[str, str | None] = {}
 # Per-page extracted text of each in-horizon applied job, newest first, for the reference profile.
 # Kept as pages until a prompt serializes it (text_budget.pages_to_prompt), so size is reportable.
 _reference_job_pages: list[list[str]] = []
+# The applied-jobs file each entry of _reference_job_pages came from, in the same order, so the
+# ideal-role profile can name its sources (Record Rating Inputs).
+_reference_job_files: list[str] = []
 # In-horizon applied-job records: filename, applied_date, company, job_title, is_agency, end_client
 _applied_jobs: list[dict] = []
 # Set by a --job-ids replay: Stage 2 saves into this directory and writes notifications there, and
@@ -654,6 +657,11 @@ def raw_posting_path(candidate: dict, captured_on: date | None = None) -> Path:
 def job_trace_path(candidate: dict, captured_on: date | None = None) -> Path:
     """Where this job's Job Trace is written: beside its raw posting, so it is pruned with it."""
     return raw_posting_path(candidate, captured_on).with_suffix('.trace.jsonl')
+
+
+def rater_posting_path(candidate: dict, captured_on: date | None = None) -> Path:
+    '''Where the job posting text the rater read is kept (Record Rating Inputs), pruned with the raw posting.'''
+    return raw_posting_path(candidate, captured_on).with_suffix('.rater_posting.txt')
 
 
 def save_raw_posting(candidate: dict, text: str, source: str, chars_sent_to_model: int) -> Path | None:
@@ -1267,7 +1275,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     metadata LLM call only runs for new or changed PDFs. Records applied to longer ago than
     APPLIED_JOBS_HORIZON_DAYS stay on disk but are not read into any global.
     '''
-    global _applied_companies, _applied_identities, _reference_job_pages, _applied_jobs
+    global _applied_companies, _applied_identities, _reference_job_pages, _reference_job_files, _applied_jobs
 
     applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
     index_file = index_path or (applied_to_dir / APPLIED_JOBS_INDEX_NAME)
@@ -1277,7 +1285,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     cutoff = date.today() - timedelta(days=APPLIED_JOBS_HORIZON_DAYS)
 
     companies: dict[str, str] = {}  # company_name -> pdf filename
-    texts: list[tuple[date, list[str]]] = []
+    texts: list[tuple[date, str, list[str]]] = []
     jobs: list[dict] = []
     index_dirty = False
     total = 0
@@ -1334,7 +1342,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         if metadata['end_client']:
             companies[metadata['end_client']] = pdf.name
         if any(pages):
-            texts.append((applied_date, pages))
+            texts.append((applied_date, pdf.name, pages))
         jobs.append({'filename': pdf.name, 'applied_date': applied_date, **metadata})
 
     if index_dirty:
@@ -1349,7 +1357,9 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     # records aged out of the horizon, so the rater calibrated against jobs the user had moved on
     # from. Sorted by applied_date rather than left in filename order, because a legacy file
     # without a YYYY-MM-DD prefix sorts arbitrarily.
-    _reference_job_pages = [pages for _date, pages in sorted(texts, key=lambda pair: pair[0], reverse=True)]
+    newest_first = sorted(texts, key=lambda entry: entry[0], reverse=True)
+    _reference_job_pages = [pages for _date, _name, pages in newest_first]
+    _reference_job_files = [name for _date, name, _pages in newest_first]
     _applied_jobs = jobs
     logger.info(
         f'Loaded {len(jobs)} applied job(s) within {APPLIED_JOBS_HORIZON_DAYS} days '
@@ -2017,7 +2027,7 @@ _JUST_POSTED_PHRASES = ('just now', 'today', 'moments ago')
 DAYS_PER_MONTH_APPROX = 30
 
 
-def parse_posting_date(date_posted: str | None) -> date | None:
+def parse_posting_date(date_posted: str | None, as_of: datetime | None = None) -> date | None:
     """Parse an absolute (YYYY-MM-DD) or relative ('4 days ago') posting date.
 
     The first "N units ago" anywhere in the string wins, so prefixes ("Reposted") and trailing
@@ -2025,6 +2035,9 @@ def parse_posting_date(date_posted: str | None) -> date | None:
     phrase is what LinkedIn shows; a calendar date beside it is the extractor's own arithmetic,
     and on 2026-10-16 '2025-10-14 (posted 16-17 hours ago)' got a 17-hour-old job hard-rated 1
     as stale.
+
+    A relative date counts back from `as_of`, default now: the Job Audit counts from when the page
+    was read, since "1 day ago" in a week-old trace is not yesterday.
 
     None when no date was given. Raises ValueError for a non-empty string in no known format, so
     the caller, which knows the job, decides how to report it.
@@ -2037,14 +2050,14 @@ def parse_posting_date(date_posted: str | None) -> date | None:
         n, unit = int(m.group('count')), m.group('unit')
         deltas = {'minute': timedelta(minutes=n), 'hour': timedelta(hours=n), 'day': timedelta(days=n),
                   'week': timedelta(weeks=n), 'month': timedelta(days=n * DAYS_PER_MONTH_APPROX)}
-        return (datetime.now() - deltas[unit]).date()
+        return ((as_of or datetime.now()) - deltas[unit]).date()
     if iso := _LEADING_ISO_DATE_RE.match(s):
         try:
             return date.fromisoformat(iso.group('iso'))
         except ValueError as ex:
             raise ValueError(f'posting date {date_posted!r} looks ISO but is not a real date: {ex}') from ex
     if s in _JUST_POSTED_PHRASES:
-        return date.today()
+        return (as_of or datetime.now()).date()
     raise ValueError(
         f'posting date {date_posted!r} is neither YYYY-MM-DD, "N minutes/hours/days/weeks/months ago", '
         f'nor one of {_JUST_POSTED_PHRASES}'

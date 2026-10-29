@@ -29,7 +29,7 @@ import logging
 import re
 import sys
 import textwrap
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -60,6 +60,7 @@ from agentic_job_search import agent as A  # noqa: E402
 from agentic_job_search import config as C  # noqa: E402
 from agentic_job_search import job_trace as T  # noqa: E402
 from agentic_job_search import linkedin_page as LP  # noqa: E402
+from agentic_job_search import tools_generic as TG  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 
 RUN_DIR = PROJECT_DIR / 'run_dir'
@@ -373,6 +374,14 @@ VALUE_CHARS = 70        # one value inside a summarised object
 LIST_ITEMS_SHOWN = 3    # items of a list shown before "+N more"
 KEY_LINES_SHOWN = 6     # 'Key: value' lines of a prompt named in its summary
 SECTION_MARKER_RE = re.compile(r'^--- (?!END )(.+?) ---$', re.M)
+# A prompt section's name -> the rating_inputs kind it was saved as (agentic_job_search.rating_inputs).
+RATING_INPUT_SECTIONS = (
+    ('JOB_REQUIREMENTS.md', 'job_requirements'),
+    ('IDEAL ROLE PROFILE', 'ideal_role_profile'),
+    ('REFERENCE JOBS', 'ideal_role_profile'),
+    ('JOB POSTING', 'job_posting'),
+    ('instructions', 'evaluator_instructions'),
+)
 KEY_LINE_RE = re.compile(r'^([A-Z][A-Za-z /()-]{1,30}): (\S.{0,120})$', re.M)
 
 
@@ -431,23 +440,47 @@ def kilo_chars(n: int) -> str:
     return f'{n / CHARS_PER_KILO:.1f}k chars'
 
 
-def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None) -> list[tuple[str, object]]:
-    '''What the model was sent: each message and its size, the sections of the user message, the facts in its header.
+def message_sections(text: str) -> list[tuple[str, int]]:
+    '''(name, chars) of each `--- NAME ---` … `--- END NAME ---` section of a message.'''
+    sections = []
+    for marker in SECTION_MARKER_RE.finditer(text):
+        # The end marker drops the start marker's note: '--- IDEAL ROLE PROFILE (distilled …) ---'
+        # closes with '--- END IDEAL ROLE PROFILE ---'.
+        end = text.find(f"--- END {marker.group(1).split(' (')[0]} ---", marker.end())
+        sections.append((marker.group(1), len(text[marker.end():end if end >= 0 else len(text)].strip())))
+    return sections
+
+
+def saved_as(name: str, saved_files: dict[str, str] | None) -> str:
+    '''" = <file>" when a section is one Record Rating Inputs saved, else "".'''
+    for prefix, kind in RATING_INPUT_SECTIONS:
+        if name.startswith(prefix) and (saved_files or {}).get(kind):
+            return f' = {saved_files[kind]}'
+    return ''
+
+
+def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None,
+                  saved_files: dict[str, str] | None = None) -> list[tuple[str, object]]:
+    '''What the model was sent: each message and its size, the sections of each message, the facts in its header.
 
     `page_text` is (file name, chars, step number) of the text "Read job page" saved; a section of exactly
-    that size is named as that file.
+    that size is named as that file. `saved_files` maps a rating input kind to the file it was saved as.
     '''
     text = llm_input(step) or ''
     system = system_text(step)
     markers = list(SECTION_MARKER_RE.finditer(text))
-    sections = []
-    for marker in markers:
-        end = text.find(f'--- END {marker.group(1)} ---', marker.end())
-        sections.append((shorten(marker.group(1), 40), len(text[marker.end():end if end >= 0 else len(text)].strip())))
+    sections = [(shorten(name, 40), length) for name, length in message_sections(text)]
     head = text[:markers[0].start()] if markers else text
     pairs: list[tuple[str, object]] = []
     if system:
         pairs.append(('system message', kilo_chars(len(system))))
+        system_sections = message_sections(system)
+        for name, length in system_sections:
+            pairs.append((f'· system: {shorten(name, 40)}', kilo_chars(length) + saved_as(name, saved_files)))
+        if system_sections:
+            rest = len(system) - sum(length for _, length in system_sections)
+            pairs.append(('· system: instructions and markers',
+                          f'approx {kilo_chars(rest)}' + saved_as('instructions', saved_files)))
     pairs.append(('user message', kilo_chars(len(text))))
     if 'CLAIMS:' in head and (claims := _json_or_none(head.split('CLAIMS:', 1)[1].strip())):
         head = head.split('CLAIMS:', 1)[0]
@@ -459,7 +492,8 @@ def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None) -> 
         pairs.append(('· asks', shorten(head.strip().splitlines()[0] if head.strip() else '', 90)))
     for name, length in sections:
         same = page_text and length == page_text[1]
-        pairs.append((f'· {name}', kilo_chars(length) + (f' = {page_text[0]} from step {page_text[2]}' if same else '')))
+        pairs.append((f'· {name}', kilo_chars(length) + (f' = {page_text[0]} from step {page_text[2]}' if same else '')
+                      + saved_as(name, saved_files)))
     total = len(system) + len(text)
     tokens_in = provider_usage(step).get('prompt_tokens')
     if tool := tool_called(step):
@@ -544,11 +578,67 @@ def search_params(listing: dict, found: str) -> list[tuple[str, object]]:
     return [('search', found)]
 
 
+def posted_line(posted: str, page_step: dict) -> str:
+    '''The posting date as the page gave it, and the calendar date it means, counted from when the page was read.'''
+    if not posted:
+        return '?'
+    read_at = page_step.get('at')
+    try:
+        on = TG.parse_posting_date(posted, as_of=datetime.fromisoformat(read_at) if read_at else None)
+    except ValueError as ex:
+        return f'{posted} (not a date code can read: {ex})'
+    counted_from = f'page read {read_at[:len("YYYY-MM-DD HH:MM")].replace("T", " ")}' if read_at else 'today'
+    return f'{on.isoformat()} — "{posted}", counted from the {counted_from}' if on else posted
+
+
+def file_link(path: str) -> Link:
+    '''A clickable link to a local file, shown by its path under the project when it has one.'''
+    shown_as = str(Path(path).relative_to(PROJECT_DIR)) if Path(path).is_relative_to(PROJECT_DIR) else path
+    return Link(shown_as, Path(path).as_uri())
+
+
+def rater_inputs_section(inputs: dict) -> list:
+    '''Section 3: a link to each saved input of the rating call, how the profile was made, the rater's settings.'''
+    parts = [('JOB_REQUIREMENTS.md', 'job_requirements'), ('Ideal role profile', 'ideal_role_profile'),
+             ('Evaluator instructions', 'evaluator_instructions'), ('Job posting (user message)', 'job_posting'),
+             ('Whole system message', 'system_message')]
+    rows: list[tuple[str, str | Link]] = []
+    for name, kind in parts:
+        part = inputs.get(kind) or {}
+        if part.get('path'):
+            rows += [(name, file_link(part['path'])), ('', f"{part.get('chars', 0):,} chars")]
+        else:
+            rows.append((name, 'NOT SAVED' + (f" — {inputs['error']}" if inputs.get('error') else '')))
+    rater = inputs.get('rater') or {}
+    rows += [('Raters, in order', ', '.join(rater.get('models') or []) or '?'),
+             ('Temperature', str(rater.get('temperature'))),
+             ('Rater returns', ', '.join(rater.get('output_fields') or []) or '?')]
+    story = [body('The rater gets one system message (JOB_REQUIREMENTS.md, the ideal role profile and the '
+                  'evaluator instructions, in that order) and one user message (the job posting). Each was '
+                  'saved exactly as sent; the links open those files. A saved file is named by its md5, so '
+                  'every run that used the same version links the same file.'),
+             kv_table(rows)]
+    profile_path = Path((inputs.get('ideal_role_profile') or {}).get('path') or '')
+    if profile_path.is_file():
+        text = profile_path.read_text(encoding='utf-8')
+        header, _, profile = text.partition('---\n\n') if text.startswith('---\n') else ('', '', text)
+        story += [h2('How the ideal role profile was made'),
+                  note('agent.build_reference_summary takes the newest MAX_REFERENCE_JOBS applied jobs, strips '
+                       "LinkedIn's page furniture, and asks one model for a single profile of at most "
+                       'REFERENCE_SUMMARY_MAX_CHARS. It is cached under the md5 of those jobs and made again '
+                       'only when they change.'),
+                  label(f'VERBATIM — the provenance header of {profile_path.name}'),
+                  verbatim(header.removeprefix('---\n') or '(none)'),
+                  label('VERBATIM — the profile as the rater received it'), verbatim(profile)]
+    return story
+
+
 def step_by_step(steps: list[dict], found: str) -> list:
     '''Every prediction and check in order: who made it (a model, or code), its input and its output.'''
     rows = [('#', 'Step', 'Made by', 'Input', 'Output')]
     call = extractor_call = 0
     page_text = None
+    saved_files: dict[str, str] = {}
     for n, s in enumerate(steps, 1):
         kind = s['kind']
         if kind == 'origin':
@@ -571,7 +661,16 @@ def step_by_step(steps: list[dict], found: str) -> list:
             served = s.get('provider') or (s.get('routing') or {}).get('provider') or s.get('transport')
             row = (f"LLM call #{call}:\n{s.get('call_site')}\n{token_counts(s)}",
                    f"model {s.get('model')} ({served}), {s.get('seconds')}s",
-                   params(prompt_params(s, page_text)), params(reply_params(s)))
+                   params(prompt_params(s, page_text, saved_files if 'rat' in str(s.get('call_site')) else None)),
+                   params(reply_params(s)))
+        elif kind == 'rating_inputs':
+            saved_files = {k: Path(v['path']).name for k, v in s.items() if isinstance(v, dict) and v.get('path')}
+            rater = s.get('rater') or {}
+            row = ('Rating inputs saved', 'code',
+                   params([(k, f"{Path(v['path']).name} ({kilo_chars(v.get('chars') or 0)})")
+                           for k, v in s.items() if isinstance(v, dict) and v.get('path')]),
+                   params([('raters, in order', rater.get('models')), ('temperature', rater.get('temperature')),
+                           ('asks for', rater.get('output_fields')), ('error', s.get('error'))]))
         elif kind == 'evidence':
             verdicts = s.get('verdicts') or []
             source = str(s.get('source') or '')
@@ -807,6 +906,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
         Spacer(1, 4 * mm),
         kv_table([
             ('Job', job_title),
+            ('Posted', posted_line(fields.get('date_posted') or group_or(r'^Posted:\s*(.+)$', md, ''), page_step)),
             ('Posting', Link(url, url) if url.startswith('http') else url),
             *poster_rows(company, page_step, fields),
             ('Found by', found),
@@ -861,31 +961,20 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
               verbatim('\n'.join(log_lines_about(log_path, 'harvested ')) or '(none)')]
 
     # 3. Rater inputs
-    story += [PageBreak(), h1('3. The ideal-role profile the rater was calibrated against'), rule()]
-    story += [body('This is the distilled profile every rating in the run is calibrated against. It '
-                   'is shown here exactly as the rater received it, including any truncation marker '
-                   'the pipeline added — a marker means the model produced more than the pipeline '
-                   'was willing to pass on, and the text after the cut never reached the rater.')]
-    profile = ''
-    cache = RUN_DIR / 'reference_summary_cache.yaml'
-    if cache.exists():
-        import yaml
-        profile = str((yaml.safe_load(cache.read_text(encoding='utf-8')) or {}).get('summary') or '')
-    if not profile:
-        backups = sorted(Path('/tmp').glob('ref_cache_backup_*.yaml'))
-        if backups:
+    story += [PageBreak(), h1('3. Every input of the rating call'), rule()]
+    inputs = next((s for s in steps if s['kind'] == 'rating_inputs'), None)
+    if inputs is not None:
+        story += rater_inputs_section(inputs)
+    else:
+        story += [note('This trace has no rating_inputs step (recorded from 2026-10-29 on, and only for a job '
+                       'that reached the rater). The profile below is the one cached NOW, which may not be '
+                       'the one this run used.')]
+        cache = RUN_DIR / 'reference_summary_cache.yaml'
+        profile = ''
+        if cache.exists():
             import yaml
-            profile = str((yaml.safe_load(backups[-1].read_text(encoding='utf-8')) or {}).get('summary') or '')
-            story += [note(f'Read from {backups[-1]} — the live cache has since been invalidated.')]
-    if profile:
-        marker = re.search(r'\[truncated: kept (\d+) of (\d+) chars\]', profile)
-        story += [kv_table([
-            ('Profile length', f'{len(profile):,} chars'),
-            ('Asked for', f'{C.REFERENCE_SUMMARY_MAX_CHARS:,} chars'),
-            ('Truncated', f'YES — kept {marker.group(1)} of {marker.group(2)}'
-                          if marker else 'no'),
-        ])]
-    story += [label('VERBATIM — the profile block'), verbatim(profile or '(no cached profile found)')]
+            profile = str((yaml.safe_load(cache.read_text(encoding='utf-8')) or {}).get('summary') or '')
+        story += [label('VERBATIM — the cached profile'), verbatim(profile or '(no cached profile found)')]
 
     # 4. Page read
     story += [PageBreak(), h1('4. The page as the run read it'), rule()]
