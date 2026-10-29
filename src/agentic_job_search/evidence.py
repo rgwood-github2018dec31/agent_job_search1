@@ -236,15 +236,39 @@ CITATION_INSTRUCTION = (
 )
 
 
-def quote_properties(fields: tuple[str, ...]) -> dict[str, dict]:
-    '''The `<field>_quote` schema properties for `fields`.'''
-    return {
-        f'{name}{QUOTE_SUFFIX}': {
-            'type': 'string',
-            'description': f'Words of the source text that state {name}, copied as written',
-        }
-        for name in fields
-    }
+def quote_property(name: str) -> dict:
+    '''The `<field>_quote` schema property for field `name`.'''
+    return {'type': 'string',
+            'description': f'Words of the source text that state {name}, copied as written; required whenever {name} is filled'}
+
+
+def with_quotes(properties: dict[str, dict], fields: tuple[str, ...]) -> dict[str, dict]:
+    '''`properties` with each cited field's `<field>_quote` placed right after the field.
+
+    A model fills a schema in order. With every quote after every field (until 2026-10-28) it
+    reached the quotes last and skipped them: Hyra's extract cited none of its six fields, so each
+    went to an LLM relocation call (4,759 output tokens) and two were rejected.
+    '''
+    missing = [name for name in fields if name not in properties]
+    if missing:
+        raise ValueError(f'with_quotes: cited fields {missing} are not in the schema properties {list(properties)}')
+    out: dict[str, dict] = {}
+    for name, spec in properties.items():
+        out[name] = spec
+        if name in fields:
+            out[f'{name}{QUOTE_SUFFIX}'] = quote_property(name)
+    return out
+
+
+def is_filled(value: object) -> bool:
+    '''Whether a field value is a claim that needs a citation: True, or a non-empty string.'''
+    return value is True or (isinstance(value, str) and bool(value.strip()))
+
+
+def unquoted_fields(args: dict, fields: tuple[str, ...]) -> list[str]:
+    '''The cited fields a model filled in `args` without their `<field>_quote`.'''
+    quotes = quotes_from(args, fields)
+    return [name for name in fields if is_filled(args.get(name)) and not quotes[name]]
 
 
 def quotes_from(args: dict, fields: tuple[str, ...]) -> dict[str, str]:

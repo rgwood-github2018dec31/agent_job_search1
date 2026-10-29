@@ -1,6 +1,7 @@
 '''Write Job Audit: choosing the job, and a render failure costing the PDF, never the run.'''
 
 import importlib.util
+import json
 import logging
 import sys
 from datetime import datetime
@@ -81,7 +82,9 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
                          raw_posting=str(tmp_path / 'linkedin-4476053167.txt'), raw_posting_bytes=2359, text='PAGE')
         job_trace.record('llm_call', transport='openrouter', call_site='extract_job_page_openrouter', model='m',
                          system='RULES ' * 50, prompt='Company: Acme\n\n--- PAGE TEXT ---\n' + 'x' * 2137 + '\n--- END PAGE TEXT ---',
-                         reply='{"title": "T"}', seconds=1.0)
+                         raw_reply=json.dumps({'tool_calls': [{'function': {'name': 'submit_job_extract', 'arguments': '{"title": "T"}'}}],
+                                               'usage': {'prompt_tokens': 2000, 'completion_tokens': 30}}),
+                         tools_chars=5000, seconds=1.0)
         job_trace.record('llm_call', transport='openrouter', call_site='rate_with_openrouter', model='m',
                          prompt='FULL PROMPT ' * 400, reply='{"rating": 4}', cost_usd=0.001, seconds=1.0,
                          usage={'prompt_tokens': 1234, 'completion_tokens': 56})
@@ -110,8 +113,8 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
                      '2. removed clutter=1 section(s), 900 chars', '3. saved text=linkedin-4476053167.txt (2,137 chars, 2 KB)',
                      'tokens in=1,234 tokens out=56', 'rating=4', 'system message=300 chars (standing instructions)',
                      'user message=', 'chars before PAGE TEXT', '· Company=Acme',
-                     '· PAGE TEXT=2,137 chars = linkedin-4476053167.txt from step 2', 'total sent=',
-                     'tokens in≈'):
+                     '· PAGE TEXT=2,137 chars = linkedin-4476053167.txt from step 2', 'submit_job_extract tool definition=5,000 chars',
+                     'total sent=7,492 chars = 2,000 tokens in (about 3.7 chars per token)'):
         assert expected in ' '.join(text.split()), expected
     first_page_links = [a.get_object()['/A']['/URI'] for a in pypdf.PdfReader(out).pages[0].get('/Annots') or []]
     assert first_page_links == [candidate['url'], 'https://www.linkedin.com/company/acme/']

@@ -515,6 +515,11 @@ REPLAY_SUMMARY_FILENAME = 'summary.tsv'               # one row per requested jo
 
 # Stage 2 (evaluation) configuration
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10
+# Send a submit_job_extract that fills a cited field without its <field>_quote back to the model
+# once, asking for the quote or an empty field. Without it a missing quote costs an LLM relocation
+# call (Hyra, 2026-10-28: 4,759 output tokens, 32 s) or a false rejection. The first submit is kept
+# if the second never arrives.
+EXTRACT_RESUBMIT_UNQUOTED = True
 # Budget for the a11y snapshot on the FALLBACK path only (linkedin_page._read_snapshot, used when
 # the DOM capture fails or the description is missing). The normal path sends de-cluttered text,
 # measured 3-9K chars, and never needs a cut. One LinkedIn snapshot once lost 34,797 chars from

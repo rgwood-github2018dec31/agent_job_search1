@@ -17,6 +17,7 @@ from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 from agentic_job_search import job_trace
 from agentic_job_search.config import (
     EXTRACT_CITED_FIELDS,
+    EXTRACT_RESUBMIT_UNQUOTED,
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
     LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
@@ -26,7 +27,7 @@ from agentic_job_search.config import (
     STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
 )
 from agentic_job_search.endpoint_pin import endpoint_failed, routing_for
-from agentic_job_search.evidence import CITATION_INSTRUCTION, quote_properties, quotes_from
+from agentic_job_search.evidence import CITATION_INSTRUCTION, QUOTE_SUFFIX, quotes_from, unquoted_fields, with_quotes
 from agentic_job_search.text_budget import quote_for_error, snippet
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ OPENROUTER_EXTRACT_TOOLS = [
             ),
             'parameters': {
                 'type': 'object',
-                'properties': {
+                'properties': with_quotes({
                     'title': {'type': 'string'},
                     'company': {'type': 'string'},
                     'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
@@ -121,13 +122,15 @@ OPENROUTER_EXTRACT_TOOLS = [
                         'type': 'string',
                         'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
                     },
-                    **quote_properties(EXTRACT_CITED_FIELDS),
-                },
+                }, EXTRACT_CITED_FIELDS),
                 'required': ['title', 'company', 'description'],
             },
         },
     },
 ]
+
+# The tool definition is sent with every call and counted in its tokens in; the Job Audit shows its size.
+_TOOLS_CHARS = len(json.dumps(OPENROUTER_EXTRACT_TOOLS))
 
 _SUBMIT_REQUIRED_FIELDS = ('title', 'company', 'description')
 # Every other field, all optional, since a required field the model cannot observe pressures it to
@@ -169,7 +172,10 @@ async def extract_job_page_openrouter(
     candidate: dict, page_text: str, stage_stats: dict, system_prompt: str
 ) -> dict | None:
     """Condense one posting's page text via submit_job_extract. Returns the extract dict, or None
-    on failure (the caller falls back to the deterministic Haiku path)."""
+    on failure (the caller falls back to the deterministic Haiku path).
+
+    A submit that fills a cited field without its quote is sent back once (EXTRACT_RESUBMIT_UNQUOTED);
+    that first submit is kept and returned if the loop then fails."""
     messages = [
         {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': (
@@ -185,6 +191,7 @@ async def extract_job_page_openrouter(
     total_cost = 0.0
     started = time.monotonic()
     retried = False   # a failed chat is asked once more when the pin moved (endpoint_failed)
+    kept = None       # a submit sent back for its missing quotes, returned if no better one comes
     for iteration in range(EXTRACTOR_OPENROUTER_MAX_ITERATIONS):
         # A timeout or transport failure raises rather than returning ok=false. Until 2026-10-18 it
         # escaped to the Stage 2 error handler, skipping the Haiku fallback and dropping the job.
@@ -198,7 +205,7 @@ async def extract_job_page_openrouter(
             )
         except Exception as ex:
             job_trace.record('llm_call', transport='openrouter', call_site='extract_job_page_openrouter',
-                             model=MODEL_NAME_EXTRACTOR, routing=routing, iteration=iteration + 1,
+                             model=MODEL_NAME_EXTRACTOR, routing=routing, iteration=iteration + 1, tools_chars=_TOOLS_CHARS,
                              messages=list(messages), error=f'{type(ex).__name__}: {ex}',
                              seconds=round(time.monotonic() - call_started, 2))
             logger.warning(
@@ -208,11 +215,11 @@ async def extract_job_page_openrouter(
             if endpoint_failed(MODEL_NAME_EXTRACTOR, routing, ex) and not retried:
                 retried = True
                 continue
-            return None
+            return kept
         # The whole exchange, raw: the tool spec is fixed (OPENROUTER_EXTRACT_TOOLS), so the
         # messages and the server's reply are everything that varied.
         job_trace.record('llm_call', transport='openrouter', call_site='extract_job_page_openrouter',
-                         model=MODEL_NAME_EXTRACTOR, routing=routing, iteration=iteration + 1,
+                         model=MODEL_NAME_EXTRACTOR, routing=routing, iteration=iteration + 1, tools_chars=_TOOLS_CHARS,
                          messages=list(messages), raw_reply=raw, seconds=round(time.monotonic() - call_started, 2))
         try:
             data = json.loads(raw)
@@ -222,7 +229,7 @@ async def extract_job_page_openrouter(
                 f"chat with {MODEL_NAME_EXTRACTOR} (iteration {iteration + 1}) returned invalid JSON ({ex}): "
                 f"{quote_for_error(raw, 'OpenRouter extract reply')}"
             )
-            return None
+            return kept
         if not data.get('ok'):
             logger.warning(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
@@ -231,7 +238,7 @@ async def extract_job_page_openrouter(
             if endpoint_failed(MODEL_NAME_EXTRACTOR, routing, str(data.get('error') or raw)) and not retried:
                 retried = True
                 continue
-            return None
+            return kept
         usage = data.get('usage') or {}
         stage_stats['cost'] += float(data.get('cost_usd') or 0.0)
         stage_stats['input_tokens'] += usage.get('prompt_tokens', 0)
@@ -245,7 +252,7 @@ async def extract_job_page_openrouter(
                 f"model stopped without submitting (iteration {iteration + 1}, "
                 f"finish_reason={data.get('finish_reason')})"
             )
-            return None
+            return kept
 
         messages.append({'role': 'assistant', 'content': data.get('content'), 'tool_calls': tool_calls})
         endpoint_defect = False
@@ -292,6 +299,22 @@ async def extract_job_page_openrouter(
                 endpoint_failed(MODEL_NAME_EXTRACTOR, routing, defect)
                 endpoint_defect = True
                 break
+            unquoted = unquoted_fields(args, EXTRACT_CITED_FIELDS) if EXTRACT_RESUBMIT_UNQUOTED and kept is None else []
+            if unquoted:
+                kept = _extract_from_submit_args(args)
+                logger.info(
+                    f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
+                    f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: {len(unquoted)} field(s) filled without "
+                    f'a quote ({", ".join(unquoted)}); asking once more'
+                )
+                messages.append({
+                    'role': 'tool', 'tool_call_id': call_id,
+                    'content': (f'Not accepted yet: {", ".join(unquoted)} filled without the matching '
+                                f'<field>{QUOTE_SUFFIX}. Call submit_job_extract again with every field. For each '
+                                'of these, copy the words of the PAGE TEXT that state it into its quote, '
+                                'or leave the field empty if the page does not state it.'),
+                })
+                continue
             extract = _extract_from_submit_args(args)
             logger.info(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
@@ -309,4 +332,4 @@ async def extract_job_page_openrouter(
         f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
         f"iteration cap ({EXTRACTOR_OPENROUTER_MAX_ITERATIONS}) reached without submit, ${total_cost:.4f} spent"
     )
-    return None
+    return kept

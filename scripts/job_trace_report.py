@@ -58,6 +58,7 @@ sys.path.insert(0, str(PROJECT_DIR / 'src'))
 
 from agentic_job_search import agent as A  # noqa: E402
 from agentic_job_search import config as C  # noqa: E402
+from agentic_job_search import extract_openrouter as EO  # noqa: E402
 from agentic_job_search import job_trace as T  # noqa: E402
 from agentic_job_search import linkedin_page as LP  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
@@ -454,8 +455,19 @@ def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None) -> 
     for name, length in sections:
         same = page_text and length == page_text[1]
         pairs.append((f'· {name}', f'{length:,} chars' + (f' = {page_text[0]} from step {page_text[2]}' if same else '')))
-    tool = tool_called(step)
-    pairs.append(('total sent', f'{len(system) + len(text):,} chars' + (f' + the {tool} tool definition' if tool else '')))
+    total = len(system) + len(text)
+    if tool := tool_called(step):
+        if step.get('tools_chars'):
+            total += step['tools_chars']
+            pairs.append((f'{tool} tool definition', f"{step['tools_chars']:,} chars (its fields and rules, sent with every call)"))
+        else:
+            pairs.append((f'{tool} tool definition', f'not recorded in this trace (today {EO._TOOLS_CHARS:,} chars)'))
+    tokens_in = provider_usage(step).get('prompt_tokens')
+    complete = not tool or step.get('tools_chars')
+    if complete and tokens_in:
+        pairs.append(('total sent', f'{total:,} chars = {tokens_in:,} tokens in (about {total / tokens_in:.1f} chars per token)'))
+    else:
+        pairs.append(('total sent', f'{total:,} chars' + ('' if complete else ' + the tool definition')))
     return pairs
 
 
@@ -498,11 +510,17 @@ def page_read_params(step: dict) -> list[tuple[str, object]]:
 CHARS_PER_TOKEN = 4   # a rough English average, for calls whose provider reports no usage
 
 
-def token_counts(step: dict) -> str:
-    '''Tokens in and out, one per line: as the provider counted them, else estimated from characters (marked ≈).'''
+def provider_usage(step: dict) -> dict:
+    '''The token usage the provider reported for a call: on the step, or inside its raw reply; {} if none.'''
     raw = _json_or_none(step.get('raw_reply'))
     usage = step.get('usage') or (raw.get('usage') if isinstance(raw, dict) else None)
-    if isinstance(usage, dict) and usage.get('prompt_tokens') is not None:
+    return usage if isinstance(usage, dict) else {}
+
+
+def token_counts(step: dict) -> str:
+    '''Tokens in and out, one per line: as the provider counted them, else estimated from characters (marked ≈).'''
+    usage = provider_usage(step)
+    if usage.get('prompt_tokens') is not None:
         reasoning = (usage.get('completion_tokens_details') or {}).get('reasoning_tokens')
         return (f"tokens in={usage['prompt_tokens']:,}\ntokens out={usage.get('completion_tokens', 0):,}"
                 + (f' ({reasoning:,} of them hidden reasoning)' if reasoning else ''))

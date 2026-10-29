@@ -2079,7 +2079,8 @@ def _tool_call(call_id, name, args) -> dict:
     return {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args) if isinstance(args, dict) else args}}
 
 
-_SUBMIT_ARGS = {'title': 'Staff Engineer', 'company': 'Acme', 'description': 'Build agents in Python.'}
+_SUBMIT_ARGS = {'title': 'Staff Engineer', 'title_quote': 'Staff Engineer', 'company': 'Acme',
+                'company_quote': 'Acme', 'description': 'Build agents in Python.'}
 
 
 def _wire_openrouter_loop(monkeypatch, chat_responses: list, chat_requests: list):
@@ -2174,6 +2175,78 @@ async def test_openrouter_loop_missing_submit_fields_retries(monkeypatch):
     assert 'missing required field' in chat_requests[1]['messages'][-1]['content']
 
 
+async def test_openrouter_loop_sends_back_a_field_filled_without_its_quote_once(monkeypatch):
+    '''Hyra's extract (2026-10-28) cited none of its fields: each cost an LLM relocation call and two
+    were rejected. The model is asked once for the quote or an empty field.'''
+    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)', 'is_agency': True, 'closed': False}
+    quoted = {**unquoted, 'location_quote': 'Germany', 'is_agency': False}
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', unquoted)]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', quoted)]),
+    ], chat_requests)
+
+    extract = await _run_loop()
+
+    reply = chat_requests[1]['messages'][-1]
+    assert reply['role'] == 'tool' and reply['content'].startswith('Not accepted yet: location, is_agency filled')
+    assert 'closed' not in reply['content'], 'False is not a claim'
+    assert extract['quotes']['location'] == 'Germany' and extract['is_agency'] is False
+
+
+async def test_openrouter_loop_asks_for_quotes_only_once(monkeypatch):
+    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)'}
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', unquoted)]),
+        _chat_response(tool_calls=[_tool_call('c2', 'submit_job_extract', unquoted)]),
+    ], chat_requests)
+
+    extract = await _run_loop()
+
+    assert len(chat_requests) == 2
+    assert extract['location'] == 'Germany (Remote)' and extract['quotes']['location'] == ''
+
+
+async def test_openrouter_loop_keeps_the_first_submit_when_the_quote_request_fails(monkeypatch):
+    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)'}
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', unquoted)]),
+        '<html>502 Bad Gateway</html>',
+    ], [])
+
+    extract = await _run_loop()
+
+    assert extract is not None and extract['location'] == 'Germany (Remote)'
+
+
+async def test_openrouter_loop_does_not_send_back_when_switched_off(monkeypatch):
+    monkeypatch.setattr(extract_openrouter, 'EXTRACT_RESUBMIT_UNQUOTED', False)
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [
+        _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', {**_SUBMIT_ARGS, 'location': 'Germany'})]),
+    ], chat_requests)
+
+    assert (await _run_loop())['location'] == 'Germany'
+    assert len(chat_requests) == 1
+
+
+@pytest.mark.parametrize('properties, fields', [
+    (extract_openrouter.OPENROUTER_EXTRACT_TOOLS[0]['function']['parameters']['properties'], config.EXTRACT_CITED_FIELDS),
+    (agent.EXTRACT_OUTPUT_SCHEMA['properties'], config.EXTRACT_CITED_FIELDS),
+])
+def test_each_quote_property_follows_its_field(properties, fields):
+    '''A model fills a schema in order; with every quote at the end it skipped them (2026-10-28).'''
+    names = list(properties)
+    for field in fields:
+        assert names[names.index(field) + 1] == f'{field}_quote', field
+
+
+def test_with_quotes_refuses_a_cited_field_the_schema_lacks():
+    with pytest.raises(ValueError, match=r"\['salary'\]"):
+        evidence.with_quotes({'title': {'type': 'string'}}, ('title', 'salary'))
+
+
 async def test_openrouter_loop_drops_an_endpoint_that_omits_every_optional_field(monkeypatch, caplog):
     '''inference-net/us returned only title, company and closed, 3 of 3 times on one page
     (2026-10-26); pinned there, the 2026-10-25 run rated 12 of 12 jobs with no location. Asking
@@ -2185,7 +2258,8 @@ async def test_openrouter_loop_drops_an_endpoint_that_omits_every_optional_field
         (2e-7, {'tag': 'morph/fp8', 'quantization': 'fp8'}),
     ]))
     thin = {**_SUBMIT_ARGS, 'closed': False}
-    full = {**_SUBMIT_ARGS, 'location': 'Cyprus (Remote)', 'workplace_type': 'remote'}
+    full = {**_SUBMIT_ARGS, 'location': 'Cyprus (Remote)', 'location_quote': 'Cyprus',
+            'workplace_type': 'remote', 'workplace_type_quote': 'Remote'}
     chat_requests = []
     _wire_openrouter_loop(monkeypatch, [
         _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', thin)]),

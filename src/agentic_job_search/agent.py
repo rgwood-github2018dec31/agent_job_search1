@@ -142,7 +142,7 @@ from agentic_job_search.config import (
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
 )
-from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim, quote_properties, quotes_from
+from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim, quotes_from, with_quotes
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
 from agentic_job_search.linkedin_page import (
     JobPage,
@@ -773,7 +773,7 @@ def build_evaluator_instructions() -> str:
 
 EXTRACT_OUTPUT_SCHEMA = {
     'type': 'object',
-    'properties': {
+    'properties': with_quotes({
         'title': {'type': 'string'},
         'company': {'type': 'string'},
         'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
@@ -810,8 +810,7 @@ EXTRACT_OUTPUT_SCHEMA = {
         'is_agency': {'type': 'boolean', 'description': 'True if the poster is a staffing firm, recruiting agency or '
                                                         'aggregator posting on behalf of the employer that would hire'},
         'end_client': {'type': 'string', 'description': 'The company that would actually hire, if the posting names one'},
-        **quote_properties(EXTRACT_CITED_FIELDS),
-    },
+    }, EXTRACT_CITED_FIELDS),
     'required': ['title', 'company', 'description'],
 }
 
@@ -2896,7 +2895,7 @@ async def verify_extract(candidate: dict, extract: dict, stage_stats: dict) -> d
         Claim(field, extract.get(field), quotes.get(field, ''))
         for field in EXTRACT_CITED_FIELDS
         if field not in statuses
-        and (extract.get(field) is True or (isinstance(extract.get(field), str) and extract[field].strip()))
+        and evidence.is_filled(extract.get(field))
     ]
     verdicts = await evidence.verify_claims('extract', subject, claims, page_text, source_label, stage_stats)
     for field, verdict in verdicts.items():

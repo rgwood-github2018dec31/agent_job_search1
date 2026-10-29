@@ -298,7 +298,7 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
             'type': 'json_schema',
             'schema': {
                 'type': 'object',
-                'properties': {
+                'properties': evidence.with_quotes({
                     'company_name': {'type': 'string', 'description': 'Name of the organization on the posting'},
                     'job_title': {'type': 'string', 'description': 'Job title of the role'},
                     'is_recruiting_agency': {
@@ -313,8 +313,7 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
                         'type': 'string',
                         'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
                     },
-                    **evidence.quote_properties(_APPLIED_METADATA_CITED_FIELDS),
-                },
+                }, _APPLIED_METADATA_CITED_FIELDS),
                 'required': ['company_name', 'job_title', 'is_recruiting_agency', 'end_client_name'],
             },
         },
