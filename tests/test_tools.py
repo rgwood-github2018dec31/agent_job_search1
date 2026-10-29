@@ -2003,21 +2003,31 @@ def _stub_read_page(monkeypatch, page=None, calls: list | None = None):
     monkeypatch.setattr(agent, 'read_page', fake_read_page)
 
 
-async def test_extract_job_page_direct_condenses_the_page_it_is_given(monkeypatch):
+async def test_extract_job_page_direct_extracts_the_page_it_is_given(monkeypatch):
     prompts = []
-    _make_agent_sdk_mock(monkeypatch, {'title': 'Staff Engineer', 'company': 'Acme', 'description': 'Build agents.'}, prompts)
+    # A model's description is ignored: code cuts the posting's own text from the page.
+    _make_agent_sdk_mock(monkeypatch, {'location': 'Lisbon, Portugal', 'description': 'Model paraphrase.'}, prompts)
 
     async def no_read(*args):
         raise AssertionError('a page the caller already read must not be read again')
 
     monkeypatch.setattr(agent, 'read_page', no_read)
-    page = linkedin_page.JobPage(text='PAGE TEXT FROM CODE', source='dom')
+    page_text = 'Acme\nStaff Engineer\nAbout the job\nPAGE TEXT FROM CODE\nAbout the company\nAcme makes things.'
+    page = linkedin_page.JobPage(text=page_text, source='dom')
     extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), page=page)
 
-    assert extract['description'] == 'Build agents.'
+    assert extract['description'] == 'PAGE TEXT FROM CODE'
+    assert extract['page_text'] == page_text
     assert extract['page_header'] is page.header, 'verify_extract reads title, company, date and closed from it'
     assert 'PAGE TEXT FROM CODE' in prompts[0]
     assert 'de-cluttered by code' in prompts[0]
+
+
+def test_job_description_is_the_text_between_the_two_headings():
+    text = 'Acme\nAI Engineer\nAbout the job\nBuild agents.\nRemote in the EU.\nAbout the company\nWe work across Europe.'
+    assert linkedin_page.job_description(text) == 'Build agents.\nRemote in the EU.'
+    assert linkedin_page.job_description('About the job\nBuild agents.') == 'Build agents.', 'no company section: to the end'
+    assert linkedin_page.job_description('a snapshot with no headings') == ''
 
 
 async def test_extract_job_page_direct_reads_the_page_when_not_given_one(monkeypatch):
@@ -2080,8 +2090,7 @@ def _tool_call(call_id, name, args) -> dict:
     return {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args) if isinstance(args, dict) else args}}
 
 
-_SUBMIT_ARGS = {'location': 'Toronto, ON (Remote)', 'location_quote': 'Toronto, ON',
-                'description': 'Build agents in Python.'}
+_SUBMIT_ARGS = {'location': 'Toronto, ON (Remote)', 'location_quote': 'Toronto, ON'}
 
 
 def _wire_openrouter_loop(monkeypatch, chat_responses: list, chat_requests: list):
@@ -2111,8 +2120,10 @@ async def test_openrouter_loop_happy_path(monkeypatch):
     extract = await extract_openrouter.extract_job_page_openrouter(
         _make_candidate(), 'PAGE TEXT FROM CODE', stats, 'system prompt')
 
-    assert extract['description'] == 'Build agents in Python.'
+    assert extract['location'] == 'Toronto, ON (Remote)'
+    assert 'description' not in extract, 'code cuts the posting text from the page (agent.attach_page)'
     assert 'title' not in extract, 'code reads the title off the page header (verify_extract)'
+    assert 'description' not in chat_requests[0]['tools'][0]['function']['parameters']['properties']
     assert stats['cost'] == pytest.approx(0.001)
     assert stats['input_tokens'] == 100
     user = chat_requests[0]['messages'][1]
@@ -7124,6 +7135,19 @@ def test_derive_residency_scope_distinguishes_a_country_object_from_an_area_obje
     '''
     extract = _make_extract(location=location, relocation='', description=_NEUTRAL_DESCRIPTION)
     assert agent.derive_residency_scope(extract) == expected
+
+
+@pytest.mark.parametrize('text', [
+    'Work From Anywhere Culture: make the most of the flexibility that comes with remote work.',
+    'Destination days: Work from anywhere. Enjoy the flexibility to work internationally.',
+])
+def test_a_work_from_anywhere_perk_in_the_posting_text_does_not_open_the_gate(text):
+    """A wrong area_wide switches the geographic gate off. Bare "work from anywhere" counts in the
+    location or relocation field, where it states the offer, and not in the posting's text, where
+    4 of 9 such hits were perks (2026-10-28)."""
+    assert agent.derive_residency_scope({'location': 'Canada (Remote)', 'description': text}) == ''
+    assert agent.derive_residency_scope({'location': 'Canada (Remote — work from anywhere)', 'description': ''}) == 'area_wide'
+
 
 
 @pytest.mark.parametrize('location', [

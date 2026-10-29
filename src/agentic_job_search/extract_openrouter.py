@@ -42,9 +42,11 @@ _INITIAL_MESSAGE_COUNT = 2
 # times — the system prompt, the tool description and the field descriptions — so the prefix sent
 # with every call was ~10.7k chars, ~2.6k tokens, and the copies had drifted apart.
 # Title, company, posting date and closed are read by code off the page header (agent.read_header_fields).
-# `location` is required because every job page states one: with `description` the only required
-# field, a model submitted just that, three times on one page (replay, 2026-10-28).
-EXTRACT_REQUIRED_FIELDS = ('location', 'description')
+# `location` is required because every job page states one. The model writes no description:
+# until 2026-10-28 it condensed the page into one, the only output nothing checked against the
+# page, and that condensation dropped stated salaries and stacks and wrote "remote in Canada" from
+# a bare Remote badge. Code now cuts the posting's own text from the page (linkedin_page.job_description).
+EXTRACT_REQUIRED_FIELDS = ('location',)
 EXTRACT_PROPERTIES = with_quotes({
     'location': {'type': 'string', 'description': (
         'Location with the workplace type the page shows, e.g. "Bucharest, Romania (Remote within country)"')},
@@ -56,8 +58,8 @@ EXTRACT_PROPERTIES = with_quotes({
     'language_requirement': {'type': 'string', 'description': (
         'Languages the posting REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german"')},
     'posting_language': {'type': 'string', 'description': (
-        'Language the PAGE ITSELF is written in, lowercase, e.g. "french". Judge the source page, not '
-        'your English condensation; the original title is the clearest tell')},
+        'Language the PAGE ITSELF is written in, lowercase, e.g. "french"; the original title is the '
+        'clearest tell')},
     'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
     'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''], 'description': (
         '"country_only" if the holder must LIVE in the country the job is advertised in ("Remote within '
@@ -75,12 +77,6 @@ EXTRACT_PROPERTIES = with_quotes({
         'company that would actually hire')},
     'end_client': {'type': 'string', 'description': (
         'That hiring company, if the posting names it; empty when anonymous ("our client, a leading fintech")')},
-    # Last: a model fills a schema in order, and with the long condensation first it left more of
-    # the short facts after it empty (12-page replay, 2026-10-28).
-    'description': {'type': 'string', 'description': (
-        'The posting condensed: requirements, responsibilities, tech stack, seniority, and any '
-        'visa/work-authorization or "no longer accepting applications" statement. Drop navigation, '
-        'footers, similar-jobs lists and marketing boilerplate')},
 }, EXTRACT_CITED_FIELDS)
 
 OPENROUTER_EXTRACT_TOOLS = [
@@ -114,7 +110,6 @@ _SUBMIT_OPTIONAL_FIELDS = (
 def extract_from_args(args: dict) -> dict:
     '''The extract from submit_job_extract's arguments, or from the fallback's structured output.'''
     return {
-        'description': args['description'],
         'location': args.get('location', ''), 'salary': args.get('salary', ''),
         'sponsorship_note': args.get('sponsorship_note', ''),
         'language_requirement': args.get('language_requirement', ''),
@@ -136,7 +131,7 @@ def extract_from_args(args: dict) -> dict:
 async def extract_job_page_openrouter(
     candidate: dict, page_text: str, stage_stats: dict, system_prompt: str
 ) -> dict | None:
-    """Condense one posting's page text via submit_job_extract. Returns the extract dict, or None
+    """Extract one posting's facts from its page text via submit_job_extract. Returns the extract dict, or None
     on failure (the caller falls back to the deterministic Haiku path).
 
     A submit that fills a cited field without its quote is sent back once (EXTRACT_RESUBMIT_UNQUOTED);
@@ -280,8 +275,7 @@ async def extract_job_page_openrouter(
             logger.info(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
                 f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: "
-                f"{len(page_text)} page chars → {len(extract['description'])} chars condensed in "
-                f'{time.monotonic() - started:.0f}s'
+                f"{len(page_text)} page chars read in {time.monotonic() - started:.0f}s"
                 + (f' over {iteration + 1} iterations' if iteration else '')
                 + f', ${total_cost:.4f}'
             )

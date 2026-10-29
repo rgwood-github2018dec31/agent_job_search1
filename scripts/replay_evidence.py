@@ -8,8 +8,8 @@ rejections. A field rejected as "absent" can let a job through a gate it should 
 (a rejected `language_requirement`), so the rate of rejections per field is the number to
 watch when the extractor model, its prompt, or the matcher changes. This measures it on real pages.
 
-It also reports each derive_* regex fallback that would change if it read the raw page instead
-of the model's condensed description (it reads the description; see agent.regex_source_text).
+It also reports each derive_* regex fallback that would change if it read the whole page instead
+of the posting's own text (it reads the posting's text; see agent.regex_source_text).
 
 Usage:
     uv run python scripts/replay_evidence.py                       # newest capture day, 20 pages
@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 from agentic_job_search import evidence
 from agentic_job_search.agent import (
     PAGE_EXTRACTOR_INSTRUCTIONS,
+    attach_page,
     derive_agency_posting,
     derive_education_requirement,
     derive_residency_scope,
@@ -44,7 +45,7 @@ from agentic_job_search.agent import (
     verify_extract,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
-from agentic_job_search.linkedin_page import header_card
+from agentic_job_search.linkedin_page import HeaderCard, JobPage, header_card
 
 logger = logging.getLogger('replay_evidence')
 
@@ -85,15 +86,14 @@ async def replay_one(path: Path) -> dict:
     if extract is None:
         return {'path': path, 'candidate': candidate, 'failed': True}
     before = dict(extract)
-    derived_from_description = {name: fn(dict(before)) for name, fn in DERIVERS.items()}
-    extract['page_text'] = page_text
     # As in a run: title, company, date and closed come off the page's header card, kept in the .html.
     html = path.with_suffix('.html')
-    if html.exists():
-        extract['page_header'] = header_card(BeautifulSoup(html.read_text(encoding='utf-8'), 'lxml'))
+    page_header = header_card(BeautifulSoup(html.read_text(encoding='utf-8'), 'lxml')) if html.exists() else HeaderCard()
+    attach_page(candidate, extract, JobPage(text=page_text, source='dom', header=page_header))
+    derived_from_description = {name: fn(dict(extract)) for name, fn in DERIVERS.items()}
     statuses = await verify_extract(candidate, extract, stats)
-    # What the regex fallbacks would say if they read the page rather than the description (they
-    # do not: see agent.regex_source_text), kept as the measurement behind that choice.
+    # What the regex fallbacks would say if they read the whole page rather than the posting's own
+    # text (they do not: see agent.regex_source_text), kept as the measurement behind that choice.
     derived_from_page = {name: fn(dict(extract, description=page_text)) for name, fn in DERIVERS.items()}
     return {'path': path, 'candidate': candidate, 'failed': False, 'before': before, 'after': extract,
             'statuses': statuses, 'derived_from_description': derived_from_description,
@@ -120,7 +120,7 @@ def report(results: list[dict]) -> str:
             if status == evidence.STATUS_REJECTED:
                 quote = (result['before'].get('quotes') or {}).get(field, '')
                 lines.append(f"- `{result['path'].name}` {field}={result['before'].get(field)!r} cited {quote!r}")
-    lines += ['', '## derive_* on the page vs on the condensed description', '']
+    lines += ['', '## derive_* on the whole page vs on the posting text', '']
     for result in results:
         if result['failed']:
             lines.append(f"- `{result['path'].name}`: extraction FAILED")

@@ -41,7 +41,7 @@ PAGE = f'''<!DOCTYPE html><html><head>
   <div class="_0fbca0ec"><h2>People you can reach out to</h2><img src="https://media.licdn.com/p/jane.jpg" alt="View Jane Doe’s profile"></div>
   <div id="JobDetails_AboutTheJob_{JOB_ID}"><div><h2>About the job</h2>
     <p>Build agentic systems in Python.</p><p>Salary: $150,000 - $180,000 per year.</p>
-    <span data-testid="expandable-text-button">… more</span></div></div>
+    <button aria-hidden="true" data-testid="expandable-text-button"><span><span>…</span><span> more</span></span></button></div></div>
   <div class="db1ec949"><h2>Set alert for similar jobs</h2><p>Staff AI Engineer, Toronto</p></div>
   <div class="_398a5a3d"><p>New from LinkedIn: see who else viewed this job</p></div>
   <div class="_398a5a3d"><p>Salary insights for this role</p><p>Typical pay: $140K/yr - $190K/yr</p></div>
@@ -159,6 +159,17 @@ def test_company_dir_name_keeps_proper_case():
 
 
 # --- known clutter ---------------------------------------------------------------------------------
+
+def test_the_hidden_expand_button_is_dropped_from_the_description():
+    '''It left "…" and "more" as the last two lines of 210 of 252 saved postings (2026-10-28).'''
+    soup = _cleaned()
+    removed = lp.remove_expand_button(soup)
+    text = lp.page_text(soup)
+    assert removed == [{'what': "button '… more'", 'chars': len('… more')}]
+    lines = text.split('\n')
+    assert '…' not in lines and 'more' not in lines
+    assert 'Salary: $150,000 - $180,000 per year.' in lines, 'the description itself is kept'
+
 
 def test_known_clutter_is_removed_and_the_facts_survive():
     text = lp.page_text(_cleaned())

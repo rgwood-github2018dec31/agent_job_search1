@@ -182,7 +182,7 @@ async def estimate_salary(
 
     None when the posting states any salary at all (the reading is not `absent`), when the model
     says it cannot estimate, when its answer does not validate, or when the call fails. `page_text`
-    is the full page the extractor read; without it the condensed description is used.
+    is the full page the extractor read; without it the posting's text (`description`) is used.
     '''
     if salary_facts_of(extract)['kind'] != 'absent':
         return None

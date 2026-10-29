@@ -45,8 +45,11 @@ from agentic_job_search.config import (
     JOB_PAGE_ASSET_FETCH_TIMEOUT_SECONDS,
     LINKEDIN_CLOSED_PHRASES,
     LINKEDIN_COMPANY_ABOUT_URL,
+    LINKEDIN_COMPANY_SECTION_HEADING,
     LINKEDIN_COMPANY_URL,
     LINKEDIN_EMPLOYMENT_TYPES,
+    LINKEDIN_EXPAND_BUTTON_TEXT,
+    LINKEDIN_JOB_DESCRIPTION_HEADING,
     LINKEDIN_PAGE_CAPTURE_JS,
     LINKEDIN_PAGE_CAPTURE_RETRIES,
     LINKEDIN_PDF_FURNITURE_LINE_PATTERNS,
@@ -396,6 +399,20 @@ def remove_known_clutter(soup: BeautifulSoup) -> list[dict]:
     return removed
 
 
+def remove_expand_button(soup: BeautifulSoup) -> list[dict]:
+    """Drop the description's hidden '… more' button (LINKEDIN_EXPAND_BUTTON_TEXT) from code's copy.
+
+    The description is protected from every removal rule, and this button sits inside it.
+    """
+    removed = []
+    about_job = soup.find(id=_ABOUT_JOB_ID_RE)
+    for button in (about_job.find_all('button', attrs={'aria-hidden': 'true'}) if about_job is not None else []):
+        if norm(button.get_text(' ')) == LINKEDIN_EXPAND_BUTTON_TEXT:
+            removed.append({'what': f'button {LINKEDIN_EXPAND_BUTTON_TEXT!r}', 'chars': len(LINKEDIN_EXPAND_BUTTON_TEXT)})
+            button.decompose()
+    return removed
+
+
 def keep_anchors(main: Tag) -> list[Tag]:
     """Elements known to carry the posting's facts: the top card, the description, the company card.
 
@@ -467,6 +484,20 @@ def listed_location(soup: BeautifulSoup) -> str:
     "EU" to a Normandy town, while the body said 'EU-based ... Portugal hub' (2026-10-21).
     """
     return header_card(soup).location
+
+
+def job_description(text: str) -> str:
+    """The posting's own text: the lines after the LINKEDIN_JOB_DESCRIPTION_HEADING line and before
+    the LINKEDIN_COMPANY_SECTION_HEADING line, cut by code from the page text the extractor read.
+    To the end of the text when the company heading is missing; '' when the description heading is
+    (the snapshot path), so the caller decides what to read instead.
+    """
+    lines = (text or '').split('\n')
+    if LINKEDIN_JOB_DESCRIPTION_HEADING not in lines:
+        return ''
+    start = lines.index(LINKEDIN_JOB_DESCRIPTION_HEADING) + 1
+    end = lines.index(LINKEDIN_COMPANY_SECTION_HEADING, start) if LINKEDIN_COMPANY_SECTION_HEADING in lines[start:] else len(lines)
+    return '\n'.join(lines[start:end])
 
 
 def is_closed_text(text: str) -> bool:
@@ -734,7 +765,7 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         'captured': datetime.now().isoformat(timespec='seconds'), 'dom_chars': len(capture['html']),
     })
 
-    removed = remove_known_clutter(soup)
+    removed = remove_known_clutter(soup) + remove_expand_button(soup)
     removed += await decide_unknown_blocks(soup, candidate, stage_stats)
     text = page_text(soup)
     tools_generic.save_raw_posting(candidate, text, 'dom', len(text))
@@ -746,7 +777,7 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         unusual += f'; JS {js_counts}'
     if any(asset_counts.get(key) for key in _UNUSUAL_ASSET_KEYS):
         unusual += f'; assets {asset_counts}'
-    # Routine success is DEBUG: the Extract line already gives page chars → condensed chars.
+    # Routine success is DEBUG: the Extract line already gives the page's size.
     logger.log(
         logging.INFO if unusual or not removed else logging.DEBUG,
         f"Job page {job_id}: DOM {len(capture['html']):,} chars → {len(text):,} chars of text; "

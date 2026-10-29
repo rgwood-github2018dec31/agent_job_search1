@@ -630,7 +630,8 @@ async def company_blacklist_reason(company: str, context: str = '', description:
 # every other company it posts for), and the end client is usually anonymised — so one pharma
 # programme produced SIX notifications between 2026-09-02 and 09-10.
 #
-# Text matching was measured and rejected. The extractor REWRITES each description as it condenses,
+# Text matching was measured and rejected. The extractor REWROTE each description as it condensed
+# (until 2026-10-28; the description is now the posting's own text, not yet re-measured),
 # so word-shingle containment across those six postings ran 0.62-0.86 for three of them and ~0.0 for
 # the other three, while unrelated repostings by direct employers (Datadog, Pipedrive) scored 0.7+.
 # No threshold separates the two cases.
@@ -726,9 +727,12 @@ def prune_raw_postings(today: date | None = None) -> int:
 
 
 RECRUITER_NOTIFICATIONS_PATH = RUN_DIR / 'recruiter_notifications.yaml'
-# Above the longest description measured across 2,345 saved jobs (2026-09-24), so a repost check
-# compares whole postings; at 1500 it cut 3 of this run's descriptions short.
-RECRUITER_DESCRIPTION_MAX_CHARS = 8_000
+# Above the longest description measured, so a repost check compares whole postings; at 1500 it
+# cut 3 of a run's descriptions short. Since 2026-10-28 the description is the posting's own text,
+# not a condensation: 50 of 252 retained postings ran past the former 8,000 and the longest to
+# 24,803 chars (a bilingual posting). A notified job is checked against at most
+# RECRUITER_REPOST_MAX_PRIORS priors, and only notified jobs are, so the whole text costs little.
+RECRUITER_DESCRIPTION_MAX_CHARS = 32_000
 
 _RECRUITER_NOTIFICATIONS_HEADER = (
     '# Postings the user has been notified about (agencies and employers alike), pruned to the\n'

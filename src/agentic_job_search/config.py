@@ -38,8 +38,8 @@ RECRUITER_REPOST_WINDOW_DAYS = 14
 # ...and how many of those postings the judgement call is shown, newest first. An agency that posts
 # daily would otherwise grow the prompt without bound: every prior carries a description capped at
 # RECRUITER_DESCRIPTION_MAX_CHARS (~9.7K chars at 7 priors was measured before that cap was raised
-# on 2026-09-24; the ceiling is now this many priors times that cap, still far inside any model's
-# context). A repost
+# on 2026-09-24; the ceiling is this many priors times that cap, about 80k tokens at the most, inside
+# the rating model's context). A repost
 # is re-advertised within days of the original, so the newest few are the ones that can match.
 RECRUITER_REPOST_MAX_PRIORS = 8
 
@@ -665,10 +665,11 @@ LINKEDIN_PDF_FURNITURE_LINE_PATTERNS = (
     r'English \(English\)',
 )
 # The description shown to the blacklist confirmation call alongside company/location/title. Sized
-# above the longest description measured across 2,345 saved jobs (2026-09-24), so in practice it is
-# whole: the call runs only on an exact name hit, and more of the posting is what tells "Cohere" the
-# AI lab from Cohere Health.
-BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS = 8_000
+# above the longest description measured, so in practice it is whole: the call runs only on an
+# exact name hit, and more of the posting is what tells "Cohere" the AI lab from Cohere Health.
+# Raised from 8,000 when the description became the posting's own text (2026-10-28): the longest of
+# 252 retained postings is 24,803 chars.
+BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS = 32_000
 # OpenAI-compatible function-calling APIs reject a tool description longer than this.
 OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS = 1024
 # The scraper's report_blocked `what_happened` argument, echoed into logs and the audit.
@@ -775,6 +776,15 @@ LINKEDIN_EMPLOYMENT_TYPES = ('Full-time', 'Part-time', 'Contract', 'Temporary', 
 # A closed posting says one of these. Until 2026-10-28 only the first was checked: 13 of 252 saved
 # pages said the second.
 LINKEDIN_CLOSED_PHRASES = ('No longer accepting applications', 'Not currently accepting applications')
+# The posting's own text is the page text between these two heading lines (linkedin_page.job_description).
+# Both were on every one of 252 saved pages (2026-10-28). The company blurb after the second one
+# ("we work across Europe") is not the job's, so no regex or rater reads it as the job's terms.
+LINKEDIN_JOB_DESCRIPTION_HEADING = 'About the job'
+LINKEDIN_COMPANY_SECTION_HEADING = 'About the company'
+# The description's expand button, hidden from screen readers and left as two junk lines ("…",
+# "more") at the end of 210 of 252 saved postings (2026-10-28). Matched on this text with
+# aria-hidden, and only ever removed from code's copy of the page, never clicked.
+LINKEDIN_EXPAND_BUTTON_TEXT = '… more'
 # Before each About-page visit: a (min, max) range for the same reason as the scraper's delays.
 # Visited once per company slug, ever, and only for a job headed for the paid rating call.
 COMPANY_ABOUT_PAGE_DELAY_SECONDS = (3.0, 8.0)
@@ -853,8 +863,9 @@ EVIDENCE_MIN_QUOTE_CHARS = 4
 # acceptance still needs that span to be found in the source by code.
 MODEL_NAME_EVIDENCE = MODEL_NAME_SINGLE_TURN
 # The extract fields a model predicts as facts of the page, each cited and verified. `description`
-# is a condensation, not a fact, and `date_posted` is read from the page by code whenever the page
-# shows the usual "N hours ago" line (linkedin_page.posted_age_from_page).
+# is not here: code cuts it from the page (linkedin_page.job_description), and `date_posted` is
+# read from the page by code whenever the page shows the usual "N hours ago" line
+# (linkedin_page.posted_age_from_page).
 # title, company, date_posted and closed are not here: code reads them off the page's header card
 # (agent.read_header_fields) and the model is no longer asked for them (2026-10-28).
 EXTRACT_CITED_FIELDS = (

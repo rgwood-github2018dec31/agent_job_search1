@@ -59,7 +59,8 @@ FIELD_RE = {
     'workplace': re.compile(r'^Workplace:[ \t]*(\S.*)$', re.MULTILINE),
 }
 RATING_RE = re.compile(r'-rating_(\d)-')
-# The condensed description is everything after the header block, i.e. after the URL line.
+# The description (the posting's text; before 2026-10-28 the model's condensation) is everything
+# after the header block, i.e. after the URL line.
 DESCRIPTION_RE = re.compile(r'^URL:[ \t]*\S+[ \t]*$(.*)', re.MULTILINE | re.DOTALL)
 
 

@@ -77,6 +77,7 @@ from agentic_job_search.config import (
     FAILED_QUERIES_NAMED_MAX,
     JOB_AUDIT_ENABLED,
     JOB_STALE_AGE_DAYS,
+    LINKEDIN_JOB_DESCRIPTION_HEADING,
     LISTING_ESTIMATE_HISTORY_RUNS,
     LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
@@ -153,6 +154,7 @@ from agentic_job_search.linkedin_page import (
     LinkedInBlockedError,
     company_page_url,
     is_closed_text,
+    job_description,
     posted_age_from_page,
     read_company_about,
     read_job_page,
@@ -601,13 +603,13 @@ PAGE_EXTRACTOR_INSTRUCTIONS = '''You are a job page extractor. The user message 
 have no browser and need none.
 
 Call submit_job_extract exactly once with what the page text says. Each field's description says what goes in it. Never invent a field the text does not
-support; leave it empty instead. Condense the description aggressively.
+support; leave it empty instead.
 
 Do not rate the job.
 '''
 
-EVALUATOR_INSTRUCTIONS_TEMPLATE = '''You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not
-need to browse anywhere.
+EVALUATOR_INSTRUCTIONS_TEMPLATE = '''You are evaluating a single job posting. The user message holds facts read from the posting page, then the posting's
+own text as written — you do not need to browse anywhere.
 {sponsorship_section}{work_rights_section}{relocation_section}
 ## Workplace type
 Check the `Workplace:` and `Location:` lines. Any requirement to be in an office some days a week is **hybrid**, even if the listing is badged "Remote".
@@ -2376,7 +2378,7 @@ async def identify_poster(
 async def extract_job_page_direct(
     candidate: dict, playwright_mcp_url: str, stage_stats: dict, page: JobPage | None = None
 ) -> dict | None:
-    '''Fallback for a failed extract, and the audit path: condense the page text with one
+    '''Fallback for a failed extract, and the audit path: extract the page's facts with one
     non-agentic Haiku call. Reads the page itself when the caller has not already.'''
     if page is None:
         page = await read_page(candidate, playwright_mcp_url, stage_stats)
@@ -2385,10 +2387,8 @@ async def extract_job_page_direct(
     what = ('the text of a job posting page, read and de-cluttered by code' if page.source == 'dom'
             else 'an accessibility snapshot of a job posting page')
     prompt = (
-        f'Below is {what}. Condense it into a structured extract. '
-        'Keep requirements, responsibilities, tech stack, seniority, and any visa/work-authorization or '
-        '"no longer accepting applications" statements. Strip navigation chrome, footers, similar-jobs '
-        f'lists, and marketing boilerplate. {CITATION_INSTRUCTION}\n\n'
+        f'Below is {what}. Extract the facts it states into the structured output; leave a field '
+        f'empty when the page does not state it. {CITATION_INSTRUCTION}\n\n'
         + page.text
     )
     options = ClaudeAgentOptions(
@@ -2419,11 +2419,29 @@ async def extract_job_page_direct(
         logger.warning(f"Extract fallback: job {candidate['job_id']} {candidate['company']} — "
                        f"{candidate['title']}: no structured output{cost_note}")
         return None
-    extract = {**extract_from_args(structured), 'page_text': page.text, 'page_header': page.header}
+    extract = attach_page(candidate, extract_from_args(structured), page)
     logger.info(
         f"Extract fallback: job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
-        f"{len(page.text)} page chars ({page.source}) → {len(extract['description'])} chars condensed{cost_note}"
+        f"{len(page.text)} page chars ({page.source}) read{cost_note}"
     )
+    return extract
+
+
+def attach_page(candidate: dict, extract: dict, page: JobPage) -> dict:
+    '''Add to the extract what code read off the page: the page text every field is checked against,
+    the header card, and the posting's own text as `description`, which the rater, the regex
+    fallbacks, the blacklist and repost checks and the salary context read.
+
+    The whole page stands in for the description, with a WARNING, when the page has no
+    LINKEDIN_JOB_DESCRIPTION_HEADING line (the snapshot path): reading more text beats reading none.
+    '''
+    description = job_description(page.text)
+    if not description:
+        logger.warning(
+            f"Job {candidate['job_id']} {candidate['company']}: no {LINKEDIN_JOB_DESCRIPTION_HEADING!r} line in "
+            f'the {page.source} page text ({len(page.text)} chars), so the whole page is read as its description')
+        description = page.text
+    extract.update(page_text=page.text, page_header=page.header, description=description)
     return extract
 
 
@@ -2514,7 +2532,6 @@ _AREA_WIDE_RE = re.compile(
     r'\b(?:work|working|remote|based|located|reside|residing|hire[sd]?|employed|eligible)\s+'
     r'(?:from|in|within|across|throughout|anywhere\s+in|to)\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
     r'|\banywhere\s+in\s+' + _AREA_LEAD + _AREA_WORDS + r'\b'
-    r'|\b(?:work|remote|based|hire[sd]?|located)\s+(?:from\s+)?anywhere\b'
     # Every verb `_COUNTRY_ONLY_RE` pins with, so what it refuses through `_NOT_AREA` lands here.
     r'|\b(?:work|working|remote|based|located|resident|reside|residing|live|living|hire[sd]?|employed|eligible)'
     r'\s+(?:from|in|within|across|throughout|to)\s+' + _OR_AREA +
@@ -2531,9 +2548,8 @@ _AREA_WIDE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Objects of "must work in …" that are not places. Since 2026-10-19 the regex reads the raw page,
-# not the condensed description, and "solutions that must work in the field" (2026-10-18, two
-# DACH postings) read as a residency pin.
+# Objects of "must work in …" that are not places: "solutions that must work in the field"
+# (2026-10-18, two DACH postings) read as a residency pin.
 _NOT_A_PLACE = r'(?!(?:the\s+|an?\s+)?(?:field|team|teams|practice|production)\b)'
 
 _COUNTRY_ONLY_RE = re.compile(
@@ -2550,18 +2566,31 @@ _COUNTRY_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "Work from anywhere" with no place after it. In the location or relocation field it states the
+# offer; in the posting's text it is as often a perk: "Work From Anywhere Culture", "Destination
+# days: Work from anywhere", and 4 of 9 jobs newly read as area_wide when the regexes moved to the
+# posting's own text (2026-10-28). Read in the fields only, since area_wide switches the gate off.
+_UNBOUNDED_ANYWHERE_RE = re.compile(r'anywhere\W*$', re.IGNORECASE)
+
+
+def _area_wide_in_text(text: str) -> bool:
+    '''Whether the posting's text offers an area wider than one country (_AREA_WIDE_RE), not
+    counting a bare "work from anywhere" (_UNBOUNDED_ANYWHERE_RE).'''
+    return any(not _UNBOUNDED_ANYWHERE_RE.search(found.group(0)) for found in _AREA_WIDE_RE.finditer(text))
+
 RESIDENCY_SCOPES = ('country_only', 'area_wide')
 
 
 def regex_source_text(extract: dict) -> str:
-    """The text a derive_* regex fallback reads: the condensed `description`, NOT the raw page.
+    """The text a derive_* regex fallback reads: the posting's own text (`description`, cut by
+    linkedin_page.job_description), never the whole page.
 
-    Reading the raw page was tried on 2026-10-19 and measured over the 308 retained postings that
-    have a saved job: it changed a derive_* result on 56, and moved residency_scope from
-    `country_only` to `area_wide` on about a dozen. That is the direction that silently switches
-    the geographic gate off. The raw page carries company blurbs ("we work across Europe") that
-    the condensation drops. Kept on the description until the patterns are scoped to the job's own
-    sections; see Known open issues.
+    The whole page was tried on 2026-10-19: over 308 retained postings it changed a derive_* result
+    on 56 and moved residency_scope from `country_only` to `area_wide` on about a dozen, the
+    direction that silently switches the geographic gate off, because the company section carries
+    blurbs like "we work across Europe". Until 2026-10-28 the regexes read the model's condensed
+    description instead, which wrote "remote in Canada" from a bare Remote badge (jobs 4481291346,
+    4482045749) and so made up a `country_only` the page never states.
     """
     return str(extract.get('description') or '')
 
@@ -2590,10 +2619,11 @@ def derive_residency_scope(extract: dict) -> str:
     if explicit not in RESIDENCY_SCOPES:
         explicit = ''
 
-    haystack = f"{extract.get('location', '')}\n{extract.get('relocation', '')}\n{regex_source_text(extract)}"
+    fields = f"{extract.get('location', '')}\n{extract.get('relocation', '')}"
+    haystack = f'{fields}\n{regex_source_text(extract)}'
     if explicit == 'country_only' or _COUNTRY_ONLY_RE.search(haystack):
         return 'country_only'
-    if explicit == 'area_wide' or _AREA_WIDE_RE.search(haystack):
+    if explicit == 'area_wide' or _AREA_WIDE_RE.search(fields) or _area_wide_in_text(regex_source_text(extract)):
         return 'area_wide'
     return ''
 
@@ -4584,8 +4614,7 @@ async def _evaluate_candidates(
                 extract = await extract_job_page_openrouter(
                     candidate, page.text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS)
                 if extract is not None:
-                    extract['page_text'] = page.text
-                    extract['page_header'] = page.header
+                    attach_page(candidate, extract, page)
             if extract is None:
                 extract = await extract_job_page_direct(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)

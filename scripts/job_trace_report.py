@@ -790,7 +790,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
     warnings = re.findall(r'^• (.+)$', md.split('## Warnings')[1].split('\n\n')[0], re.M) \
         if '## Warnings' in md else []
     estimate_line = group_or(r'^Estimated salary:\s*(.+)$', md, '')
-    # Everything after the header block, i.e. the condensed extract the rater read.
+    # Everything after the header block, i.e. the extract text the rater read.
     extract_text = md.split('\n\n', 1)[1] if '\n\n' in md else ''
 
     found = found_by(steps, log_path, job_id)
@@ -904,7 +904,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
               verbatim(A.PAGE_EXTRACTOR_INSTRUCTIONS)]
     story += [label('VERBATIM — the extract signal line from the run log'),
               verbatim('\n'.join(log_lines_about(log_path, f'Extract signal: job {job_id}')) or '(not found)')]
-    story += [label('VERBATIM — the condensed extract the rater read (from the Saved Job)'),
+    story += [label('VERBATIM — the extract text the rater read (from the Saved Job)'),
               verbatim(extract_text or '(none)')]
 
     # 6. Salary
