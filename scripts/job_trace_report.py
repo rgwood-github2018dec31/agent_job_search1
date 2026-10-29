@@ -410,28 +410,52 @@ def params(pairs: dict | list[tuple[str, object]]) -> str:
     return '\n'.join(lines) or '—'
 
 
-def prompt_params(step: dict) -> list[tuple[str, object]]:
-    '''What the model was given: its parts and their sizes, and the short facts it was asked about.'''
-    text = llm_input(step) or ''
-    system = step.get('system') or next(
+def system_text(step: dict) -> str:
+    return step.get('system') or next(
         (m.get('content') for m in step.get('messages') or [] if isinstance(m, dict) and m.get('role') == 'system'), '')
-    pairs: list[tuple[str, object]] = [('prompt', f'{len(text):,} chars')]
-    if system:
-        pairs.append(('instructions', f'{len(system):,} chars'))
+
+
+def tool_called(step: dict) -> str | None:
+    '''The tool a loop's reply called (its definition is sent too, and counted in the tokens in).'''
+    out = llm_output(step)
+    return next(iter(out)) if step.get('raw_reply') and isinstance(out, dict) and len(out) == 1 else None
+
+
+def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None) -> list[tuple[str, object]]:
+    '''What the model was sent: each message and its size, the sections of the user message, the facts in its header.
+
+    `page_text` is (file name, chars, step number) of the text "Read job page" saved; a section of exactly
+    that size is named as that file.
+    '''
+    text = llm_input(step) or ''
+    system = system_text(step)
     markers = list(SECTION_MARKER_RE.finditer(text))
+    sections = []
     for marker in markers:
         end = text.find(f'--- END {marker.group(1)} ---', marker.end())
-        length = (end if end >= 0 else len(text)) - marker.end()
-        pairs.append((shorten(marker.group(1), 40), f'{length:,} chars'))
+        sections.append((shorten(marker.group(1), 40), len(text[marker.end():end if end >= 0 else len(text)].strip())))
     head = text[:markers[0].start()] if markers else text
+    pairs: list[tuple[str, object]] = []
+    if system:
+        pairs.append(('system message', f'{len(system):,} chars (standing instructions)'))
+    if sections:
+        parts = ', then '.join(name for name, _ in sections)
+        pairs.append(('user message', f'{len(text):,} chars: {len(head.strip()):,} chars before {parts}'))
+    else:
+        pairs.append(('user message', f'{len(text):,} chars (instructions and question in one)'))
     if 'CLAIMS:' in head and (claims := _json_or_none(head.split('CLAIMS:', 1)[1].strip())):
         head = head.split('CLAIMS:', 1)[0]
-        pairs += [(f"claim {c.get('field')}", f"{compact(c.get('value'))} (cited: {compact(c.get('cited')) or '—'})")
+        pairs += [(f"· claim {c.get('field')}", f"{compact(c.get('value'))} (cited: {compact(c.get('cited')) or '—'})")
                   for c in claims if isinstance(c, dict)]
     keys = KEY_LINE_RE.findall(head)[:KEY_LINES_SHOWN]
-    pairs += keys
-    if not markers and not keys:
-        pairs.append(('asks', shorten(head.strip().splitlines()[0] if head.strip() else '', 90)))
+    pairs += [(f'· {k}', v) for k, v in keys]
+    if not sections and not keys:
+        pairs.append(('· asks', shorten(head.strip().splitlines()[0] if head.strip() else '', 90)))
+    for name, length in sections:
+        same = page_text and length == page_text[1]
+        pairs.append((f'· {name}', f'{length:,} chars' + (f' = {page_text[0]} from step {page_text[2]}' if same else '')))
+    tool = tool_called(step)
+    pairs.append(('total sent', f'{len(system) + len(text):,} chars' + (f' + the {tool} tool definition' if tool else '')))
     return pairs
 
 
@@ -475,15 +499,17 @@ CHARS_PER_TOKEN = 4   # a rough English average, for calls whose provider report
 
 
 def token_counts(step: dict) -> str:
-    '''Tokens in and out: as the provider reported them, else estimated from characters (marked ≈).'''
+    '''Tokens in and out, one per line: as the provider counted them, else estimated from characters (marked ≈).'''
     raw = _json_or_none(step.get('raw_reply'))
     usage = step.get('usage') or (raw.get('usage') if isinstance(raw, dict) else None)
     if isinstance(usage, dict) and usage.get('prompt_tokens') is not None:
-        return f"in {usage['prompt_tokens']:,} / out {usage.get('completion_tokens', 0):,} tokens"
-    system = step.get('system') or ''
-    sent = len(system) + len(llm_input(step) or '') if not step.get('messages') else len(as_text(step['messages']))
+        reasoning = (usage.get('completion_tokens_details') or {}).get('reasoning_tokens')
+        return (f"tokens in={usage['prompt_tokens']:,}\ntokens out={usage.get('completion_tokens', 0):,}"
+                + (f' ({reasoning:,} of them hidden reasoning)' if reasoning else ''))
+    sent = len(system_text(step)) + len(llm_input(step) or '') if not step.get('messages') else len(as_text(step['messages']))
     received = len(as_text(llm_output(step)))
-    return f'in ≈{sent // CHARS_PER_TOKEN:,} / out ≈{received // CHARS_PER_TOKEN:,} tokens (estimated)'
+    return (f'tokens in≈{sent // CHARS_PER_TOKEN:,}\ntokens out≈{received // CHARS_PER_TOKEN:,}\n'
+            f'(estimated: the provider reports none)')
 
 
 FOUND_RE = re.compile(r'^search "(?P<query>.+)" / (?P<region>.+)$')
@@ -502,6 +528,7 @@ def step_by_step(steps: list[dict], found: str) -> list:
     '''Every prediction and check in order: who made it (a model, or code), its input and its output.'''
     rows = [('#', 'Step', 'Made by', 'Input', 'Output')]
     call = extractor_call = 0
+    page_text = None
     for n, s in enumerate(steps, 1):
         kind = s['kind']
         if kind == 'origin':
@@ -513,6 +540,8 @@ def step_by_step(steps: list[dict], found: str) -> list:
                            ('snippet', card.get('snippet')), ('posted', card.get('date_posted')),
                            ('Stage 2 position', s.get('position'))]))
         elif kind == 'page_read':
+            if s.get('raw_posting'):
+                page_text = (Path(s['raw_posting']).name, s.get('chars'), n)
             row = ('Read job page', 'code (one read-only page capture)', params([('url', s.get('url'))]),
                    params(page_read_params(s)))
         elif kind == 'llm_call':
@@ -522,7 +551,7 @@ def step_by_step(steps: list[dict], found: str) -> list:
             served = s.get('provider') or (s.get('routing') or {}).get('provider') or s.get('transport')
             row = (f"LLM call #{call}:\n{s.get('call_site')}\n{token_counts(s)}",
                    f"model {s.get('model')} ({served}), {s.get('seconds')}s",
-                   params(prompt_params(s)), params(reply_params(s)))
+                   params(prompt_params(s, page_text)), params(reply_params(s)))
         elif kind == 'evidence':
             verdicts = s.get('verdicts') or []
             source = str(s.get('source') or '')

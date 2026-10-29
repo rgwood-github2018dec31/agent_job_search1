@@ -79,6 +79,9 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
                          company_url='https://www.linkedin.com/company/acme/',
                          raw_html=str(tmp_path / 'linkedin-4476053167.html'), raw_html_bytes=152394,
                          raw_posting=str(tmp_path / 'linkedin-4476053167.txt'), raw_posting_bytes=2359, text='PAGE')
+        job_trace.record('llm_call', transport='openrouter', call_site='extract_job_page_openrouter', model='m',
+                         system='RULES ' * 50, prompt='Company: Acme\n\n--- PAGE TEXT ---\n' + 'x' * 2137 + '\n--- END PAGE TEXT ---',
+                         reply='{"title": "T"}', seconds=1.0)
         job_trace.record('llm_call', transport='openrouter', call_site='rate_with_openrouter', model='m',
                          prompt='FULL PROMPT ' * 400, reply='{"rating": 4}', cost_usd=0.001, seconds=1.0,
                          usage={'prompt_tokens': 1234, 'completion_tokens': 56})
@@ -105,7 +108,10 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
                      'query=Staff AI Engineer', 'region=European Union',
                      '1. saved full page=linkedin-4476053167.html (149 KB', 'captured=160,000 chars',
                      '2. removed clutter=1 section(s), 900 chars', '3. saved text=linkedin-4476053167.txt (2,137 chars, 2 KB)',
-                     'in 1,234 / out 56 tokens', 'rating=4'):
+                     'tokens in=1,234 tokens out=56', 'rating=4', 'system message=300 chars (standing instructions)',
+                     'user message=', 'chars before PAGE TEXT', '· Company=Acme',
+                     '· PAGE TEXT=2,137 chars = linkedin-4476053167.txt from step 2', 'total sent=',
+                     'tokens in≈'):
         assert expected in ' '.join(text.split()), expected
     first_page_links = [a.get_object()['/A']['/URI'] for a in pypdf.PdfReader(out).pages[0].get('/Annots') or []]
     assert first_page_links == [candidate['url'], 'https://www.linkedin.com/company/acme/']
