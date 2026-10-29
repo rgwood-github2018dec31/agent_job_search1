@@ -239,7 +239,7 @@ CITATION_INSTRUCTION = (
 def quote_property(name: str) -> dict:
     '''The `<field>_quote` schema property for field `name`.'''
     return {'type': 'string',
-            'description': f'Words of the source text that state {name}, copied as written; required whenever {name} is filled'}
+            'description': f'Source words stating {name}'}
 
 
 def with_quotes(properties: dict[str, dict], fields: tuple[str, ...]) -> dict[str, dict]:

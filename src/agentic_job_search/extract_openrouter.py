@@ -37,94 +37,58 @@ _SUBMIT_TOOL_NAME = 'submit_job_extract'
 _INITIAL_MESSAGE_COUNT = 2
 
 
+# Each field's rule is stated ONCE, in its description here, and both extract schemas use these
+# properties (agent.EXTRACT_OUTPUT_SCHEMA too). Until 2026-10-28 the rules were written out three
+# times — the system prompt, the tool description and the field descriptions — so the prefix sent
+# with every call was ~10.7k chars, ~2.6k tokens, and the copies had drifted apart.
+EXTRACT_REQUIRED_FIELDS = ('title', 'company', 'description')
+EXTRACT_PROPERTIES = with_quotes({
+    'title': {'type': 'string'},
+    'company': {'type': 'string'},
+    'description': {'type': 'string', 'description': (
+        'The posting condensed: requirements, responsibilities, tech stack, seniority, and any '
+        'visa/work-authorization or "no longer accepting applications" statement. Drop navigation, '
+        'footers, similar-jobs lists and marketing boilerplate')},
+    'location': {'type': 'string', 'description': (
+        'Location with the workplace type the page shows, e.g. "Bucharest, Romania (Remote within country)"')},
+    'workplace_type': {'type': 'string', 'description': (
+        '"remote", "hybrid" or "onsite", when the page states it. Any required office days ("2-3 days '
+        'onsite") is "hybrid", even when a badge says Remote')},
+    'date_posted': {'type': 'string', 'description': 'As the page shows it, absolute or relative'},
+    'closed': {'type': 'boolean', 'description': 'True if the page shows "No longer accepting applications"'},
+    'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
+    'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
+    'language_requirement': {'type': 'string', 'description': (
+        'Languages the posting REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german"')},
+    'posting_language': {'type': 'string', 'description': (
+        'Language the PAGE ITSELF is written in, lowercase, e.g. "french". Judge the source page, not '
+        'your English condensation; the original title is the clearest tell')},
+    'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
+    'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''], 'description': (
+        '"country_only" if the holder must LIVE in the country the job is advertised in ("Remote within '
+        'country", "must be based in Germany"); "area_wide" if any country of a multi-country area will '
+        'do ("remote anywhere in the EU", "any EMEA country"); empty when not said ("Romania (Remote)" '
+        'alone says nothing)')},
+    'relocation': {'type': 'string', 'description': (
+        'Country/city the candidate must relocate to or live in ("must be based in Portugal", '
+        '"relocation to Madrid"); empty for work-from-anywhere roles')},
+    'education_requirement': {'type': 'string', 'description': (
+        '"master" or "phd" ONLY when an advanced degree is a hard requirement ("MSc required", "PhD is '
+        'a must"); empty when preferred, when equivalent experience is accepted, or when a Bachelor\'s suffices')},
+    'is_agency': {'type': 'boolean', 'description': (
+        'True if the poster is a staffing firm, recruiting agency or job aggregator posting for another '
+        'company that would actually hire')},
+    'end_client': {'type': 'string', 'description': (
+        'That hiring company, if the posting names it; empty when anonymous ("our client, a leading fintech")')},
+}, EXTRACT_CITED_FIELDS)
+
 OPENROUTER_EXTRACT_TOOLS = [
     {
         'type': 'function',
         'function': {
             'name': 'submit_job_extract',
-            'description': (
-                'Submit the condensed extract of the job posting. Call exactly once when done. '
-                'Set closed=true if the page shows "No longer accepting applications". '
-                'Include the workplace type (Remote / Hybrid / On-site) in location, and also pass '
-                "workplace_type as exactly 'remote', 'hybrid', or 'onsite'. Any mention of required "
-                "days in the office (e.g. '2-3 days onsite') is 'hybrid', not 'remote'. "
-                'Pass sponsorship_note with any visa/work-authorization statement, verbatim. '
-                'Pass language_requirement with languages explicitly REQUIRED (not nice-to-have), '
-                "comma-separated lowercase, e.g. 'english, german'; omit if none stated. "
-                "Pass residency_scope as 'country_only' if the posting requires LIVING IN the "
-                "country it is advertised in ('Remote within country', 'must be based in "
-                "Germany'), or 'area_wide' if it offers a whole multi-country area ('remote "
-                "anywhere in the EU', 'Work from Anywhere', 'any EMEA country'); omit it when "
-                "the posting does not say. This is where the HOLDER MUST LIVE, not where the "
-                "job is advertised. "
-                'Pass posting_language with the language the SOURCE PAGE ITSELF IS WRITTEN IN, '
-                "lowercase, e.g. 'english', 'french'. Judge the original page, NOT the condensed "
-                'English text you are writing here — you translate as you condense. The original job '
-                "title is the clearest tell ('Scientifique principal des données en IA' means "
-                "'french'). Omit only if genuinely undeterminable. "
-                'Pass stated_working_language with the language the posting SAYS the team works in '
-                "('our working language is English'); omit it unless stated. "
-                'Pass relocation with the country/city if the posting requires relocating to or '
-                'residing in a specific place; omit for work-from-anywhere roles. '
-                "Pass education_requirement as 'master' or 'phd' ONLY if an advanced degree is a hard "
-                "requirement (e.g. 'MSc required', 'PhD is a must'); omit it when the degree is merely "
-                "preferred, when equivalent experience is accepted, or when only a Bachelor's is required. "
-                'Pass is_agency=true if the poster is a staffing firm, recruiting agency, or job '
-                'aggregator reposting on behalf of another company rather than the employer that would '
-                "actually hire, and pass end_client with that hiring company's name if the posting "
-                "names it (agencies usually keep it anonymous, e.g. 'our client, a leading fintech' — "
-                'leave end_client empty in that case). '
-                + CITATION_INSTRUCTION
-            ),
-            'parameters': {
-                'type': 'object',
-                'properties': with_quotes({
-                    'title': {'type': 'string'},
-                    'company': {'type': 'string'},
-                    'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
-                    'location': {'type': 'string'},
-                    'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
-                    'date_posted': {'type': 'string'},
-                    'closed': {'type': 'boolean'},
-                    'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
-                    'sponsorship_note': {'type': 'string'},
-                    'language_requirement': {
-                        'type': 'string',
-                        'description': 'Explicitly required languages, comma-separated lowercase',
-                    },
-                    'posting_language': {
-                        'type': 'string',
-                        'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — "
-                                       'judge the original page, not your condensed English output',
-                    },
-                    'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
-                    'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
-                                        'description': "Whether the posting pins residence to the country it is anchored in "
-                                                       "('country_only') or offers a whole multi-country area ('area_wide'); "
-                                                       'empty when the posting does not say'},
-                    'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if required'},
-                    'education_requirement': {
-                        'type': 'string',
-                        'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement; "
-                                       'empty when merely preferred or when equivalent experience is accepted',
-                    },
-                    # Must stay in sync with agent.EXTRACT_OUTPUT_SCHEMA — a field added to one
-                    # extractor and not the other silently returns empty for that path.
-                    'is_agency': {
-                        'type': 'boolean',
-                        'description': (
-                            'True if the poster is a staffing firm, recruiting agency, or job aggregator '
-                            'reposting on behalf of another company, rather than the employer that '
-                            'would actually hire.'
-                        ),
-                    },
-                    'end_client': {
-                        'type': 'string',
-                        'description': 'The company that would actually hire, if the posting names one; otherwise an empty string',
-                    },
-                }, EXTRACT_CITED_FIELDS),
-                'required': ['title', 'company', 'description'],
-            },
+            'description': 'Submit the extract of the job posting, exactly once. ' + CITATION_INSTRUCTION,
+            'parameters': {'type': 'object', 'properties': EXTRACT_PROPERTIES, 'required': list(EXTRACT_REQUIRED_FIELDS)},
         },
     },
 ]
@@ -132,7 +96,7 @@ OPENROUTER_EXTRACT_TOOLS = [
 # The tool definition is sent with every call and counted in its tokens in; the Job Audit shows its size.
 _TOOLS_CHARS = len(json.dumps(OPENROUTER_EXTRACT_TOOLS))
 
-_SUBMIT_REQUIRED_FIELDS = ('title', 'company', 'description')
+_SUBMIT_REQUIRED_FIELDS = EXTRACT_REQUIRED_FIELDS
 # Every other field, all optional, since a required field the model cannot observe pressures it to
 # make one up (Anti-fabrication). A real page always carries some of these, at least a location.
 # A submit with NONE of them is an endpoint defect, not a page: inference-net/us returned only

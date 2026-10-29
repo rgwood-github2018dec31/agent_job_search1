@@ -115,7 +115,6 @@ from agentic_job_search.config import (
     REPLAY_NOTIFICATIONS_FILENAME,
     REPLAY_SUMMARY_FILENAME,
     SALARY_ESTIMATE_ENABLED,
-    SALARY_FIELD_DESCRIPTION,
     SALARY_IMPLAUSIBLE_ANNUAL_FLOOR,
     SATURATION_MIN_NEW_JOBS,
     SATURATION_MIN_NEW_RATIO,
@@ -133,7 +132,6 @@ from agentic_job_search.config import (
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SECONDS_PER_MINUTE,
-    STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION,
     THINKING_MAX_CHARS,
     TRIAGE_DISAGREEMENT_LOG_MIN,
     TRIAGE_ENABLED,
@@ -142,8 +140,8 @@ from agentic_job_search.config import (
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
 )
-from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim, quotes_from, with_quotes
-from agentic_job_search.extract_openrouter import extract_job_page_openrouter
+from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim, quotes_from
+from agentic_job_search.extract_openrouter import EXTRACT_PROPERTIES, EXTRACT_REQUIRED_FIELDS, extract_job_page_openrouter
 from agentic_job_search.linkedin_page import (
     JobPage,
     LinkedInBlockedError,
@@ -589,43 +587,16 @@ Stage 2 will fill in the details from the job page.
 '''
 
 # What to capture and how, shared by both extractor prompts below.
-EXTRACT_FIELD_GUIDANCE = '''Condense aggressively: keep the title, company, location, posting date, salary, requirements, responsibilities, tech stack,
-seniority, and any visa/work-authorization or "no longer accepting applications" statements. In the location field, always include the workplace type shown on
-the page (Remote / Hybrid / On-site), e.g. "Bucharest, Romania (Remote within country)". Strip navigation chrome, footers, "similar jobs" lists, and marketing
-boilerplate.
-
-Also capture:
-- workplace_type: exactly one of "remote", "hybrid", or "onsite", whenever the page states the work arrangement. Any mention of required days in the office
-(e.g. "2-3 days onsite", "3 days per week in our Amsterdam office") is "hybrid", NOT "remote" — even when the search result or the header badge said Remote.
-Leave empty only if the page genuinely does not say.
-- language_requirement: languages the posting explicitly REQUIRES (not nice-to-haves), comma-separated lowercase, e.g. "english, german". Leave empty if no
-language requirement is stated.
-- posting_language: the language the POSTING PAGE ITSELF IS WRITTEN IN, lowercase English name, e.g. "english", "french", "german". Judge the SOURCE page you
-read, NOT the condensed English text you are about to write — you translate as you condense, so your own output says nothing about the original. The original
-job title is usually the clearest tell (e.g. a title like "Scientifique principal des données en IA" means "french"). Leave empty only if genuinely
-undeterminable.
-- stated_working_language: the language(s) the posting SAYS the team or company works in, lowercase, e.g. "english" for "our working language is English" or
-"international English-speaking team". Leave empty unless the posting states it — never infer it from the location.
-- residency_scope: "country_only" if the posting requires LIVING IN the country it is advertised in (e.g. "Remote within country", "must be based in Germany",
-"open only to candidates residing in Poland"), or "area_wide" if it offers a whole multi-country area (e.g. "remote anywhere in the EU", "Work from Anywhere",
-"any EMEA country"). Leave empty when the posting does not say. This is about where the HOLDER MUST LIVE, which is not the same as where the job is
-advertised: "Romania (Remote)" on its own says nothing here.
-- relocation: if the posting requires the candidate to relocate to or reside in a specific country/city (e.g. "must be based in Portugal", "remote within
-Spain", "relocation to Madrid"), give that location. Leave empty for work-from-anywhere roles.
-- education_requirement: "master" or "phd" ONLY if the posting states an advanced degree as a hard requirement (e.g. "MSc in Computer Science required", "PhD
-is a must"). Leave empty when the degree is merely preferred, when equivalent experience is accepted ("Master's or equivalent practical experience", "MSc a
-plus", "Bachelor's or Master's"), or when only a Bachelor's is required.'''
-
 # The default path: code has already read the page (linkedin_page.read_job_page), so the model
-# has the text and one tool, and no browser.
-PAGE_EXTRACTOR_INSTRUCTIONS = '''You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code — you
+# has the text and one tool, and no browser. What goes in each field is said once, in that field's
+# description (extract_openrouter.EXTRACT_PROPERTIES), not repeated here.
+PAGE_EXTRACTOR_INSTRUCTIONS = '''You are a job page extractor. The user message holds the text of ONE job posting page, already read and cleaned by code; you
 have no browser and need none.
 
-Call submit_job_extract exactly once, with what the page text says. Never invent a field the text does not support; leave it empty instead.
+Call submit_job_extract exactly once with what the page text says. Each field's description says what goes in it. Never invent a field the text does not
+support; leave it empty instead. Condense the description aggressively.
 
-''' + EXTRACT_FIELD_GUIDANCE + '''
-
-Do not rate the job. Extract this one posting, submit it, then stop.
+Do not rate the job.
 '''
 
 EVALUATOR_INSTRUCTIONS_TEMPLATE = '''You are evaluating a single job posting. A condensed extract of the posting is provided in the user message — you do not
@@ -771,48 +742,7 @@ def build_evaluator_instructions() -> str:
         hybrid_locations_section=hybrid_locations_section,
     )
 
-EXTRACT_OUTPUT_SCHEMA = {
-    'type': 'object',
-    'properties': with_quotes({
-        'title': {'type': 'string'},
-        'company': {'type': 'string'},
-        'description': {'type': 'string', 'description': 'Condensed posting content (requirements, responsibilities, stack, seniority)'},
-        'location': {'type': 'string', 'description': 'Location including workplace type (Remote / Hybrid / On-site)'},
-        'workplace_type': {'type': 'string', 'description': "Work arrangement: 'remote', 'hybrid', or 'onsite'"},
-        'date_posted': {'type': 'string', 'description': 'As shown on the page, absolute or relative'},
-        'closed': {'type': 'boolean', 'description': 'True if the page shows "No longer accepting applications"'},
-        'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
-        'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
-        'language_requirement': {
-            'type': 'string',
-            'description': "Explicitly required languages, comma-separated lowercase, e.g. 'english, german'",
-        },
-        'posting_language': {
-            'type': 'string',
-            'description': "Language the SOURCE page is written in, lowercase e.g. 'english', 'french' — "
-                           "judge the original page, not your condensed English output; "
-                           'the original title is the clearest tell',
-        },
-        'stated_working_language': {'type': 'string', 'description': STATED_WORKING_LANGUAGE_FIELD_DESCRIPTION},
-        'residency_scope': {'type': 'string', 'enum': ['country_only', 'area_wide', ''],
-                            'description': "Whether the posting pins residence to the country it is anchored in "
-                                           "('country_only') or offers a whole multi-country area ('area_wide'); "
-                                           'empty when the posting does not say'},
-        'relocation': {'type': 'string', 'description': 'Location the candidate must relocate to / reside in, if the posting requires one'},
-        'education_requirement': {
-            'type': 'string',
-            'description': "'master' or 'phd' ONLY if an advanced degree is a HARD requirement "
-                           "(e.g. 'MSc required', 'PhD is a must'); empty when merely preferred, "
-                           "when equivalent experience is accepted, or when only a Bachelor's is required",
-        },
-        # Same meaning as in extract_openrouter.OPENROUTER_EXTRACT_TOOLS. Until 2026-10-19 this
-        # schema lacked both, so a job extracted by the fallback silently lost its agency status.
-        'is_agency': {'type': 'boolean', 'description': 'True if the poster is a staffing firm, recruiting agency or '
-                                                        'aggregator posting on behalf of the employer that would hire'},
-        'end_client': {'type': 'string', 'description': 'The company that would actually hire, if the posting names one'},
-    }, EXTRACT_CITED_FIELDS),
-    'required': ['title', 'company', 'description'],
-}
+EXTRACT_OUTPUT_SCHEMA = {'type': 'object', 'properties': EXTRACT_PROPERTIES, 'required': list(EXTRACT_REQUIRED_FIELDS)}
 
 # A rater's pro or warning: the phrase, and the words of the posting it stands on (Verify Source Reference).
 _CITED_ITEM_SCHEMA = {
