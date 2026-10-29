@@ -111,10 +111,10 @@ def minimise(main: Tag) -> list[dict]:
 def page_html(main: Tag, meta: dict, removed: list[dict]) -> str:
     '''The self-contained page: a provenance line, the minimised content, what was removed.'''
     url = html.escape(str(meta.get('url', '')))
-    meta_line = (f'<div class="archive-meta">Archived {html.escape(str(meta.get("captured", "")))} · '
-                 f'job {html.escape(str(meta.get("job_id", "")))} · <a href="{url}">{url}</a></div>')
+    captured = html.escape(str(meta.get('captured', '')))
+    meta_line = f'<div class="archive-meta"><a href="{url}">{url}</a> · Archived {captured}</div>'
     items = ''.join(f'<li>{html.escape(r["what"])} ({r["chars"]} chars)</li>' for r in removed)
-    removed_block = f'<div class="archive-removed">Removed from the archived page:<ul>{items}</ul></div>'
+    removed_block = f'<div class="archive-removed"><b>Archive Process Notes</b><br>Removed from the archived page:<ul>{items}</ul></div>'
     title = html.escape(f'{meta.get("company", "")} — job {meta.get("job_id", "")}')
     main.name = 'main'
     return (f'<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'

@@ -499,7 +499,9 @@ async def test_read_job_page_writes_the_minimal_archive_beside_the_full_one(monk
     assert 'More jobs' in minimal.split('Removed from the archived page')[1], 'the footer names what went'
     content = minimal.split('<main>')[1].split('</main>')[0]
     assert '<script' not in minimal and 'class=' not in content
-    assert JOB_ID in minimal and _candidate()['url'] in minimal, 'provenance line'
+    url = _candidate()['url']
+    assert f'<div class="archive-meta"><a href="{url}">{url}</a> · Archived ' in minimal, 'provenance line'
+    assert '<b>Archive Process Notes</b><br>Removed from the archived page:' in minimal
     assert 'More jobs' in lp.raw_html_path(_candidate()).read_text(), 'the full archive is still written'
     assert 'Build agentic systems in Python.' in page.text
 
