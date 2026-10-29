@@ -58,7 +58,6 @@ sys.path.insert(0, str(PROJECT_DIR / 'src'))
 
 from agentic_job_search import agent as A  # noqa: E402
 from agentic_job_search import config as C  # noqa: E402
-from agentic_job_search import extract_openrouter as EO  # noqa: E402
 from agentic_job_search import job_trace as T  # noqa: E402
 from agentic_job_search import linkedin_page as LP  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
@@ -404,10 +403,13 @@ def size(n_bytes: int | None) -> str:
     return f'{n_bytes / 1024:,.0f} KB' if n_bytes >= 1024 else f'{n_bytes:,} bytes'
 
 
+NOTE = object()   # a params() entry printed as its name alone, with no '=value'
+
+
 def params(pairs: dict | list[tuple[str, object]]) -> str:
     '''One "name=value" line per parameter; each value shortened by compact().'''
     items = pairs.items() if isinstance(pairs, dict) else pairs
-    lines = [f'{k}={compact(v)}' for k, v in items if v not in (None, '', [], {})]
+    lines = [k if v is NOTE else f'{k}={compact(v)}' for k, v in items if v not in (None, '', [], {})]
     return '\n'.join(lines) or '—'
 
 
@@ -420,6 +422,13 @@ def tool_called(step: dict) -> str | None:
     '''The tool a loop's reply called (its definition is sent too, and counted in the tokens in).'''
     out = llm_output(step)
     return next(iter(out)) if step.get('raw_reply') and isinstance(out, dict) and len(out) == 1 else None
+
+
+CHARS_PER_KILO = 1000
+
+
+def kilo_chars(n: int) -> str:
+    return f'{n / CHARS_PER_KILO:.1f}k chars'
 
 
 def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None) -> list[tuple[str, object]]:
@@ -438,12 +447,8 @@ def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None) -> 
     head = text[:markers[0].start()] if markers else text
     pairs: list[tuple[str, object]] = []
     if system:
-        pairs.append(('system message', f'{len(system):,} chars (standing instructions)'))
-    if sections:
-        parts = ', then '.join(name for name, _ in sections)
-        pairs.append(('user message', f'{len(text):,} chars: {len(head.strip()):,} chars before {parts}'))
-    else:
-        pairs.append(('user message', f'{len(text):,} chars (instructions and question in one)'))
+        pairs.append(('system message', kilo_chars(len(system))))
+    pairs.append(('user message', kilo_chars(len(text))))
     if 'CLAIMS:' in head and (claims := _json_or_none(head.split('CLAIMS:', 1)[1].strip())):
         head = head.split('CLAIMS:', 1)[0]
         pairs += [(f"· claim {c.get('field')}", f"{compact(c.get('value'))} (cited: {compact(c.get('cited')) or '—'})")
@@ -454,20 +459,17 @@ def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None) -> 
         pairs.append(('· asks', shorten(head.strip().splitlines()[0] if head.strip() else '', 90)))
     for name, length in sections:
         same = page_text and length == page_text[1]
-        pairs.append((f'· {name}', f'{length:,} chars' + (f' = {page_text[0]} from step {page_text[2]}' if same else '')))
+        pairs.append((f'· {name}', kilo_chars(length) + (f' = {page_text[0]} from step {page_text[2]}' if same else '')))
     total = len(system) + len(text)
-    if tool := tool_called(step):
-        if step.get('tools_chars'):
-            total += step['tools_chars']
-            pairs.append((f'{tool} tool definition', f"{step['tools_chars']:,} chars (its fields and rules, sent with every call)"))
-        else:
-            pairs.append((f'{tool} tool definition', f'not recorded in this trace (today {EO._TOOLS_CHARS:,} chars)'))
     tokens_in = provider_usage(step).get('prompt_tokens')
-    complete = not tool or step.get('tools_chars')
-    if complete and tokens_in:
-        pairs.append(('total sent', f'{total:,} chars = {tokens_in:,} tokens in (about {total / tokens_in:.1f} chars per token)'))
-    else:
-        pairs.append(('total sent', f'{total:,} chars' + ('' if complete else ' + the tool definition')))
+    if tool := tool_called(step):
+        # Recorded since 2026-10-28; for an older trace, what the provider's token count leaves over.
+        tool_chars = step.get('tools_chars') or (
+            max(tokens_in * CHARS_PER_TOKEN - total, 0) if tokens_in else None)
+        if tool_chars is not None:
+            total += tool_chars
+            pairs.append((f'{tool} tool definition: approx {kilo_chars(tool_chars)}', NOTE))
+    pairs.append(('total sent', kilo_chars(total) + (f' ({tokens_in / CHARS_PER_KILO:.1f}k tokens)' if tokens_in else '')))
     return pairs
 
 

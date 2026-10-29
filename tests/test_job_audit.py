@@ -111,10 +111,10 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
                      'query=Staff AI Engineer', 'region=European Union',
                      '1. saved full page=linkedin-4476053167.html (149 KB', 'captured=160,000 chars',
                      '2. removed clutter=1 section(s), 900 chars', '3. saved text=linkedin-4476053167.txt (2,137 chars, 2 KB)',
-                     'tokens in=1,234 tokens out=56', 'rating=4', 'system message=300 chars (standing instructions)',
-                     'user message=', 'chars before PAGE TEXT', '· Company=Acme',
-                     '· PAGE TEXT=2,137 chars = linkedin-4476053167.txt from step 2', 'submit_job_extract tool definition=5,000 chars',
-                     'total sent=7,492 chars = 2,000 tokens in (about 3.7 chars per token)'):
+                     'tokens in=1,234 tokens out=56', 'rating=4', 'system message=0.3k chars',
+                     'user message=2.2k chars', '· Company=Acme',
+                     '· PAGE TEXT=2.1k chars = linkedin-4476053167.txt from step 2', 'submit_job_extract tool definition: approx 5.0k chars',
+                     'total sent=7.5k chars (2.0k tokens)'):
         assert expected in ' '.join(text.split()), expected
     first_page_links = [a.get_object()['/A']['/URI'] for a in pypdf.PdfReader(out).pages[0].get('/Annots') or []]
     assert first_page_links == [candidate['url'], 'https://www.linkedin.com/company/acme/']
