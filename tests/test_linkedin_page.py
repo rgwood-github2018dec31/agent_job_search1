@@ -370,6 +370,37 @@ def test_a_zero_price_is_not_pay_wording(text, expected):
     assert lp.mentions_pay(text) is expected
 
 
+BADGED_CARD = ('<p>Toronto, ON · 2 days ago · 40 applicants</p><p>$150K/yr - $180K/yr</p><p>Hybrid</p>'
+               '<p>Contract</p><p>Not currently accepting applications</p>')
+
+
+def test_header_card_reads_what_the_card_states():
+    header = lp.header_card(BeautifulSoup(PAGE.replace('<p>Toronto, ON · 2 days ago · 40 applicants</p>', BADGED_CARD), 'lxml'))
+    assert header == lp.HeaderCard(company='Acme Corp', title='Staff AI Engineer', location='Toronto, ON',
+                                   posted='2 days ago', workplace='hybrid', employment_type='Contract',
+                                   salary='$150K/yr - $180K/yr', closed=True)
+
+
+def test_header_card_without_badges_leaves_them_empty():
+    header = lp.header_card(_soup())
+    assert (header.title, header.posted, header.workplace, header.employment_type, header.closed) == (
+        'Staff AI Engineer', '2 days ago', '', '', False)
+
+
+def test_header_card_is_empty_without_a_header_card():
+    page = PAGE.replace('alt="Company logo for, Acme Corp."', 'alt=""')
+    assert lp.header_card(BeautifulSoup(page, 'lxml')) == lp.HeaderCard()
+
+
+@pytest.mark.parametrize('text, expected', [
+    ('No longer accepting applications', True),
+    ('not currently accepting applications', True),   # 13 of 252 saved pages, missed until 2026-10-28
+    ('Accepting applications until Friday', False),
+])
+def test_is_closed_text(text, expected):
+    assert lp.is_closed_text(f'About the job\n{text}') is expected
+
+
 def test_listed_location_reads_the_header_card():
     assert lp.listed_location(_soup()) == 'Toronto, ON'
 

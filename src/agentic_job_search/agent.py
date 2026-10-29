@@ -140,12 +140,19 @@ from agentic_job_search.config import (
     YIELD_HISTORY_RUNS_SHOWN,
     should_notify_based_on_rating,
 )
-from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim, quotes_from
-from agentic_job_search.extract_openrouter import EXTRACT_PROPERTIES, EXTRACT_REQUIRED_FIELDS, extract_job_page_openrouter
+from agentic_job_search.evidence import CITATION_INSTRUCTION, Claim
+from agentic_job_search.extract_openrouter import (
+    EXTRACT_PROPERTIES,
+    EXTRACT_REQUIRED_FIELDS,
+    extract_from_args,
+    extract_job_page_openrouter,
+)
 from agentic_job_search.linkedin_page import (
+    HeaderCard,
     JobPage,
     LinkedInBlockedError,
     company_page_url,
+    is_closed_text,
     posted_age_from_page,
     read_company_about,
     read_job_page,
@@ -2412,24 +2419,7 @@ async def extract_job_page_direct(
         logger.warning(f"Extract fallback: job {candidate['job_id']} {candidate['company']} — "
                        f"{candidate['title']}: no structured output{cost_note}")
         return None
-    extract = {
-        'title': structured['title'], 'company': structured['company'],
-        'description': structured['description'],
-        'location': structured.get('location', ''), 'date_posted': structured.get('date_posted', ''),
-        'closed': structured.get('closed', False), 'salary': structured.get('salary', ''),
-        'sponsorship_note': structured.get('sponsorship_note', ''),
-        'language_requirement': structured.get('language_requirement', ''),
-        'posting_language': (structured.get('posting_language') or '').strip().lower(),
-        'stated_working_language': (structured.get('stated_working_language') or '').strip().lower(),
-        'relocation': structured.get('relocation', ''),
-        'residency_scope': (structured.get('residency_scope') or '').strip().lower(),
-        'workplace_type': (structured.get('workplace_type') or '').strip().lower(),
-        'education_requirement': (structured.get('education_requirement') or '').strip().lower(),
-        'is_agency': structured.get('is_agency'),
-        'end_client': str(structured.get('end_client') or '').strip(),
-        'quotes': quotes_from(structured, EXTRACT_CITED_FIELDS),
-        'page_text': page.text,
-    }
+    extract = {**extract_from_args(structured), 'page_text': page.text, 'page_header': page.header}
     logger.info(
         f"Extract fallback: job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
         f"{len(page.text)} page chars ({page.source}) → {len(extract['description'])} chars condensed{cost_note}"
@@ -2622,6 +2612,10 @@ def derive_workplace_type(extract: dict) -> str:
         return explicit
     if explicit in {'on-site', 'on site', 'in-office', 'in office'}:
         return 'onsite'
+    # The header badge, read by code: after the extractor, which reads the body and so sees the
+    # office days a 'Remote' badge leaves out, and before the free-text guess.
+    if extract.get('workplace_badge'):
+        return extract['workplace_badge']
 
     haystack = f"{extract.get('location', '')}\n{regex_source_text(extract)}"
     if _HYBRID_RE.search(haystack):
@@ -2797,15 +2791,39 @@ def _rejected_extract_value(field: str, candidate: dict) -> Any:
     return ''
 
 
+def read_header_fields(candidate: dict, extract: dict) -> dict[str, str]:
+    """Fill the fields code reads off the job page instead of asking a model, from the header card
+    the page reader put in `extract['page_header']`, else from the search card. Returns field ->
+    'read_by_code' (the page) or 'search_card'.
+
+    The model was asked for these until 2026-10-28, each with a quote that cost output and a
+    citation check, though the page states every one in its header. The posting date from the
+    model went wrong too: on 2026-10-16 it returned '2025-10-14 (posted 16-17 hours ago)' for a
+    page saying '17 hours ago', and the invented year hard-rated a fresh job as stale.
+    """
+    header = extract.pop('page_header', None) or HeaderCard()
+    page_text = extract.get('page_text') or ''
+    sources: dict[str, str] = {}
+    for field, on_page, on_card in (
+            ('title', header.title, candidate.get('title')),
+            ('company', header.company, candidate.get('company')),
+            ('date_posted', header.posted or posted_age_from_page(page_text), candidate.get('date_posted'))):
+        extract[field] = on_page or str(on_card or '')
+        sources[field] = 'read_by_code' if on_page else 'search_card'
+    extract['closed'] = header.closed or is_closed_text(page_text)
+    sources['closed'] = 'read_by_code'
+    extract['employment_type'] = header.employment_type
+    extract['workplace_badge'] = header.workplace
+    return sources
+
+
 async def verify_extract(candidate: dict, extract: dict, stage_stats: dict) -> dict[str, str]:
     """Verify Source Reference for an extract: every cited field stands only on text found in the
     page it was made from (`extract['page_text']`). Rejected fields are reset to absent in place.
     Returns, and stores as `extract['evidence']`, field -> how it was grounded.
 
-    Two fields are read by code instead. The posting date comes from the page header's own
-    "N hours ago" line whenever the page has one: on 2026-10-16 the extractor returned
-    '2025-10-14 (posted 16-17 hours ago)' for a page saying '17 hours ago', and the invented year
-    hard-rated a fresh job as stale. A salary's AMOUNTS must also each appear in the page as
+    Title, company, posting date and closed are read by code first (read_header_fields), so no
+    model predicts them. A salary's AMOUNTS must also each appear in the page as
     numbers (salary_digits_are_in_the_source), whatever its quote says: the page the extractor
     read is retained word for word since 2026-09-24, so a figure absent from it was invented, and
     a rejected salary now reads as absent instead of as an `unverified` figure.
@@ -2813,13 +2831,7 @@ async def verify_extract(candidate: dict, extract: dict, stage_stats: dict) -> d
     page_text = extract.get('page_text') or ''
     subject = f"job {candidate.get('job_id')} {candidate.get('company')}"
     source_label = str(tools_module.raw_posting_path(candidate))
-    statuses: dict[str, str] = {}
-    posted = posted_age_from_page(page_text)
-    if posted:
-        if extract.get('date_posted') and extract['date_posted'] != posted:
-            logger.debug(f"Posted age: {subject}: page says {posted!r}, extractor said {extract['date_posted']!r}")
-        extract['date_posted'] = posted
-        statuses['date_posted'] = 'read_by_code'
+    statuses = read_header_fields(candidate, extract)
     quotes = extract.get('quotes') or {}
     claims = [
         Claim(field, extract.get(field), quotes.get(field, ''))
@@ -2894,6 +2906,7 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         *([f'LinkedIn-listed location: {listed}']
           if (listed := extract.get('listed_location')) and listed != extract['location'] else []),
         *([f'Workplace: {workplace_type}'] if workplace_type else []),
+        *([f"Employment type: {extract['employment_type']}"] if extract.get('employment_type') else []),
         f"Posted: {extract['date_posted'] or candidate['date_posted']}",
         f"URL: {candidate['url']}",
     ]
@@ -2990,7 +3003,7 @@ async def apply_hard_rules(candidate: dict, extract: dict) -> str | None:
             return fired('blacklist', f'blacklisted company: {name} ({reason})', name=name)
     passed('blacklist', names=[extract.get('company') or candidate.get('company', ''), derive_end_client(extract)])
 
-    if extract['closed'] or 'no longer accepting applications' in full_text.lower():
+    if extract['closed'] or is_closed_text(full_text):
         return fired('closed', 'posting closed (no longer accepting applications)', closed=extract['closed'])
     passed('closed', closed=extract['closed'])
     try:
@@ -3535,6 +3548,8 @@ def apply_rating_caps(extract: dict, rating: int) -> tuple[int, str]:
     return min(cap for cap, _ in applicable), '; '.join(reason for _, reason in applicable)
 
 
+# The header card's employment types that make a role a contract (LINKEDIN_EMPLOYMENT_TYPES).
+CONTRACT_EMPLOYMENT_TYPES = ('Contract', 'Temporary')
 _CONTRACT_RE = re.compile(
     r'\bcontract(?:or)?\b|\bfreelance\b|\bday\s*rate\b|\b\d+\s*-\s*\d+\s*months?\b|\bfixed[\s-]term\b'
     # 'Temporary position up to 12 months' was caught by the rater and missed here (2026-09-15).
@@ -3733,7 +3748,8 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     if extract.get('relocation') and not relocation_already_met(extract['relocation']):
         warnings.append(f"Relocation required: {extract['relocation']}")
 
-    if _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')}"):
+    if (extract.get('employment_type') in CONTRACT_EMPLOYMENT_TYPES
+            or _CONTRACT_RE.search(f"{extract.get('title', '')} {extract.get('description', '')}")):
         warnings.append('Contract role — full-time preferred')
 
     # Absent, one-ended, a lone figure or unreadable — each says something different, and a digit
@@ -4569,6 +4585,7 @@ async def _evaluate_candidates(
                     candidate, page.text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS)
                 if extract is not None:
                     extract['page_text'] = page.text
+                    extract['page_header'] = page.header
             if extract is None:
                 extract = await extract_job_page_direct(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)

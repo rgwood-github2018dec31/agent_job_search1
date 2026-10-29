@@ -43,14 +43,17 @@ from agentic_job_search.config import (
     EXTRACT_PAGE_RENDER_WAIT_SECONDS,
     EXTRACTOR_SNAPSHOT_MAX_CHARS,
     JOB_PAGE_ASSET_FETCH_TIMEOUT_SECONDS,
+    LINKEDIN_CLOSED_PHRASES,
     LINKEDIN_COMPANY_ABOUT_URL,
     LINKEDIN_COMPANY_URL,
+    LINKEDIN_EMPLOYMENT_TYPES,
     LINKEDIN_PAGE_CAPTURE_JS,
     LINKEDIN_PAGE_CAPTURE_RETRIES,
     LINKEDIN_PDF_FURNITURE_LINE_PATTERNS,
     LINKEDIN_REMOVE_ARIA_LABELS,
     LINKEDIN_REMOVE_SECTION_PHRASES,
     LINKEDIN_REMOVE_TAGS,
+    LINKEDIN_WORKPLACE_BADGES,
     MODEL_NAME_PAGE_SECTIONS,
     PAGE_SECTION_SAMPLE_MAX_CHARS,
     PAGE_SECTION_SIGNATURE_MAX_WORDS,
@@ -105,6 +108,19 @@ _PAGE_SECTIONS_HEADER = (
 
 
 @dataclass
+class HeaderCard:
+    '''What the job page's header card states, read by code (header_card()); '' where it does not say.'''
+    company: str = ''
+    title: str = ''
+    location: str = ''
+    posted: str = ''            # the posting age as written, e.g. 'Reposted 6 days ago'
+    workplace: str = ''         # 'remote' / 'hybrid' / 'onsite', from the badge (LINKEDIN_WORKPLACE_BADGES)
+    employment_type: str = ''   # one of LINKEDIN_EMPLOYMENT_TYPES as written
+    salary: str = ''            # LinkedIn's own pay badge, e.g. '100K EUR/yr - 120K EUR/yr'
+    closed: bool = False        # the card says one of LINKEDIN_CLOSED_PHRASES
+
+
+@dataclass
 class JobPage:
     '''What the extractor reads, and how it came to be.'''
     text: str
@@ -112,6 +128,7 @@ class JobPage:
     removed: list[dict] = field(default_factory=list)
     company_slug: str = ''   # the poster's LinkedIn page, from the About-the-company card; '' if absent
     listed_location: str = ''   # the header card's location (listed_location()); '' if absent
+    header: HeaderCard = field(default_factory=HeaderCard)   # empty on the snapshot path
     posting_company: str = ''   # the poster as the page's logo names it (posting_company()); '' if absent
     dom_chars: int = 0          # the captured page before scripts and clutter were removed
     removed_chars: int = 0      # what clutter removal took out of the text
@@ -410,28 +427,52 @@ def top_card(main: Tag) -> Tag | None:
     return top
 
 
+def header_card(soup: BeautifulSoup) -> HeaderCard:
+    """What the posting's header card states, read in code so no model has to predict it.
+
+    The card lines run company, title, location, then '·' between the location and the posting
+    age, '·' again before the applicant count, then the badges: pay (when LinkedIn shows one),
+    workplace type, employment type, and Apply or a closed notice. Matched on that text structure
+    and the badges' exact words, never on LinkedIn's hashed class names. An empty HeaderCard when
+    the card cannot be found or lacks the shape.
+    """
+    main = soup.find('main') or soup.body or soup
+    card = top_card(main)
+    if card is None:
+        return HeaderCard()
+    # The separator is its own text node on the live page, inline in the text on older markup.
+    text = card.get_text('\n').replace(_TOP_CARD_SEPARATOR, f'\n{_TOP_CARD_SEPARATOR}\n')
+    lines = [line for line in (norm(line) for line in text.split('\n')) if line]
+    separators = [i for i, line in enumerate(lines) if line == _TOP_CARD_SEPARATOR]
+    # Company and title come first, so the location is at least the third line.
+    if not separators or separators[0] - 1 < _TOP_CARD_MIN_LINES_BEFORE_LOCATION:
+        return HeaderCard()
+    first = separators[0]
+    badges = lines[separators[1] + 2:] if len(separators) > 1 else lines[first + 2:]
+    return HeaderCard(
+        company=lines[0], title=lines[1], location=lines[first - 1],
+        posted=lines[first + 1] if first + 1 < len(lines) and _POSTED_AGE_LINE_RE.match(lines[first + 1]) else '',
+        workplace=next((LINKEDIN_WORKPLACE_BADGES[b] for b in badges if b in LINKEDIN_WORKPLACE_BADGES), ''),
+        employment_type=next((b for b in badges if b in LINKEDIN_EMPLOYMENT_TYPES), ''),
+        salary=next((b for b in badges if mentions_pay(b)), ''),
+        closed=any(b in LINKEDIN_CLOSED_PHRASES for b in badges),
+    )
+
+
 def listed_location(soup: BeautifulSoup) -> str:
     """The location LinkedIn's header card lists for the posting, or '' when it cannot be found.
 
     Read in code because it is on the page: the extractor reads the body, which can disagree. For
     Lucentive (job 4481299924) the card said 'Eu, Normandy, France', LinkedIn's geocoding of
-    "EU" to a Normandy town, while the body said 'EU-based ... Portugal hub' (2026-10-21). The card
-    lines run company, title, location, then '·' between the location and the posting age. Matched
-    on that text structure, never on LinkedIn's hashed class names.
+    "EU" to a Normandy town, while the body said 'EU-based ... Portugal hub' (2026-10-21).
     """
-    main = soup.find('main') or soup.body or soup
-    card = top_card(main)
-    if card is None:
-        return ''
-    # The separator is its own text node on the live page, inline in the text on older markup.
-    text = card.get_text('\n').replace(_TOP_CARD_SEPARATOR, f'\n{_TOP_CARD_SEPARATOR}\n')
-    lines = [norm(line) for line in text.split('\n')]
-    lines = [line for line in lines if line]
-    separator = next((i for i, line in enumerate(lines) if line == _TOP_CARD_SEPARATOR), None)
-    # Company and title come first, so the location is at least the third line.
-    if separator is None or separator - 1 < _TOP_CARD_MIN_LINES_BEFORE_LOCATION:
-        return ''
-    return lines[separator - 1]
+    return header_card(soup).location
+
+
+def is_closed_text(text: str) -> bool:
+    '''Whether page text says the posting no longer takes applications (LINKEDIN_CLOSED_PHRASES).'''
+    folded = (text or '').casefold()
+    return any(phrase.casefold() in folded for phrase in LINKEDIN_CLOSED_PHRASES)
 
 
 def company_card_anchors(root: Tag) -> list[Tag]:
@@ -680,8 +721,10 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         return await _read_snapshot(candidate, call, 'the page has no JobDetails_AboutTheJob_ section')
 
     company_slug = posting_company_slug(soup)
-    if not (location := listed_location(soup)):
-        logger.info(f'Job page {job_id}: no location found in the header card (only the location-mismatch check is lost)')
+    header = header_card(soup)
+    if not header.title:
+        logger.info(f'Job page {job_id}: the header card could not be read (title, company, posted age, badges '
+                    'and the location-mismatch check fall back to the search card or the extractor)')
     js_counts = strip_js(soup)
     company = posting_company(soup) or str(candidate.get('company') or '') or None
     html_path = raw_html_path(candidate)
@@ -711,7 +754,7 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     )
     logger.debug(f'Job page {job_id}: removed {removed_summary}; JS {js_counts}; assets {asset_counts}')
     return JobPage(text=text, source='dom', removed=removed, company_slug=company_slug,
-                   listed_location=location, posting_company=company or '', dom_chars=len(capture['html']),
+                   listed_location=header.location, header=header, posting_company=company or '', dom_chars=len(capture['html']),
                    removed_chars=sum(r['chars'] for r in removed))
 
 

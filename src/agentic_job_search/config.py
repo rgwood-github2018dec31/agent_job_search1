@@ -768,6 +768,13 @@ EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after naviga
 # "Affiliated pages" Parent entry); a model is asked only for what that page does not state.
 LINKEDIN_COMPANY_ABOUT_URL = 'https://www.linkedin.com/company/{slug}/about/'
 LINKEDIN_COMPANY_URL = 'https://www.linkedin.com/company/{slug}/'
+# The job page's header card badges, matched on their exact text (Read Job Page Header). Seen on
+# 252 saved pages (2026-10-28): every one carried a workplace badge or an employment type.
+LINKEDIN_WORKPLACE_BADGES = {'Remote': 'remote', 'Hybrid': 'hybrid', 'On-site': 'onsite'}
+LINKEDIN_EMPLOYMENT_TYPES = ('Full-time', 'Part-time', 'Contract', 'Temporary', 'Internship', 'Volunteer', 'Other')
+# A closed posting says one of these. Until 2026-10-28 only the first was checked: 13 of 252 saved
+# pages said the second.
+LINKEDIN_CLOSED_PHRASES = ('No longer accepting applications', 'Not currently accepting applications')
 # Before each About-page visit: a (min, max) range for the same reason as the scraper's delays.
 # Visited once per company slug, ever, and only for a job headed for the paid rating call.
 COMPANY_ABOUT_PAGE_DELAY_SECONDS = (3.0, 8.0)
@@ -845,8 +852,10 @@ MODEL_NAME_EVIDENCE = MODEL_NAME_SINGLE_TURN
 # The extract fields a model predicts as facts of the page, each cited and verified. `description`
 # is a condensation, not a fact, and `date_posted` is read from the page by code whenever the page
 # shows the usual "N hours ago" line (linkedin_page.posted_age_from_page).
+# title, company, date_posted and closed are not here: code reads them off the page's header card
+# (agent.read_header_fields) and the model is no longer asked for them (2026-10-28).
 EXTRACT_CITED_FIELDS = (
-    'title', 'company', 'location', 'workplace_type', 'date_posted', 'closed', 'salary',
+    'location', 'workplace_type', 'salary',
     'sponsorship_note', 'language_requirement', 'posting_language', 'stated_working_language',
     'residency_scope', 'relocation', 'education_requirement', 'is_agency', 'end_client',
 )

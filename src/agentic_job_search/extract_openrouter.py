@@ -41,21 +41,16 @@ _INITIAL_MESSAGE_COUNT = 2
 # properties (agent.EXTRACT_OUTPUT_SCHEMA too). Until 2026-10-28 the rules were written out three
 # times — the system prompt, the tool description and the field descriptions — so the prefix sent
 # with every call was ~10.7k chars, ~2.6k tokens, and the copies had drifted apart.
-EXTRACT_REQUIRED_FIELDS = ('title', 'company', 'description')
+# Title, company, posting date and closed are read by code off the page header (agent.read_header_fields).
+# `location` is required because every job page states one: with `description` the only required
+# field, a model submitted just that, three times on one page (replay, 2026-10-28).
+EXTRACT_REQUIRED_FIELDS = ('location', 'description')
 EXTRACT_PROPERTIES = with_quotes({
-    'title': {'type': 'string'},
-    'company': {'type': 'string'},
-    'description': {'type': 'string', 'description': (
-        'The posting condensed: requirements, responsibilities, tech stack, seniority, and any '
-        'visa/work-authorization or "no longer accepting applications" statement. Drop navigation, '
-        'footers, similar-jobs lists and marketing boilerplate')},
     'location': {'type': 'string', 'description': (
         'Location with the workplace type the page shows, e.g. "Bucharest, Romania (Remote within country)"')},
     'workplace_type': {'type': 'string', 'description': (
         '"remote", "hybrid" or "onsite", when the page states it. Any required office days ("2-3 days '
         'onsite") is "hybrid", even when a badge says Remote')},
-    'date_posted': {'type': 'string', 'description': 'As the page shows it, absolute or relative'},
-    'closed': {'type': 'boolean', 'description': 'True if the page shows "No longer accepting applications"'},
     'salary': {'type': 'string', 'description': SALARY_FIELD_DESCRIPTION},
     'sponsorship_note': {'type': 'string', 'description': 'Any visa/work-authorization statement, verbatim'},
     'language_requirement': {'type': 'string', 'description': (
@@ -80,6 +75,12 @@ EXTRACT_PROPERTIES = with_quotes({
         'company that would actually hire')},
     'end_client': {'type': 'string', 'description': (
         'That hiring company, if the posting names it; empty when anonymous ("our client, a leading fintech")')},
+    # Last: a model fills a schema in order, and with the long condensation first it left more of
+    # the short facts after it empty (12-page replay, 2026-10-28).
+    'description': {'type': 'string', 'description': (
+        'The posting condensed: requirements, responsibilities, tech stack, seniority, and any '
+        'visa/work-authorization or "no longer accepting applications" statement. Drop navigation, '
+        'footers, similar-jobs lists and marketing boilerplate')},
 }, EXTRACT_CITED_FIELDS)
 
 OPENROUTER_EXTRACT_TOOLS = [
@@ -100,21 +101,21 @@ _SUBMIT_REQUIRED_FIELDS = EXTRACT_REQUIRED_FIELDS
 # Every other field, all optional, since a required field the model cannot observe pressures it to
 # make one up (Anti-fabrication). A real page always carries some of these, at least a location.
 # A submit with NONE of them is an endpoint defect, not a page: inference-net/us returned only
-# title, company and closed, 3 of 3 times on one page, while morph and deepinfra filled them
+# title, company and closed (since read by code), 3 of 3 times on one page, while morph and deepinfra filled them
 # (2026-10-26). Pinned there, the 2026-10-25 run rated 12 of 12 jobs with no location, language
 # or salary, so no gate or warning saw them.
 _SUBMIT_OPTIONAL_FIELDS = (
-    'location', 'workplace_type', 'date_posted', 'salary', 'sponsorship_note', 'language_requirement',
+    'workplace_type', 'salary', 'sponsorship_note', 'language_requirement',
     'posting_language', 'stated_working_language', 'residency_scope', 'relocation',
     'education_requirement', 'is_agency', 'end_client',
 )
 
 
-def _extract_from_submit_args(args: dict) -> dict:
+def extract_from_args(args: dict) -> dict:
+    '''The extract from submit_job_extract's arguments, or from the fallback's structured output.'''
     return {
-        'title': args['title'], 'company': args['company'], 'description': args['description'],
-        'location': args.get('location', ''), 'date_posted': args.get('date_posted', ''),
-        'closed': bool(args.get('closed', False)), 'salary': args.get('salary', ''),
+        'description': args['description'],
+        'location': args.get('location', ''), 'salary': args.get('salary', ''),
         'sponsorship_note': args.get('sponsorship_note', ''),
         'language_requirement': args.get('language_requirement', ''),
         'posting_language': str(args.get('posting_language') or '').strip().lower(),
@@ -143,13 +144,9 @@ async def extract_job_page_openrouter(
     messages = [
         {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': (
-            f"Extract this job posting:\n"
-            f"Company: {candidate['company']}\n"
-            f"Title: {candidate['title']}\n"
-            f"URL: {candidate['url']}\n"
-            f"Posted: {candidate['date_posted']}\n"
-            f"Snippet: {candidate['snippet']}\n\n"
-            f"--- PAGE TEXT ---\n{page_text}\n--- END PAGE TEXT ---"
+            # Only the page: the search card's title, company, date and snippet are on it already,
+            # and code reads those itself (agent.read_header_fields).
+            f'Extract this job posting:\n\n--- PAGE TEXT ---\n{page_text}\n--- END PAGE TEXT ---'
         )},
     ]
     total_cost = 0.0
@@ -265,7 +262,7 @@ async def extract_job_page_openrouter(
                 break
             unquoted = unquoted_fields(args, EXTRACT_CITED_FIELDS) if EXTRACT_RESUBMIT_UNQUOTED and kept is None else []
             if unquoted:
-                kept = _extract_from_submit_args(args)
+                kept = extract_from_args(args)
                 logger.info(
                     f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
                     f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: {len(unquoted)} field(s) filled without "
@@ -279,7 +276,7 @@ async def extract_job_page_openrouter(
                                 'or leave the field empty if the page does not state it.'),
                 })
                 continue
-            extract = _extract_from_submit_args(args)
+            extract = extract_from_args(args)
             logger.info(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
                 f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: "

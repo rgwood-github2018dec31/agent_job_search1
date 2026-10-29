@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+from bs4 import BeautifulSoup
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
@@ -43,6 +44,7 @@ from agentic_job_search.agent import (
     verify_extract,
 )
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
+from agentic_job_search.linkedin_page import header_card
 
 logger = logging.getLogger('replay_evidence')
 
@@ -85,6 +87,10 @@ async def replay_one(path: Path) -> dict:
     before = dict(extract)
     derived_from_description = {name: fn(dict(before)) for name, fn in DERIVERS.items()}
     extract['page_text'] = page_text
+    # As in a run: title, company, date and closed come off the page's header card, kept in the .html.
+    html = path.with_suffix('.html')
+    if html.exists():
+        extract['page_header'] = header_card(BeautifulSoup(html.read_text(encoding='utf-8'), 'lxml'))
     statuses = await verify_extract(candidate, extract, stats)
     # What the regex fallbacks would say if they read the page rather than the description (they
     # do not: see agent.regex_source_text), kept as the measurement behind that choice.

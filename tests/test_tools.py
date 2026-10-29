@@ -2014,8 +2014,8 @@ async def test_extract_job_page_direct_condenses_the_page_it_is_given(monkeypatc
     page = linkedin_page.JobPage(text='PAGE TEXT FROM CODE', source='dom')
     extract = await agent.extract_job_page_direct(_make_candidate(), 'http://localhost:1/mcp', agent.new_stage_stats(), page=page)
 
-    assert extract['title'] == 'Staff Engineer'
-    assert extract['closed'] is False  # default filled
+    assert extract['description'] == 'Build agents.'
+    assert extract['page_header'] is page.header, 'verify_extract reads title, company, date and closed from it'
     assert 'PAGE TEXT FROM CODE' in prompts[0]
     assert 'de-cluttered by code' in prompts[0]
 
@@ -2080,8 +2080,8 @@ def _tool_call(call_id, name, args) -> dict:
     return {'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args) if isinstance(args, dict) else args}}
 
 
-_SUBMIT_ARGS = {'title': 'Staff Engineer', 'title_quote': 'Staff Engineer', 'company': 'Acme',
-                'company_quote': 'Acme', 'description': 'Build agents in Python.'}
+_SUBMIT_ARGS = {'location': 'Toronto, ON (Remote)', 'location_quote': 'Toronto, ON',
+                'description': 'Build agents in Python.'}
 
 
 def _wire_openrouter_loop(monkeypatch, chat_responses: list, chat_requests: list):
@@ -2111,12 +2111,13 @@ async def test_openrouter_loop_happy_path(monkeypatch):
     extract = await extract_openrouter.extract_job_page_openrouter(
         _make_candidate(), 'PAGE TEXT FROM CODE', stats, 'system prompt')
 
-    assert extract['title'] == 'Staff Engineer'
-    assert extract['closed'] is False  # default filled
+    assert extract['description'] == 'Build agents in Python.'
+    assert 'title' not in extract, 'code reads the title off the page header (verify_extract)'
     assert stats['cost'] == pytest.approx(0.001)
     assert stats['input_tokens'] == 100
     user = chat_requests[0]['messages'][1]
     assert user['role'] == 'user' and 'PAGE TEXT FROM CODE' in user['content']
+    assert 'Company:' not in user['content'] and 'URL:' not in user['content'], 'only the page; code reads the header'
     assert [t['function']['name'] for t in chat_requests[0]['tools']] == ['submit_job_extract']
 
 
@@ -2179,7 +2180,7 @@ async def test_openrouter_loop_missing_submit_fields_retries(monkeypatch):
 async def test_openrouter_loop_sends_back_a_field_filled_without_its_quote_once(monkeypatch):
     '''Hyra's extract (2026-10-28) cited none of its fields: each cost an LLM relocation call and two
     were rejected. The model is asked once for the quote or an empty field.'''
-    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)', 'is_agency': True, 'closed': False}
+    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)', 'location_quote': '', 'is_agency': True, 'closed': False}
     quoted = {**unquoted, 'location_quote': 'Germany', 'is_agency': False}
     chat_requests = []
     _wire_openrouter_loop(monkeypatch, [
@@ -2196,7 +2197,7 @@ async def test_openrouter_loop_sends_back_a_field_filled_without_its_quote_once(
 
 
 async def test_openrouter_loop_asks_for_quotes_only_once(monkeypatch):
-    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)'}
+    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)', 'location_quote': ''}
     chat_requests = []
     _wire_openrouter_loop(monkeypatch, [
         _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', unquoted)]),
@@ -2210,7 +2211,7 @@ async def test_openrouter_loop_asks_for_quotes_only_once(monkeypatch):
 
 
 async def test_openrouter_loop_keeps_the_first_submit_when_the_quote_request_fails(monkeypatch):
-    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)'}
+    unquoted = {**_SUBMIT_ARGS, 'location': 'Germany (Remote)', 'location_quote': ''}
     _wire_openrouter_loop(monkeypatch, [
         _chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', unquoted)]),
         '<html>502 Bad Gateway</html>',
@@ -2281,7 +2282,7 @@ async def test_openrouter_loop_keeps_a_thin_extract_when_unpinned(monkeypatch):
     chat_requests = []
     _wire_openrouter_loop(monkeypatch, [_chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', _SUBMIT_ARGS)])],
                           chat_requests)
-    assert (await _run_loop())['location'] == ''
+    assert (await _run_loop())['workplace_type'] == ''
     assert len(chat_requests) == 1
 
 
@@ -5209,12 +5210,39 @@ async def test_verify_extract_rejects_an_uncited_field_as_absent(no_relocation, 
 
 
 async def test_verify_extract_keeps_a_cited_field(no_relocation):
-    extract = _make_extract(workplace_type='remote', title='Staff Machine Learning Engineer - Wildfire',
-                            page_text=OVERSTORY_PAGE_TEXT,
-                            quotes={'workplace_type': 'Remote', 'title': 'Staff Machine Learning Engineer - Wildfire'})
+    extract = _make_extract(workplace_type='remote', page_text=OVERSTORY_PAGE_TEXT, quotes={'workplace_type': 'Remote'})
     statuses = await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats())
     assert extract['workplace_type'] == 'remote'
-    assert statuses['title'] == evidence.STATUS_REGEX
+    assert statuses['workplace_type'] == evidence.STATUS_REGEX
+
+
+async def test_verify_extract_reads_the_header_fields_off_the_page_card(no_relocation):
+    '''2026-10-28: the model was asked for these, each with a quote, though the header states them.'''
+    header = linkedin_page.HeaderCard(company='Overstory', title='Staff Machine Learning Engineer - Wildfire',
+                                      posted='17 hours ago', workplace='remote', employment_type='Contract', closed=True)
+    extract = _make_extract(title='Invented', company='Invented', date_posted='2025-10-14', closed=False,
+                            page_text=OVERSTORY_PAGE_TEXT, page_header=header)
+    statuses = await agent.verify_extract(_make_candidate(), extract, agent.new_stage_stats())
+    assert (extract['title'], extract['company'], extract['date_posted'], extract['closed']) == (
+        'Staff Machine Learning Engineer - Wildfire', 'Overstory', '17 hours ago', True)
+    assert (extract['employment_type'], extract['workplace_badge']) == ('Contract', 'remote')
+    assert {statuses[f] for f in ('title', 'company', 'date_posted', 'closed')} == {'read_by_code'}
+    assert 'page_header' not in extract
+
+
+async def test_a_closed_notice_in_either_wording_fires_the_closed_rule():
+    extract = _make_extract(description='Build agents. Not currently accepting applications.')
+    assert 'closed' in (await agent.apply_hard_rules(_make_candidate(), extract) or '')
+
+
+def test_a_contract_badge_makes_a_contract_warning():
+    assert 'Contract role — full-time preferred' in agent.build_deterministic_warnings(
+        _make_candidate(), _make_extract(employment_type='Contract'))
+
+
+def test_the_workplace_badge_fills_in_only_when_the_extractor_did_not_say():
+    assert agent.derive_workplace_type(_make_extract(workplace_type='', workplace_badge='hybrid')) == 'hybrid'
+    assert agent.derive_workplace_type(_make_extract(workplace_type='hybrid', workplace_badge='remote')) == 'hybrid'
 
 
 async def test_verify_extract_falls_back_to_the_listing_title_and_company(no_relocation):
