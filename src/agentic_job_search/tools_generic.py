@@ -319,9 +319,11 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
         },
         cwd=str(PROJECT_DIR),
     )
+    # Citations are checked against exactly the text the model was shown, labels included: a quote
+    # starting "Filename: …" copied from the prompt must be found (2026-10-28).
+    source = f'Filename: {filename}\n\nJob posting text:\n{text}'
     prompt = (
-        f'Filename: {filename}\n\n'
-        f'Job posting text:\n{text}\n\n'
+        f'{source}\n\n'
         'Identify the organization posting this job, the job title, whether the poster is a '
         'recruiting agency/aggregator rather than the hiring employer, and the end client if named. '
         + evidence.CITATION_INSTRUCTION
@@ -332,7 +334,7 @@ async def _extract_applied_job_metadata(text: str, filename: str) -> dict:
                 continue
             _raise_if_result_error(msg, f'Applied-job metadata extraction failed for {filename}')
             if msg.structured_output:
-                out = await _grounded_applied_metadata(dict(msg.structured_output), f'{filename}\n{text}', filename)
+                out = await _grounded_applied_metadata(dict(msg.structured_output), source, filename)
                 return {
                     'company': out.get('company_name', ''),
                     'job_title': out.get('job_title', ''),
@@ -1050,7 +1052,14 @@ async def _categorize_pdf_text(text: str, filename: str) -> str | None:
                     },
                     'quote': {
                         'type': 'string',
-                        'description': 'Words of the filename or content that show the category, copied as written',
+                        # A category is a judgment no passage states, so the evidence model
+                        # cannot relocate a stitched or labelled quote: it must match as cited.
+                        'description': (
+                            'ONE passage of the content that shows the category (e.g. the job '
+                            'title line or the first sentence of the description), copied exactly '
+                            'as written: no filename, no labels, no quote marks, no joining of '
+                            'separate fragments'
+                        ),
                     },
                 },
                 'required': ['category', 'quote'],
@@ -1074,7 +1083,7 @@ async def _categorize_pdf_text(text: str, filename: str) -> str | None:
         # grounded leaves the file uncategorized (logged by verify_claims), to be asked next run.
         verdict = (await evidence.verify_claims(
             'pdf_categorize', filename, [evidence.Claim('category', category, quote)],
-            f'{filename}\n{text}', filename))['category']
+            prompt, filename))['category']
         if not verdict.accepted:
             return None
         return underscorify(category) or 'other'

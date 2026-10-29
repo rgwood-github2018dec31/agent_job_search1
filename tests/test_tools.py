@@ -1114,6 +1114,15 @@ async def test_categorize_pdf_text_saved_jd(monkeypatch):
     assert result == 'saved_jd'
 
 
+async def test_a_category_citing_the_filename_label_it_was_shown_is_accepted(monkeypatch):
+    # 2026-10-28: the model copied "Filename: …" from its prompt, which was checked against a source
+    # without the label, so every new saved posting stayed uncategorized.
+    _make_sdk_mock(monkeypatch, {'category': 'saved_jd',
+                                 'quote': 'Filename: AI_ML Architect _ Talentmatics _ LinkedIn.pdf … Hiring: AI Architect'})
+    result = await tools._categorize_pdf_text('About the job\nHiring: AI Architect', 'AI_ML Architect _ Talentmatics _ LinkedIn.pdf')
+    assert result == 'saved_jd'
+
+
 async def test_a_category_that_cites_nothing_in_the_file_leaves_it_uncategorized(monkeypatch):
     _make_sdk_mock(monkeypatch, {'category': 'resume', 'quote': 'Curriculum Vitae'})
     assert await tools._categorize_pdf_text('job posting text', 'acme_job.pdf') is None
