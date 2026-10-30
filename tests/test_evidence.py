@@ -141,3 +141,15 @@ def test_a_quote_with_an_html_entity_is_found_in_the_text_it_was_copied_from():
     source = 'Remote (USA & Canada - PST preferred)'
     assert evidence.find_quote('Remote (USA &amp; Canada - PST preferred)', source) is not None
     assert evidence.find_quote('USA &amp; Mexico', source) is None
+
+
+@pytest.mark.parametrize('quote', [
+    'This is a Canada-based, full-time permanent position, with Remote / Hybrid options available.',
+    'Hybrid/ In office: we are hybrid',
+])
+def test_a_space_at_punctuation_does_not_hide_a_faithful_quote(quote):
+    '''Job 4457646614: the Markdown put the bold on a line of its own, so ', with' followed a line break (2026-10-30).'''
+    source = ('This is a\n**Canada-based, full-time permanent position**\n, with Remote / Hybrid options available.\n'
+              'Hybrid/In office: We are hybrid')
+    assert evidence.find_quote(quote, source) is not None
+    assert evidence.find_quote('This is a Canada-based, full-time temporary position', source) is None

@@ -51,17 +51,21 @@ _MARKDOWN_BOLD_RE = re.compile(r'\*\*|__')
 # A free-standing dash: a `- ` bullet, or a separator ('Remote - Germany') a quote may wrap at.
 _DASH_SEPARATOR_RE = re.compile(r'(^|\s)-+(?=\s|$)', re.MULTILINE)
 _ELLIPSIS_RE = re.compile(r'\s*(?:…|\.{3,})\s*')
+# A space before closing punctuation or around a slash. The Markdown page puts an inline bold on a
+# line of its own, so 'position**\n, with Remote' reads 'position , with Remote' where a faithful
+# quote has 'position, with Remote' (job 4457646614, 2026-10-30); 'Hybrid/ In office' vs 'Hybrid/In'.
+_SPACE_AT_PUNCTUATION_RE = re.compile(r' (?=[,.;:!?)\]/])|(?<=[/(\[]) ')
 _EDGE_CHARS = ' \t\n.,;:!?"\'()[]{}*-'
 
 
 def normalize_for_match(text: object) -> str:
     '''Fold what a faithful citation may legitimately differ in: case, width, whitespace, dash and
-    quote styles, Markdown markers and HTML entities (a model copied `&` as `&amp;`, 2026-10-30).
-    Letters, digits and word order are left alone.'''
+    quote styles, Markdown markers, HTML entities (a model copied `&` as `&amp;`, 2026-10-30) and a
+    space at punctuation. Letters, digits and word order are left alone.'''
     folded = unicodedata.normalize('NFKC', html.unescape(str(text or ''))).translate(_DASHES).translate(_QUOTES)
     folded = _MARKDOWN_BOLD_RE.sub('', _MARKDOWN_LINE_MARKER_RE.sub('', folded))
     folded = _DASH_SEPARATOR_RE.sub(r'\1', folded)
-    return _WHITESPACE_RE.sub(' ', folded.casefold()).strip()
+    return _SPACE_AT_PUNCTUATION_RE.sub('', _WHITESPACE_RE.sub(' ', folded.casefold()).strip())
 
 
 def find_quote(quote: object, source: object) -> tuple[int, int] | None:
