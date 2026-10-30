@@ -109,9 +109,9 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
                      'The Job Trace', 'Step by step', 'Found by', 'European Union',
                      'Posted by', 'Globex — the poster is recruiting for this client',
                      'query=Staff AI Engineer', 'region=European Union',
-                     '1. saved full page=linkedin-4476053167.html (149 KB', 'captured=160,000 chars',
-                     '2. removed clutter=1 section(s), 900 chars', '3. saved text=linkedin-4476053167.txt (2,137 chars, 2 KB)',
-                     'tokens in=1,234 tokens out=56', 'rating=4', 'system message=0.3k chars',
+                     '1. saved full page=linkedin-4476053167.html (149 KB', 'captured=160k chars',
+                     '2. removed clutter=1 section(s), 0.90k chars', '3. saved text=linkedin-4476053167.txt (2.1k chars, 2 KB)',
+                     'tokens in=1.2k tokens out=0.056k', 'rating=4', 'system message=0.30k chars',
                      'user message=2.2k chars', '· Company=Acme',
                      '· PAGE TEXT=2.1k chars = linkedin-4476053167.txt from step 2', 'submit_job_extract tool definition: approx 5.0k chars',
                      'total sent=7.5k chars (2.0k tokens)'):
@@ -126,3 +126,35 @@ def test_the_report_renders_every_traced_step_and_the_exact_message(tmp_path):
     # The step-by-step table quotes the prompt's head; the verbatim trace section must hold all of it.
     verbatim_section = ' '.join(text.split('The Job Trace — every step, verbatim', 1)[1].split())
     assert verbatim_section.count('FULL PROMPT') == 400, 'the prompt is printed whole, never cut'
+
+
+def _report_module():
+    pytest.importorskip('reportlab')
+    script = Path(__file__).parent.parent / 'scripts' / 'job_trace_report.py'
+    spec = importlib.util.spec_from_file_location('job_trace_report', script)
+    report = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(report)
+    return report
+
+
+def test_counts_are_thousands_to_two_significant_figures():
+    report = _report_module()
+    assert [report.kilo_chars(n) for n in (6387, 14498, 171525, 0)] == ['6.4k chars', '14k chars', '170k chars', '0 chars']
+    assert [report.kilo_tokens(n) for n in (4826, 883, 43, 999)] == ['4.8k tokens', '0.88k tokens', '0.043k tokens', '1.0k tokens']
+
+
+def test_the_audit_log_is_found_by_the_name_the_run_writes(tmp_path, monkeypatch):
+    report = _report_module()
+    monkeypatch.setattr(report, 'RUN_DIR', tmp_path)
+    (tmp_path / 'audit_logs').mkdir()
+    for stamp in ('001437', '130327'):
+        (tmp_path / 'audit_logs' / f'audit-2026Oct29-{stamp}.md').write_text('x', encoding='utf-8')
+    assert report.audit_log_for('2026-10-29', '2026-10-29T13:02:15').name == 'audit-2026Oct29-130327.md'
+    assert report.audit_log_for('2026-10-28', '2026-10-28T13:02:15') is None
+
+
+def test_a_saved_rating_input_is_sized_as_saved():
+    report = _report_module()
+    saved = {'job_requirements': {'name': 'job_requirements-ec656998be5d.md', 'chars': 6387}}
+    assert report.section_size('JOB_REQUIREMENTS.md', 6300, saved) == '6.4k chars = job_requirements-ec656998be5d.md'
+    assert report.section_size('instructions', 6200, saved, approx=True) == 'approx 6.2k chars'

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import sys
 import textwrap
@@ -222,12 +223,13 @@ def run_log_for(run_date: str, captured: str | None = None) -> Path | None:
 def audit_log_for(run_date: str, captured: str | None = None) -> Path | None:
     """The audit log for that run: the audit is written at the run's END, so the earliest one at or
     after the artifact's capture time belongs to it."""
-    audits = sorted((RUN_DIR / 'audit_logs').glob(f'audit-{run_date.replace("-", "")}*.md'))
+    day = date.fromisoformat(run_date).strftime('%Y%b%d')   # audit-YYYYMonDD-HHMMSS, as write_run_audit_log names it
+    audits = sorted((RUN_DIR / 'audit_logs').glob(f'audit-{day}-*.md'))
     if not audits or not captured:
         return audits[-1] if audits else None
-    want = captured[:19].replace('T', '')                   # audit-YYYYMonDD-HHMMSS
+    want = captured[11:19].replace(':', '')                 # HHMMSS from YYYY-MM-DDTHH:MM:SS
     for path in audits:
-        if path.stem.split('-', 2)[-1] >= want[9:]:
+        if path.stem.rsplit('-', 1)[-1] >= want:
             return path
     return audits[-1]
 
@@ -434,10 +436,30 @@ def tool_called(step: dict) -> str | None:
 
 
 CHARS_PER_KILO = 1000
+SIGNIFICANT_FIGURES = 2   # every char and token count in the step table
 
 
-def kilo_chars(n: int) -> str:
-    return f'{n / CHARS_PER_KILO:.1f}k chars'
+def kilo_number(n: float) -> str:
+    '''A count in thousands to SIGNIFICANT_FIGURES: 6387 -> "6.4k", 883 -> "0.88k", 171525 -> "170k", 999 -> "1.0k".'''
+    if not n:
+        return '0'
+    thousands = n / CHARS_PER_KILO
+    rounded = round(thousands, SIGNIFICANT_FIGURES - math.floor(math.log10(abs(thousands))) - 1)
+    # Counted again after rounding, since 0.999 rounds up to 1.0 and gains a digit.
+    decimals = max(SIGNIFICANT_FIGURES - math.floor(math.log10(abs(rounded))) - 1, 0)
+    return f'{rounded:.{decimals}f}k'
+
+
+def kilo(n: float, unit: str) -> str:
+    return f'{kilo_number(n)} {unit}'
+
+
+def kilo_chars(n: float) -> str:
+    return kilo(n, 'chars')
+
+
+def kilo_tokens(n: float) -> str:
+    return kilo(n, 'tokens')
 
 
 def message_sections(text: str) -> list[tuple[str, int]]:
@@ -451,12 +473,20 @@ def message_sections(text: str) -> list[tuple[str, int]]:
     return sections
 
 
-def saved_as(name: str, saved_files: dict[str, str] | None) -> str:
-    '''" = <file>" when a section is one Record Rating Inputs saved, else "".'''
+def saved_part(name: str, saved_files: dict[str, dict] | None) -> dict | None:
+    '''{name, chars} of the file Record Rating Inputs saved a section as, or None.'''
     for prefix, kind in RATING_INPUT_SECTIONS:
         if name.startswith(prefix) and (saved_files or {}).get(kind):
-            return f' = {saved_files[kind]}'
-    return ''
+            return saved_files[kind]
+    return None
+
+
+def section_size(name: str, length: int, saved_files: dict[str, dict] | None, approx: bool = False) -> str:
+    '''A section's size and, when it was saved, its file. A saved section is sized as saved (markers
+    included), so the number matches section 3; otherwise it is the text between its markers.'''
+    if part := saved_part(name, saved_files):
+        return f"{kilo_chars(part['chars'])} = {part['name']}"
+    return ('approx ' if approx else '') + kilo_chars(length)
 
 
 def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None,
@@ -476,11 +506,11 @@ def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None,
         pairs.append(('system message', kilo_chars(len(system))))
         system_sections = message_sections(system)
         for name, length in system_sections:
-            pairs.append((f'· system: {shorten(name, 40)}', kilo_chars(length) + saved_as(name, saved_files)))
+            pairs.append((f'· system: {shorten(name, 40)}', section_size(name, length, saved_files)))
         if system_sections:
             rest = len(system) - sum(length for _, length in system_sections)
             pairs.append(('· system: instructions and markers',
-                          f'approx {kilo_chars(rest)}' + saved_as('instructions', saved_files)))
+                          section_size('instructions', rest, saved_files, approx=True)))
     pairs.append(('user message', kilo_chars(len(text))))
     if 'CLAIMS:' in head and (claims := _json_or_none(head.split('CLAIMS:', 1)[1].strip())):
         head = head.split('CLAIMS:', 1)[0]
@@ -492,8 +522,8 @@ def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None,
         pairs.append(('· asks', shorten(head.strip().splitlines()[0] if head.strip() else '', 90)))
     for name, length in sections:
         same = page_text and length == page_text[1]
-        pairs.append((f'· {name}', kilo_chars(length) + (f' = {page_text[0]} from step {page_text[2]}' if same else '')
-                      + saved_as(name, saved_files)))
+        pairs.append((f'· {name}', f'{kilo_chars(length)} = {page_text[0]} from step {page_text[2]}' if same
+                      else section_size(name, length, saved_files)))
     total = len(system) + len(text)
     tokens_in = provider_usage(step).get('prompt_tokens')
     if tool := tool_called(step):
@@ -503,7 +533,7 @@ def prompt_params(step: dict, page_text: tuple[str, int, int] | None = None,
         if tool_chars is not None:
             total += tool_chars
             pairs.append((f'{tool} tool definition: approx {kilo_chars(tool_chars)}', NOTE))
-    pairs.append(('total sent', kilo_chars(total) + (f' ({tokens_in / CHARS_PER_KILO:.1f}k tokens)' if tokens_in else '')))
+    pairs.append(('total sent', kilo_chars(total) + (f' ({kilo_tokens(tokens_in)})' if tokens_in else '')))
     return pairs
 
 
@@ -530,16 +560,16 @@ def page_read_params(step: dict) -> list[tuple[str, object]]:
     txt_bytes = step.get('raw_posting_bytes') or (txt.stat().st_size if txt.exists() else None)
     if step.get('source') != 'dom':
         return [('method', 'page capture unavailable; accessibility snapshot instead'),
-                ('text', f"{step.get('chars') or 0:,} chars → {txt.name} ({size(txt_bytes)})")]
+                ('text', f"{kilo_chars(step.get('chars') or 0)} → {txt.name} ({size(txt_bytes)})")]
     html = Path(step['raw_html']) if step.get('raw_html') else txt.with_suffix('.html')
     html_bytes = step.get('raw_html_bytes') or (html.stat().st_size if html.exists() else None)
     removed = step.get('removed') or []
     removed_chars = step.get('removed_chars') or sum(r.get('chars', 0) for r in removed)
     return [
-        ('captured', f"{step['dom_chars']:,} chars of page" if step.get('dom_chars') else 'size not recorded'),
+        ('captured', f"{kilo_chars(step['dom_chars'])} of page" if step.get('dom_chars') else 'size not recorded'),
         ('1. saved full page', f'{html.name} ({size(html_bytes)}, scripts stripped)'),
-        ('2. removed clutter', f'{len(removed)} section(s), {removed_chars:,} chars of text'),
-        ('3. saved text', f"{txt.name} ({step.get('chars') or 0:,} chars, {size(txt_bytes)}) — what the extractor read"),
+        ('2. removed clutter', f'{len(removed)} section(s), {kilo_chars(removed_chars)} of text'),
+        ('3. saved text', f"{txt.name} ({kilo_chars(step.get('chars') or 0)}, {size(txt_bytes)}) — what the extractor read"),
     ]
 
 
@@ -558,11 +588,12 @@ def token_counts(step: dict) -> str:
     usage = provider_usage(step)
     if usage.get('prompt_tokens') is not None:
         reasoning = (usage.get('completion_tokens_details') or {}).get('reasoning_tokens')
-        return (f"tokens in={usage['prompt_tokens']:,}\ntokens out={usage.get('completion_tokens', 0):,}"
-                + (f' ({reasoning:,} of them hidden reasoning)' if reasoning else ''))
+        return (f"tokens in={kilo_number(usage['prompt_tokens'])}\n"
+                f"tokens out={kilo_number(usage.get('completion_tokens', 0))}"
+                + (f' ({kilo_tokens(reasoning)} of them hidden reasoning)' if reasoning else ''))
     sent = len(system_text(step)) + len(llm_input(step) or '') if not step.get('messages') else len(as_text(step['messages']))
     received = len(as_text(llm_output(step)))
-    return (f'tokens in≈{sent // CHARS_PER_TOKEN:,}\ntokens out≈{received // CHARS_PER_TOKEN:,}\n'
+    return (f'tokens in≈{kilo_number(sent / CHARS_PER_TOKEN)}\ntokens out≈{kilo_number(received / CHARS_PER_TOKEN)}\n'
             f'(estimated: the provider reports none)')
 
 
@@ -638,7 +669,7 @@ def step_by_step(steps: list[dict], found: str) -> list:
     rows = [('#', 'Step', 'Made by', 'Input', 'Output')]
     call = extractor_call = 0
     page_text = None
-    saved_files: dict[str, str] = {}
+    saved_files: dict[str, dict] = {}
     for n, s in enumerate(steps, 1):
         kind = s['kind']
         if kind == 'origin':
@@ -664,7 +695,8 @@ def step_by_step(steps: list[dict], found: str) -> list:
                    params(prompt_params(s, page_text, saved_files if 'rat' in str(s.get('call_site')) else None)),
                    params(reply_params(s)))
         elif kind == 'rating_inputs':
-            saved_files = {k: Path(v['path']).name for k, v in s.items() if isinstance(v, dict) and v.get('path')}
+            saved_files = {k: {'name': Path(v['path']).name, 'chars': v.get('chars') or 0}
+                           for k, v in s.items() if isinstance(v, dict) and v.get('path')}
             rater = s.get('rater') or {}
             row = ('Rating inputs saved', 'code',
                    params([(k, f"{Path(v['path']).name} ({kilo_chars(v.get('chars') or 0)})")
@@ -884,7 +916,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
     url = group_or(r'^URL:\s*(.+)$', md)
     rating = group_or(r'rating (\d)/5', title)
     reasoning = group_or(r'^Reasoning:\s*(.+)$', md, '')
-    triage = group_or(r'^Triage score \(local\):\s*(\d+)', md)
+    triage = group_or(r'^Triage score \(local\):\s*(\d+)', md, '')
     pros = re.findall(r'^• (.+)$', md.split('## Warnings')[0], re.M)
     warnings = re.findall(r'^• (.+)$', md.split('## Warnings')[1].split('\n\n')[0], re.M) \
         if '## Warnings' in md else []
@@ -910,7 +942,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
             ('Posting', Link(url, url) if url.startswith('http') else url),
             *poster_rows(company, page_step, fields),
             ('Found by', found),
-            ('Rating', f'{rating}/5 (local triage {triage}/5)'),
+            ('Rating', f'{rating}/5 (local triage {triage}/5)' if triage else f'{rating}/5 (triage not run)'),
             ('Run', f'{run_date}; log {log_path.name if log_path else "?"}; '
                     f'audit {audit_path.name if audit_path else "?"}'),
             ('Saved job', str(saved.relative_to(PROJECT_DIR)) if saved else 'NOT FOUND'),
