@@ -172,6 +172,7 @@ scripts/
   job_trace_report.py             # Job Audit PDF for one job (uv run --with reportlab)
   minimal_archive_replay.py       # Rebuilds the minimal archive from saved full archives (check a change, or --in-place backfill)
   replay_markdown_ab.py           # Plain text vs Markdown for the extractor and the rater, with repeats to measure noise (costs ~$1)
+  local_field_probe.py            # Asks local models one extract field at a time, compared with the extractor's runs (free, ~1 h)
   release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
 tests/
   test_tools.py                   # Unit tests for all tools
