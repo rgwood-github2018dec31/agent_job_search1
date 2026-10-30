@@ -2054,6 +2054,29 @@ def test_job_description_is_the_text_between_the_two_headings():
     assert linkedin_page.job_description('a snapshot with no headings') == ''
 
 
+def test_job_description_reads_the_markdown_heading_lines():
+    markdown = '# AI Engineer\n## About the job\n**Requirements**\n- Python\n## About the company\nWe work across Europe.'
+    assert linkedin_page.job_description(markdown) == '**Requirements**\n- Python'
+
+
+def test_the_rater_reads_the_markdown_description_and_the_regexes_the_plain_one():
+    page = linkedin_page.JobPage(text='About the job\nNice to have\nGerman', source='dom',
+                                 markdown='## About the job\n**Nice to have**\n- German')
+    extract = agent.attach_page(_make_candidate(), {}, page)
+    assert extract['page_text'] == page.markdown, 'citations are checked against what the extractor read'
+    assert extract['description'] == 'Nice to have\nGerman'
+    text = agent.format_extract_text(_make_candidate(), _make_extract(**extract))
+    assert '**Nice to have**\n- German' in text
+
+
+def test_the_snapshot_path_has_no_markdown_and_reads_the_text():
+    page = linkedin_page.JobPage(text='About the job\nGerman', source='snapshot')
+    extract = agent.attach_page(_make_candidate(), {}, page)
+    assert page.model_text == page.text == extract['page_text']
+    assert extract['description_markdown'] == ''
+    assert 'German' in agent.format_extract_text(_make_candidate(), _make_extract(**extract))
+
+
 async def test_extract_job_page_direct_reads_the_page_when_not_given_one(monkeypatch):
     calls = []
     _stub_read_page(monkeypatch, calls=calls)

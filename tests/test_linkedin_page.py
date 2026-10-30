@@ -358,6 +358,12 @@ async def test_read_job_page_archives_the_page_then_returns_clean_text(monkeypat
     retained = tools.raw_posting_path(_candidate()).read_text()
     assert 'source: dom' in retained and 'Salary: $150,000 - $180,000' in retained, \
         'salary provenance checks the text the model read'
+    assert page.model_text == page.markdown
+    assert '## About the job' in page.markdown.splitlines() and 'About the job' in page.text.splitlines()
+    assert lp.job_description(page.markdown) == lp.job_description(page.text) != ''
+    assert page.markdown in retained, 'the capture is the Markdown the extractor read'
+    assert evidence.normalize_for_match(page.markdown) == evidence.normalize_for_match(page.text), \
+        'a quote copied from either form is found in the other'
 
 
 async def test_read_job_page_waits_again_then_falls_back_when_the_description_never_renders(caplog):

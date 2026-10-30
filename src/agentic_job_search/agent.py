@@ -2349,13 +2349,13 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
         raw_txt = tools_module.raw_posting_path(candidate)
         raw_html = raw_txt.with_suffix('.html')
         job_trace.record('page_read', url=candidate.get('url'), source=page.source if page else None,
-                         chars=len(page.text) if page else 0, removed=page.removed if page else [],
+                         chars=len(page.model_text) if page else 0, removed=page.removed if page else [],
                          dom_chars=page.dom_chars if page else 0, removed_chars=page.removed_chars if page else 0,
                          posting_company=page.posting_company if page else '',
                          company_url=company_page_url(page.company_slug) if page else '',
                          raw_html=str(raw_html), raw_html_bytes=raw_html.stat().st_size if raw_html.exists() else None,
                          raw_posting=str(raw_txt), raw_posting_bytes=raw_txt.stat().st_size if raw_txt.exists() else None,
-                         text=page.text if page else '')
+                         text=page.model_text if page else '')
         return page
     except Exception as ex:
         job_trace.record('page_read', url=candidate.get('url'), error=unwrap_exception(ex))
@@ -2406,7 +2406,7 @@ async def extract_job_page_direct(
     prompt = (
         f'Below is {what}. Extract the facts it states into the structured output; leave a field '
         f'empty when the page does not state it. {CITATION_INSTRUCTION}\n\n'
-        + page.text
+        + page.model_text
     )
     options = ClaudeAgentOptions(
         setting_sources=[],
@@ -2439,15 +2439,17 @@ async def extract_job_page_direct(
     extract = attach_page(candidate, extract_from_args(structured), page)
     logger.info(
         f"Extract fallback: job {candidate['job_id']} {candidate['company']} — {candidate['title']}: "
-        f"{len(page.text)} page chars ({page.source}) read{cost_note}"
+        f"{len(page.model_text)} page chars ({page.source}) read{cost_note}"
     )
     return extract
 
 
 def attach_page(candidate: dict, extract: dict, page: JobPage) -> dict:
-    '''Add to the extract what code read off the page: the page text every field is checked against,
-    the header card, and the posting's own text as `description`, which the rater, the regex
-    fallbacks, the blacklist and repost checks and the salary context read.
+    '''Add to the extract what code read off the page: the page text every field is checked against
+    (`page_text`, the Markdown the extractor read), the header card, the plain page text
+    (`page_plain_text`) and the posting's own text twice: plain as `description`, which the regex
+    fallbacks, the blacklist and repost checks and the salary context read, and as Markdown as
+    `description_markdown`, which the rater reads ('' on the snapshot path).
 
     The whole page stands in for the description, with a WARNING, when the page has no
     LINKEDIN_JOB_DESCRIPTION_HEADING line (the snapshot path): reading more text beats reading none.
@@ -2458,7 +2460,9 @@ def attach_page(candidate: dict, extract: dict, page: JobPage) -> dict:
             f"Job {candidate['job_id']} {candidate['company']}: no {LINKEDIN_JOB_DESCRIPTION_HEADING!r} line in "
             f'the {page.source} page text ({len(page.text)} chars), so the whole page is read as its description')
         description = page.text
-    extract.update(page_text=page.text, page_header=page.header, description=description)
+    description_markdown = job_description(page.markdown) if page.markdown else ''
+    extract.update(page_text=page.model_text, page_plain_text=page.text, page_header=page.header,
+                   description=description, description_markdown=description_markdown)
     return extract
 
 
@@ -2849,7 +2853,7 @@ def read_header_fields(candidate: dict, extract: dict) -> dict[str, str]:
     page saying '17 hours ago', and the invented year hard-rated a fresh job as stale.
     """
     header = extract.pop('page_header', None) or HeaderCard()
-    page_text = extract.get('page_text') or ''
+    page_text = extract.get('page_plain_text') or extract.get('page_text') or ''
     sources: dict[str, str] = {}
     for field, on_page, on_card in (
             ('title', header.title, candidate.get('title')),
@@ -3002,7 +3006,7 @@ def format_extract_text(candidate: dict, extract: dict) -> str:
         lines.append(f"Education requirement: {extract['education_requirement']}")
     if extract['closed']:
         lines.append('Status: no longer accepting applications')
-    lines.append(f"\n{extract['description']}")
+    lines.append(f"\n{extract.get('description_markdown') or extract['description']}")
     return '\n'.join(lines)
 
 
@@ -4078,7 +4082,7 @@ async def resolve_pay_display(
     estimate = None
     if SALARY_ESTIMATE_ENABLED and facts['kind'] == 'absent':
         estimate = await estimate_salary(
-            candidate, extract, page.text if page is not None else '', stage_stats
+            candidate, extract, page.model_text if page is not None else '', stage_stats
         )
         if estimate:
             estimate['conversion'] = fx.convert_bounds(
@@ -4401,6 +4405,38 @@ async def _save_job(candidate: dict, rating: int, summary: str, content: str) ->
     job_trace.record('saved', rating=rating, summary=summary, content=content, result=saved)
 
 
+async def resolve_extract_fields(extract: dict, salary_stats: dict) -> tuple[str, dict]:
+    """Resolve once, in place, what the rater's input and the sync checks read off an extract.
+
+    Returns (the extractor's own residency_scope, the location's geography). Shared by the run and
+    scripts/replay_markdown_ab.py, so a replayed rating reads the input a run would build.
+    """
+    # Resolve the likely spoken languages ONCE, here, and write it back — so
+    # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
+    # field. Cosmetic only: no gate reads it, by design. `broad_area` rides along from the
+    # same cached answer, for the marginal-warning rule.
+    extract['likely_spoken_languages'] = await derive_likely_spoken_languages(extract)
+    extract['location_broad_area'] = bool(
+        (await classify_location(extract.get('location', ''))).get('broad_area'))
+    # Same treatment for residency_scope, and for the same reason: resolve once here so
+    # the sync consumers (the gate, the warnings) read a plain field, and log raw->derived
+    # so a fallback that silently overrides the extractor stays countable.
+    raw_residency_scope = str(extract.get('residency_scope') or '')
+    extract['residency_scope'] = derive_residency_scope(extract)
+    # Every other name this place goes by, resolved ONCE (the classifier answer is already
+    # cached from derive_likely_spoken_languages above, which now calls it unconditionally,
+    # so this is always free) and written back, so the sync consumers below read a plain
+    # field instead of each needing to be async.
+    geography = await classify_location(extract.get('location', ''))
+    extract['place_names'] = geography.get('place_names') or []
+    # And the salary reading, same pattern: resolved once here (the rules answer almost
+    # every string for free; only one they cannot read reaches a model, and then only
+    # once ever, cached) so the sync consumers -- the warning, the notification line, the
+    # extract text -- all read ONE reading instead of each deriving its own.
+    extract['salary_facts'] = await resolve_salary(extract, salary_stats)
+    return raw_residency_scope, geography
+
+
 EXTRACT_SIGNAL_FIELDS = (
     'date_posted', 'location', 'closed', 'language_requirement', 'posting_language',
     'likely_spoken_languages', 'stated_working_language', 'relocation',
@@ -4657,7 +4693,7 @@ async def _evaluate_candidates(
             extract = None
             if page is not None and route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
                 extract = await extract_job_page_openrouter(
-                    candidate, page.text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS)
+                    candidate, page.model_text, stage_stats['extraction'], PAGE_EXTRACTOR_INSTRUCTIONS)
                 if extract is not None:
                     attach_page(candidate, extract, page)
             # The OpenRouter conversation already sent back any quote regex could not find.
@@ -4667,7 +4703,8 @@ async def _evaluate_candidates(
                     candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)
             if extract is not None:
                 await verify_extract(candidate, extract, stage_stats['evidence'], use_llm=not resubmitted)
-                job_trace.record('extract', fields={k: v for k, v in extract.items() if k != 'page_text'})
+                job_trace.record('extract', fields={k: v for k, v in extract.items()
+                                                    if k not in ('page_text', 'page_plain_text')})
             if extract is None and browser is not None and await browser.confirm_dead():
                 index -= 1   # the browser, not the page, failed: retry this job after the restart
                 continue
@@ -4685,29 +4722,7 @@ async def _evaluate_candidates(
             # Read by code off the job page, not predicted: who posted it, and where their page is.
             if page is not None and page.company_slug:
                 extract['posting_company_url'] = company_page_url(page.company_slug)
-            # Resolve the likely spoken languages ONCE, here, and write it back — so
-            # format_extract_text and build_deterministic_warnings (both sync) keep reading a plain
-            # field. Cosmetic only: no gate reads it, by design. `broad_area` rides along from the
-            # same cached answer, for the marginal-warning rule.
-            extract['likely_spoken_languages'] = await derive_likely_spoken_languages(extract)
-            extract['location_broad_area'] = bool(
-                (await classify_location(extract.get('location', ''))).get('broad_area'))
-            # Same treatment for residency_scope, and for the same reason: resolve once here so
-            # the sync consumers (the gate, the warnings) read a plain field, and log raw->derived
-            # so a fallback that silently overrides the extractor stays countable.
-            raw_residency_scope = str(extract.get('residency_scope') or '')
-            extract['residency_scope'] = derive_residency_scope(extract)
-            # Every other name this place goes by, resolved ONCE (the classifier answer is already
-            # cached from derive_likely_spoken_languages above, which now calls it unconditionally,
-            # so this is always free) and written back, so the sync consumers below read a plain
-            # field instead of each needing to be async.
-            geography = await classify_location(extract.get('location', ''))
-            extract['place_names'] = geography.get('place_names') or []
-            # And the salary reading, same pattern: resolved once here (the rules answer almost
-            # every string for free; only one they cannot read reaches a model, and then only
-            # once ever, cached) so the sync consumers -- the warning, the notification line, the
-            # extract text -- all read ONE reading instead of each deriving its own.
-            extract['salary_facts'] = await resolve_salary(extract, stage_stats['salary'])
+            raw_residency_scope, geography = await resolve_extract_fields(extract, stage_stats['salary'])
             extract_text = format_extract_text(candidate, extract)
             # A location classified just now (not from the cache) is shown here rather than on a
             # line of its own; salary.py's classified line is likewise DEBUG, since `->kind=` and

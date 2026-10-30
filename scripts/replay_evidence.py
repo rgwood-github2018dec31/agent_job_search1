@@ -115,9 +115,7 @@ async def replay_one(path: Path, page_text: str | None = None, markdown: str | N
     # As in a run: title, company, date and closed come off the page's header card, kept in the .html.
     html = path.with_suffix('.html')
     page_header = header_card(BeautifulSoup(html.read_text(encoding='utf-8'), 'lxml')) if html.exists() else HeaderCard()
-    attach_page(candidate, extract, JobPage(text=page_text, source='dom', header=page_header))
-    if markdown is not None:
-        extract['page_text'] = markdown
+    attach_page(candidate, extract, JobPage(text=page_text, source='dom', header=page_header, markdown=markdown or ''))
     derived_from_description = {name: fn(dict(extract)) for name, fn in DERIVERS.items()}
     statuses = await verify_extract(candidate, extract, stats)
     # What the regex fallbacks would say if they read the whole page rather than the posting's own

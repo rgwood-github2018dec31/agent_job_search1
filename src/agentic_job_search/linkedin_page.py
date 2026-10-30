@@ -137,6 +137,12 @@ class JobPage:
     posting_company: str = ''   # the poster as the page's logo names it (posting_company()); '' if absent
     dom_chars: int = 0          # the captured page before scripts and clutter were removed
     removed_chars: int = 0      # what clutter removal took out of the text
+    markdown: str = ''          # the same lines as `text` with headings, bullets and bold marked; '' on the snapshot path
+
+    @property
+    def model_text(self) -> str:
+        '''What the models read and their citations are checked against: the Markdown, else the text.'''
+        return self.markdown or self.text
 
 
 @dataclass
@@ -494,17 +500,22 @@ def listed_location(soup: BeautifulSoup) -> str:
     return header_card(soup).location
 
 
+_MARKDOWN_HEADING_MARKER_RE = re.compile(r'^#+\s+')
+
+
 def job_description(text: str) -> str:
     """The posting's own text: the lines after the LINKEDIN_JOB_DESCRIPTION_HEADING line and before
     the LINKEDIN_COMPANY_SECTION_HEADING line, cut by code from the page text the extractor read.
     To the end of the text when the company heading is missing; '' when the description heading is
-    (the snapshot path), so the caller decides what to read instead.
+    (the snapshot path), so the caller decides what to read instead. Reads the Markdown too: a
+    heading line matches with its `#` marker.
     """
     lines = (text or '').split('\n')
-    if LINKEDIN_JOB_DESCRIPTION_HEADING not in lines:
+    bare = [_MARKDOWN_HEADING_MARKER_RE.sub('', line) for line in lines]
+    if LINKEDIN_JOB_DESCRIPTION_HEADING not in bare:
         return ''
-    start = lines.index(LINKEDIN_JOB_DESCRIPTION_HEADING) + 1
-    end = lines.index(LINKEDIN_COMPANY_SECTION_HEADING, start) if LINKEDIN_COMPANY_SECTION_HEADING in lines[start:] else len(lines)
+    start = bare.index(LINKEDIN_JOB_DESCRIPTION_HEADING) + 1
+    end = bare.index(LINKEDIN_COMPANY_SECTION_HEADING, start) if LINKEDIN_COMPANY_SECTION_HEADING in bare[start:] else len(lines)
     return '\n'.join(lines[start:end])
 
 
@@ -792,7 +803,8 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     removed = remove_known_clutter(soup) + remove_expand_button(soup)
     removed += await decide_unknown_blocks(soup, candidate, stage_stats)
     text = page_text(soup)
-    tools_generic.save_raw_posting(candidate, text, 'dom', len(text))
+    markdown = minimal_archive.to_markdown(soup.find('main') or soup.body or soup)
+    tools_generic.save_raw_posting(candidate, markdown, 'dom', len(markdown))
     # Last: the minimal archive consumes the de-cluttered soup.
     await minimal_archive.save_minimal_archive(soup, html_path, archive_meta, removed)
     removed_summary = ', '.join(f"{r['what']} ({r['chars']})" for r in removed) or 'nothing'
@@ -812,7 +824,7 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
     logger.debug(f'Job page {job_id}: removed {removed_summary}; JS {js_counts}; assets {asset_counts}')
     return JobPage(text=text, source='dom', removed=removed, company_slug=company_slug,
                    listed_location=header.location, header=header, posting_company=company or '', dom_chars=len(capture['html']),
-                   removed_chars=sum(r['chars'] for r in removed))
+                   removed_chars=sum(r['chars'] for r in removed), markdown=markdown)
 
 
 def visible_block_signature(soup: BeautifulSoup) -> str:
