@@ -717,6 +717,14 @@ def step_by_step(steps: list[dict], found: str) -> list:
                    params([('from', f'LLM call #{extractor_call}' if extractor_call else 'the extractor')]),
                    params({k: v for k, v in fields.items()
                            if k not in ('description', 'quotes', 'evidence') and v is not False}))
+        elif kind == 'gate_fields':
+            answers = s.get('answers') or {}
+            row = ('Ask gate fields', 'model, one call per field above, + code (citations, meaning)',
+                   params([('header facts', s.get('facts'))]),
+                   params([(f, f"{compact(a.get('raw_value'))}{' (' + a['basis'] + ')' if a.get('basis') else ''} -> "
+                               f"{compact(a.get('value'))}{' — REJECTED' if a.get('rejected') else ''}"
+                               f"{' — FAILED, extractor value kept: ' + a['error'] if a.get('error') else ''}")
+                           for f, a in answers.items()]))
         elif kind == 'classified':
             geo = s.get('geography') or {}
             salary = s.get('salary_facts') or {}

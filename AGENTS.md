@@ -148,6 +148,7 @@ src/agentic_job_search/
   snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
   evidence.py                     # Verify Source Reference: a prediction stands only on a citation found in its input
+  gate_fields.py                  # Ask Gate Fields: relocation, residency_scope, language_requirement asked one per call, cited
   job_trace.py                    # Job Trace: every step of one Stage 2 job, recorded via a ContextVar
   job_audit.py                    # Write Job Audit: choose one rated job per run, render its trace as a PDF
   rating_inputs.py                # Record Rating Inputs: save each part of the rater's input once, for the trace to link

@@ -883,6 +883,13 @@ EVIDENCE_MIN_QUOTE_CHARS = 4
 # The model that relocates a citation regex search could not find. It only points at a span;
 # acceptance still needs that span to be found in the source by code.
 MODEL_NAME_EVIDENCE = MODEL_NAME_SINGLE_TURN
+# Ask Gate Fields (gate_fields.py): relocation, residency_scope and language_requirement asked one at a
+# time after the extract. In one extract call they changed between two runs of the same page on 7-25
+# of 243 pages; asked one at a time, on 0-5% (2026-10-30, scripts/local_field_probe.py).
+MODEL_NAME_GATE_FIELDS = MODEL_NAME_SINGLE_TURN
+GATE_FIELDS_TEMPERATURE = 0.0
+# A malformed or failed reply is asked again: such replies came right on the next try 9 of 9 times.
+GATE_FIELDS_ATTEMPTS = 2
 # The extract fields a model predicts as facts of the page, each cited and verified. `description`
 # is not here: code cuts it from the page (linkedin_page.job_description), and `date_posted` is
 # read from the page by code whenever the page shows the usual "N hours ago" line

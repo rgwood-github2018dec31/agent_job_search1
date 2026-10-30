@@ -12,8 +12,8 @@ does, and where it disagrees with the extractor, so a person can judge which one
 Per page and model, each field in PROBE_FIELDS is asked on its own: the page's Markdown first (so
 Ollama reuses it for the next field), then what code read off the page's header card (location and
 workplace badge, so the model is told whether the job is remote), then the field's definition from
-PROBE_DEFINITIONS, answered as {quote, reason, value}. The definitions are this probe's own, being
-tuned here; the extractor's schema (EXTRACT_PROPERTIES) is unchanged. A field never answers empty:
+gate_fields.DEFINITIONS, answered as {quotes, reason, value}: the prompt Ask Gate Fields sends in a
+run, so a change to it is measured here before a run relies on it. A field never answers empty:
 a page that does not say gives the field's NOT_KNOWN value, so "the model looked and the page does
 not say" is told apart from "no answer".
 
@@ -54,6 +54,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from agentic_job_search import evidence
 from agentic_job_search.config import LLM_LOCAL_MCP_URL, LLM_LOCAL_SERVICE_NAME, OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH
+from agentic_job_search.gate_fields import NOT_KNOWN, SYSTEM, output_schema, question
+from agentic_job_search.gate_fields import header_facts as gate_header_facts
 from agentic_job_search.linkedin_page import header_card
 from agentic_job_search.triage import chat_openrouter, extract_json_object
 from replay_evidence import RUN_DIR, inputs_from_html
@@ -71,57 +73,12 @@ PROBE_TEMPERATURE = 0.0
 LOCAL_MAX_TOKENS = 600
 LOCAL_TIMEOUT_SECONDS = 300
 VALUE_SHOWN_MAX_CHARS = 100
-SYSTEM = ('You read one job posting page and answer one question about it. Answer only from the page and '
-          'the header facts given with it.')
-
-# What a field is when the page does not say. Never '': an empty answer reads the same as no answer.
-NOT_KNOWN = {
-    'relocation': 'relocation_area_required_not_known',
-    'residency_scope': 'residency_scope_not_known',
-    'language_requirement': 'language_requirement_not_known',
-}
-RESIDENCY_SCOPES = ['city_only', 'country_only', 'area_wide']
-# Rules every field reads the page by. Each came from a page the models misread (2026-10-30, 40 pages).
-READING_RULES = (
-    "How to read the page: (a) the posting's own words about where this job may be done beat the header "
-    'location, which is only the one place LinkedIn lists: header "Canada" with "we hire across the United States '
-    'and Canada" in the text means both; (b) when the header shows no workplace type and the page never says the '
-    'job is remote or hybrid, the job is on-site; (c) company boilerplate describes the company, not this job: a '
-    '"work from anywhere" culture, offices or countries the company is in, perks, and pay ranges or benefits '
-    'listed per country never beat the header location or an explicit "based in"; only the posting saying this '
-    'job may be done from anywhere does; (d) a time-zone requirement is not a place.')
-PLACES_FORMAT = ('Write places as the page names them, countries in full English ("United States", not "US"), '
-                 'the office city as the header names it ("Vancouver, BC", "Greater Toronto Area, Canada"), several '
-                 'separated by "; ", with no qualifiers such as time zones.')
-PROBE_DEFINITIONS = {
-    'relocation': (
-        'Where the holder must live to do this job: a country, region or city, or several. Decide by these rules, '
-        'in order: (1) the posting says where ("must be based in Portugal", "relocation to Madrid") -> that place; '
-        '(2) the job is remote and names countries or an area it is open to ("remote in the EU", "Canada, United '
-        'Kingdom") -> those; (3) the job is remote and the page names only a city or region, such as the header '
-        'location "Vancouver, BC" -> that place\'s country ("Canada"), since anywhere in that country will do; '
-        "(4) the job is on-site or hybrid -> the office's city, since the holder must commute to it; (5) the "
-        'posting says the holder may work from anywhere in the world -> "anywhere". When none of these settles it '
-        f'-> "{NOT_KNOWN["relocation"]}". {PLACES_FORMAT}'),
-    'residency_scope': (
-        'How wide the area the holder may live in is. "city_only" if the job is on-site or hybrid (the holder '
-        'must commute to the office\'s city), or the posting names one city to live in. "country_only" if the '
-        'holder must live in one country: the posting says so ("Remote within country", "must be based in '
-        'Germany"), or the job is remote and the page names only one country or a place in it (header location '
-        '"Vancouver, BC" -> Canada). "area_wide" if any country of a multi-country area or list will do ("remote '
-        'anywhere in the EU", "any EMEA country", "Canada, United Kingdom"), or anywhere in the world. '
-        f'"{NOT_KNOWN["residency_scope"]}" when the page does not settle it.'),
-    'language_requirement': (
-        'Languages the posting requires, comma-separated lowercase, e.g. "english, german". A language marked as '
-        'an asset, a plus or nice to have is not required; a requirement may be implied ("Bilingualism (English '
-        'and French). French is an asset but not required." -> "english"). '
-        f'"{NOT_KNOWN["language_requirement"]}" when the posting names no language it requires.'),
-}
+# The definitions, rules and prompt are Ask Gate Fields' own (gate_fields.py): this probe measures them.
 
 
 def comparable(field: str, value: object) -> str:
     '''A value as compared: case-folded, NOT_KNOWN as '' (as the extractor leaves it), a list as a sorted set
-    (order carries nothing): languages separated by commas, places by "; " (PLACES_FORMAT).'''
+    (order carries nothing): languages separated by commas, places by "; " (gate_fields.PLACES_FORMAT).'''
     text = str(value or '').strip().casefold()
     if text == NOT_KNOWN[field]:
         return ''
@@ -133,32 +90,10 @@ def comparable(field: str, value: object) -> str:
     return text
 
 
-def output_schema(field: str) -> dict:
-    value = {'type': 'string'}
-    if field == 'residency_scope':
-        value['enum'] = [*RESIDENCY_SCOPES, NOT_KNOWN[field]]
-    # Decoded in this order: the evidence and the reason come before the value.
-    return {'type': 'object',
-            'properties': {'quotes': {'type': 'array', 'items': {'type': 'string'}}, 'reason': {'type': 'string'},
-                           'value': value},
-            'required': ['quotes', 'reason', 'value']}
-
-
 def header_facts(path: Path) -> str:
-    '''What code read off the header card, so the model is told rather than left to guess it.'''
+    '''What code read off the header card, as Ask Gate Fields states it to the model.'''
     header = header_card(BeautifulSoup(path.with_suffix('.html').read_text(encoding='utf-8'), 'lxml'))
-    return (f'Header facts, read by code from the page header: location "{header.location or "not shown"}"; '
-            f'workplace type "{header.workplace or "not shown"}".')
-
-
-def question(markdown: str, facts: str, field: str) -> str:
-    return (f'--- PAGE ---\n{markdown}\n--- END PAGE ---\n\n{facts}\n\n{READING_RULES}\n\n'
-            f'Field `{field}`: {PROBE_DEFINITIONS[field]}\n'
-            'Reply with only a JSON object with these keys, in this order: "quotes" is a list of the passages of the '
-            'page that give the value, each copied exactly from one place on the page (for a header fact, the '
-            'page\'s own words, such as "Vancouver, BC" or "On-site"), [] when nothing on the page states it; '
-            '"reason" is one sentence on why those passages and the header facts give the value; "value" is the '
-            'field\'s value, never "".')
+    return gate_header_facts(header.location, header.workplace)
 
 
 async def reply_local(model: str, prompt: str, field: str) -> tuple[dict, dict]:
@@ -233,7 +168,7 @@ async def ask(model: str, markdown: str, facts: str, field: str, relocate_model:
         missing = [q for q in missing if not relocated[q]]
     found = value == NOT_KNOWN[field] or (bool(quotes) and not missing)
     return {'value': value if found else NOT_KNOWN[field], 'raw_value': value, 'quote': ' | '.join(quotes),
-            'quotes_not_found': missing, 'relocated': relocated, 'reason': reason, 'rejected': not found,
+            'quotes_not_found': missing, 'relocated': relocated, 'reason': reason, 'basis': str(answer.get('basis') or ''), 'rejected': not found,
             'seconds': round(time.monotonic() - started, 2), **meta}
 
 
@@ -355,20 +290,25 @@ async def main() -> int:
     earlier = {p['job_id']: p for p in json.loads(args.fill.read_text(encoding='utf-8'))} if args.fill else {}
     slots = asyncio.Semaphore(args.concurrent)
 
-    async def probe_page(number: int, path: Path) -> dict:
+    async def probe_page(number: int, path: Path) -> dict | None:
         job_id = path.stem.split('-')[-1]
         page = earlier.get(job_id) or {'path': str(path), 'job_id': job_id, 'answers': {}}
         missing = any(len(page['answers'].get(m, {}).get(f) or []) < args.repeat for m in models for f in PROBE_FIELDS)
         if missing:
             async with slots:
-                _, markdown = inputs_from_html(path)
+                try:
+                    _, markdown = inputs_from_html(path)
+                except FileNotFoundError as ex:
+                    # Raw postings are pruned after RAW_POSTINGS_RETENTION_DAYS; an older reference names some gone.
+                    logger.warning(f'Skipping {path.name}: {ex}')
+                    return None
                 page['facts'] = header_facts(path)
                 # Models on different servers run side by side; each one asks its fields in turn.
                 await asyncio.gather(*(ask_model(m, page, markdown, args.repeat, args.relocate_model) for m in models))
             print(f'[{number}/{len(paths)}] {path.name}', flush=True)
         return page
 
-    results = await asyncio.gather(*(probe_page(n, p) for n, p in enumerate(paths, start=1)))
+    results = [p for p in await asyncio.gather(*(probe_page(n, p) for n, p in enumerate(paths, start=1))) if p]
     lines = [f'# One extract field at a time vs the page extractor ({started:%Y-%m-%d %H:%M})', '',
              f'{len(results)} pages, {args.repeat} runs per model, reference {args.reference.name}; '
              f'{(datetime.now() - started).total_seconds() / 60:.0f} min. A count is pages; "agree" etc. compare '

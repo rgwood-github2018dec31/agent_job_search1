@@ -455,6 +455,20 @@ def _no_llm_server(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _extractor_gate_fields(request, monkeypatch):
+    '''The run loop's Ask Gate Fields leaves the extractor's values in place: a test of Stage 2 sets the gate
+    fields in its canned extract and means them. tests/test_gate_fields.py tests the module itself, and a
+    test of the wiring patches gate_fields.ask_gate_fields back in.'''
+    if any(request.node.get_closest_marker(marker) for marker in LIVE_MARKERS):
+        return
+
+    async def _keep_extractor_values(candidate, extract, page, stage_stats):
+        return {}
+
+    monkeypatch.setattr(agent, 'ask_gate_fields', _keep_extractor_values)
+
+
+@pytest.fixture(autouse=True)
 def _unpinned_scraper_provider(monkeypatch):
     '''No test may reach the OpenRouter MCP server to choose a scraper endpoint: Stage 1b runs
     unpinned. Tests of the pin itself build a ProviderPin and patch call_mcp_tool.'''

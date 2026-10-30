@@ -12,7 +12,7 @@ measures a scheme that spends the per-field calls only where they are needed:
    `replay_markdown_ab.py --noise-only`, so they are not paid for again).
 2. GLM extracts the same page with the same extractor and prompt (MODEL_NAME_EXTRACTOR swapped).
 3. Every field whose two values differ is asked of DeepSeek on its own: the page, the header facts,
-   local_field_probe.READING_RULES and the extractor's own definition of that field
+   gate_fields.READING_RULES and the extractor's own definition of that field
    (EXTRACT_PROPERTIES), answered as {quotes, reason, value}; the quotes are checked as
    Verify Source Reference does. That answer is the field's final value.
 
@@ -47,9 +47,10 @@ from agentic_job_search import evidence, extract_openrouter
 from agentic_job_search.agent import EXTRACT_CITED_FIELDS
 from agentic_job_search.config import OPENROUTER_MODEL_NAME_DEEPSEEK_V41_FLASH
 from agentic_job_search.extract_openrouter import EXTRACT_PROPERTIES
+from agentic_job_search.gate_fields import READING_RULES, SYSTEM
 from agentic_job_search.linkedin_page import header_card
 from agentic_job_search.triage import chat_openrouter, extract_json_object
-from local_field_probe import OPENROUTER_ATTEMPTS, OPENROUTER_MODEL_NAME_GLM, READING_RULES, SYSTEM, header_facts
+from local_field_probe import OPENROUTER_ATTEMPTS, OPENROUTER_MODEL_NAME_GLM, header_facts
 from replay_evidence import RUN_DIR, candidate_for, inputs_from_html, load_capture
 from replay_markdown_ab import _value, extract_once
 

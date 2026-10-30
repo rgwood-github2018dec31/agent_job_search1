@@ -1521,6 +1521,23 @@ def test_relocation_is_never_met_without_a_tax_residence():
     assert not agent.relocation_already_met('Canada')
 
 
+@pytest.fixture
+def commute_to_vancouver(monkeypatch):
+    merged = preferences._deep_merge(preferences.load_preferences(), {'locations': {'would_commute_here': ['Vancouver']}})
+    monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+
+
+@pytest.mark.parametrize('relocation', ['Vancouver, BC', 'Toronto, ON; Vancouver, BC', 'Toronto, ON or Vancouver, BC'])
+def test_relocation_to_an_office_city_on_the_commute_list_is_met(commute_to_vancouver, relocation):
+    """Ask Gate Fields puts a hybrid job's office city in `relocation`; the user reaches that office (2026-10-30)."""
+    assert agent.relocation_already_met(relocation)
+
+
+@pytest.mark.parametrize('relocation', ['Toronto, ON', 'Greater Toronto Area, Canada', 'North Vancouverland'])
+def test_relocation_to_an_office_city_off_the_commute_list_is_a_move(commute_to_vancouver, relocation):
+    assert not agent.relocation_already_met(relocation)
+
+
 def test_build_deterministic_warnings_omits_relocation_to_the_residence_country(tax_residence_canada):
     def relocation_warnings(relocation):
         extract = _make_extract(relocation=relocation, salary='CAD 200,000 - 240,000 per year')

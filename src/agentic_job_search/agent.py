@@ -152,6 +152,7 @@ from agentic_job_search.extract_openrouter import (
     extract_from_args,
     extract_job_page_openrouter,
 )
+from agentic_job_search.gate_fields import ask_gate_fields
 from agentic_job_search.linkedin_page import (
     HeaderCard,
     JobPage,
@@ -2922,7 +2923,7 @@ _RESIDENCE_FILLER_WORDS = frozenset({
     'remotely', 'reside', 'residence', 'resident', 'residents', 'residing', 'required', 'role',
     'the', 'this', 'throughout', 'to', 'within', 'work', 'working',
 })
-_RESIDENCE_ALTERNATIVE_RE = re.compile(r'\bor\b', re.IGNORECASE)
+_RESIDENCE_ALTERNATIVE_RE = re.compile(r'\bor\b|;', re.IGNORECASE)   # ';' separates Ask Gate Fields' places
 _RESIDENCE_WORD_RE = re.compile(r'[^\W_]+')
 
 
@@ -2935,11 +2936,19 @@ def relocation_already_met(relocation: str) -> bool:
     `current_tax_residence` and nothing narrower: 'Ontario, Canada' can still mean a move, and tax
     residence says nothing about which province. Wording this does not recognise keeps the
     warning, so a miss is visible rather than silent.
+
+    Also met when an alternative names a place on `would_commute_here`: a hybrid or on-site job's
+    relocation is its office city (Ask Gate Fields), and the holder must live near enough to go there,
+    which the user does for those places (2026-10-30).
     """
+    alternatives = _RESIDENCE_ALTERNATIVE_RE.split(' '.join(str(relocation or '').split()))
+    if any(location_token_matches(token, alternative)
+           for token in preferences.would_commute_here() for alternative in alternatives):
+        return True
     residence = preferences.current_tax_residence()
     if not residence:
         return False
-    for alternative in _RESIDENCE_ALTERNATIVE_RE.split(' '.join(str(relocation or '').split())):
+    for alternative in alternatives:
         if not location_token_matches(residence, alternative):
             continue
         rest = _RESIDENCE_WORD_RE.findall(alternative.replace(residence, ' '))
@@ -4705,6 +4714,9 @@ async def _evaluate_candidates(
                 await verify_extract(candidate, extract, stage_stats['evidence'], use_llm=not resubmitted)
                 job_trace.record('extract', fields={k: v for k, v in extract.items()
                                                     if k not in ('page_text', 'page_plain_text')})
+                # The fields the gates read, asked one at a time: steadier than in the one extract call.
+                if page is not None:
+                    await ask_gate_fields(candidate, extract, page, stage_stats['extraction'])
             if extract is None and browser is not None and await browser.confirm_dead():
                 index -= 1   # the browser, not the page, failed: retry this job after the restart
                 continue
