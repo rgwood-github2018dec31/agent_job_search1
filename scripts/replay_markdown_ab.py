@@ -24,6 +24,7 @@ The raw rating is compared, before hard rules and caps, since those read fields,
 Usage:
     uv run python scripts/replay_markdown_ab.py                     # every retained page, 2 repeats
     uv run python scripts/replay_markdown_ab.py --date 2026-10-29 --limit 10 --repeat 3
+    uv run python scripts/replay_markdown_ab.py --noise-only --extract-temperature 0   # does a setting steady the extractor?
 
 Needs the OpenRouter MCP tool server on :8006. Costs about a tenth of a cent per extraction and
 less per rating: about half a cent per page at `--repeat 2`. Reads only: nothing is saved, rated
@@ -43,7 +44,7 @@ from bs4 import BeautifulSoup
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from agentic_job_search import evidence
+from agentic_job_search import evidence, extract_openrouter
 from agentic_job_search.agent import (
     EXTRACT_CITED_FIELDS,
     PAGE_EXTRACTOR_INSTRUCTIONS,
@@ -117,7 +118,8 @@ async def rate_both(candidate: dict, extract: dict, header, evaluator_prompt: st
             'same_input': texts['text'] == texts['markdown']}
 
 
-async def replay_page(path: Path, evaluator_prompt: str, repeat: int, gate: asyncio.Semaphore) -> dict | None:
+async def replay_page(path: Path, evaluator_prompt: str, repeat: int, gate: asyncio.Semaphore,
+                      forms: tuple[str, ...] = FORMS, rate: bool = True) -> dict | None:
     async with gate:
         try:
             plain, markdown = inputs_from_html(path)
@@ -131,10 +133,10 @@ async def replay_page(path: Path, evaluator_prompt: str, repeat: int, gate: asyn
         page = {'path': str(path), 'job_id': candidate['job_id'], 'company': candidate.get('company', '')}
         try:
             page['extracts'] = {form: [await extract_once(path, candidate, plain, markdown, header, form)
-                                       for _ in range(repeat)] for form in FORMS}
+                                       for _ in range(repeat)] for form in forms}
             rated_from = next((r for r in page['extracts']['markdown'] if not r['failed']), None)
             page['rating'] = (await rate_both(candidate, rated_from['extract'], header, evaluator_prompt, repeat)
-                              if rated_from else None)
+                              if rated_from and rate else None)
         except Exception as ex:
             logger.warning(f'{path.name}: replay failed: {type(ex).__name__}: {ex}')
             page['error'] = f'{type(ex).__name__}: {ex}'
@@ -151,10 +153,10 @@ def _differs(page: dict, field: str, a: tuple[str, int], b: tuple[str, int]) -> 
     return not x['failed'] and not y['failed'] and x['fields'][field] != y['fields'][field]
 
 
-def extractor_report(pages: list[dict], repeat: int) -> list[str]:
+def extractor_report(pages: list[dict], repeat: int, forms: tuple[str, ...] = FORMS) -> list[str]:
     pages = [p for p in pages if 'extracts' in p]
-    noise_pairs = [((form, 0), (form, i)) for form in FORMS for i in range(1, repeat)]
-    effect_pairs = [(('text', i), ('markdown', i)) for i in range(repeat)]
+    noise_pairs = [((form, 0), (form, i)) for form in forms for i in range(1, repeat)]
+    effect_pairs = [(('text', i), ('markdown', i)) for i in range(repeat)] if 'text' in forms else noise_pairs
 
     def count(field: str, pairs: list) -> float:
         '''Pages differing, averaged over the pairs, so noise and effect are on the same scale.'''
@@ -173,7 +175,7 @@ def extractor_report(pages: list[dict], repeat: int) -> list[str]:
             lines.append(f'| {field} | {noise:.1f} | {effect:.1f} |')
     lines.append(f'| **all fields** | **{total_noise:.1f}** | **{total_effect:.1f}** |')
     lines += ['', f'Field values compared per pair: {len(pages) * len(EXTRACT_CITED_FIELDS)}.', '']
-    for form in FORMS:
+    for form in forms:
         runs = [r for p in pages for r in p['extracts'][form]]
         ok = [r for r in runs if not r['failed']]
         rejected = collections.Counter(f for r in ok for f in r['rejected'])
@@ -223,6 +225,10 @@ async def main() -> int:
     parser.add_argument('--repeat', type=int, default=DEFAULT_REPEAT, help=f'runs per input (default {DEFAULT_REPEAT})')
     parser.add_argument('--concurrent', type=int, default=DEFAULT_CONCURRENT_PAGES,
                         help=f'pages replayed at once (default {DEFAULT_CONCURRENT_PAGES})')
+    parser.add_argument('--noise-only', action='store_true',
+                        help='only the Markdown extractor, repeated: its run-to-run variation, no text runs, no ratings')
+    parser.add_argument('--extract-temperature', type=float,
+                        help='override EXTRACT_TEMPERATURE for this replay (default: the configured one)')
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format='%(levelname)s %(name)s %(message)s')
     if args.repeat < 2:
@@ -235,15 +241,20 @@ async def main() -> int:
     if not paths:
         print(f'No captures under {", ".join(map(str, days))}')
         return 1
-    evaluator_prompt = build_evaluator_prompt(await build_reference_summary(new_stage_stats()))
+    if args.extract_temperature is not None:
+        extract_openrouter.EXTRACT_TEMPERATURE = args.extract_temperature
+    forms = ('markdown',) if args.noise_only else FORMS
+    evaluator_prompt = '' if args.noise_only else build_evaluator_prompt(await build_reference_summary(new_stage_stats()))
     gate = asyncio.Semaphore(args.concurrent)
     started = datetime.now()
-    pages = [p for p in await asyncio.gather(*(replay_page(p, evaluator_prompt, args.repeat, gate) for p in paths)) if p]
+    pages = [p for p in await asyncio.gather(*(replay_page(p, evaluator_prompt, args.repeat, gate, forms, not args.noise_only)
+                                               for p in paths)) if p]
     errors = [p for p in pages if 'error' in p]
     lines = [f'# Plain text vs Markdown: extractor and rater ({started:%Y-%m-%d %H:%M})', '',
              f"{len(pages)} pages from {', '.join(d.name for d in days)}; {len(errors)} failed; "
-             f'{(datetime.now() - started).total_seconds() / 60:.0f} min.', '']
-    lines += extractor_report(pages, args.repeat) + rater_report(pages, args.repeat)
+             f'{(datetime.now() - started).total_seconds() / 60:.0f} min; extractor temperature '
+             f'{extract_openrouter.EXTRACT_TEMPERATURE}.', '']
+    lines += extractor_report(pages, args.repeat, forms) + ([] if args.noise_only else rater_report(pages, args.repeat))
     lines += [f"- error: {p['path']}: {p['error']}" for p in errors]
     out = RUN_DIR / 'replays' / f'markdown-ab-{started:%Y%m%d-%H%M%S}'
     out.parent.mkdir(parents=True, exist_ok=True)

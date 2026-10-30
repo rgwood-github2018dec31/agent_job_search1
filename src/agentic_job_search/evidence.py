@@ -18,6 +18,7 @@ A failure of the step-2 call rejects every claim it was asked about: a predictio
 ground does not get to gate a job.
 '''
 
+import html
 import json
 import logging
 import re
@@ -55,8 +56,9 @@ _EDGE_CHARS = ' \t\n.,;:!?"\'()[]{}*-'
 
 def normalize_for_match(text: object) -> str:
     '''Fold what a faithful citation may legitimately differ in: case, width, whitespace, dash and
-    quote styles, and Markdown markers. Letters, digits and word order are left alone.'''
-    folded = unicodedata.normalize('NFKC', str(text or '')).translate(_DASHES).translate(_QUOTES)
+    quote styles, Markdown markers and HTML entities (a model copied `&` as `&amp;`, 2026-10-30).
+    Letters, digits and word order are left alone.'''
+    folded = unicodedata.normalize('NFKC', html.unescape(str(text or ''))).translate(_DASHES).translate(_QUOTES)
     folded = _MARKDOWN_BOLD_RE.sub('', _MARKDOWN_LINE_MARKER_RE.sub('', folded))
     folded = _DASH_SEPARATOR_RE.sub(r'\1', folded)
     return _WHITESPACE_RE.sub(' ', folded.casefold()).strip()

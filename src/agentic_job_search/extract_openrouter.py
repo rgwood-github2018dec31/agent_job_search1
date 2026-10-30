@@ -18,6 +18,7 @@ from agentic_job_search import job_trace
 from agentic_job_search.config import (
     EXTRACT_CITED_FIELDS,
     EXTRACT_RESUBMIT_UNGROUNDED,
+    EXTRACT_TEMPERATURE,
     EXTRACTOR_OPENROUTER_MAX_ITERATIONS,
     LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
@@ -157,7 +158,8 @@ async def extract_job_page_openrouter(
         try:
             raw = await call_mcp_tool(
                 LLM_OPENROUTER_MCP_URL, 'chat',
-                {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS, **routing},
+                {'messages': messages, 'model': MODEL_NAME_EXTRACTOR, 'tools': OPENROUTER_EXTRACT_TOOLS, **routing,
+                 **({'temperature': EXTRACT_TEMPERATURE} if EXTRACT_TEMPERATURE is not None else {})},
                 timeout_seconds=LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS,
             )
         except Exception as ex:

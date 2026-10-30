@@ -2179,6 +2179,17 @@ async def test_openrouter_loop_happy_path(monkeypatch):
     assert [t['function']['name'] for t in chat_requests[0]['tools']] == ['submit_job_extract']
 
 
+@pytest.mark.parametrize('temperature', [None, 0.0])
+async def test_openrouter_loop_sends_the_extract_temperature_only_when_set(monkeypatch, temperature):
+    chat_requests = []
+    _wire_openrouter_loop(monkeypatch, [_chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', _SUBMIT_ARGS)])], chat_requests)
+    monkeypatch.setattr(extract_openrouter, 'EXTRACT_TEMPERATURE', temperature)
+
+    await _run_loop()
+
+    assert chat_requests[0].get('temperature', 'unset') == ('unset' if temperature is None else temperature)
+
+
 async def test_openrouter_loop_returns_none_on_a_chat_timeout_so_the_fallback_runs(monkeypatch, caplog):
     '''A raised timeout escaped to the Stage 2 error handler and dropped the job (2026-10-16).'''
     timeouts = []

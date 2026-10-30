@@ -864,6 +864,10 @@ LOCAL_LLM_TEMPERATURE = 0.2
 # OpenRouter rating calls. Unset, the provider's default applied, and the same job given twice
 # changed its rating on 17 of 60 jobs and its notify decision on 8 (2026-10-28).
 RATING_TEMPERATURE = 0.0
+# The page extractor's sampling temperature; None sends none, so the provider's default applies.
+# Over 243 pages run twice (2026-10-30), 200 field values differed between the two runs unset and
+# 157 at 0. The model reasons first, so 0 does not make it deterministic.
+EXTRACT_TEMPERATURE: float | None = 0.0
 
 # The run's sleep watcher (system_sleep.py) ticks this often and reports a wall-clock step longer
 # than the tick by at least SLEEP_GAP_MIN_SECONDS: on 2026-10-14 a closed lid stopped the run for

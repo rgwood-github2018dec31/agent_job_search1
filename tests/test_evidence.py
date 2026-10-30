@@ -134,3 +134,10 @@ def test_a_quote_copied_from_markdown_or_plain_text_is_found_in_either(quote, so
 def test_markdown_folding_leaves_letters_digits_and_order_alone():
     assert evidence.find_quote('Fluent German **not** required', MARKDOWN_PAGE) is None
     assert evidence.find_quote('Python 5+ years', PLAIN_PAGE) is None
+
+
+def test_a_quote_with_an_html_entity_is_found_in_the_text_it_was_copied_from():
+    '''Talently (job 4463980329): the page read 'USA & Canada', the citation 'USA &amp; Canada' (2026-10-30).'''
+    source = 'Remote (USA & Canada - PST preferred)'
+    assert evidence.find_quote('Remote (USA &amp; Canada - PST preferred)', source) is not None
+    assert evidence.find_quote('USA &amp; Mexico', source) is None
