@@ -61,7 +61,7 @@ from agentic_job_search.agent import (
 from agentic_job_search.config import EXTRACT_RESUBMIT_UNGROUNDED, RATING_NOTIFICATION_THRESHOLD
 from agentic_job_search.extract_openrouter import extract_job_page_openrouter
 from agentic_job_search.linkedin_page import JobPage, header_card
-from replay_evidence import RUN_DIR, candidate_for, inputs_from_html, load_capture
+from replay_evidence import RAW_POSTINGS_DIR, REPLAY_CORPUS_DIR, RUN_DIR, candidate_for, inputs_from_html, load_capture
 
 logger = logging.getLogger('replay_markdown_ab')
 
@@ -221,6 +221,8 @@ def rater_report(pages: list[dict], repeat: int) -> list[str]:
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--date', action='append', help='capture day under run_dir/raw_postings; repeatable (default: all)')
+    parser.add_argument('--corpus', action='store_true',
+                        help='replay the pinned copies in run_dir/replay_corpus (scripts/pin_replay_corpus.py), not raw_postings')
     parser.add_argument('--limit', type=int, help='pages to replay (default: all)')
     parser.add_argument('--repeat', type=int, default=DEFAULT_REPEAT, help=f'runs per input (default {DEFAULT_REPEAT})')
     parser.add_argument('--concurrent', type=int, default=DEFAULT_CONCURRENT_PAGES,
@@ -234,7 +236,7 @@ async def main() -> int:
     if args.repeat < 2:
         parser.error('--repeat must be at least 2: noise is measured between repeats')
 
-    root = RUN_DIR / 'raw_postings'
+    root = REPLAY_CORPUS_DIR if args.corpus else RAW_POSTINGS_DIR
     days = [root / d for d in args.date] if args.date else sorted(p for p in root.iterdir() if p.is_dir())
     paths = [p for day in days for p in sorted(day.glob('linkedin-*.txt'))
              if not p.name.endswith('.rater_posting.txt')][:args.limit]

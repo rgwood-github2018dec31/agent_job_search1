@@ -57,6 +57,11 @@ from agentic_job_search.linkedin_page import HeaderCard, JobPage, header_card
 logger = logging.getLogger('replay_evidence')
 
 RUN_DIR = Path(__file__).parent.parent / 'run_dir'
+RAW_POSTINGS_DIR = RUN_DIR / 'raw_postings'
+# Captures copied out of raw_postings/ by scripts/pin_replay_corpus.py, which a run's retention pruning
+# (RAW_POSTINGS_RETENTION_DAYS) never touches: on 2026-10-30 a run pruned 84 of the 243 pages a
+# measurement was replaying. Same {date}/{name} layout.
+REPLAY_CORPUS_DIR = RUN_DIR / 'replay_corpus'
 DEFAULT_REPLAY_LIMIT = 20
 FRONT_MATTER_DELIMITER = '---\n'
 INPUT_TEXT, INPUT_MARKDOWN, INPUT_BOTH = 'text', 'markdown', 'both'
@@ -67,6 +72,12 @@ DERIVERS = {
     'education_requirement': derive_education_requirement,
     'is_agency': derive_agency_posting,
 }
+
+
+def pinned(path: Path) -> Path:
+    '''The same capture in REPLAY_CORPUS_DIR when it has been pinned there, else `path` as given.'''
+    copy = REPLAY_CORPUS_DIR / path.parent.name / path.name
+    return copy if copy.exists() else path
 
 
 def load_capture(path: Path) -> tuple[dict, str]:

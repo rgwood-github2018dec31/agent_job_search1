@@ -51,7 +51,7 @@ from agentic_job_search.gate_fields import READING_RULES, SYSTEM
 from agentic_job_search.linkedin_page import header_card
 from agentic_job_search.triage import chat_openrouter, extract_json_object
 from local_field_probe import OPENROUTER_ATTEMPTS, OPENROUTER_MODEL_NAME_GLM, header_facts
-from replay_evidence import RUN_DIR, candidate_for, inputs_from_html, load_capture
+from replay_evidence import RUN_DIR, candidate_for, inputs_from_html, load_capture, pinned
 from replay_markdown_ab import _value, extract_once
 
 logger = logging.getLogger('replay_extract_arbitrate')
@@ -118,9 +118,13 @@ async def arbitrate_retrying(markdown: str, facts: str, field: str) -> dict | No
     return None
 
 
-async def run_page(path: Path, deepseek_runs: list[dict], repeat: int, gate: asyncio.Semaphore) -> dict:
+async def run_page(path: Path, deepseek_runs: list[dict], repeat: int, gate: asyncio.Semaphore) -> dict | None:
     async with gate:
-        plain, markdown = inputs_from_html(path)
+        try:
+            plain, markdown = inputs_from_html(path)
+        except FileNotFoundError as ex:
+            logger.warning(f'Skipping {path.name}: {ex}')
+            return None
         front, _ = load_capture(path)
         candidate = candidate_for(front, plain)
         header = header_card(BeautifulSoup(path.with_suffix('.html').read_text(encoding='utf-8'), 'lxml'))
@@ -226,8 +230,8 @@ async def main() -> int:
     extract_openrouter.MODEL_NAME_EXTRACTOR = OPENROUTER_MODEL_NAME_GLM
     gate = asyncio.Semaphore(args.concurrent)
     started = datetime.now()
-    pages = await asyncio.gather(*(run_page(Path(p['path']), [r for r in p['extracts']['markdown'] if not r['failed']],
-                                            args.repeat, gate) for p in usable))
+    pages = [page for page in await asyncio.gather(*(run_page(pinned(Path(p['path'])), [r for r in p['extracts']['markdown'] if not r['failed']],
+                                            args.repeat, gate) for p in usable)) if page]
     lines = [f'# DeepSeek and GLM extract, DeepSeek per field where they differ ({started:%Y-%m-%d %H:%M})', '',
              f'{len(pages)} pages ({skipped} in the reference left out: fewer than {args.repeat} DeepSeek runs), '
              f'{args.repeat} runs each, DeepSeek runs from {args.reference.name}; '

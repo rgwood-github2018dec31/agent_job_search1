@@ -175,6 +175,7 @@ scripts/
   replay_markdown_ab.py           # Plain text vs Markdown for the extractor and the rater, with repeats to measure noise (costs ~$1)
   replay_extract_arbitrate.py     # DeepSeek and GLM extract, DeepSeek per field where they differ; run-to-run variation (costs ~$1)
   local_field_probe.py            # Asks local or OpenRouter models one extract field at a time; compares models and the extractor's runs
+  pin_replay_corpus.py            # Copies retained captures into run_dir/replay_corpus/, out of reach of pruning, for the replay scripts
   release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
 tests/
   test_tools.py                   # Unit tests for all tools
@@ -207,6 +208,7 @@ run_dir/
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
   job_audits/                     # One Job Audit PDF per run: every step that decided one job's rating
   rating_inputs/                  # The rater's JOB_REQUIREMENTS.md, ideal-role profile (with provenance), instructions and system message, one file per md5
+  replay_corpus/                  # Pinned copies of raw_postings captures ({date}/ .txt .html .rater_posting.txt); never pruned; the replay scripts prefer them
   replays/                        # --job-ids output (job-ids-{timestamp}/ with saved postings and the REPLAY_*_FILENAME files) and scripts/replay_evidence.py reports
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
 ```

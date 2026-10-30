@@ -58,7 +58,7 @@ from agentic_job_search.gate_fields import NOT_KNOWN, SYSTEM, output_schema, que
 from agentic_job_search.gate_fields import header_facts as gate_header_facts
 from agentic_job_search.linkedin_page import header_card
 from agentic_job_search.triage import chat_openrouter, extract_json_object
-from replay_evidence import RUN_DIR, inputs_from_html
+from replay_evidence import RUN_DIR, inputs_from_html, pinned
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 logger = logging.getLogger('local_field_probe')
@@ -285,7 +285,7 @@ async def main() -> int:
     models = args.model or list(DEFAULT_MODELS)
     reference = reference_fields(args.reference)
     pages = json.loads(args.reference.read_text(encoding='utf-8'))
-    paths = [Path(p['path']) for p in pages if p['job_id'] in reference][:args.limit]
+    paths = [pinned(Path(p['path'])) for p in pages if p['job_id'] in reference][:args.limit]
     started = datetime.now()
     earlier = {p['job_id']: p for p in json.loads(args.fill.read_text(encoding='utf-8'))} if args.fill else {}
     slots = asyncio.Semaphore(args.concurrent)
