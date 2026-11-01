@@ -12143,3 +12143,127 @@ async def test_job_ids_replay_screens_like_stage_1_and_summarises(tmp_path, monk
     assert rows[1].split('\t')[3] == 'queue_skipped: excluded title'
     assert rows[2].split('\t')[3] == 'already_applied: applied.pdf'
     assert rows[3].split('\t')[3:] == ['saved', '4', 'good fit']
+
+
+# --- identify_poster: an About page is visited once ever, even when it cannot be read ------------
+
+_POSTER = {'company': 'Example Co'}
+
+
+def _not_about() -> linkedin_page.NotAnAboutPageError:
+    return linkedin_page.NotAnAboutPageError('not an About page')
+
+
+@pytest.fixture
+def about_visits(monkeypatch):
+    '''Stub the browser. Set `results[slug]` to an exception to raise it. Returns (visits, results).'''
+    visits: list[str] = []
+    results: dict[str, Exception] = {}
+
+    @contextlib.asynccontextmanager
+    async def fake_session(url):
+        yield None
+
+    async def fake_read_about(slug, call):
+        visits.append(slug)
+        if slug in results:
+            raise results[slug]
+        return linkedin_page.CompanyAbout(slug=slug, name=slug, website=f'https://{slug}.example.com')
+
+    async def no_pause(*_args):
+        return None
+
+    async def no_model(name, stage_stats=None):
+        return company_domain.CompanyIdentity(name, source='none')
+
+    monkeypatch.setattr(agent, 'mcp_session', fake_session)
+    monkeypatch.setattr(agent, 'read_company_about', fake_read_about)
+    monkeypatch.setattr(agent, '_human_pause', no_pause)
+    monkeypatch.setattr(company_domain, 'identity_for_name', no_model)
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    return visits, results
+
+
+async def test_an_unreadable_about_page_is_not_visited_again(about_visits):
+    '''2026-10-30: failures were not cached, so 19 companies got 27 visits, Provectus 6.'''
+    visits, results = about_visits
+    results['acme'] = _not_about()
+    for _ in range(2):
+        assert await agent.identify_poster('acme', _POSTER, 'http://x', {}) is None
+    assert visits == ['acme']
+
+
+async def test_a_browser_failure_leaves_the_page_to_try_again_and_counts_for_nothing(about_visits):
+    visits, results = about_visits
+    results['acme'] = RuntimeError('peer closed connection')
+    stats: dict = {}
+    assert await agent.identify_poster('acme', _POSTER, 'http://x', stats) is None
+    assert not company_domain.about_page_unreadable('acme')
+    assert stats.get(agent.ABOUT_FAILURES_IN_A_ROW_KEY, 0) == 0
+    await agent.identify_poster('acme', _POSTER, 'http://x', stats)
+    assert visits == ['acme', 'acme']
+
+
+async def test_repeated_unreadable_pages_stop_the_visits_and_raise_one_alert(about_visits):
+    '''2026-10-30: all 27 reads failed and run health said nothing.'''
+    visits, results = about_visits
+    limit = agent.COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES
+    slugs = [f'company-{i}' for i in range(limit + 2)]
+    results.update({slug: _not_about() for slug in slugs})
+    stats: dict = {}
+    for slug in slugs:
+        await agent.identify_poster(slug, _POSTER, 'http://x', stats)
+    assert visits == slugs[:limit]
+    assert [a['kind'] for a in tools._ui_alerts] == ['about_pages_unreadable']
+    assert 'COMPANY ABOUT PAGES UNREADABLE' in agent.attach_run_health({'ui_alerts': list(tools._ui_alerts)})[0]
+
+
+async def test_a_page_that_reads_resets_the_count(about_visits):
+    visits, results = about_visits
+    limit = agent.COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES
+    stats: dict = {}
+    bad = [f'bad-{i}' for i in range(limit - 1)]
+    results.update({slug: _not_about() for slug in bad})
+    for slug in [*bad, 'good', 'after']:
+        await agent.identify_poster(slug, _POSTER, 'http://x', stats)
+    assert visits == [*bad, 'good', 'after']
+    assert stats[agent.ABOUT_FAILURES_IN_A_ROW_KEY] == 0
+
+
+def test_the_failure_count_stays_out_of_the_public_cost_log():
+    public = agent.public_stage_stats({'extraction': {'cost': 0.0, agent.ABOUT_FAILURES_IN_A_ROW_KEY: 2}})
+    assert public == {'extraction': {'cost': 0.0}}
+
+
+# --- Salary period, audit section 1c ---------------------------------------------------------------
+
+@pytest.mark.parametrize('text, period', [
+    ('$250,000 - $300,000 USD / year + competitive equity', 'year'),
+    ('$250,000 USD/year', 'year'),
+    ('€5,000 / month', 'month'),
+    ('€1,000/week', 'week'),
+    ('$100–$150/hour (~15 hrs/week part-time)', 'hour'),
+    ('$100/hour, 15 hours / week', 'hour'),
+    ('$100/hour, up to $2,000/week', 'hour'),
+    ('€5,000 gross/month (€60k/year)', 'month'),
+    ('15 hrs/week at $100/hour', 'hour'),
+    ('€5,000/mo', 'month'),
+    ('$200K/yr', 'year'),
+    ('€6,500 to €9,000 gross', ''),
+])
+def test_detect_period_reads_spelled_out_slash_forms(text, period):
+    '''2026-10-30: Talently's "USD / year" read as no period; only /yr, /mo and /wk matched.'''
+    assert salary.detect_period(text) == period
+
+
+def test_audit_1c_ignores_the_retired_country_advice_and_dates_the_warnings():
+    '''2026-10-30: 32 countries of 2026-09 advice printed each run, against current preferences.'''
+    review = {
+        'countries': {'Serbia': {'status': 'pending', 'recommendation': 'keep_as_is', 'reason': 'stale'}},
+        'entry_warnings': [{'entry': 'Roma', 'list': 'would_live_here', 'collides_with': 'Romania',
+                            'kind': 'collision', 'detail': 'ambiguous', 'status': 'pending'}],
+        'reviewed': {'on': '2026-09-11'},
+    }
+    text = '\n'.join(tools.list_hygiene_lines(review))
+    assert 'Serbia' not in text and 'Roma' in text and '2026-09-11' in text
+    assert tools.list_hygiene_lines({'countries': review['countries']}) == ['No pending warnings.']

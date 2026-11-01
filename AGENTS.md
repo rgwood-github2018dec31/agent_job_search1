@@ -201,11 +201,12 @@ run_dir/
   raw_postings/                   # Per job: .html page archive (JS-free) + .min.html/.min.pdf minimal archive + .txt the Markdown the extractor read + .rater_posting.txt the posting the rater read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
-  location_recommendations.yaml   # Advisory review of the country lists (recommend-only, hand-edited)
+  location_recommendations.yaml   # Advisory hygiene warnings on the place lists (recommend-only, hand-edited)
   recruiter_notifications.yaml    # Postings already notified, any poster (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
   eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error (EVAL_ERROR_MAX_RELEASES)
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
+  about_page_failures/            # Pages that did not read as a company's About page, one per slug and day
   job_audits/                     # One Job Audit PDF per run: every step that decided one job's rating
   rating_inputs/                  # The rater's JOB_REQUIREMENTS.md, ideal-role profile (with provenance), instructions and system message, one file per md5
   replay_corpus/                  # Pinned copies of raw_postings captures ({date}/ .txt .html .rater_posting.txt); never pruned; the replay scripts prefer them

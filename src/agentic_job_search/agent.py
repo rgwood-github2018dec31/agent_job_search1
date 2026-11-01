@@ -72,6 +72,7 @@ from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     AUDIT_FALSE_NEGATIVE_MIN_RATING,
     AUDIT_OPUS_SAMPLE_SIZE,
+    COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES,
     COMPANY_ABOUT_PAGE_DELAY_SECONDS,
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
@@ -157,6 +158,7 @@ from agentic_job_search.linkedin_page import (
     HeaderCard,
     JobPage,
     LinkedInBlockedError,
+    NotAnAboutPageError,
     company_page_url,
     is_closed_text,
     job_description,
@@ -1500,7 +1502,9 @@ def print_result_stats(msg: ResultMessage, cost_delta: float | None = None, summ
 
 # Keys that are internal bookkeeping, not reported metrics. stage_stats dicts are serialized
 # straight into cost_log.jsonl, so these are stripped before logging to keep its schema stable.
-_PRIVATE_STAGE_STAT_KEYS = ('session_costs',)
+# In the extraction stage's stats: reset by any read that works, never by a browser failure.
+ABOUT_FAILURES_IN_A_ROW_KEY = 'about_page_failures_in_a_row'
+_PRIVATE_STAGE_STAT_KEYS = (ABOUT_FAILURES_IN_A_ROW_KEY, 'session_costs',)
 
 
 def new_stage_stats() -> dict:
@@ -1732,6 +1736,8 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'COUNTRY LISTS: {alert.get("detail")}')
         elif kind == 'browser_restarted':
             alerts.append(f'BROWSER RESTARTED: {alert.get("detail")}')
+        elif kind == 'about_pages_unreadable':
+            alerts.append(f'COMPANY ABOUT PAGES UNREADABLE: {alert.get("detail")}')
         elif kind == 'browser_dead':
             alerts.append(f'BROWSER DIED, STAGE 2 STOPPED: {alert.get("detail")}')
         elif kind == system_sleep.SYSTEM_SLEEP_ALERT_KIND:
@@ -2377,16 +2383,39 @@ async def identify_poster(
     '''
     if cached := company_domain.cached_identity_for_slug(slug):
         return cached
+    if company_domain.about_page_unreadable(slug):
+        logger.debug(f"Company identity: the About page of {slug} ({candidate['company']}) was already found "
+                     f'unreadable, not visiting it again')
+        return None
+    failures_in_a_row = stage_stats.get(ABOUT_FAILURES_IN_A_ROW_KEY, 0)
+    if failures_in_a_row >= COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES:
+        logger.debug(f'Company identity: About page reads are stopped for this run, skipping {slug}')
+        return None
     await _human_pause(COMPANY_ABOUT_PAGE_DELAY_SECONDS, f'the LinkedIn About page of {slug}')
     try:
         async with mcp_session(playwright_mcp_url) as call:
             about = await read_company_about(slug, call)
     except LinkedInBlockedError:
         raise
+    except NotAnAboutPageError as ex:
+        logger.warning(f"Company identity: {candidate['company']}: not an About page, identifying the company "
+                       f'by name instead and not visiting {slug} again: {ex}')
+        company_domain.record_about_page_unreadable(slug, str(ex))
+        failures_in_a_row += 1
+        stage_stats[ABOUT_FAILURES_IN_A_ROW_KEY] = failures_in_a_row
+        if failures_in_a_row >= COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES:
+            detail = (f'{failures_in_a_row} pages in a row were not About pages, so no more were visited this run '
+                      f'(last: {ex}). If LinkedIn changed the page, fix parse_company_about, then remove the '
+                      f'`source: {company_domain.SOURCE_ABOUT_UNREADABLE}` entries from company_identities.yaml')
+            logger.error(f'Company identity: {detail}')
+            tools_module._ui_alerts.append(
+                {'kind': 'about_pages_unreadable', 'query': '(Stage 2)', 'region': '(all)', 'detail': detail})
+        return None
     except Exception as ex:
         logger.warning(f"Company identity: the About page of {slug} ({candidate['company']}) could not be "
                        f'read, identifying the company by name instead: {unwrap_exception(ex)}')
         return None
+    stage_stats[ABOUT_FAILURES_IN_A_ROW_KEY] = 0
     identity = await company_domain.record_linkedin_identity(
         slug, about.name, about.website, about.parent_name, about.parent_slug, stage_stats)
     logger.info(f"Company identity: {candidate['company']} is {identity.describe()} (LinkedIn {slug})")

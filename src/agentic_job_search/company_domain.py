@@ -15,7 +15,9 @@ Two sources, in order:
    "Unknown" is a first-class answer and is cached like any other.
 
 Every answer is cached in `run_dir/company_identities.yaml` once, ever, and can be hand-edited: an
-entry marked `source: manual` is never overwritten. A failed lookup is never cached.
+entry marked `source: manual` is never overwritten. A failed lookup is never cached, with one
+exception: a slug whose page loaded but was not an About page is marked `about_page_unreadable`, so
+it is not visited again. That is not an identity, and removing the entry by hand allows a retry.
 
 The match itself is decided in code (`identities_match`): same name, same domain, or one company
 the other's parent. Two siblings under one parent do not match: applying to one regional arm of a
@@ -47,6 +49,7 @@ SOURCE_LINKEDIN = 'linkedin'
 SOURCE_MODEL = 'model'
 SOURCE_MANUAL = 'manual'
 SOURCE_NONE = 'none'   # asked, and nobody knew: the name is all there is
+SOURCE_ABOUT_UNREADABLE = 'about_page_unreadable'   # by_slug only: visited, and not an About page
 
 # The bundled public-suffix snapshot, never a network fetch: a lookup must not depend on a host
 # being reachable, and the suffixes that matter here do not change between releases.
@@ -181,7 +184,25 @@ def cached_identity_for_name(name: str) -> CompanyIdentity | None:
 
 def cached_identity_for_slug(slug: str) -> CompanyIdentity | None:
     entry = _load_cache()['by_slug'].get(slug)
+    if about_page_unreadable(slug):
+        return None
     return _identity_from_entry(slug, entry) if _usable(entry) else None
+
+
+def about_page_unreadable(slug: str) -> bool:
+    '''This slug's page was visited and was not an About page, so it must not be visited again.'''
+    entry = _load_cache()['by_slug'].get(slug)
+    return isinstance(entry, dict) and entry.get('source') == SOURCE_ABOUT_UNREADABLE
+
+
+def record_about_page_unreadable(slug: str, error: str) -> None:
+    '''Mark a slug as visited with nothing to read. Never replaces an identity already known.'''
+    by_slug = _load_cache()['by_slug']
+    if isinstance(by_slug.get(slug), dict) and not about_page_unreadable(slug):
+        return
+    by_slug[slug] = {'schema': CACHE_SCHEMA_VERSION, 'source': SOURCE_ABOUT_UNREADABLE,
+                     'resolved_on': date.today().isoformat(), 'error': error}
+    _write_cache()
 
 
 # --- Model lookup ------------------------------------------------------------------------------

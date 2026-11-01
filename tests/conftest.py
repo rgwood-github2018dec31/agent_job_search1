@@ -363,6 +363,7 @@ def _isolated_company_identities(monkeypatch, tmp_path):
         raise AssertionError('a unit test tried to reach the OpenRouter MCP server')
 
     monkeypatch.setattr(company_domain, 'COMPANY_IDENTITY_CACHE_PATH', tmp_path / 'company_identities.yaml')
+    monkeypatch.setattr(linkedin_page, 'COMPANY_ABOUT_FAILURES_DIR', tmp_path / 'about_page_failures')
     monkeypatch.setattr(company_domain, '_cache', None)
     monkeypatch.setattr(company_domain, 'chat_openrouter', _no_network)
     monkeypatch.setattr(tools, '_applied_identities', {})

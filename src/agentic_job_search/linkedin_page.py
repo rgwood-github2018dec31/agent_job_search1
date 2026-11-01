@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from http import HTTPStatus
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import yaml
@@ -71,6 +72,9 @@ from agentic_job_search.triage import chat_openrouter
 
 logger = logging.getLogger(__name__)
 
+# Pages that failed to read as an About page, one per slug and day; personal, so under run_dir.
+COMPANY_ABOUT_FAILURES_DIR = tools_generic.RUN_DIR / 'about_page_failures'
+
 COMPANY_ASSETS_DIR = tools_generic.RUN_DIR / 'company_assets'
 PAGE_SECTIONS_PATH = tools_generic.RUN_DIR / 'linkedin_page_sections.yaml'
 ASSET_INDEX_NAME = 'index.yaml'
@@ -86,6 +90,8 @@ _COMPANY_LOGO_ALT_RE = re.compile(r'^Company logo for,\s*(?P<company>.+?)\.?$')
 _COMPANY_SLUG_RE = re.compile(r'linkedin\.com/company/(?P<slug>[^/?#]+)')
 # The About page's own labels, matched on text: LinkedIn's class names are hashed.
 _ABOUT_WEBSITE_LABEL = 'Website'
+_ABOUT_TITLE_RE = re.compile(r'^(?:\(\d+\)\s*)?(?P<name>.+): About \| LinkedIn$')
+_LINKEDIN_REDIRECT_PATH = '/safety/go'
 _ABOUT_AFFILIATED_HEADING = 'Affiliated pages'
 _ABOUT_PARENT_RELATION = 'Parent'
 _FOLLOWERS_RE = re.compile(r'^[\d,.]+[KkMm]?\s+followers$')
@@ -153,6 +159,10 @@ class CompanyAbout:
     website: str = ''
     parent_name: str = ''
     parent_slug: str = ''
+
+
+class NotAnAboutPageError(RuntimeError):
+    '''The page loaded but does not read as a company's About page. Not a transport failure.'''
 
 
 class LinkedInBlockedError(RuntimeError):
@@ -840,29 +850,56 @@ def visible_block_signature(soup: BeautifulSoup) -> str:
     return next((phrase for phrase in UI_BLOCK_SIGNATURES if phrase in text), '')
 
 
+def _about_page_name(soup: BeautifulSoup) -> str:
+    """The company's name: the title reads 'X: About | LinkedIn' since LinkedIn dropped the <h1>."""
+    title = norm(soup.title.get_text(' ')) if soup.title is not None else ''
+    if m := _ABOUT_TITLE_RE.match(title):
+        return m.group('name')
+    heading = soup.find('h1')
+    return norm(heading.get_text(' ')) if heading is not None else ''
+
+
+def _block_after_label(soup: BeautifulSoup, label: str) -> Tag | None:
+    """The element following a label, however deep the label's wrappers go; None when absent.
+
+    Matched on the label's text alone: `<dt>Website</dt><dd>` until 2026-10-29, then
+    `<div><p>Website</p></div><div>`, and the hashed classes between them mean nothing.
+    """
+    found = soup.find(string=lambda text: norm(text) == label)
+    for ancestor in (found.parents if found is not None else ()):
+        if sibling := ancestor.find_next_sibling(True):
+            return sibling
+    return None
+
+
+def _unwrap_linkedin_redirect(href: str) -> str:
+    """The real target of LinkedIn's /safety/go/?url=... outbound link; any other href unchanged."""
+    parsed = urlparse(href)
+    if parsed.path.startswith(_LINKEDIN_REDIRECT_PATH):
+        return parse_qs(parsed.query).get('url', [''])[0]
+    return href
+
+
 def parse_company_about(soup: BeautifulSoup, slug: str) -> CompanyAbout:
     """The name, Website and Parent an About page states. Raises when the page is not one.
 
-    Website is the `<dd>` link after a `<dt>` reading "Website". Parent is the "Affiliated pages"
-    entry whose last line reads "Parent"; its link gives the parent's own slug.
+    Website is the link after the label "Website". Parent is the "Affiliated pages" entry whose
+    last line reads "Parent"; its link gives the parent's own slug.
     """
-    heading = soup.find('h1')
-    name = norm(heading.get_text(' ')) if heading is not None else ''
+    name = _about_page_name(soup)
     if not name:
-        raise RuntimeError(f'LinkedIn company {slug}: the page has no <h1> company name, so it is not an '
-                           f'About page (a login wall or an error page?)')
+        title = norm(soup.title.get_text(' ')) if soup.title is not None else ''
+        raise NotAnAboutPageError(f'LinkedIn company {slug}: neither the title ({title!r}) nor an <h1> names a '
+                                  f'company, so it is not an About page (a login wall or an error page?)')
     about = CompanyAbout(slug=slug, name=name)
-    for term in soup.find_all('dt'):
-        if norm(term.get_text(' ')) != _ABOUT_WEBSITE_LABEL:
-            continue
-        definition = term.find_next_sibling('dd')
-        link = definition.find('a', href=True) if definition is not None else None
-        if link is not None and str(link['href']).startswith(('http://', 'https://')):
-            about.website = str(link['href'])
-        break
-    affiliated = soup.find(string=lambda text: norm(text) == _ABOUT_AFFILIATED_HEADING)
-    section = affiliated.find_parent('section') if affiliated is not None else None
-    for link in (section.find_all('a', href=True) if section is not None else []):
+    website_block = _block_after_label(soup, _ABOUT_WEBSITE_LABEL)
+    link = website_block.find('a', href=True) if website_block is not None else None
+    if link is not None:
+        target = _unwrap_linkedin_redirect(str(link['href']))
+        if target.startswith(('http://', 'https://')):
+            about.website = target
+    affiliated = _block_after_label(soup, _ABOUT_AFFILIATED_HEADING)
+    for link in (affiliated.find_all('a', href=True) if affiliated is not None else []):
         lines = [norm(line) for line in link.stripped_strings]
         m = _COMPANY_SLUG_RE.search(str(link['href']))
         if m and len(lines) > 1 and lines[-1] == _ABOUT_PARENT_RELATION:
@@ -871,19 +908,36 @@ def parse_company_about(soup: BeautifulSoup, slug: str) -> CompanyAbout:
     return about
 
 
+def _keep_unreadable_about_page(slug: str, html: str) -> str:
+    '''Save the page that failed to parse; returns where it went, for the error message.'''
+    path = COMPANY_ABOUT_FAILURES_DIR / f'{slug}-{date.today().isoformat()}.html'
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(html, encoding='utf-8')
+    except OSError as ex:
+        logger.warning(f'Could not keep the unreadable About page of {slug} at {path}: {type(ex).__name__}: {ex}')
+        return f'not saved ({type(ex).__name__}: {ex})'
+    return f'saved at {path}'
+
+
 async def read_company_about(slug: str, call: BrowserCall) -> CompanyAbout:
     """Navigate to a company's About page and read it with one read-only DOM capture.
 
-    Raises LinkedInBlockedError on a challenge page, and RuntimeError when the page is not an
-    About page; the caller falls back to the model for the latter and stops for the former.
+    Raises LinkedInBlockedError on a challenge page, and NotAnAboutPageError when the page is not
+    an About page; the caller falls back to the model for the latter and stops for the former. The
+    page is kept in COMPANY_ABOUT_FAILURES_DIR, since nothing else shows what it was.
     """
     url = LINKEDIN_COMPANY_ABOUT_URL.format(slug=slug)
     await call('browser_navigate', {'url': url})
     await call('browser_wait_for', {'time': COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS})
-    soup = BeautifulSoup((await _capture_dom(call, f'company {slug}'))['html'], 'lxml')
+    html = (await _capture_dom(call, f'company {slug}'))['html']
+    soup = BeautifulSoup(html, 'lxml')
     if blocked := visible_block_signature(soup):
         raise LinkedInBlockedError(f'LinkedIn company About page {url} shows "{blocked}"')
-    return parse_company_about(soup, slug)
+    try:
+        return parse_company_about(soup, slug)
+    except NotAnAboutPageError as ex:
+        raise NotAnAboutPageError(f'{ex}; {url}, {len(html)} chars, {_keep_unreadable_about_page(slug, html)}') from ex
 
 
 _PDF_FURNITURE_LINE_RE = re.compile('|'.join(f'(?:{p})' for p in LINKEDIN_PDF_FURNITURE_LINE_PATTERNS))

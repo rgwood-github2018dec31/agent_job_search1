@@ -1593,6 +1593,24 @@ def entry_warning_lines(warnings: list[dict]) -> list[str]:
     return lines
 
 
+def list_hygiene_lines(review: dict) -> list[str]:
+    """Audit section 1c: the pending entry warnings, dated, since they can outlive a list's rename.
+
+    The file's old `countries` map is not read. The reviewer that wrote it was replaced by Guess
+    Unbucketed Location, and what it left kept printing 2026-09 advice in every run's audit log, such
+    as keeping Serbia, which preferences have since excluded.
+    """
+    warnings = [w for w in (review.get('entry_warnings') or []) if (w or {}).get('status') == 'pending']
+    if not warnings:
+        return ['No pending warnings.']
+    reviewed_on = (review.get('reviewed') or {}).get('on', 'unknown')
+    return [
+        f'Last new warning recorded {reviewed_on}.', '', *entry_warning_lines(warnings), '',
+        'Fix the list in `run_dir/preferences.yaml` yourself and set `status:` in '
+        f'`{location_review.LOCATION_RECOMMENDATIONS_PATH.name}`. The agent never edits preferences.',
+    ]
+
+
 def write_run_audit_log(
     queries: list[str],
     applied_jobs_in_horizon: int,
@@ -1682,7 +1700,7 @@ def write_run_audit_log(
     # 1c. Country-list review. Advisory: nothing here changed a rating or a preference. It lives in
     # the audit log rather than only in the alert because the alert carries a count and this
     # carries the reasoning, which is what the user needs in order to promote or dismiss an entry.
-    lines += ['', '## 1c. Country list review (advisory)', '']
+    lines += ['', '## 1c. List hygiene warnings (advisory)', '']
     review: dict = {}
     if location_review.LOCATION_RECOMMENDATIONS_PATH.exists():
         try:
@@ -1692,28 +1710,9 @@ def write_run_audit_log(
         except (OSError, yaml.YAMLError) as ex:
             logger.warning(
                 f'Could not read {location_review.LOCATION_RECOMMENDATIONS_PATH} for the audit '
-                f'log; section 1c will list no pending countries: {type(ex).__name__}: {ex}'
+                f'log; section 1c will list no warnings: {type(ex).__name__}: {ex}'
             )
-    pending = {
-        country: entry for country, entry in (review.get('countries') or {}).items()
-        if (entry or {}).get('status') == 'pending'
-    }
-    warnings = [w for w in (review.get('entry_warnings') or []) if (w or {}).get('status') == 'pending']
-    if not pending and not warnings:
-        lines.append('No pending recommendations.')
-    for country, entry in sorted(pending.items()):
-        lines.append(
-            f'- **{country}** ({entry.get("region", "?")}) -> `{entry.get("recommendation")}` '
-            f'— {entry.get("reason", "")}'
-        )
-    lines += entry_warning_lines(warnings)
-    if pending or warnings:
-        lines.append('')
-        lines.append(
-            'Promote or dismiss these by editing `run_dir/preferences.yaml` yourself and setting '
-            f'`status:` in `{location_review.LOCATION_RECOMMENDATIONS_PATH.name}`. '
-            'The agent never edits preferences.'
-        )
+    lines += list_hygiene_lines(review)
 
     lines += ['', '## 2. Search queries', '']
 

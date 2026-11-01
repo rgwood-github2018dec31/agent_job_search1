@@ -803,6 +803,9 @@ LINKEDIN_EXPAND_BUTTON_TEXT = '… more'
 # Visited once per company slug, ever, and only for a job headed for the paid rating call.
 COMPANY_ABOUT_PAGE_DELAY_SECONDS = (3.0, 8.0)
 COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS = 3
+# This many pages in a row that are not About pages means LinkedIn changed the page or the session
+# is wrong, not that these companies are odd: stop visiting for the run and raise a health alert.
+COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES = 3
 # Model lookups for the applied-job companies run together at load; one cheap call each, once ever.
 COMPANY_IDENTITY_LOOKUP_CONCURRENCY = 8
 # Hosts that serve many unrelated organizations' pages, so their domain identifies nobody and is

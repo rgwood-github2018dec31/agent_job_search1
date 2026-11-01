@@ -277,3 +277,60 @@ async def test_an_unidentified_name_falls_back_to_one_name_match_per_run(applied
     assert await tools.company_matches_applied('NTT DATA Europe & Latam') == 'ntt.pdf'
     assert await tools.company_matches_applied('NTT DATA Europe & Latam') == 'ntt.pdf'
     assert name_match_calls == ['NTT DATA Europe & Latam']
+
+
+# --- The About page as LinkedIn serves it since 2026-10-30: no <h1>, no <dt>, no <section> --------
+
+CURRENT_ABOUT_HTML = '''<html><head><title>(3) Paygate: About | LinkedIn</title></head><body><main>
+<h2>Paygate</h2><div><h2>Overview</h2>
+<div><div><div><p>Website</p></div><div><a href="https://www.linkedin.com/safety/go/?url=http%3A%2F%2Fwww%2Epaygate%2Eexample%2Ecom&amp;urlhash=abc&amp;isSdui=true"><p>http://www.paygate.example.com</p></a></div></div>
+<div><div><p>Industry</p></div><div><p>Software Development</p></div></div></div></div>
+<div><div><h2>Affiliated pages</h2></div><div role="list">
+<div role="listitem">
+<a href="https://www.linkedin.com/company/paygate-labs/"><div><p><span>
+<a aria-label="View Paygate Labs page" href="https://www.linkedin.com/company/paygate-labs/">Paygate Labs</a></span></p>
+<p><span>IT Services</span></p><p>Subsidiary</p></div></a></div>
+<div role="listitem">
+<a href="https://www.linkedin.com/company/paygate-holdings/"><div><p><span>
+<a aria-label="View Paygate Holdings page" href="https://www.linkedin.com/company/paygate-holdings/">Paygate Holdings</a></span></p>
+<p><span>Financial Services</span></p><p>Parent</p></div></a></div>
+</div></div></main></body></html>'''
+
+
+def test_the_current_about_page_reads_from_its_title_label_and_redirect_link():
+    about = linkedin_page.parse_company_about(BeautifulSoup(CURRENT_ABOUT_HTML, 'lxml'), 'paygate')
+    assert about.name == 'Paygate'
+    assert about.website == 'http://www.paygate.example.com', 'the real site, not the LinkedIn redirect'
+    assert (about.parent_name, about.parent_slug) == ('Paygate Holdings', 'paygate-holdings'), 'not the Subsidiary'
+
+
+def test_a_page_with_no_website_label_states_no_website():
+    html = CURRENT_ABOUT_HTML.replace('<p>Website</p>', '<p>Phone</p>')
+    assert linkedin_page.parse_company_about(BeautifulSoup(html, 'lxml'), 'paygate').website == ''
+
+
+async def test_a_page_that_is_not_an_about_page_is_kept_and_named_in_the_error():
+    call, _calls = _fake_browser('<html><head><title>Sign in</title></head><body>Sign in</body></html>')
+    with pytest.raises(linkedin_page.NotAnAboutPageError, match="'Sign in'") as caught:
+        await linkedin_page.read_company_about('paygate', call)
+    saved = list(linkedin_page.COMPANY_ABOUT_FAILURES_DIR.glob('paygate-*.html'))
+    assert len(saved) == 1 and 'Sign in' in saved[0].read_text()
+    assert str(saved[0]) in str(caught.value)
+
+
+def test_an_unreadable_mark_is_no_identity_and_never_replaces_one():
+    company_domain.record_about_page_unreadable('paygate', 'not an About page')
+    assert company_domain.about_page_unreadable('paygate')
+    assert company_domain.cached_identity_for_slug('paygate') is None
+    stored = yaml.safe_load(company_domain.COMPANY_IDENTITY_CACHE_PATH.read_text())['by_slug']['paygate']
+    assert stored['source'] == company_domain.SOURCE_ABOUT_UNREADABLE
+
+
+async def test_a_real_identity_survives_a_later_unreadable_mark_and_replaces_an_earlier_one(model_answers):
+    answers, _asked = model_answers
+    answers['Paygate'] = _identity_reply(domain='paygate.example.com')
+    company_domain.record_about_page_unreadable('paygate', 'not an About page')
+    await company_domain.record_linkedin_identity('paygate', 'Paygate', 'https://www.paygate.example.com', '', '')
+    assert not company_domain.about_page_unreadable('paygate')
+    company_domain.record_about_page_unreadable('paygate', 'not an About page')
+    assert company_domain.cached_identity_for_slug('paygate').domain == 'example.com'

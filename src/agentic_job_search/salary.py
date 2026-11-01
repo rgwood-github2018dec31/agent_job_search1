@@ -110,9 +110,11 @@ _CURRENCY_RE = re.compile(
 
 # Period words, mapped onto the controlled vocabulary above.
 _PERIOD_PATTERNS = (
-    ('year', re.compile(r'/\s*yr\b|\bper\s+year\b|\bannual(?:ly|ised|ized)?\b|\bp\.?a\.?\b|\byearly\b', re.IGNORECASE)),
-    ('month', re.compile(r'/\s*mo\b|\bper\s+month\b|\bmonthly\b|\bgross/month\b', re.IGNORECASE)),
-    ('week', re.compile(r'/\s*wk\b|\bper\s+week\b|\bweekly\b', re.IGNORECASE)),
+    ('year', re.compile(r'/\s*y(?:ea)?r\b|\bper\s+year\b|\bannual(?:ly|ised|ized)?\b|\bp\.?a\.?\b|\byearly\b', re.IGNORECASE)),
+    ('month', re.compile(r'/\s*mo(?:nth)?\b|\bper\s+month\b|\bmonthly\b|\bgross/month\b', re.IGNORECASE)),
+    # Not 'hrs/week': '$100/hour, ~15 hrs/week' states hours worked, not weekly pay.
+    ('week', re.compile(r'(?<!hr)(?<!hrs)(?<!hour)(?<!hours)(?<!hr\s)(?<!hrs\s)(?<!hour\s)(?<!hours\s)'
+                        r'/\s*w(?:ee)?k\b|\bper\s+week\b|\bweekly\b', re.IGNORECASE)),
     ('day', re.compile(r'/\s*day\b|\bper\s+day\b|\bdaily\s+rate\b|\bday\s+rate\b|\bdiem\b', re.IGNORECASE)),
     ('hour', re.compile(r'/\s*h(?:r|our)?\b|\bper\s+hour\b|\bhourly\b', re.IGNORECASE)),
 )
@@ -310,11 +312,9 @@ def detect_currency(text: str) -> str:
 
 
 def detect_period(text: str) -> str:
-    """The pay period the text quotes amounts per, or '' when it does not say."""
-    for period, pattern in _PERIOD_PATTERNS:
-        if pattern.search(str(text or '')):
-            return period
-    return ''
+    """The period stated first: '$100/hour, up to $2,000/week' is an hourly rate."""
+    found = [(match.start(), period) for period, pattern in _PERIOD_PATTERNS if (match := pattern.search(str(text or '')))]
+    return min(found)[1] if found else ''
 
 
 def classify_salary(text: str) -> dict[str, Any]:
