@@ -158,3 +158,12 @@ def test_a_saved_rating_input_is_sized_as_saved():
     saved = {'job_requirements': {'name': 'job_requirements-ec656998be5d.md', 'chars': 6387}}
     assert report.section_size('JOB_REQUIREMENTS.md', 6300, saved) == '6.4k chars = job_requirements-ec656998be5d.md'
     assert report.section_size('instructions', 6200, saved, approx=True) == 'approx 6.2k chars'
+
+
+def test_run_summary_links_the_job_audit_pdf_and_counts_the_gate_audit(tmp_path):
+    from agentic_job_search.agent import audit_summary_lines
+    pdf = tmp_path / 'job audit.pdf'
+    lines = audit_summary_lines({'job_audit': str(pdf), 'audit_false_negatives': 2}, audit=True)
+    assert lines == ['• Gate audit false negatives: 2', f'• Job Audit PDF: {pdf.as_uri()}']
+    assert '%20' in lines[1], 'a space in the path must not break the link'
+    assert audit_summary_lines({}, audit=False) == [], 'no PDF and no audit: nothing added'

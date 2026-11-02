@@ -1836,6 +1836,16 @@ def attach_run_health(funnel: dict) -> list[str]:
     return alerts
 
 
+def audit_summary_lines(funnel: dict, audit: bool) -> list[str]:
+    '''Run-summary lines for the gate audit's count and a local link to the Job Audit PDF.'''
+    lines = []
+    if audit:
+        lines.append(f"• Gate audit false negatives: {funnel.get('audit_false_negatives', 0)}")
+    if funnel.get('job_audit'):
+        lines.append(f"• Job Audit PDF: {Path(funnel['job_audit']).resolve().as_uri()}")
+    return lines
+
+
 def health_alert_block(alerts: list[str]) -> str:
     """The Telegram/console NEEDS ATTENTION section, or '' when the run was healthy."""
     if not alerts:
@@ -5834,6 +5844,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         f'• Cost by stage:\n{stage_cost_lines}',
         f'• Total cost: ${total_cost:.4f}',
     ]
+    stats_lines += audit_summary_lines(funnel, audit)
     if block := health_alert_block(health_alerts):
         stats_lines.insert(1, block)
         if history := recent_yield_history():
