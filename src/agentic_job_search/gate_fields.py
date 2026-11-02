@@ -71,7 +71,9 @@ DEFINITIONS = {
         'How wide the area the holder may live in is. "city_only" if the job is on-site or hybrid (the holder '
         "must live near the office's city), or the posting names one city to live in. \"country_only\" only if "
         'the posting says the holder must live in one country ("Remote within country", "must be based in '
-        'Germany", "Canada-based position"); a remote job whose page merely names one place does not say this. '
+        'Germany", "Canada-based position"); a remote job whose page merely names one place does not say this, '
+        'and neither does a country it leaves to the holder ("from anywhere within your country of residence", '
+        '"from your home country"), which names no country. '
         '"area_wide" if any country of a multi-country area or list will do ("remote anywhere in the EU", "any '
         f'EMEA country", "Canada, United Kingdom"), or anywhere in the world. "{NOT_KNOWN["residency_scope"]}" '
         'when the page does not settle it.'),
