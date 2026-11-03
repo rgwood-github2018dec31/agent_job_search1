@@ -563,6 +563,14 @@ TRIAGE_THRESHOLD = 1  # skip the rating call when local triage scores <= this (c
 # A job whose Stage 2 evaluation errored is released for a later run at most this many times;
 # past it the error is terminal, so one posting that always fails cannot be re-read every run.
 EVAL_ERROR_MAX_RELEASES = 2
+# Wait Out Tool Server Outage (2026-11-02): a failure to reach a local LLM tool server pauses the
+# work and polls the server every TOOL_SERVER_WAIT_POLL_SECONDS, up to TOOL_SERVER_WAIT_MAX_SECONDS,
+# before retrying it. The agent_meta1 daemon restarted :8006 2.3 minutes after it went down that day,
+# so the cap allows for one health-check cycle and a restart. Each probe is a tools/list capped at
+# TOOL_SERVER_PROBE_TIMEOUT_SECONDS.
+TOOL_SERVER_WAIT_MAX_SECONDS = 600
+TOOL_SERVER_WAIT_POLL_SECONDS = 15
+TOOL_SERVER_PROBE_TIMEOUT_SECONDS = 10
 # The Rating log line carries triage's reason only when the two scores differ by at least this.
 TRIAGE_DISAGREEMENT_LOG_MIN = 2
 # That reason on the job's Rating line, cut (with the cut reported) past this; a 360-char reason

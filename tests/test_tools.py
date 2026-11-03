@@ -11880,6 +11880,141 @@ async def test_stage_2_error_says_so_when_the_job_cannot_be_released(monkeypatch
     assert 'NOT retried: could not release it (FileNotFoundError' in errors[0]
 
 
+def _tool_server_outage() -> Exception:
+    '''The error the shared MCP client raised for every call while :8006 was down on 2026-11-02.'''
+    import httpx
+    return httpx.ConnectError(f'MCP initialize at {agent.tool_server.LLM_OPENROUTER_MCP_URL} transport '
+                              'failed: ConnectError: All connection attempts failed')
+
+
+def _tool_server_probes(monkeypatch, answers: list[str | None]) -> list[str]:
+    '''Replace the probe with `answers` in turn (None: up); returns the URLs probed.'''
+    probed: list[str] = []
+    replies = iter(answers)
+
+    async def fake_probe(url):
+        probed.append(url)
+        return next(replies)
+    monkeypatch.setattr(agent.tool_server, 'probe', fake_probe)
+    monkeypatch.setattr(agent.tool_server, 'TOOL_SERVER_WAIT_POLL_SECONDS', 0)
+    return probed
+
+
+def _rater_down_for(monkeypatch, failures: int) -> list[int]:
+    '''The rater fails on a tool server outage `failures` times, then rates; returns the call count.'''
+    calls = [0]
+    rate = agent.rate_job
+
+    async def flaky_rate(evaluator_prompt, extract_text, stats):
+        calls[0] += 1
+        if calls[0] <= failures:
+            raise RuntimeError('every rating model failed') from _tool_server_outage()
+        return await rate(evaluator_prompt, extract_text, stats)
+    monkeypatch.setattr(agent, 'rate_job', flaky_rate)
+    return calls
+
+
+def test_outage_url_names_the_tool_server_only_for_a_transport_failure():
+    assert agent.tool_server.outage_url(_tool_server_outage()) == agent.tool_server.LLM_OPENROUTER_MCP_URL
+    wrapped = RuntimeError('relocation: every attempt failed')
+    wrapped.__cause__ = _tool_server_outage()
+    assert agent.tool_server.outage_url(wrapped) == agent.tool_server.LLM_OPENROUTER_MCP_URL
+    # A timeout means the server was up and waiting on its provider; the browser has its own recovery.
+    assert agent.tool_server.outage_url(RuntimeError(
+        f'MCP tool chat at {agent.tool_server.LLM_OPENROUTER_MCP_URL} timed out after 30s')) is None
+    assert agent.tool_server.outage_url(RuntimeError(
+        'MCP initialize at http://localhost:54343/mcp transport failed: ConnectError: refused')) is None
+    assert agent.tool_server.outage_url(ValueError('No JSON object found in LLM response')) is None
+
+
+async def test_stage_2_waits_out_a_tool_server_outage_and_rates_the_job(tmp_path, monkeypatch, caplog):
+    '''2026-11-02: :8006 was down 2.3 minutes and the first 7 of 21 jobs were written off as eval_error.'''
+    record = _processed_record(tmp_path, monkeypatch, '222')
+    _repost_llm(monkeypatch, '')
+    _notifications, saved = _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False,
+                                                                      salary='CAD 250,000'))
+    calls = _rater_down_for(monkeypatch, 1)
+    probed = _tool_server_probes(monkeypatch, ['ConnectError: refused', None])
+    funnel: dict = {}
+
+    await _run_stage2(_make_candidate(job_id='222', company='Acme'), funnel)
+
+    assert calls[0] == 2 and len(probed) == 2
+    assert [s['rating'] for s in saved] == [5]
+    assert 'eval_error' not in funnel and 'tool_server_down' not in funnel
+    assert record.exists(), 'a rated job stays processed'
+
+
+async def test_stage_2_stops_without_using_a_release_when_the_tool_server_stays_down(
+        tmp_path, monkeypatch, caplog):
+    for job_id in ('222', '223'):
+        _processed_record(tmp_path, monkeypatch, job_id)
+    monkeypatch.setattr(tools, '_processed_jobs', {('linkedin', '222'), ('linkedin', '223')})
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+    calls = _rater_down_for(monkeypatch, 99)
+    monkeypatch.setattr(agent.tool_server, 'TOOL_SERVER_WAIT_MAX_SECONDS', 0)
+    _tool_server_probes(monkeypatch, ['ConnectError: refused'])
+    funnel: dict = {}
+
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await agent.evaluate_all_candidates(
+            [_make_candidate(job_id='222', company='Acme'), _make_candidate(job_id='223', company='Acme')],
+            {'type': 'http', 'url': 'http://localhost:1/mcp'}, 'prompt', 'profile', _stage2_stats(),
+            funnel=funnel)
+
+    assert calls[0] == 1, 'the second job is not tried against a server that stayed down'
+    assert funnel.get('tool_server_down') == 2 and 'eval_error' not in funnel
+    assert not list((tmp_path / 'processed_jobs').glob('*.yaml')), 'both jobs released'
+    assert not tools.EVAL_ERROR_RELEASES_PATH.exists(), "the outage is not the jobs' fault"
+    assert any(a['kind'] == 'tool_server_down' for a in tools._ui_alerts)
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any(m.startswith('Stage 2 stopped: ') and '2 job(s) not rated' in m for m in errors)
+
+
+async def test_stage_2_does_not_wait_on_a_job_level_error(tmp_path, monkeypatch, caplog):
+    _processed_record(tmp_path, monkeypatch, '222')
+    probed = _tool_server_probes(monkeypatch, [])
+    funnel, _errors = await _stage2_with_a_broken_rater(monkeypatch, caplog, '222')
+    assert probed == [] and funnel.get('eval_error') == 1
+
+
+def test_assess_run_health_reports_jobs_stage_2_did_not_rate():
+    '''2026-11-02: the summary read "Candidates found: 21, Jobs saved: 14" and said nothing of the 7.'''
+    alerts = agent.assess_run_health({
+        'queries_generated': 6, 'listings_distinct': 0, 'candidates_queued': 21,
+        'eval_error': 7, 'eval_error_released': 6, 'tool_server_down': 2,
+        'eval_error_first': 'ConnectError: MCP initialize at http://127.0.0.1:8006/mcp transport failed',
+    })
+    alert = next(a for a in alerts if 'JOBS NOT RATED' in a)
+    assert alert.startswith('9 of 21 JOBS NOT RATED')
+    assert '6 released for the next run, 1 not' in alert and '8006' in alert
+    assert '2 kept from rating by a tool server outage' in alert
+    assert alert in agent.health_alert_block(alerts)
+    assert not any('JOBS NOT RATED' in a for a in agent.assess_run_health({'queries_generated': 6}))
+
+
+async def _no_pause(*_args) -> None:
+    return None
+
+
+async def test_stage_1b_runs_a_query_again_after_a_tool_server_outage(monkeypatch):
+    queries_run: list[str] = []
+
+    async def run_pass(prompt):
+        query = re.search(r'"([^"]+)"', prompt).group(1)
+        queries_run.append(query)
+        if queries_run.count(query) == 1 and query == 'Q1':
+            raise _tool_server_outage()
+        return 1
+    _tool_server_probes(monkeypatch, [None])
+    monkeypatch.setattr(agent, '_human_pause', _no_pause)
+    await agent._run_scraper_queries(run_pass, ['Q1', 'Q2'], agent.QueryNarration())
+    # Then the loop's own zero-listings retry may ask again; this fake harvests nothing.
+    assert queries_run[:2] == ['Q1', 'Q1'] and 'Q2' in queries_run
+    assert 'Q1' not in tools._query_errors
+
+
 def test_release_errored_job_counts_per_job(tmp_path, monkeypatch):
     _processed_record(tmp_path, monkeypatch, '222')
     tools.release_errored_job('linkedin', '222')

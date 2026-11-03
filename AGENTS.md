@@ -164,6 +164,7 @@ src/agentic_job_search/
   salary_estimate.py              # Model pay estimate for a notified posting with no salary; cached per job, gates nothing
   text_budget.py                  # Reported truncation: truncate_reported, pages_to_prompt, snippet
   cache_io.py                     # Fail-open load/save of the YAML-mapping caches (location, salary, salary_estimate, fx)
+  tool_server.py                  # Wait Out Tool Server Outage: tells a down LLM tool server from a job's failure, polls until it is back
   system_sleep.py                 # Holds a no-idle-sleep assertion for the run; logs and alerts a sleep it could not stop
 scripts/
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
@@ -229,7 +230,7 @@ measurements) are in git history: `git show dd14c73:docs/diagnoses/README.md`.
 | Location gate, `location.py`, `location_review.py`, the `locations.*` preferences | Reject Excluded Location, Classify Job Location, Detect Residency Scope, Review Country Lists; NFRs A matching rule fails silently permissive, Names stay proper |
 | Hard rules, rating caps, warnings, notifications | Apply Hard Rules, Rate Job Fit, Build Deterministic Warnings; NFRs A structural fact is decided in code, Rating hard rules, Rating caps |
 | Salary parsing, `salary.py`, `fx.py`, `salary_estimate.py`, the `💰` line, raw-posting retention | Classify Salary, Convert Salary Currency, Estimate Pay Range, Retain Raw Posting Text, Check Salary Provenance, Build Deterministic Warnings, Notify User of Match; NFRs A matching rule fails silently permissive, No silent truncation |
-| `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks | NFRs Resilience, Observability |
+| `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks, `tool_server.py` | Wait Out Tool Server Outage; NFRs Resilience, Observability |
 | A new `ClaudeAgentOptions` / `sdk_query` site, or an SDK tool schema | NFRs Cost efficiency, Observability, Anti-fabrication |
 | Already-applied matching, `company_domain.py`, LinkedIn company About pages | Resolve Company Identity, Match Applied Company, Deduplicate by Poster Identity; NFR Account safety |
 | Applied-job ingest or the reference profile | [docs/architecture.md](docs/architecture.md); Summarize Reference Jobs |

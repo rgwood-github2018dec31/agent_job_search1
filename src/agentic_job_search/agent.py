@@ -66,6 +66,7 @@ from agentic_job_search import (
     rating_inputs,
     scrape_openrouter,
     system_sleep,
+    tool_server,
 )
 from agentic_job_search.company_domain import CompanyIdentity
 from agentic_job_search.config import (
@@ -139,6 +140,7 @@ from agentic_job_search.config import (
     SCRAPER_MIN_TURNS_PER_QUERY,
     SECONDS_PER_MINUTE,
     THINKING_MAX_CHARS,
+    TOOL_SERVER_WAIT_MAX_SECONDS,
     TRIAGE_DISAGREEMENT_LOG_MIN,
     TRIAGE_ENABLED,
     TRIAGE_REASON_LOG_MAX_CHARS,
@@ -1687,7 +1689,8 @@ def _same_query(reported: str, base: str) -> bool:
 
 
 def assess_run_health(funnel: dict) -> list[str]:
-    """Return human-readable alerts about THIS run's discovery quality; empty means healthy.
+    """Return human-readable alerts about THIS run's discovery quality and the jobs Stage 2 could
+    not rate; empty means healthy.
 
     A saturated run and a healthy one looked identical to the user: silence. Aug 15-18 2026
     produced 4, 4, 2 and 1 new jobs from ~300 listings each, four days in a row with no
@@ -1740,6 +1743,8 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'COMPANY ABOUT PAGES UNREADABLE: {alert.get("detail")}')
         elif kind == 'browser_dead':
             alerts.append(f'BROWSER DIED, STAGE 2 STOPPED: {alert.get("detail")}')
+        elif kind == 'tool_server_down':
+            alerts.append(f'TOOL SERVER DOWN, STAGE 2 STOPPED: {alert.get("detail")}')
         elif kind == system_sleep.SYSTEM_SLEEP_ALERT_KIND:
             if sleep_reported:
                 continue
@@ -1796,6 +1801,23 @@ def assess_run_health(funnel: dict) -> list[str]:
                 f'{len(failed)} of {total} QUERIES FAILED ({shown}) — their unfinished searches '
                 f'did not run; the other {total - len(failed)} completed. First error: {first_reason}'
             )
+
+    # 1c. Jobs Stage 2 did not rate. On 2026-11-02 a 2.3-minute tool-server outage cost 7 of 21
+    #     jobs, and the summary said only "Candidates found: 21, Jobs saved: 14": the alerts above
+    #     look at discovery alone, so the 7 were listed nowhere but the audit log's job table.
+    errored = funnel.get('eval_error') or 0
+    outage = funnel.get('tool_server_down') or 0
+    if errored or outage:
+        total = funnel.get('candidates_queued') or errored + outage
+        released = funnel.get('eval_error_released') or 0
+        parts = []
+        if errored:
+            parts.append(f'{errored} errored ({released} released for the next run, '
+                         f'{errored - released} not; first error: {snippet(funnel.get("eval_error_first") or "")})')
+        if outage:
+            parts.append(f'{outage} kept from rating by a tool server outage (released, no release counted)')
+        alerts.append(f'{errored + outage} of {total} JOBS NOT RATED: {"; ".join(parts)}. A released job is '
+                      'rated only if a later search lists it again')
 
     # 2. A dead region axis: two regions returning the same jobs is not "the query is exhausted".
     for query, overlap in (funnel.get('region_overlap') or {}).items():
@@ -2153,7 +2175,14 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
                                narration: QueryNarration,
                                before_query: Callable[[], Awaitable[None]] | None = None) -> None:
     """The per-query loop of `run_scraper`, which owns the narration's lifetime."""
-    for i, query in enumerate(queries, 1):
+    # A query that failed on an unreachable tool server is run again, once, when the server is
+    # back; a server that stayed down past the wait is not waited for again (2026-11-02).
+    outage_retried: set[str] = set()
+    outage_gave_up: set[str] = set()
+    i = 0
+    while i < len(queries):
+        query = queries[i]
+        i += 1
         logger.debug(f'Stage 1b: query {i}/{len(queries)} — "{query}"')
         narration.begin(query)
         if i > 1:
@@ -2202,6 +2231,18 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
                 tools_module._query_errors.setdefault(pending, str(ex))
             raise
         except Exception as ex:
+            outage_url = tool_server.outage_url(ex)
+            if outage_url and query not in outage_retried and outage_url not in outage_gave_up:
+                if await tool_server.wait_until_up(outage_url, f'Stage 1b query "{query}"'):
+                    # Searches already done are searched again; what they recorded is already
+                    # queued and now dedupes as already_processed.
+                    logger.warning(f'Stage 1b: query "{query}" failed on {outage_url} '
+                                   f'({type(ex).__name__}: {ex}); running it again from the start')
+                    outage_retried.add(query)
+                    narration.close()
+                    i -= 1
+                    continue
+                outage_gave_up.add(outage_url)
             # One failed query must not abort the remaining ones.
             logger.warning(f'Stage 1b: query "{query}" failed: {ex}')
             tools_module._queries_searched[query] = 'error'
@@ -4707,6 +4748,25 @@ async def _evaluate_candidates(
                       f'evaluated, released for the next run',
         })
 
+    outage_retried: set[tuple[str, str]] = set()
+
+    def release_after_outage(job: dict, outage_url: str, ex: BaseException) -> str:
+        '''Hand a job the tool server's outage kept from being rated back to the next run.
+
+        Not release_errored_job: the fault was the server's, so none of the job's
+        EVAL_ERROR_MAX_RELEASES is used up. Returns what was done, for the log.'''
+        bump('tool_server_down')
+        try:
+            tools_module.forget_processed_job(job['site'], job['job_id'])
+            note = 'released for the next run (no release counted)'
+        except FileNotFoundError as release_ex:
+            note = f'NOT released: {release_ex}'
+        tools_module.record_job_outcome(
+            job['site'], job['job_id'], 'tool_server_down',
+            summary=f'not rated: {outage_url} unreachable; {note} — {snippet(str(ex))}',
+        )
+        return note
+
     stage_stats.setdefault('evidence', new_stage_stats())
     trace_token = None
     logger.info(f'Stage 2: evaluating {len(candidates)} candidate(s)')
@@ -5046,7 +5106,41 @@ async def _evaluate_candidates(
                                f"{candidate['title']} ({type(ex).__name__}: {ex}); not counted as an eval_error")
                 index -= 1   # retried after the restart, or released if the browser stays down
                 continue
+            if outage_url := tool_server.outage_url(ex):
+                # The tool server is down, which says nothing about this job: wait for it, then
+                # rate the job again. Not an eval_error, so no release is used up (2026-11-02).
+                job_key = (candidate['site'], candidate['job_id'])
+                why = f"Stage 2 job {candidate['job_id']} ({candidate['company']})"
+                if job_key not in outage_retried and await tool_server.wait_until_up(outage_url, why):
+                    outage_retried.add(job_key)
+                    index -= 1
+                    continue
+                if job_key in outage_retried:
+                    # The server went down again on the retry. Hand this job back and go on; the
+                    # next job waits for the server in its turn.
+                    note = release_after_outage(candidate, outage_url, ex)
+                    logger.error(f"Stage 2: {candidate['company']} — {candidate['title']} (job "
+                                 f"{candidate['job_id']}) failed again on {outage_url} after the "
+                                 f'server came back; {note}: {type(ex).__name__}: {ex}')
+                    continue
+                # Down for longer than the wait: every remaining job needs the server too.
+                remaining = candidates[index - 1:]
+                notes = [release_after_outage(unrated, outage_url, ex) for unrated in remaining]
+                not_released = [n for n in notes if not n.startswith('released')]
+                tools_module._ui_alerts.append({
+                    'kind': 'tool_server_down', 'query': '(Stage 2)', 'region': outage_url,
+                    'detail': f'{outage_url} stayed down past {TOOL_SERVER_WAIT_MAX_SECONDS}s; '
+                              f'{len(remaining)} job(s) not rated, released for the next run',
+                })
+                logger.error(f'Stage 2 stopped: {outage_url} stayed down past '
+                             f'{TOOL_SERVER_WAIT_MAX_SECONDS}s; {len(remaining)} job(s) not rated and '
+                             f'released for the next run'
+                             + (f'; {len(not_released)} could not be released: {"; ".join(not_released)}'
+                                if not_released else '')
+                             + f'. Last error: {type(ex).__name__}: {ex}')
+                break
             bump('eval_error')
+            funnel.setdefault('eval_error_first', f'{type(ex).__name__}: {ex}')
             # The job is in processed_jobs/ since Stage 1b, so left alone the next run returns
             # already_processed and it is never rated: release it, a bounded number of times.
             try:
