@@ -12402,3 +12402,57 @@ def test_audit_1c_ignores_the_retired_country_advice_and_dates_the_warnings():
     text = '\n'.join(tools.list_hygiene_lines(review))
     assert 'Serbia' not in text and 'Roma' in text and '2026-09-11' in text
     assert tools.list_hygiene_lines({'countries': review['countries']}) == ['No pending warnings.']
+
+
+# rating model override (--rating-model, the run-scoped test option)
+# ---------------------------------------------------------------------------
+
+async def test_rate_job_override_routes_the_primary_to_the_sidecar(monkeypatch):
+    '''--rating-model replaces only the PRIMARY rater: the fallback chain stays, and
+    the override is read through the config module at call time (main() rebinds it).'''
+    import agentic_job_search.config as config_module
+    override = 'mlx-lm-server:mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit'
+    monkeypatch.setattr(config_module, 'RATING_MODEL_OVERRIDE', override)
+
+    seen = {}
+
+    async def fake_rate(system_prompt, user_prompt, model=''):
+        seen['model'] = model
+        return {'rating': 4, 'company': 'Acme', 'title': 'Engineer',
+                'reasoning': 'good', 'summary': 'acme_engineer'}
+
+    monkeypatch.setattr(agent, 'rate_with_ollama', fake_rate)
+    stats = agent.new_stage_stats()
+    result = await agent.rate_job('system', 'job text', stats)
+
+    assert seen['model'] == override          # the sidecar name rode the ollama route
+    assert result['rating'] == 4
+    assert result['rated_by'] == override
+    assert stats['cost'] == 0.0               # a local rating costs nothing
+
+
+async def test_rate_job_override_falls_back_to_the_proven_chain(monkeypatch):
+    '''The override is a TEST option: when the new rater fails, the existing chain runs.'''
+    import agentic_job_search.config as config_module
+    override = 'mlx-lm-server:mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit'
+    monkeypatch.setattr(config_module, 'RATING_MODEL_OVERRIDE', override)
+
+    calls = []
+
+    async def fail_sidecar(system_prompt, user_prompt, model=''):
+        calls.append(model)
+        raise RuntimeError('sidecar down')
+
+    async def fake_openrouter(system_prompt, user_prompt, model=''):
+        calls.append(model)
+        return {'rating': 3, 'company': 'Acme', 'title': 'Engineer',
+                'reasoning': 'ok', 'summary': 'acme_engineer'}, 0.002
+
+    monkeypatch.setattr(agent, 'rate_with_ollama', fail_sidecar)
+    monkeypatch.setattr(agent, 'rate_with_openrouter', fake_openrouter)
+    stats = agent.new_stage_stats()
+    result = await agent.rate_job('system', 'job text', stats)
+
+    assert calls == [override, agent.MODEL_NAME_RATING_FALLBACKS[0]]
+    assert result['rating'] == 3
+    assert result['rated_by'] == agent.MODEL_NAME_RATING_FALLBACKS[0]

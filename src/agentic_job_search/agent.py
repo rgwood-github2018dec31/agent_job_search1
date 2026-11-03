@@ -68,6 +68,7 @@ from agentic_job_search import (
     system_sleep,
     tool_server,
 )
+from agentic_job_search import config as config_module
 from agentic_job_search.company_domain import CompanyIdentity
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
@@ -4404,7 +4405,9 @@ def record_rating_inputs(candidate: dict, evaluator_prompt: str, extract_text: s
         job_posting={'path': str(posting_path), 'chars': len(extract_text),
                      'cut_from': str(tools_module.raw_posting_path(candidate))},
         user_message_chars=len(rating_user_message(extract_text)),
-        rater={'models': list(dict.fromkeys((MODEL_NAME_RATING, *MODEL_NAME_RATING_FALLBACKS))),
+        rater={'models': list(dict.fromkeys(
+                   (config_module.RATING_MODEL_OVERRIDE or MODEL_NAME_RATING,
+                    *MODEL_NAME_RATING_FALLBACKS))),
                'temperature': RATING_TEMPERATURE, 'output_fields': RATING_OUTPUT_SCHEMA['required']},
     )
 
@@ -4460,13 +4463,15 @@ async def _rate_with(model: str, evaluator_prompt: str, extract_text: str, stage
 
 
 async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) -> dict:
-    """Stage 2d: rate with MODEL_NAME_RATING, then each of MODEL_NAME_RATING_FALLBACKS in order.
+    """Stage 2d: rate with RATING_MODEL_OVERRIDE or MODEL_NAME_RATING, then each of
+    MODEL_NAME_RATING_FALLBACKS in order.
 
     A different model is asked rather than the same one again: on 2026-10-08 the rater's reply
     held a rating of 5 inside JSON it had left unclosed, the job errored, and it was never rated.
     The result's `rated_by` names the model that answered. The last model's failure propagates.
     """
-    models = list(dict.fromkeys((MODEL_NAME_RATING, *MODEL_NAME_RATING_FALLBACKS)))
+    primary = config_module.RATING_MODEL_OVERRIDE or MODEL_NAME_RATING
+    models = list(dict.fromkeys((primary, *MODEL_NAME_RATING_FALLBACKS)))
     for position, model in enumerate(models):
         try:
             result = await _rate_with(model, evaluator_prompt, extract_text, stage_stats)
@@ -6100,6 +6105,16 @@ async def main() -> None:
         help='Skip the startup check for a newer @playwright/mcp than the pinned version',
     )
     parser.add_argument(
+        '--rating-model',
+        metavar='MODEL',
+        default=None,
+        help='Run-scoped test: rate jobs with MODEL as the PRIMARY rater this run '
+             '(the MODEL_NAME_RATING_FALLBACKS chain stays as the safety net, and '
+             "'rated_by' in each Job Trace names the model that answered). Route follows "
+             "the model value's shape, e.g. an 'mlx-lm-server:<org>/<repo>' name rides the "
+             'local LLM MCP server to the mlx-lm sidecar.',
+    )
+    parser.add_argument(
         '--audit-opus',
         nargs='?',
         type=int,
@@ -6161,6 +6176,39 @@ async def main() -> None:
             "the browser. Wait for it to finish, or re-run with --force to override.[/yellow]"
         )
         sys.exit(1)
+
+    if args.rating_model:
+        # Fail fast, before the run lock or the browser: a typo'd model name should cost
+        # nothing. The route check catches a name that would silently bill OpenRouter;
+        # LOCAL routes only — a typo'd OpenRouter-looking name cannot be caught cheaply
+        # before a live call (this exact mistake started a real run on 2026-11-03 and
+        # marked one posting processed without rating it; the record had to be removed by
+        # hand). Other routes stay a config.py edit, which is reviewable before a run.
+        import asyncio as _asyncio
+
+        from agentic_job_search.triage import preflight_local_model
+        if args.rating_model in MODEL_NAME_RATING_FALLBACKS:
+            console.print(f'[red]--rating-model {args.rating_model} is already in the '
+                          'fallback chain; the primary must differ from every fallback '
+                          '(a same-model retry is the failure mode the chain exists to avoid).[/red]')
+            sys.exit(1)
+        if route_for(args.rating_model) != 'ollama':
+            console.print(f"[red]--rating-model supports local routes only "
+                          f"({args.rating_model!r} routes "
+                          f"{route_for(args.rating_model)!r}). Use an Ollama tag or an "
+                          "'mlx-lm-server:<org>/<repo>' sidecar name; for OpenRouter/"
+                          'Anthropic raters edit MODEL_NAME_RATING in config.py instead — '
+                          'a typo there fails over to the proven chain.[/red]')
+            sys.exit(1)
+        preflight = _asyncio.run(preflight_local_model(args.rating_model))
+        if preflight:
+            console.print(f'[red]--rating-model {args.rating_model}: {preflight}[/red]')
+            sys.exit(1)
+        import agentic_job_search.config as _config
+        _config.RATING_MODEL_OVERRIDE = args.rating_model
+        logger.warning(f'Rating override active for this run: primary rater '
+                       f'{args.rating_model} (route ollama); fallbacks unchanged '
+                       f'{MODEL_NAME_RATING_FALLBACKS}')
 
     if not interactive and not JOB_REQUIREMENTS_PATH.exists():
         console.print('[red]Error: JOB_REQUIREMENTS.md not found. Non-interactive mode requires it.[/red]')

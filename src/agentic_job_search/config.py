@@ -401,6 +401,13 @@ MODEL_NAME_RATING = MODEL_NAME_SINGLE_TURN
 # already runs on, the entry stopped being a different model at all. The remaining entry is the
 # GLM intelligence default, so a fallback is still a genuinely different model.
 MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,)
+# Run-scoped override for the PRIMARY rating model (CLI --rating-model, agent.py). None
+# keeps MODEL_NAME_RATING. The fallback chain is deliberately unchanged: a test run of a
+# new rater still falls back to the proven chain, and `rated_by` in the trace names which
+# model actually answered, so the test is auditable per job. The override value routes
+# like any model value (models.route_for) — an `mlx-lm-server:<org>/<repo>` name rides
+# the local Ollama MCP server (:8002) to the mlx-lm sidecar; see docs/architecture.md.
+RATING_MODEL_OVERRIDE: str | None = None
 # Reading amounts out of a compensation phrase is a PARSE, not a judgement — the deterministic
 # tiers in salary.py answer all but a few strings, and this only sees what they could not read.
 # Flash tier for that reason, and cached per string so a phrase is parsed once, ever.
