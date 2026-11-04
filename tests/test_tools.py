@@ -2196,6 +2196,15 @@ async def test_openrouter_loop_happy_path(monkeypatch):
     assert [t['function']['name'] for t in chat_requests[0]['tools']] == ['submit_job_extract']
 
 
+async def test_openrouter_extract_carries_the_field_confidence_it_was_given(monkeypatch):
+    args = {**_SUBMIT_ARGS, 'field_confidence': {'location': 5, 'salary': 7}}
+    _wire_openrouter_loop(monkeypatch, [_chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', args)])], [])
+    extract = await _run_loop()
+    assert extract['field_confidence'] == {'location': 5}, 'an out-of-range level is not recorded'
+    _wire_openrouter_loop(monkeypatch, [_chat_response(tool_calls=[_tool_call('c1', 'submit_job_extract', _SUBMIT_ARGS)])], [])
+    assert (await _run_loop())['field_confidence'] == {}
+
+
 @pytest.mark.parametrize('temperature', [None, 0.0])
 async def test_openrouter_loop_sends_the_extract_temperature_only_when_set(monkeypatch, temperature):
     chat_requests = []
@@ -6456,7 +6465,8 @@ def test_extract_schemas_stay_in_sync_across_both_extractors():
     """A field added to one extractor and not the other silently returns empty for that path,
     which looks identical to 'the posting did not say'. Until 2026-10-19 the direct fallback
     lacked is_agency/end_client; with the agentic extractor removed the two now match exactly."""
-    openrouter_schema = set(_openrouter_extract_properties())
+    # field_confidence is the OpenRouter extractor's alone, by choice (2026-11-04): data, read by nothing.
+    openrouter_schema = set(_openrouter_extract_properties()) - {extract_openrouter.FIELD_CONFIDENCE_KEY}
     direct_schema = set(agent.EXTRACT_OUTPUT_SCHEMA['properties'])
     assert openrouter_schema == direct_schema, (
         f'extract schemas drifted: openrouter-only={sorted(openrouter_schema - direct_schema)}, '
@@ -6464,6 +6474,20 @@ def test_extract_schemas_stay_in_sync_across_both_extractors():
     )
     for field in ('is_agency', 'end_client', 'residency_scope'):
         assert field in openrouter_schema
+
+
+def test_field_confidence_covers_every_extract_field_and_keeps_only_valid_levels():
+    '''2026-11-04: the extractor reports, per field, how sure it is; only a 1-5 level for a known field is kept.'''
+    confidence_fields = set(extract_openrouter.FIELD_CONFIDENCE_PROPERTY['properties'])
+    assert confidence_fields == set(agent.EXTRACT_OUTPUT_SCHEMA['properties']) - {
+        f for f in agent.EXTRACT_OUTPUT_SCHEMA['properties'] if f.endswith(evidence.QUOTE_SUFFIX)}
+    kept, dropped = extract_openrouter.field_confidence_from_args({'field_confidence': {
+        'salary': 5, 'location': 3, 'relocation': 9, 'is_agency': True, 'nonsense': 4}})
+    assert kept == {'salary': 5, 'location': 3}
+    assert dropped == {'relocation': 9, 'is_agency': True, 'nonsense': 4}
+    assert extract_openrouter.field_confidence_from_args({}) == ({}, {})
+    assert extract_openrouter.field_confidence_from_args({'field_confidence': 'high'}) == (
+        {}, {'field_confidence': 'high'})
 
 
 def test_every_cited_extract_field_has_a_quote_property_on_both_extractors():

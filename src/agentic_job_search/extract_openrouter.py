@@ -80,20 +80,6 @@ EXTRACT_PROPERTIES = with_quotes({
         'a direct posting and when anonymous ("our client, a leading fintech")')},
 }, EXTRACT_CITED_FIELDS)
 
-OPENROUTER_EXTRACT_TOOLS = [
-    {
-        'type': 'function',
-        'function': {
-            'name': 'submit_job_extract',
-            'description': 'Submit the extract of the job posting, exactly once. ' + CITATION_INSTRUCTION,
-            'parameters': {'type': 'object', 'properties': EXTRACT_PROPERTIES, 'required': list(EXTRACT_REQUIRED_FIELDS)},
-        },
-    },
-]
-
-# The tool definition is sent with every call and counted in its tokens in; the Job Audit shows its size.
-_TOOLS_CHARS = len(json.dumps(OPENROUTER_EXTRACT_TOOLS))
-
 _SUBMIT_REQUIRED_FIELDS = EXTRACT_REQUIRED_FIELDS
 # Every other field, all optional, since a required field the model cannot observe pressures it to
 # make one up (Anti-fabrication). A real page always carries some of these, at least a location.
@@ -106,6 +92,53 @@ _SUBMIT_OPTIONAL_FIELDS = (
     'posting_language', 'stated_working_language', 'residency_scope', 'relocation',
     'education_requirement', 'is_agency', 'end_client',
 )
+
+
+# The extractor's own confidence in each field it filled (2026-11-04), recorded in the Job Trace as
+# data for deciding which fields a cheaper or local model could be trusted with. This extractor
+# only: the Haiku fallback's schema (agent.EXTRACT_OUTPUT_SCHEMA) shares EXTRACT_PROPERTIES and
+# stays as it was. Nothing in the pipeline reads it — no gate, cap, warning or rater.
+# Verify Source Reference: exempt — a self-report about the answer, not a fact about the page.
+FIELD_CONFIDENCE_KEY = 'field_confidence'
+FIELD_CONFIDENCE_MIN, FIELD_CONFIDENCE_MAX = 1, 5
+_EXTRACT_FIELDS = (*_SUBMIT_REQUIRED_FIELDS, *_SUBMIT_OPTIONAL_FIELDS)
+FIELD_CONFIDENCE_PROPERTY = {
+    'type': 'object',
+    'description': ('For each field you filled, how sure you are that it is right: 1 = a guess, 5 = the page '
+                    'states it plainly. Fields you left empty need no entry.'),
+    'properties': {name: {'type': 'integer', 'minimum': FIELD_CONFIDENCE_MIN, 'maximum': FIELD_CONFIDENCE_MAX}
+                   for name in _EXTRACT_FIELDS},
+}
+
+OPENROUTER_EXTRACT_TOOLS = [
+    {
+        'type': 'function',
+        'function': {
+            'name': 'submit_job_extract',
+            'description': 'Submit the extract of the job posting, exactly once. ' + CITATION_INSTRUCTION,
+            'parameters': {'type': 'object',
+                           'properties': {**EXTRACT_PROPERTIES, FIELD_CONFIDENCE_KEY: FIELD_CONFIDENCE_PROPERTY},
+                           'required': list(EXTRACT_REQUIRED_FIELDS)},
+        },
+    },
+]
+
+# The tool definition is sent with every call and counted in its tokens in; the Job Audit shows its size.
+_TOOLS_CHARS = len(json.dumps(OPENROUTER_EXTRACT_TOOLS))
+
+def field_confidence_from_args(args: dict) -> tuple[dict[str, int], dict]:
+    '''(field -> 1-5 for the known fields with a valid level, the entries dropped as unusable).'''
+    raw = args.get(FIELD_CONFIDENCE_KEY)
+    if not isinstance(raw, dict):
+        return {}, ({FIELD_CONFIDENCE_KEY: raw} if raw is not None else {})
+    kept, dropped = {}, {}
+    for name, level in raw.items():
+        if (name in _EXTRACT_FIELDS and isinstance(level, int) and not isinstance(level, bool)
+                and FIELD_CONFIDENCE_MIN <= level <= FIELD_CONFIDENCE_MAX):
+            kept[name] = level
+        else:
+            dropped[name] = level
+    return kept, dropped
 
 
 def extract_from_args(args: dict) -> dict:
@@ -282,6 +315,10 @@ async def extract_job_page_openrouter(
                 })
                 continue
             extract = extract_from_args(args)
+            extract[FIELD_CONFIDENCE_KEY], dropped = field_confidence_from_args(args)
+            if dropped:
+                logger.info(f"Extract (openrouter): job {candidate['job_id']}: field confidence entries not "
+                            f'recorded (unknown field or not 1-5): {dropped!r}')
             logger.info(
                 f"Extract (openrouter): job {candidate['job_id']} {candidate['company']} — "
                 f"{snippet(candidate['title'], LOG_TITLE_MAX_CHARS)}: "
