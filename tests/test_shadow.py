@@ -105,11 +105,12 @@ async def test_calls_unanswered_at_the_end_are_written_as_pending(monkeypatch, s
     assert {r['prompt'].split('\n')[0] for r in records} == {'first', 'second'}
 
 
-async def test_shadow_mode_off_changes_nothing(monkeypatch):
+async def test_without_shadow_mode_the_confidence_is_still_asked_and_cut_but_nothing_is_shadowed(monkeypatch):
+    '''2026-11-04: every remote answer carries its confidence, shadow mode or not.'''
     monkeypatch.setattr(config, 'SHADOW_MODEL', None)
     calls = _servers(monkeypatch, 'yes\nCONFIDENCE: 4', 'unused')
     reply = await triage.chat_openrouter('Q?', model='vendor/remote')
-    assert calls[0][1]['messages'][-1]['content'] == 'Q?'
-    assert reply.content == 'yes\nCONFIDENCE: 4' and reply.confidence is None
-    assert len(calls) == 1
+    assert calls[0][1]['messages'][-1]['content'] == 'Q?' + shadow.CONFIDENCE_INSTRUCTION
+    assert reply.content == 'yes' and reply.confidence == 4
+    assert len(calls) == 1, 'no local call'
     assert await shadow.finish() is None

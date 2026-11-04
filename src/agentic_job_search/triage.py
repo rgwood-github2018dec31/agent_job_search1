@@ -151,7 +151,7 @@ class ChatReply:
     served_quantization: str
     finish_reason: str
     usage: dict = field(default_factory=dict)
-    # The model's own CONFIDENCE line (1-5), cut from `content`; set only while shadow mode is on.
+    # The model's own CONFIDENCE line (1-5), cut from `content`; None when it wrote none.
     confidence: int | None = None
 
     def describe(self) -> str:
@@ -193,11 +193,10 @@ async def chat_openrouter(
     '''One completion via the OpenRouter MCP server, recorded in the current Job Trace in full:
     prompt, reply or error, who served it, tokens, cost and latency (see _chat_openrouter).'''
     call_site = job_trace.caller_name()
-    shadowed = shadow.active()
-    if shadowed:
-        # Shadow Local Model: both models are asked for a confidence line, cut off again below
-        # so no caller ever sees it.
-        prompt = shadow.with_confidence_request(prompt)
+    # Every remote answer comes with the model's own confidence (2026-11-04, recorded in the Job
+    # Trace and, in shadow mode, beside the local model's): the line is cut off again below, so no
+    # caller ever sees it.
+    prompt = shadow.with_confidence_request(prompt)
     started = time.monotonic()
     try:
         reply = await _chat_openrouter(prompt, system, model, max_tokens, timeout_seconds, temperature)
@@ -206,9 +205,9 @@ async def chat_openrouter(
                          prompt=prompt, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
         raise
     seconds = round(time.monotonic() - started, 2)
-    if shadowed:
-        content, confidence = shadow.split_confidence(reply.content)
-        reply = dataclasses.replace(reply, content=content, confidence=confidence)
+    content, confidence = shadow.split_confidence(reply.content)
+    reply = dataclasses.replace(reply, content=content, confidence=confidence)
+    if shadow.active():
         shadow.enqueue(call_site=call_site, system=system, prompt=prompt, temperature=temperature, remote={
             'model': model, 'served_model': reply.model, 'provider': reply.provider, 'content': content,
             'confidence': confidence, 'finish_reason': reply.finish_reason, 'cost_usd': reply.cost_usd,

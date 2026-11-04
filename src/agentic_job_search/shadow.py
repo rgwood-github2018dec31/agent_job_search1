@@ -1,8 +1,8 @@
 '''Shadow Local Model: ask a local model every single-turn remote question too, and record both answers.
 
-Run-scoped and off by default (`--shadow-model`). While it is on, every `chat_openrouter` prompt
-also asks for a final `CONFIDENCE: <1-5>` line, which is stripped from the reply before any caller
-sees it, and the same prompt and system message are queued for the local model. One background
+Every `chat_openrouter` prompt, on every run, asks for a final `CONFIDENCE: <1-5>` line, which is
+stripped from the reply before any caller sees it. Run-scoped and off by default (`--shadow-model`):
+while shadow mode is on, the same prompt and system message are also queued for the local model. One background
 worker answers the queue in order, since the local server runs one model call at a time, and never
 holds up the pipeline. Each pair is appended to `run_dir/shadow_calls/shadow-<run>.jsonl`; what is
 still queued when the run ends is written as `pending` for `scripts/shadow_replay.py` to finish.
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 SHADOW_CALLS_DIR = RUN_DIR / 'shadow_calls'
 
-# Appended to every remote and shadow prompt while shadow mode is on. A last line of its own so it
+# Appended to every remote prompt (and so to every shadow prompt). A last line of its own so it
 # can be cut off without touching the answer, whatever shape the answer has.
 CONFIDENCE_INSTRUCTION = (
     '\n\nAfter your answer, on a final line of its own, write CONFIDENCE: <1-5> — how sure you are '
