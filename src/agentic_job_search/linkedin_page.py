@@ -23,9 +23,11 @@ Guards decided in code, not by the model: the keep anchors are never shown to it
 a pay figure is never removed on its say-so, and any failure keeps the block. A kept block costs a
 few hundred chars of noise; a wrongly removed one could cost the job's facts.
 """
+import asyncio
 import hashlib
 import logging
 import os
+import random
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -54,6 +56,7 @@ from agentic_job_search.config import (
     LINKEDIN_JOB_DESCRIPTION_HEADING,
     LINKEDIN_PAGE_CAPTURE_JS,
     LINKEDIN_PAGE_CAPTURE_RETRIES,
+    LINKEDIN_PAGE_SCROLL_JS,
     LINKEDIN_PDF_FURNITURE_LINE_PATTERNS,
     LINKEDIN_REMOVE_ARIA_LABELS,
     LINKEDIN_REMOVE_LINK_HREF_PATTERNS,
@@ -63,6 +66,8 @@ from agentic_job_search.config import (
     MODEL_NAME_PAGE_SECTIONS,
     PAGE_SECTION_SAMPLE_MAX_CHARS,
     PAGE_SECTION_SIGNATURE_MAX_WORDS,
+    STAGE2_PAGE_DWELL_SECONDS,
+    STAGE2_PAGE_SCROLL_STEPS,
     UI_BLOCK_SIGNATURES,
 )
 from agentic_job_search.salary import mentions_pay
@@ -78,6 +83,8 @@ COMPANY_ABOUT_FAILURES_DIR = tools_generic.RUN_DIR / 'about_page_failures'
 # quotes this many visible characters either side of the matched phrase.
 BLOCKED_PAGE_SUFFIX = '-blocked'
 BLOCK_CONTEXT_CHARS = 200
+# Each pause between scroll steps gets at least this share of an even split, so none is near zero.
+PAUSE_WEIGHT_FLOOR = 0.3
 
 COMPANY_ASSETS_DIR = tools_generic.RUN_DIR / 'company_assets'
 PAGE_SECTIONS_PATH = tools_generic.RUN_DIR / 'linkedin_page_sections.yaml'
@@ -776,6 +783,32 @@ async def _read_snapshot(candidate: dict, call: BrowserCall, reason: str) -> Job
     return JobPage(text=budgeted, source='snapshot')
 
 
+async def browse_page(call: BrowserCall, what: str) -> None:
+    '''Stay on the open page a randomised time, scrolling it in a few randomised steps.
+
+    Called after the capture, so it changes what LinkedIn sees and not what the extractor reads:
+    a page left a fixed 3 s after load, never scrolled, is a robotic signature (2026-11-04). A
+    failed scroll is logged and the stay continues without scrolling; it never fails the read.
+    '''
+    dwell = random.uniform(*STAGE2_PAGE_DWELL_SECONDS)
+    steps = random.randint(*STAGE2_PAGE_SCROLL_STEPS)
+    weights = [random.random() + PAUSE_WEIGHT_FLOOR for _ in range(steps + 1)]
+    pauses = [dwell * w / sum(weights) for w in weights]
+    logger.debug(f'Staying {dwell:.1f}s on {what}, scrolling {steps} time(s)')
+    scrolling = True
+    for pause in pauses[:-1]:
+        await asyncio.sleep(pause)
+        if not scrolling:
+            continue
+        try:
+            await call('browser_evaluate', {'function': LINKEDIN_PAGE_SCROLL_JS})
+        except Exception as ex:
+            logger.warning(f'Scrolling {what} failed, staying on the page without scrolling: '
+                           f'{unwrap_exception(ex)}')
+            scrolling = False
+    await asyncio.sleep(pauses[-1])
+
+
 async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | None = None) -> JobPage:
     '''Navigate to the posting and return the text the extractor should read.
 
@@ -798,6 +831,7 @@ async def read_job_page(candidate: dict, call: BrowserCall, stage_stats: dict | 
         logger.info(f'Job page {job_id}: no description yet (attempt {attempt + 1}), waiting again')
     else:
         return await _read_snapshot(candidate, call, 'the page has no JobDetails_AboutTheJob_ section')
+    await browse_page(call, f'job page {job_id}')
 
     company_slug = posting_company_slug(soup)
     header = header_card(soup)
@@ -960,6 +994,7 @@ async def read_company_about(slug: str, call: BrowserCall) -> CompanyAbout:
         kept = _keep_unreadable_about_page(slug, html, suffix=BLOCKED_PAGE_SUFFIX)
         raise LinkedInBlockedError(
             f'LinkedIn company About page {url} shows "{blocked}" in: {context!r}; page {kept}')
+    await browse_page(call, f'the About page of {slug}')
     try:
         return parse_company_about(soup, slug)
     except NotAnAboutPageError as ex:

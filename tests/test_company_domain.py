@@ -6,7 +6,7 @@ import pytest
 import yaml
 from agentic_job_search import company_domain, linkedin_page
 from agentic_job_search.company_domain import CompanyIdentity, identities_match
-from agentic_job_search.config import LINKEDIN_PAGE_CAPTURE_JS
+from agentic_job_search.config import LINKEDIN_PAGE_CAPTURE_JS, LINKEDIN_PAGE_SCROLL_JS
 from bs4 import BeautifulSoup
 from fakes import chat_reply
 
@@ -218,7 +218,9 @@ async def test_reading_an_about_page_only_navigates_waits_and_captures():
     call, calls = _fake_browser(INDEPENDENT_ABOUT_HTML)
     about = await linkedin_page.read_company_about('paygate', call)
     assert about.website == 'https://www.paygate.example.com'
-    assert [tool for tool, _args in calls] == ['browser_navigate', 'browser_wait_for', 'browser_evaluate']
+    assert [tool for tool, _args in calls[:3]] == ['browser_navigate', 'browser_wait_for', 'browser_evaluate']
+    assert calls[3:] and all(c == ('browser_evaluate', {'function': LINKEDIN_PAGE_SCROLL_JS}) for c in calls[3:]), \
+        "after the capture, only the stay's scrolls"
     assert calls[0][1] == {'url': 'https://www.linkedin.com/company/paygate/about/'}
     assert calls[2][1] == {'function': LINKEDIN_PAGE_CAPTURE_JS}, 'the tested read-only capture, nothing else'
 

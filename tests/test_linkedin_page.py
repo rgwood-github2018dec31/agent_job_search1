@@ -10,11 +10,12 @@ import logging
 
 import pytest
 import yaml
-from agentic_job_search import evidence, minimal_archive
+from agentic_job_search import evidence, linkedin_page, minimal_archive
 from agentic_job_search import linkedin_page as lp
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.config import (
     LINKEDIN_PAGE_CAPTURE_JS,
+    LINKEDIN_PAGE_SCROLL_JS,
     LINKEDIN_REMOVE_SECTION_PHRASES,
     PAGE_SECTION_SIGNATURE_MAX_WORDS,
 )
@@ -95,6 +96,53 @@ def test_capture_js_only_reads_the_page():
     assert _guard_call('browser_evaluate', {'function': LINKEDIN_PAGE_CAPTURE_JS}) is None
     for driving in ('.click(', 'dispatchEvent', '.remove(', 'innerHTML =', 'outerHTML =', 'appendChild', 'setAttribute'):
         assert driving not in LINKEDIN_PAGE_CAPTURE_JS
+
+
+def test_scroll_js_only_scrolls():
+    '''The stay on a page scrolls it, and does nothing else to it (Account safety).'''
+    assert _guard_call('browser_evaluate', {'function': LINKEDIN_PAGE_SCROLL_JS}) is None
+    for driving in ('.click(', 'dispatchEvent', '.remove(', 'innerHTML =', 'outerHTML =', 'appendChild',
+                    'setAttribute', '.focus(', '.submit(', 'location ='):
+        assert driving not in LINKEDIN_PAGE_SCROLL_JS
+
+
+async def test_browse_page_stays_and_scrolls_within_the_drawn_ranges(monkeypatch):
+    '''2026-11-04: a page left a fixed 3 s after load, never scrolled, is a robotic signature.'''
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+    monkeypatch.setattr(linkedin_page.asyncio, 'sleep', fake_sleep)
+    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_DWELL_SECONDS', (10.0, 10.0))
+    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_SCROLL_STEPS', (3, 3))
+    calls = []
+
+    async def call(tool, args):
+        calls.append((tool, args))
+        return '### Result\n"{}"'
+    await linkedin_page.browse_page(call, 'a test page')
+    assert calls == [('browser_evaluate', {'function': LINKEDIN_PAGE_SCROLL_JS})] * 3
+    assert len(slept) == 4 and sum(slept) == pytest.approx(10.0)
+    assert min(slept) > 0
+
+
+async def test_a_failed_scroll_ends_the_scrolling_not_the_stay(monkeypatch, caplog):
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+    monkeypatch.setattr(linkedin_page.asyncio, 'sleep', fake_sleep)
+    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_SCROLL_STEPS', (3, 3))
+    calls = []
+
+    async def call(tool, args):
+        calls.append(tool)
+        raise RuntimeError('page closed')
+    with caplog.at_level(logging.WARNING, logger=linkedin_page.logger.name):
+        await linkedin_page.browse_page(call, 'a test page')
+    assert calls == ['browser_evaluate'], 'one failure stops the scrolling'
+    assert len(slept) == 4, 'the stay still runs to the end'
+    assert any('Scrolling a test page failed' in r.getMessage() for r in caplog.records)
 
 
 # --- JS-free archive -----------------------------------------------------------------------------
@@ -350,7 +398,9 @@ async def test_read_job_page_archives_the_page_then_returns_clean_text(monkeypat
     page = await lp.read_job_page(_candidate(), call, {'cost': 0.0})
 
     assert page.source == 'dom'
-    assert calls == ['browser_navigate', 'browser_wait_for', 'browser_evaluate'], 'no click, no snapshot'
+    assert calls[:3] == ['browser_navigate', 'browser_wait_for', 'browser_evaluate'], 'no click, no snapshot'
+    low, high = lp.STAGE2_PAGE_SCROLL_STEPS
+    assert low <= len(calls) - 3 <= high and set(calls[3:]) == {'browser_evaluate'}, "then only the stay's scrolls"
     assert 'Build agentic systems in Python.' in page.text and 'More jobs' not in page.text
     html = lp.raw_html_path(_candidate()).read_text()
     assert html.startswith('<!--') and '<script' not in html

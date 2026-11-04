@@ -4561,6 +4561,10 @@ def test_pacing_delays_are_ranges_not_constants():
     for name in (
         'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
         'SCRAPER_INTER_QUERY_DELAY_SECONDS',
+        'COMPANY_ABOUT_PAGE_DELAY_SECONDS',
+        'STAGE2_PAGE_DWELL_SECONDS',
+        'STAGE2_PAGE_SCROLL_STEPS',
+        'STAGE2_INTER_JOB_DELAY_SECONDS',
     ):
         low, high = getattr(config, name)
         assert 0 < low < high, f'{name} must be a non-degenerate (min, max) range, got {(low, high)}'

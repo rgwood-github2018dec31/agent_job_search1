@@ -285,8 +285,10 @@ def _no_human_pacing(monkeypatch):
         'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
         'SCRAPER_INTER_QUERY_DELAY_SECONDS',
         'COMPANY_ABOUT_PAGE_DELAY_SECONDS',
+        'STAGE2_INTER_JOB_DELAY_SECONDS',
     ):
         monkeypatch.setattr(agent, name, (0.0, 0.0))
+    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_DWELL_SECONDS', (0.0, 0.0))
     yield
 
 
