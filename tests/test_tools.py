@@ -12145,6 +12145,76 @@ async def test_stage_2_rating_line_and_funnel_name_the_fallback_model(monkeypatc
                for m in _stage2_messages(caplog))
 
 
+async def test_rate_job_carries_the_primary_raters_error_onto_a_fallback_result(monkeypatch):
+    _rating_models(monkeypatch, {'vendor/first': UNCLOSED_ARRAY_REPLY, 'vendor/second': GOOD_RATING_REPLY})
+    result = await agent.rate_job('system', 'job text', agent.new_stage_stats())
+    assert 'MalformedRatingReplyError' in result['primary_rater_error']
+    _rating_models(monkeypatch, {'vendor/first': GOOD_RATING_REPLY})
+    assert 'primary_rater_error' not in await agent.rate_job('system', 'job text', agent.new_stage_stats())
+
+
+async def test_stage_2_names_the_rating_override_as_the_failed_primary(monkeypatch, caplog):
+    '''2026-11-03: with --rating-model set, the line said "fallback: deepseek… failed" while the
+    override was what had failed, and the fallback count compared against the wrong model.'''
+    _repost_llm(monkeypatch, '')
+    _stage2_stubs(monkeypatch, _make_extract(company='Acme', is_agency=False, salary='CAD 250,000'))
+    monkeypatch.setattr(config, 'RATING_MODEL_OVERRIDE', 'mlx-lm-server:org/local-rater')
+
+    async def fallback_rate(evaluator_prompt, extract_text, stats):
+        return {'rating': 4, 'reasoning': 'ok', 'summary': 'ok', 'title': 'Engineer', 'company': 'Acme',
+                'pros': [], 'warnings': [], 'rated_by': agent.MODEL_NAME_RATING,
+                'primary_rater_error': 'TruncatedResponseError: cut at 512'}
+    monkeypatch.setattr(agent, 'rate_job', fallback_rate)
+    funnel: dict = {}
+    with caplog.at_level(logging.INFO, logger='agentic_job_search.agent'):
+        await _run_stage2(_make_candidate(job_id='223', company='Acme'), funnel)
+    assert funnel.get('rating_fallback') == 1
+    assert funnel['rating_primary'] == 'mlx-lm-server:org/local-rater'
+    assert funnel['rating_fallback_first'] == 'TruncatedResponseError: cut at 512'
+    assert any('(fallback: mlx-lm-server:org/local-rater failed)' in m for m in _stage2_messages(caplog))
+
+
+def test_assess_run_health_reports_a_failing_primary_rater():
+    '''2026-11-03: the primary rater failed 49 of 49 and the summary did not say so.'''
+    alerts = agent.assess_run_health({
+        'queries_generated': 6, 'rated_2': 40, 'rated_4': 9, 'rating_fallback': 49,
+        'rating_primary': 'mlx-lm-server:org/local-rater',
+        'rating_fallback_first': 'TruncatedResponseError: done_reason=length',
+    })
+    alert = next(a for a in alerts if 'PRIMARY RATER FAILED' in a)
+    assert alert.startswith('PRIMARY RATER FAILED 49 of 49: mlx-lm-server:org/local-rater')
+    assert 'done_reason=length' in alert
+    assert not any('PRIMARY RATER' in a for a in agent.assess_run_health({'queries_generated': 6, 'rated_4': 3}))
+
+
+async def test_rate_with_ollama_retries_a_truncated_reply_with_room(monkeypatch):
+    '''2026-11-03: the MLX sidecar's output default cut every rating of a thinking model to nothing.'''
+    caps: list = []
+
+    async def fake_generate_local(prompt, system='', model='', max_tokens=None, purpose_slug='', output_format=None):
+        caps.append(max_tokens)
+        if max_tokens is None:
+            raise triage.TruncatedResponseError('Local LLM response truncated (done_reason=length)')
+        return GOOD_RATING_REPLY
+    monkeypatch.setattr(triage, 'generate_local', fake_generate_local)
+    result = await triage.rate_with_ollama('system', 'posting', model='mlx-lm-server:org/local-rater')
+    assert result['rating'] == 4
+    assert caps == [None, triage._TRUNCATION_RETRY_MAX_TOKENS]
+
+
+async def test_probe_local_rater_reports_a_rater_that_cannot_answer(monkeypatch):
+    async def truncated(prompt, system='', model='', max_tokens=None, purpose_slug='', output_format=None):
+        raise triage.TruncatedResponseError('Local LLM response truncated (done_reason=length)')
+    monkeypatch.setattr(triage, 'generate_local', truncated)
+    problem = await triage.probe_local_rater('mlx-lm-server:org/local-rater')
+    assert problem and 'done_reason=length' in problem
+
+    async def answers(prompt, system='', model='', max_tokens=None, purpose_slug='', output_format=None):
+        return GOOD_RATING_REPLY
+    monkeypatch.setattr(triage, 'generate_local', answers)
+    assert await triage.probe_local_rater('mlx-lm-server:org/local-rater') is None
+
+
 def test_log_run_cost_puts_elapsed_and_cost_in_the_run_log(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger=tools.logger.name):
         tools.log_run_cost({

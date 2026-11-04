@@ -526,9 +526,45 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
 
 
 async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OLLAMA_MODEL_NAME_TRIAGE) -> dict:
-    '''Rate a job via the local Ollama server. Returns the rating dict (cost is zero).'''
-    response = await generate_local(
-        f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}', system=system_prompt, model=model,
-        purpose_slug=LLM_LOCAL_PURPOSE_RATING,
-    )
-    return parse_rating_reply(response)
+    '''Rate a job via the local Ollama server. Returns the rating dict (cost is zero).
+
+    Retries once on truncation, as rate_with_openrouter does. The MLX sidecar applies
+    mlx_lm.server's own small output default when no max_tokens is sent, and a thinking model
+    spends it before answering: all 49 ratings of the 2026-11-03 --rating-model run came back
+    empty that way and fell over to the fallback rater.
+    '''
+    prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}'
+    try:
+        response = await generate_local(prompt, system=system_prompt, model=model,
+                                        purpose_slug=LLM_LOCAL_PURPOSE_RATING)
+    except TruncatedResponseError as ex:
+        logger.warning(f'Local rating call truncated, retrying once with max_tokens={_TRUNCATION_RETRY_MAX_TOKENS}: {ex}')
+        response = await generate_local(prompt, system=system_prompt, model=model,
+                                        max_tokens=_TRUNCATION_RETRY_MAX_TOKENS,
+                                        purpose_slug=LLM_LOCAL_PURPOSE_RATING)
+    try:
+        return parse_rating_reply(response)
+    except MalformedRatingReplyError as ex:
+        raise MalformedRatingReplyError(
+            f'{ex} — model={model}; content: {quote_for_error(response, f"malformed rating reply from {model}")!r}'
+        ) from ex
+
+
+# One small real rating asked of a --rating-model before the run starts. "Installed" was not
+# enough on 2026-11-03: the model answered every rating of the run with an empty, cut-off reply.
+RATER_PROBE_SYSTEM = "You rate how well a job posting fits a candidate's requirements."
+RATER_PROBE_USER = (
+    '--- REQUIREMENTS ---\nRemote senior Python backend roles.\n\n'
+    '--- JOB POSTING ---\nSenior Python Backend Engineer. Fully remote. Build APIs in Python.\n'
+    '--- END JOB POSTING ---'
+)
+
+
+async def probe_local_rater(model: str) -> str | None:
+    '''None when `model` returns a usable rating for a tiny posting, otherwise why it did not.'''
+    try:
+        result = await rate_with_ollama(RATER_PROBE_SYSTEM, RATER_PROBE_USER, model=model)
+    except Exception as ex:
+        return f'probe rating failed: {unwrap_exception(ex)}'
+    logger.info(f'Rater probe for {model}: rating {result["rating"]} — {result.get("reasoning", "")}')
+    return None

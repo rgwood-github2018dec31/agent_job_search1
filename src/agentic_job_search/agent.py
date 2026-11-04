@@ -114,6 +114,8 @@ from agentic_job_search.config import (
     PLAYWRIGHT_STOP_TIMEOUT_SECONDS,
     PROCESS_RSS_PROBE_TIMEOUT_SECONDS,
     RATING_AUTO_REJECT,
+    RATING_MAX,
+    RATING_MIN,
     RATING_TEMPERATURE,
     REFERENCE_JOB_PROMPT_MAX_CHARS,
     REFERENCE_SUMMARY_LIMIT_CHARS,
@@ -1819,6 +1821,18 @@ def assess_run_health(funnel: dict) -> list[str]:
             parts.append(f'{outage} kept from rating by a tool server outage (released, no release counted)')
         alerts.append(f'{errored + outage} of {total} JOBS NOT RATED: {"; ".join(parts)}. A released job is '
                       'rated only if a later search lists it again')
+
+    # 1d. Jobs the primary rater failed on, rated by a fallback instead. On 2026-11-03 a
+    #     --rating-model test run's primary failed all 49 ratings (an empty reply cut at the MLX
+    #     sidecar's output default) and the summary did not say so: the run looked like a valid test
+    #     of a model that had answered nothing.
+    fallbacks = funnel.get('rating_fallback') or 0
+    if fallbacks:
+        rated = sum(funnel.get(f'rated_{r}', 0) for r in range(RATING_MIN, RATING_MAX + 1)) or fallbacks
+        alerts.append(
+            f'PRIMARY RATER FAILED {fallbacks} of {rated}: {funnel.get("rating_primary", "?")} did not '
+            f'answer, a fallback rated them. First error: {snippet(funnel.get("rating_fallback_first") or "")}'
+        )
 
     # 2. A dead region axis: two regions returning the same jobs is not "the query is exhausted".
     for query, overlap in (funnel.get('region_overlap') or {}).items():
@@ -4468,16 +4482,20 @@ async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) 
 
     A different model is asked rather than the same one again: on 2026-10-08 the rater's reply
     held a rating of 5 inside JSON it had left unclosed, the job errored, and it was never rated.
-    The result's `rated_by` names the model that answered. The last model's failure propagates.
+    The result's `rated_by` names the model that answered and, when that is not the primary,
+    `primary_rater_error` holds the primary's failure for the run-health alert. The last model's
+    failure propagates.
     """
-    primary = config_module.RATING_MODEL_OVERRIDE or MODEL_NAME_RATING
-    models = list(dict.fromkeys((primary, *MODEL_NAME_RATING_FALLBACKS)))
+    models = list(dict.fromkeys((primary_rating_model(), *MODEL_NAME_RATING_FALLBACKS)))
+    primary_error = None
     for position, model in enumerate(models):
         try:
             result = await _rate_with(model, evaluator_prompt, extract_text, stage_stats)
         except Exception as ex:
             if position == len(models) - 1:
                 raise
+            if primary_error is None:
+                primary_error = unwrap_exception(ex)
             logger.warning(
                 f'Rating by {model} failed, asking {models[position + 1]} instead '
                 # unwrap_exception already leads with the type name; prefixing it again printed
@@ -4486,8 +4504,15 @@ async def rate_job(evaluator_prompt: str, extract_text: str, stage_stats: dict) 
             )
             continue
         result['rated_by'] = model
+        if primary_error is not None:
+            result['primary_rater_error'] = primary_error
         return result
     raise AssertionError('unreachable: the last rating model returns or raises')
+
+
+def primary_rating_model() -> str:
+    '''The model rate_job asks first: the run's --rating-model override, else MODEL_NAME_RATING.'''
+    return config_module.RATING_MODEL_OVERRIDE or MODEL_NAME_RATING
 
 
 async def _save_job(candidate: dict, rating: int, summary: str, content: str) -> None:
@@ -4978,9 +5003,12 @@ async def _evaluate_candidates(
                     f"{result['rating']} → {rating} ({cap_reason})"
                 )
             bump(f'rated_{rating}')
-            rated_by = result.get('rated_by') or MODEL_NAME_RATING
-            if rated_by != MODEL_NAME_RATING:
+            primary_rater = primary_rating_model()
+            rated_by = result.get('rated_by') or primary_rater
+            if rated_by != primary_rater:
                 bump('rating_fallback')
+                funnel['rating_primary'] = primary_rater
+                funnel.setdefault('rating_fallback_first', result.get('primary_rater_error') or '')
             pros = merge_pros(deterministic_pros(extract),
                               await verified_rating_items(candidate, 'pros', result.get('pros'), extract_text,
                                                           stage_stats['evidence']))
@@ -5075,7 +5103,7 @@ async def _evaluate_candidates(
                 notify_note = 'notification queued'
             logger.info(
                 f"Rating [{index}/{len(candidates)}]: job {candidate['job_id']}: {rating}/5 via {rated_by}"
-                + (f' (fallback: {MODEL_NAME_RATING} failed)' if rated_by != MODEL_NAME_RATING else '')
+                + (f' (fallback: {primary_rater} failed)' if rated_by != primary_rater else '')
                 + f'{triage_note}, {rating_seconds:.0f}s — saved, {notify_note}'
                 + (f'; pay: {pay_note}' if pay_note else '')
             )
@@ -6184,9 +6212,7 @@ async def main() -> None:
         # before a live call (this exact mistake started a real run on 2026-11-03 and
         # marked one posting processed without rating it; the record had to be removed by
         # hand). Other routes stay a config.py edit, which is reviewable before a run.
-        import asyncio as _asyncio
-
-        from agentic_job_search.triage import preflight_local_model
+        from agentic_job_search.triage import preflight_local_model, probe_local_rater
         if args.rating_model in MODEL_NAME_RATING_FALLBACKS:
             console.print(f'[red]--rating-model {args.rating_model} is already in the '
                           'fallback chain; the primary must differ from every fallback '
@@ -6200,8 +6226,12 @@ async def main() -> None:
                           'Anthropic raters edit MODEL_NAME_RATING in config.py instead — '
                           'a typo there fails over to the proven chain.[/red]')
             sys.exit(1)
-        preflight = _asyncio.run(preflight_local_model(args.rating_model))
+        preflight = await preflight_local_model(args.rating_model)
+        if not preflight:
+            console.print(f'Asking {args.rating_model} for one probe rating before the run…')
+            preflight = await probe_local_rater(args.rating_model)
         if preflight:
+            logger.error(f'--rating-model {args.rating_model} rejected before the run: {preflight}')
             console.print(f'[red]--rating-model {args.rating_model}: {preflight}[/red]')
             sys.exit(1)
         import agentic_job_search.config as _config
