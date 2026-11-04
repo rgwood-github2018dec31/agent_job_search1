@@ -229,6 +229,29 @@ async def test_a_challenge_page_raises_the_stop_error():
         await linkedin_page.read_company_about('paygate', call)
 
 
+async def test_a_challenge_page_is_kept_and_quoted_in_the_stop_error():
+    '''2026-11-04: an About page read as "you have been blocked", loaded normally in the user's
+    browser an hour later, and nothing had been kept to tell a real challenge from a false match.'''
+    html = '<html><body><h1>Paygate</h1><p>Sorry, you have been blocked from this page.</p></body></html>'
+    call, _calls = _fake_browser(html)
+    with pytest.raises(linkedin_page.LinkedInBlockedError) as excinfo:
+        await linkedin_page.read_company_about('paygate', call)
+    message = str(excinfo.value)
+    assert 'Sorry, you have been blocked from this page.' in message
+    kept = list(linkedin_page.COMPANY_ABOUT_FAILURES_DIR.glob(f'paygate-*{linkedin_page.BLOCKED_PAGE_SUFFIX}.html'))
+    assert len(kept) == 1 and kept[0].read_text(encoding='utf-8') == html
+    assert str(kept[0]) in message
+
+
+def test_block_context_is_cut_either_side_of_the_phrase():
+    padding = 'x' * (linkedin_page.BLOCK_CONTEXT_CHARS * 2)
+    soup = BeautifulSoup(f'<html><body><p>{padding} unusual activity {padding}</p></body></html>', 'lxml')
+    phrase, context = linkedin_page.visible_block_match(soup)
+    assert phrase == 'unusual activity'
+    assert context.startswith('…') and context.endswith('…')
+    assert len(context) == len(phrase) + 2 * linkedin_page.BLOCK_CONTEXT_CHARS + 2
+
+
 def test_the_poster_slug_comes_from_the_about_the_company_card_only():
     soup = BeautifulSoup(
         '<html><body><a href="https://www.linkedin.com/company/someone-else/">Similar job</a>'

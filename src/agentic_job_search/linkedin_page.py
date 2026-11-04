@@ -74,6 +74,10 @@ logger = logging.getLogger(__name__)
 
 # Pages that failed to read as an About page, one per slug and day; personal, so under run_dir.
 COMPANY_ABOUT_FAILURES_DIR = tools_generic.RUN_DIR / 'about_page_failures'
+# A page read as a challenge is kept beside the unreadable ones under this suffix, and the error
+# quotes this many visible characters either side of the matched phrase.
+BLOCKED_PAGE_SUFFIX = '-blocked'
+BLOCK_CONTEXT_CHARS = 200
 
 COMPANY_ASSETS_DIR = tools_generic.RUN_DIR / 'company_assets'
 PAGE_SECTIONS_PATH = tools_generic.RUN_DIR / 'linkedin_page_sections.yaml'
@@ -843,11 +847,30 @@ def visible_block_signature(soup: BeautifulSoup) -> str:
     Never the raw HTML: a healthy About page carries 'captcha' and 'security verification' in its
     inline scripts (both 2026-10-19 captures did), which would read as a block on every visit.
     """
+    return visible_block_match(soup)[0]
+
+
+def visible_block_match(soup: BeautifulSoup) -> tuple[str, str]:
+    """(phrase, the visible text around it) for the first UI_BLOCK_SIGNATURES phrase, or ('', '').
+
+    The context is what tells a real challenge page from a phrase that merely occurs on a healthy
+    one: on 2026-11-04 an About page read as "you have been blocked", Stage 2 stopped, and the
+    same page loaded normally in the user's own browser an hour later, with nothing kept to say
+    which it had been.
+    """
     visible = BeautifulSoup(str(soup), 'lxml')
     for tag in visible.find_all(_NON_CONTENT_TAGS):
         tag.decompose()
-    text = visible.get_text(' ').lower()
-    return next((phrase for phrase in UI_BLOCK_SIGNATURES if phrase in text), '')
+    text = norm(visible.get_text(' '))
+    lowered = text.lower()
+    for phrase in UI_BLOCK_SIGNATURES:
+        at = lowered.find(phrase)
+        if at >= 0:
+            start = max(0, at - BLOCK_CONTEXT_CHARS)
+            end = at + len(phrase) + BLOCK_CONTEXT_CHARS
+            context = (('…' if start else '') + text[start:end] + ('…' if end < len(text) else ''))
+            return phrase, context
+    return '', ''
 
 
 def _about_page_name(soup: BeautifulSoup) -> str:
@@ -908,9 +931,9 @@ def parse_company_about(soup: BeautifulSoup, slug: str) -> CompanyAbout:
     return about
 
 
-def _keep_unreadable_about_page(slug: str, html: str) -> str:
-    '''Save the page that failed to parse; returns where it went, for the error message.'''
-    path = COMPANY_ABOUT_FAILURES_DIR / f'{slug}-{date.today().isoformat()}.html'
+def _keep_unreadable_about_page(slug: str, html: str, suffix: str = '') -> str:
+    '''Save the page that failed to parse or read as a block; returns where it went, for the error message.'''
+    path = COMPANY_ABOUT_FAILURES_DIR / f'{slug}-{date.today().isoformat()}{suffix}.html'
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(html, encoding='utf-8')
@@ -932,8 +955,11 @@ async def read_company_about(slug: str, call: BrowserCall) -> CompanyAbout:
     await call('browser_wait_for', {'time': COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS})
     html = (await _capture_dom(call, f'company {slug}'))['html']
     soup = BeautifulSoup(html, 'lxml')
-    if blocked := visible_block_signature(soup):
-        raise LinkedInBlockedError(f'LinkedIn company About page {url} shows "{blocked}"')
+    blocked, context = visible_block_match(soup)
+    if blocked:
+        kept = _keep_unreadable_about_page(slug, html, suffix=BLOCKED_PAGE_SUFFIX)
+        raise LinkedInBlockedError(
+            f'LinkedIn company About page {url} shows "{blocked}" in: {context!r}; page {kept}')
     try:
         return parse_company_about(soup, slug)
     except NotAnAboutPageError as ex:
