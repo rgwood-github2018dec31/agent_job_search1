@@ -41,7 +41,7 @@ import yaml
 from bs4 import BeautifulSoup, Tag
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
-from agentic_job_search import evidence, minimal_archive, tools_generic
+from agentic_job_search import evidence, minimal_archive, preferences, tools_generic
 from agentic_job_search.config import (
     COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS,
     EXTRACT_PAGE_RENDER_WAIT_SECONDS,
@@ -66,8 +66,6 @@ from agentic_job_search.config import (
     MODEL_NAME_PAGE_SECTIONS,
     PAGE_SECTION_SAMPLE_MAX_CHARS,
     PAGE_SECTION_SIGNATURE_MAX_WORDS,
-    STAGE2_PAGE_DWELL_SECONDS,
-    STAGE2_PAGE_SCROLL_STEPS,
     UI_BLOCK_SIGNATURES,
 )
 from agentic_job_search.salary import mentions_pay
@@ -790,8 +788,8 @@ async def browse_page(call: BrowserCall, what: str) -> None:
     a page left a fixed 3 s after load, never scrolled, is a robotic signature (2026-11-04). A
     failed scroll is logged and the stay continues without scrolling; it never fails the read.
     '''
-    dwell = random.uniform(*STAGE2_PAGE_DWELL_SECONDS)
-    steps = random.randint(*STAGE2_PAGE_SCROLL_STEPS)
+    dwell = random.uniform(*preferences.stage2_page_dwell_seconds())
+    steps = random.randint(*preferences.stage2_page_scroll_steps())
     weights = [random.random() + PAUSE_WEIGHT_FLOOR for _ in range(steps + 1)]
     pauses = [dwell * w / sum(weights) for w in weights]
     logger.debug(f'Staying {dwell:.1f}s on {what}, scrolling {steps} time(s)')

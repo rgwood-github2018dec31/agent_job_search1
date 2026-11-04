@@ -4562,12 +4562,29 @@ def test_pacing_delays_are_ranges_not_constants():
         'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
         'SCRAPER_INTER_QUERY_DELAY_SECONDS',
         'COMPANY_ABOUT_PAGE_DELAY_SECONDS',
-        'STAGE2_PAGE_DWELL_SECONDS',
-        'STAGE2_PAGE_SCROLL_STEPS',
-        'STAGE2_INTER_JOB_DELAY_SECONDS',
     ):
         low, high = getattr(config, name)
         assert 0 < low < high, f'{name} must be a non-degenerate (min, max) range, got {(low, high)}'
+    for key, (low, high) in preferences.DEFAULT_PREFERENCES['pacing'].items():
+        assert 0 < low < high, f'pacing.{key} default must be a non-degenerate (min, max) range, got {(low, high)}'
+
+
+def test_stage2_pacing_reads_the_preferences_and_rejects_a_bad_range(monkeypatch):
+    def use(pacing: dict) -> None:
+        merged = preferences._deep_merge(preferences.DEFAULT_PREFERENCES, {'pacing': pacing})
+        monkeypatch.setattr(preferences, 'load_preferences', lambda force_reload=False: merged)
+
+    use({'page_dwell_seconds': [2, 6]})
+    assert preferences.stage2_page_dwell_seconds() == (2.0, 6.0)
+    assert preferences.stage2_inter_job_delay_seconds() == tuple(
+        preferences.DEFAULT_PREFERENCES['pacing']['inter_job_delay_seconds'])
+    for bad in ([6, 2], [-1, 2], ['soon', 2], 5):
+        use({'page_dwell_seconds': bad})
+        with pytest.raises(ValueError, match=r'pacing\.page_dwell_seconds'):
+            preferences.stage2_page_dwell_seconds()
+    use({'page_scroll_steps': [1.5, 3]})
+    with pytest.raises(ValueError, match='whole numbers'):
+        preferences.stage2_page_scroll_steps()
 
 
 async def test_human_pause_draws_from_the_range(monkeypatch):

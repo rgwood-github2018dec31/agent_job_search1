@@ -142,7 +142,6 @@ from agentic_job_search.config import (
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SECONDS_PER_MINUTE,
-    STAGE2_INTER_JOB_DELAY_SECONDS,
     THINKING_MAX_CHARS,
     TOOL_SERVER_WAIT_MAX_SECONDS,
     TRIAGE_DISAGREEMENT_LOG_MIN,
@@ -2418,7 +2417,7 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
 async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> JobPage | None:
     """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
     try:
-        await _human_pause(STAGE2_INTER_JOB_DELAY_SECONDS, f"the job page of {candidate.get('job_id')}")
+        await _human_pause(preferences.stage2_inter_job_delay_seconds(), f"the job page of {candidate.get('job_id')}")
         async with mcp_session(playwright_mcp_url) as call:
             page = await read_job_page(candidate, call, stage_stats)
         raw_txt = tools_module.raw_posting_path(candidate)

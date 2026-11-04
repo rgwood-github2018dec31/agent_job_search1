@@ -791,15 +791,9 @@ LOCATION_GUESS_REASON_MAX_CHARS = 150
 # Stage 2 page read (linkedin_page.read_job_page)
 EXTRACT_PAGE_RENDER_WAIT_SECONDS = 3  # the job description renders after navigation
 
-# Stage 2 reading pace (2026-11-04). Each job and About page was left 3 s after it loaded, never
-# scrolled, and the next job page followed as soon as processing allowed (median ~25 s apart, as
-# little as 2 s): a fixed, scroll-free dwell is itself a robotic signature. After its capture, code
-# now stays on a page for a randomised time, scrolling it in a few randomised steps, and pauses
-# between jobs. Every value is a (min, max) range drawn uniformly. This lengthens a 60-job run by
-# roughly 20 minutes, which Account safety accepts.
-STAGE2_PAGE_DWELL_SECONDS = (8.0, 22.0)
-STAGE2_PAGE_SCROLL_STEPS = (2, 5)
-STAGE2_INTER_JOB_DELAY_SECONDS = (3.0, 9.0)
+# Stage 2 reading pace (2026-11-04): how long a page stays open, how often it is scrolled, and the
+# pause between jobs are preferences (`pacing.*`, read through preferences.stage2_*), not
+# constants here; see preferences.DEFAULT_PREFERENCES for the defaults and the reasoning.
 # One scroll step, a little under one screen, of whichever element scrolls the most: the window, or a
 # scrollable pane inside <main>. It only scrolls: no click, no event dispatch, no DOM write.
 LINKEDIN_PAGE_SCROLL_JS = r'''() => {

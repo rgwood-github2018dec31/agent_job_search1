@@ -156,6 +156,15 @@ companies:
   #     reason: bad Glassdoor reviews
   #     added: 2026-01-01
 
+pacing:
+  # How Stage 2 reads each LinkedIn page, as [min, max] ranges drawn uniformly (a fixed interval is
+  # itself a robotic signature). After its capture a job or company About page stays open for
+  # page_dwell_seconds and is scrolled page_scroll_steps times; inter_job_delay_seconds is the pause
+  # before each job page. Raise them for a gentler pace, lower them for a faster run.
+  page_dwell_seconds: [4.0, 11.0]
+  page_scroll_steps: [2, 5]
+  inter_job_delay_seconds: [1.5, 4.5]
+
 # ---------------------------------------------------------------------------
 # run_dir/location_recommendations.yaml — written by the agent, ADVISORY ONLY
 # ---------------------------------------------------------------------------

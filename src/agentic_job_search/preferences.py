@@ -88,6 +88,18 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
         # [{'name': ..., 'reason': ..., 'added': 'YYYY-MM-DD'}]; empty = no company is blocked
         'blacklist': [],
     },
+    # Stage 2 reading pace (2026-11-04). Each job and About page used to be left 3 s after it loaded,
+    # never scrolled, and the next job page followed as soon as processing allowed (median ~25 s
+    # apart, as little as 2 s): a fixed, scroll-free dwell is itself a robotic signature. After its
+    # capture a page now stays open for a time drawn from `page_dwell_seconds` and is scrolled a
+    # number of times drawn from `page_scroll_steps`; `inter_job_delay_seconds` is the pause before
+    # each job page. Each is a [min, max] range drawn uniformly. Halved by the user on 2026-11-04
+    # from 8-22 s and 3-9 s.
+    'pacing': {
+        'page_dwell_seconds': [4.0, 11.0],
+        'page_scroll_steps': [2, 5],
+        'inter_job_delay_seconds': [1.5, 4.5],
+    },
 }
 
 # Old key -> new key. A renamed key must RAISE, never be ignored: `_deep_merge` drops anything it
@@ -551,3 +563,39 @@ def _bucket_insertion_point(lines: list[str]) -> int | None:
     while after < end_of_block and lines[after].strip().startswith('- '):
         after += 1
     return after
+
+
+def _pacing_range(key: str) -> tuple[float, float]:
+    '''`pacing.<key>` as a (min, max) pair of non-negative numbers with min <= max; raises otherwise.
+
+    A malformed range raises rather than falling back: a pause silently reset to its default, or
+    to zero, changes how the agent drives a real account with no sign anywhere.
+    '''
+    raw = load_preferences()['pacing'].get(key)
+    try:
+        low, high = (float(value) for value in raw)
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f'{PREFERENCES_PATH}: `pacing.{key}` must be a [min, max] pair of numbers, '
+                         f'got {raw!r} ({type(ex).__name__}: {ex})') from ex
+    if not 0 <= low <= high:
+        raise ValueError(f'{PREFERENCES_PATH}: `pacing.{key}` must have 0 <= min <= max, got {raw!r}')
+    return low, high
+
+
+def stage2_page_dwell_seconds() -> tuple[float, float]:
+    '''How long a Stage 2 page stays open after its capture, as a (min, max) range in seconds.'''
+    return _pacing_range('page_dwell_seconds')
+
+
+def stage2_page_scroll_steps() -> tuple[int, int]:
+    '''How many times a Stage 2 page is scrolled during its stay, as a (min, max) range.'''
+    low, high = _pacing_range('page_scroll_steps')
+    if low != int(low) or high != int(high):
+        raise ValueError(f'{PREFERENCES_PATH}: `pacing.page_scroll_steps` must be whole numbers, '
+                         f'got {[low, high]!r}')
+    return int(low), int(high)
+
+
+def stage2_inter_job_delay_seconds() -> tuple[float, float]:
+    '''The pause before each Stage 2 job page, as a (min, max) range in seconds.'''
+    return _pacing_range('inter_job_delay_seconds')

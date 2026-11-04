@@ -31,6 +31,9 @@ load_env()
 # that file is personal and machine-local, so depending on it would make results differ per
 # developer and silently change when someone edits their own job-search settings.
 TEST_PREFERENCES = {
+    # Stage 2's stay on each page and its pause between jobs, zeroed so the suite does not sleep
+    # (see _no_human_pacing for the Stage 1b delays).
+    'pacing': {'page_dwell_seconds': [0, 0], 'inter_job_delay_seconds': [0, 0]},
     # Deliberately nonexistent: every test passes an explicit directory, and this makes sure a
     # test that forgets to can never glob or rename PDFs in the developer's own ~/Downloads.
     'save_dir': '/nonexistent/test-save-dir',
@@ -285,10 +288,8 @@ def _no_human_pacing(monkeypatch):
         'SCRAPER_INTER_SEARCH_DELAY_SECONDS',
         'SCRAPER_INTER_QUERY_DELAY_SECONDS',
         'COMPANY_ABOUT_PAGE_DELAY_SECONDS',
-        'STAGE2_INTER_JOB_DELAY_SECONDS',
     ):
         monkeypatch.setattr(agent, name, (0.0, 0.0))
-    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_DWELL_SECONDS', (0.0, 0.0))
     yield
 
 

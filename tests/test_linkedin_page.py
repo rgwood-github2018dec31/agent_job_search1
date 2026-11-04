@@ -113,8 +113,8 @@ async def test_browse_page_stays_and_scrolls_within_the_drawn_ranges(monkeypatch
     async def fake_sleep(seconds):
         slept.append(seconds)
     monkeypatch.setattr(linkedin_page.asyncio, 'sleep', fake_sleep)
-    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_DWELL_SECONDS', (10.0, 10.0))
-    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_SCROLL_STEPS', (3, 3))
+    monkeypatch.setattr(linkedin_page.preferences, 'stage2_page_dwell_seconds', lambda: (10.0, 10.0))
+    monkeypatch.setattr(linkedin_page.preferences, 'stage2_page_scroll_steps', lambda: (3, 3))
     calls = []
 
     async def call(tool, args):
@@ -132,7 +132,7 @@ async def test_a_failed_scroll_ends_the_scrolling_not_the_stay(monkeypatch, capl
     async def fake_sleep(seconds):
         slept.append(seconds)
     monkeypatch.setattr(linkedin_page.asyncio, 'sleep', fake_sleep)
-    monkeypatch.setattr(linkedin_page, 'STAGE2_PAGE_SCROLL_STEPS', (3, 3))
+    monkeypatch.setattr(linkedin_page.preferences, 'stage2_page_scroll_steps', lambda: (3, 3))
     calls = []
 
     async def call(tool, args):
@@ -399,7 +399,7 @@ async def test_read_job_page_archives_the_page_then_returns_clean_text(monkeypat
 
     assert page.source == 'dom'
     assert calls[:3] == ['browser_navigate', 'browser_wait_for', 'browser_evaluate'], 'no click, no snapshot'
-    low, high = lp.STAGE2_PAGE_SCROLL_STEPS
+    low, high = lp.preferences.stage2_page_scroll_steps()
     assert low <= len(calls) - 3 <= high and set(calls[3:]) == {'browser_evaluate'}, "then only the stay's scrolls"
     assert 'Build agentic systems in Python.' in page.text and 'More jobs' not in page.text
     html = lp.raw_html_path(_candidate()).read_text()
