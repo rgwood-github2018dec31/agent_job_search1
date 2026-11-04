@@ -65,6 +65,7 @@ from agentic_job_search import (
     location_review,
     rating_inputs,
     scrape_openrouter,
+    shadow,
     system_sleep,
     tool_server,
 )
@@ -6144,6 +6145,15 @@ async def main() -> None:
              'local LLM MCP server to the mlx-lm sidecar.',
     )
     parser.add_argument(
+        '--shadow-model',
+        metavar='MODEL',
+        default=None,
+        help='Run-scoped data collection: ask local MODEL every single-turn remote question too, in the '
+             'background, and record both answers (each with a 1-5 confidence) in '
+             'run_dir/shadow_calls/. The pipeline only ever uses the remote answer. Local routes only, '
+             "e.g. an 'mlx-lm-server:<org>/<repo>' name. Compare with scripts/shadow_report.py.",
+    )
+    parser.add_argument(
         '--audit-opus',
         nargs='?',
         type=int,
@@ -6241,6 +6251,21 @@ async def main() -> None:
                        f'{args.rating_model} (route ollama); fallbacks unchanged '
                        f'{MODEL_NAME_RATING_FALLBACKS}')
 
+    if args.shadow_model:
+        from agentic_job_search.triage import preflight_local_model
+        if route_for(args.shadow_model) != 'ollama':
+            console.print(f'[red]--shadow-model supports local routes only ({args.shadow_model!r} routes '
+                          f'{route_for(args.shadow_model)!r}).[/red]')
+            sys.exit(1)
+        preflight = await preflight_local_model(args.shadow_model)
+        if preflight:
+            logger.error(f'--shadow-model {args.shadow_model} rejected before the run: {preflight}')
+            console.print(f'[red]--shadow-model {args.shadow_model}: {preflight}[/red]')
+            sys.exit(1)
+        shadow_path = shadow.activate(args.shadow_model, datetime.now().strftime('%Y-%m-%d_%H%M%S'))
+        logger.warning(f'Shadow mode active for this run: {args.shadow_model} answers every single-turn '
+                       f'remote call too, both with a confidence line; pairs go to {shadow_path}')
+
     if not interactive and not JOB_REQUIREMENTS_PATH.exists():
         console.print('[red]Error: JOB_REQUIREMENTS.md not found. Non-interactive mode requires it.[/red]')
         sys.exit(1)
@@ -6292,6 +6317,11 @@ async def main() -> None:
         logger.exception(f'Run aborted by {type(ex).__name__}: {ex}')
         raise
     finally:
+        try:
+            await shadow.finish()
+        except Exception as ex:
+            logger.error(f'Shadow: finishing the shadow queue failed; unanswered calls are not recorded: '
+                         f'{unwrap_exception(ex)}')
         sleep_watch.cancel()
         system_sleep.release_awake(awake)
         tools_module.release_run_lock()

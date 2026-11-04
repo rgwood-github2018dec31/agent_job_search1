@@ -10,6 +10,7 @@ lives in utils_tools_n_agents_common.mcp_client, shared with agent_meta1 and
 agent_stock_trends1.
 '''
 
+import dataclasses
 import json
 import logging
 import time
@@ -20,7 +21,7 @@ from typing import Any, TypeVar
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
 from utils_tools_n_agents_common.models import OLLAMA_MODEL_NAME_TRIAGE
 
-from agentic_job_search import job_trace
+from agentic_job_search import job_trace, shadow
 from agentic_job_search.config import (
     LLM_LOCAL_MCP_URL,
     LLM_LOCAL_PURPOSE_RATING,
@@ -150,6 +151,8 @@ class ChatReply:
     served_quantization: str
     finish_reason: str
     usage: dict = field(default_factory=dict)
+    # The model's own CONFIDENCE line (1-5), cut from `content`; set only while shadow mode is on.
+    confidence: int | None = None
 
     def describe(self) -> str:
         '''The call's metadata in one line, for log lines and exception messages.'''
@@ -190,6 +193,11 @@ async def chat_openrouter(
     '''One completion via the OpenRouter MCP server, recorded in the current Job Trace in full:
     prompt, reply or error, who served it, tokens, cost and latency (see _chat_openrouter).'''
     call_site = job_trace.caller_name()
+    shadowed = shadow.active()
+    if shadowed:
+        # Shadow Local Model: both models are asked for a confidence line, cut off again below
+        # so no caller ever sees it.
+        prompt = shadow.with_confidence_request(prompt)
     started = time.monotonic()
     try:
         reply = await _chat_openrouter(prompt, system, model, max_tokens, timeout_seconds, temperature)
@@ -197,10 +205,18 @@ async def chat_openrouter(
         job_trace.record('llm_call', transport='openrouter', call_site=call_site, model=model, system=system,
                          prompt=prompt, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
         raise
+    seconds = round(time.monotonic() - started, 2)
+    if shadowed:
+        content, confidence = shadow.split_confidence(reply.content)
+        reply = dataclasses.replace(reply, content=content, confidence=confidence)
+        shadow.enqueue(call_site=call_site, system=system, prompt=prompt, temperature=temperature, remote={
+            'model': model, 'served_model': reply.model, 'provider': reply.provider, 'content': content,
+            'confidence': confidence, 'finish_reason': reply.finish_reason, 'cost_usd': reply.cost_usd,
+            'seconds': seconds})
     job_trace.record('llm_call', transport='openrouter', call_site=call_site, model=model, system=system,
                      prompt=prompt, reply=reply.content, served_model=reply.model, provider=reply.provider,
                      quantization=reply.served_quantization, finish_reason=reply.finish_reason,
-                     usage=reply.usage, cost_usd=reply.cost_usd, seconds=round(time.monotonic() - started, 2))
+                     usage=reply.usage, cost_usd=reply.cost_usd, seconds=seconds, confidence=reply.confidence)
     return reply
 
 
@@ -352,8 +368,11 @@ async def _generate_local(
     *,
     purpose_slug: str,
     output_format: dict | None = None,
+    temperature: float | None = None,
 ) -> str:
     """One completion via the local Ollama MCP server. Returns the response text.
+
+    `temperature` None means LOCAL_LLM_TEMPERATURE.
 
     `output_format`, a JSON schema, constrains decoding so the reply always parses as it.
 
@@ -367,7 +386,8 @@ async def _generate_local(
     """
     try:
         args = {
-            'prompt': prompt, 'system': system, 'model': model, 'temperature': LOCAL_LLM_TEMPERATURE,
+            'prompt': prompt, 'system': system, 'model': model,
+            'temperature': LOCAL_LLM_TEMPERATURE if temperature is None else temperature,
             'service_name': LLM_LOCAL_SERVICE_NAME, 'purpose_slug': purpose_slug,
         }
         if max_tokens is not None:

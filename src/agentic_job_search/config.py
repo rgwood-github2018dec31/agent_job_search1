@@ -90,6 +90,7 @@ LLM_LOCAL_SERVICE_NAME = 'agent-job-search1'
 LLM_LOCAL_PURPOSE_TRIAGE = 'job-triage'
 LLM_LOCAL_PURPOSE_RATING = 'job-rating'
 LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY = 'reference-summary'
+LLM_LOCAL_PURPOSE_SHADOW = 'shadow-compare'
 # Wall-clock cap for one LLM call (chat/generate) through the shared MCP client. Its own default
 # (30s) is sized for quick sends like Telegram, and silently applied to every LLM call when this
 # repo moved onto it: a Stage 1b scraper round resending a conversation full of 30k-char snapshots
@@ -408,6 +409,9 @@ MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,)
 # like any model value (models.route_for) — an `mlx-lm-server:<org>/<repo>` name rides
 # the local Ollama MCP server (:8002) to the mlx-lm sidecar; see docs/architecture.md.
 RATING_MODEL_OVERRIDE: str | None = None
+# Run-scoped local model asked every single-turn remote question too (CLI --shadow-model, shadow.py).
+# None = off. Its answers are recorded and never read by the pipeline.
+SHADOW_MODEL: str | None = None
 # Reading amounts out of a compensation phrase is a PARSE, not a judgement — the deterministic
 # tiers in salary.py answer all but a few strings, and this only sees what they could not read.
 # Flash tier for that reason, and cached per string so a phrase is parsed once, ever.
