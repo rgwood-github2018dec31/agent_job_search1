@@ -4405,9 +4405,11 @@ def test_scraper_keeps_obstacle_handling_tools():
     obstacle_tools = (
         'fill_form', 'type', 'hover', 'select_option', 'handle_dialog', 'console_messages',
         # take_screenshot is the only way to SEE a block page / CAPTCHA / consent overlay that
-        # the accessibility tree renders uninformatively; find and press_key help work a
-        # restructured page. A silent zero-listing run costs more than the turns these burn.
-        'take_screenshot', 'find', 'press_key',
+        # the accessibility tree renders uninformatively; press_key helps work a restructured
+        # page. A silent zero-listing run costs more than the turns these burn. `find` was here
+        # too until 2026-11-06: on @playwright/mcp 0.0.84 all 16 of a run's calls left out the
+        # search text and failed, and the user chose to remove it (see SCRAPER_DISALLOWED_BROWSER_TOOLS).
+        'take_screenshot', 'press_key',
     )
     for tool in obstacle_tools:
         assert f'mcp__playwright__browser_{tool}' not in config.SCRAPER_DISALLOWED_BROWSER_TOOLS

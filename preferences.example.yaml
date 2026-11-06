@@ -162,6 +162,9 @@ pacing:
   # page_dwell_seconds and is scrolled page_scroll_steps times; inter_job_delay_seconds is the pause
   # before each job page. Raise them for a gentler pace, lower them for a faster run.
   page_dwell_seconds: [4.0, 11.0]
+  # The gap between two signed-out page requests (job and company pages, one plain HTTP GET each).
+  # LinkedIn answered 429 Too Many Requests after ~27 of them in 15 minutes.
+  signed_out_request_interval_seconds: [61.0, 66.0]
   page_scroll_steps: [2, 5]
   inter_job_delay_seconds: [1.5, 4.5]
 

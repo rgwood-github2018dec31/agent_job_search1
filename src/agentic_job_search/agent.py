@@ -180,6 +180,7 @@ from agentic_job_search.linkedin_page import (
 )
 from agentic_job_search.linkedin_signed_out import (
     SOURCE_SIGNED_OUT,
+    JobPagePrefetcher,
     read_company_page_signed_out,
     read_job_page_signed_out,
 )
@@ -2427,15 +2428,20 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
 
 # --job-and-company-pages-via: how Stage 2 reads job and company pages this run (LINKEDIN_PAGE_READERS), set once in main().
 _job_and_company_pages_via = LINKEDIN_PAGE_READER_DEFAULT
+# The signed-out read-ahead of this run's job pages, started before Stage 1b (run_non_interactive).
+_prefetcher: JobPagePrefetcher | None = None
 
 
 async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> JobPage | None:
     """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
     try:
-        await _human_pause(preferences.stage2_inter_job_delay_seconds(), f"the job page of {candidate.get('job_id')}")
         if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
-            page = await read_job_page_signed_out(candidate)
+            # Paced by linkedin_signed_out.pacer, not by the inter-job pause.
+            page = await (_prefetcher.page(candidate) if _prefetcher is not None
+                          else read_job_page_signed_out(candidate))
         else:
+            await _human_pause(preferences.stage2_inter_job_delay_seconds(),
+                               f"the job page of {candidate.get('job_id')}")
             async with mcp_session(playwright_mcp_url) as call:
                 page = await read_job_page(candidate, call, stage_stats)
         raw_txt = tools_module.raw_posting_path(candidate)
@@ -5746,6 +5752,7 @@ def _reset_run_state() -> None:
 
 async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0,
                               job_audit_enabled: bool = JOB_AUDIT_ENABLED, job_audit_job_id: str | None = None) -> None:
+    global _prefetcher
     # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
     # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
     if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
@@ -5803,6 +5810,11 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
             return
 
         console.print('[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n')
+        if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
+            # Signed-out pages are paced at about one a minute, so reading starts with the first job
+            # Stage 1b queues rather than after the search.
+            _prefetcher = JobPagePrefetcher(lambda: tools_module._candidates)
+            _prefetcher.start()
         await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats['scraping'], browser=browser)
 
         candidates = tools_module._candidates
@@ -5926,6 +5938,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 1 for f in audit_findings if f['verdict'] == 'FALSE NEGATIVE'
             )
     finally:
+        if _prefetcher is not None:
+            await _prefetcher.stop()
+            _prefetcher = None
         await browser.stop()
 
     chosen = job_audit.choose_job(candidates, job_audit_job_id, seed=int(start_time)) if job_audit_enabled else None

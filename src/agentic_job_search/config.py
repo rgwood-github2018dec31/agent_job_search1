@@ -362,6 +362,10 @@ SCRAPER_DISALLOWED_BROWSER_TOOLS = [
     'mcp__playwright__browser_navigate_back',
     'mcp__playwright__browser_close',
     'mcp__playwright__browser_run_code_unsafe',
+    # 2026-11-06, @playwright/mcp 0.0.84: every one of 16 calls in a run sent maxResults and a
+    # filename but neither `text` nor `regex`, and failed (0-3 correct calls per run on 0.0.83).
+    # Discovery never needed it: the harvest is one browser_evaluate.
+    'mcp__playwright__browser_find',
 ]
 # Never remove these — measured as load-bearing for discovery (guarded by a unit test).
 SCRAPER_REQUIRED_BROWSER_TOOLS = [
@@ -884,6 +888,8 @@ LINKEDIN_SIGNED_OUT_HEADERS = {
 # LinkedIn refuses a visitor it is rate-limiting with 429, or with its own non-standard 999.
 LINKEDIN_HTTP_STATUS_REFUSED = 999
 LINKEDIN_SIGNED_OUT_BLOCK_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, LINKEDIN_HTTP_STATUS_REFUSED})
+# How often the read-ahead looks for a newly queued job when it has none to read.
+SIGNED_OUT_PREFETCH_POLL_SECONDS = 2
 # A redirect to one of these means the page wants a signed-in member.
 LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES = ('/uas/login', '/login', '/authwall', '/checkpoint', '/signup')
 # Model lookups for the applied-job companies run together at load; one cheap call each, once ever.

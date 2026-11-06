@@ -99,6 +99,10 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
         'page_dwell_seconds': [4.0, 11.0],
         'page_scroll_steps': [2, 5],
         'inter_job_delay_seconds': [1.5, 4.5],
+        # The gap between two signed-out page requests (job or company page), drawn per request.
+        # Set by the user on 2026-11-06 after a 429 at ~27 requests in 15 minutes: 61 s plus a
+        # random 0-5 s. Paces every signed-out request, whichever stage asks for it.
+        'signed_out_request_interval_seconds': [61.0, 66.0],
     },
 }
 
@@ -594,6 +598,11 @@ def stage2_page_scroll_steps() -> tuple[int, int]:
         raise ValueError(f'{PREFERENCES_PATH}: `pacing.page_scroll_steps` must be whole numbers, '
                          f'got {[low, high]!r}')
     return int(low), int(high)
+
+
+def signed_out_request_interval_seconds() -> tuple[float, float]:
+    '''The gap between two signed-out LinkedIn page requests, as a (min, max) range in seconds.'''
+    return _pacing_range('signed_out_request_interval_seconds')
 
 
 def stage2_inter_job_delay_seconds() -> tuple[float, float]:

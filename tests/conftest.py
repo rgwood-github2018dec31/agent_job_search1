@@ -34,7 +34,8 @@ load_env()
 TEST_PREFERENCES = {
     # Stage 2's stay on each page and its pause between jobs, zeroed so the suite does not sleep
     # (see _no_human_pacing for the Stage 1b delays).
-    'pacing': {'page_dwell_seconds': [0, 0], 'inter_job_delay_seconds': [0, 0]},
+    'pacing': {'page_dwell_seconds': [0, 0], 'inter_job_delay_seconds': [0, 0],
+               'signed_out_request_interval_seconds': [0, 0]},
     # Deliberately nonexistent: every test passes an explicit directory, and this makes sure a
     # test that forgets to can never glob or rename PDFs in the developer's own ~/Downloads.
     'save_dir': '/nonexistent/test-save-dir',
