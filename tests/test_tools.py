@@ -6315,6 +6315,8 @@ def _stub_company_about(monkeypatch, about=None, error: Exception | None = None)
 
     monkeypatch.setattr(agent, 'mcp_session', fake_session)
     monkeypatch.setattr(agent, 'read_company_about', fake_read_about)
+    # The browser About-page path, off by default since 2026-11-06.
+    monkeypatch.setattr(agent, 'COMPANY_ABOUT_VIA_BROWSER', True)
     return visits
 
 
@@ -12460,6 +12462,8 @@ def about_visits(monkeypatch):
     monkeypatch.setattr(agent, 'mcp_session', fake_session)
     monkeypatch.setattr(agent, 'read_company_about', fake_read_about)
     monkeypatch.setattr(agent, '_human_pause', no_pause)
+    # These tests are about the browser About-page path, off by default since 2026-11-06.
+    monkeypatch.setattr(agent, 'COMPANY_ABOUT_VIA_BROWSER', True)
     monkeypatch.setattr(company_domain, 'identity_for_name', no_model)
     monkeypatch.setattr(tools, '_ui_alerts', [])
     return visits, results
@@ -12509,6 +12513,34 @@ async def test_a_page_that_reads_resets_the_count(about_visits):
         await agent.identify_poster(slug, _POSTER, 'http://x', stats)
     assert visits == [*bad, 'good', 'after']
     assert stats[agent.ABOUT_FAILURES_IN_A_ROW_KEY] == 0
+
+
+async def test_by_default_the_about_page_is_not_read_through_the_signed_in_browser(about_visits, monkeypatch):
+    '''Q6a, 2026-11-06: two runs in a row stopped on a Cloudflare block served on an About page.'''
+    visits, _results = about_visits
+    monkeypatch.setattr(agent, 'COMPANY_ABOUT_VIA_BROWSER', False)
+    assert await agent.identify_poster('acme', _POSTER, 'http://x', {}) is None
+    assert visits == []
+
+
+async def test_page_fetch_http_reads_the_public_company_page_and_never_the_browser(about_visits, monkeypatch):
+    visits, _results = about_visits
+    guest_visits = []
+
+    async def fake_guest(slug):
+        guest_visits.append(slug)
+        return linkedin_page.CompanyAbout(slug=slug, name='Acme', website='https://acme.example.com')
+
+    async def fake_record(slug, name, website, parent_name, parent_slug, stats):
+        return company_domain.CompanyIdentity(name, domain='acme.example.com', source='linkedin')
+
+    monkeypatch.setattr(agent, 'COMPANY_ABOUT_VIA_BROWSER', False)
+    monkeypatch.setattr(agent, '_page_fetch', agent.PAGE_FETCH_HTTP)
+    monkeypatch.setattr(agent, 'read_company_guest', fake_guest)
+    monkeypatch.setattr(company_domain, 'record_linkedin_identity', fake_record)
+    identity = await agent.identify_poster('acme', _POSTER, 'http://x', {})
+    assert identity.domain == 'acme.example.com'
+    assert guest_visits == ['acme'] and visits == []
 
 
 def test_the_failure_count_stays_out_of_the_public_cost_log():

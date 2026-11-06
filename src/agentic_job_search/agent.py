@@ -77,6 +77,7 @@ from agentic_job_search.config import (
     AUDIT_OPUS_SAMPLE_SIZE,
     COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES,
     COMPANY_ABOUT_PAGE_DELAY_SECONDS,
+    COMPANY_ABOUT_VIA_BROWSER,
     CONSOLE_BANNER_WIDTH,
     COST_DELTA_DISPLAY_TOLERANCE_USD,
     EXTRACT_CITED_FIELDS,
@@ -103,6 +104,9 @@ from agentic_job_search.config import (
     NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_RECRUITER_MARKER,
     NOTIFICATION_SALARY_MAX_CHARS,
+    PAGE_FETCH_BROWSER,
+    PAGE_FETCH_HTTP,
+    PAGE_FETCH_MODES,
     PLAYWRIGHT_LIVENESS_PROBE_TIMEOUT_SECONDS,
     PLAYWRIGHT_MAX_RESTARTS_PER_RUN,
     PLAYWRIGHT_MCP_PACKAGE,
@@ -160,6 +164,7 @@ from agentic_job_search.extract_openrouter import (
     extract_job_page_openrouter,
 )
 from agentic_job_search.gate_fields import ask_gate_fields
+from agentic_job_search.linkedin_guest import read_company_guest, read_job_page_guest
 from agentic_job_search.linkedin_page import (
     HeaderCard,
     JobPage,
@@ -2415,12 +2420,19 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
     )
 
 
+# --page-fetch: how Stage 2 reads job and company pages this run (PAGE_FETCH_MODES), set once in main().
+_page_fetch = PAGE_FETCH_BROWSER
+
+
 async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> JobPage | None:
     """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
     try:
         await _human_pause(preferences.stage2_inter_job_delay_seconds(), f"the job page of {candidate.get('job_id')}")
-        async with mcp_session(playwright_mcp_url) as call:
-            page = await read_job_page(candidate, call, stage_stats)
+        if _page_fetch == PAGE_FETCH_HTTP:
+            page = await read_job_page_guest(candidate)
+        else:
+            async with mcp_session(playwright_mcp_url) as call:
+                page = await read_job_page(candidate, call, stage_stats)
         raw_txt = tools_module.raw_posting_path(candidate)
         raw_html = raw_txt.with_suffix('.html')
         job_trace.record('page_read', url=candidate.get('url'), source=page.source if page else None,
@@ -2432,6 +2444,8 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
                          raw_posting=str(raw_txt), raw_posting_bytes=raw_txt.stat().st_size if raw_txt.exists() else None,
                          text=page.model_text if page else '')
         return page
+    except LinkedInBlockedError:
+        raise
     except Exception as ex:
         job_trace.record('page_read', url=candidate.get('url'), error=unwrap_exception(ex))
         logger.warning(
@@ -2459,10 +2473,17 @@ async def identify_poster(
     if failures_in_a_row >= COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES:
         logger.debug(f'Company identity: About page reads are stopped for this run, skipping {slug}')
         return None
-    await _human_pause(COMPANY_ABOUT_PAGE_DELAY_SECONDS, f'the LinkedIn About page of {slug}')
+    if _page_fetch != PAGE_FETCH_HTTP and not COMPANY_ABOUT_VIA_BROWSER:
+        logger.debug(f"Company identity: {slug} ({candidate['company']}) by name; the About page is not read "
+                     'through the signed-in browser (COMPANY_ABOUT_VIA_BROWSER), and --page-fetch is not http')
+        return None
+    await _human_pause(COMPANY_ABOUT_PAGE_DELAY_SECONDS, f'the LinkedIn company page of {slug}')
     try:
-        async with mcp_session(playwright_mcp_url) as call:
-            about = await read_company_about(slug, call)
+        if _page_fetch == PAGE_FETCH_HTTP:
+            about = await read_company_guest(slug)
+        else:
+            async with mcp_session(playwright_mcp_url) as call:
+                about = await read_company_about(slug, call)
     except LinkedInBlockedError:
         raise
     except NotAnAboutPageError as ex:
@@ -2499,7 +2520,7 @@ async def extract_job_page_direct(
         page = await read_page(candidate, playwright_mcp_url, stage_stats)
         if page is None:
             return None
-    what = ('the text of a job posting page, read and de-cluttered by code' if page.source == 'dom'
+    what = ('the text of a job posting page, read and de-cluttered by code' if page.source in ('dom', 'guest')
             else 'an accessibility snapshot of a job posting page')
     prompt = (
         f'Below is {what}. Extract the facts it states into the structured output; leave a field '
@@ -6154,6 +6175,15 @@ async def main() -> None:
              "e.g. an 'mlx-lm-server:<org>/<repo>' name. Compare with scripts/shadow_report.py.",
     )
     parser.add_argument(
+        '--page-fetch',
+        choices=PAGE_FETCH_MODES,
+        default=PAGE_FETCH_BROWSER,
+        help='How Stage 2 reads job pages and company pages: through the signed-in browser (default; '
+             'company pages are then not read, and the company is identified by name), or "http": one '
+             'cookie-free GET of the public page each, never touching the account. The public job page '
+             'has no Remote/Hybrid badge, so the workplace comes from the description',
+    )
+    parser.add_argument(
         '--audit-opus',
         nargs='?',
         type=int,
@@ -6187,6 +6217,10 @@ async def main() -> None:
     )
     args = parser.parse_args()
     interactive = not (args.non_interactive or args.job_ids)
+    global _page_fetch
+    _page_fetch = args.page_fetch
+    if _page_fetch == PAGE_FETCH_HTTP:
+        logger.info('Stage 2 reads job and company pages signed out, one HTTP GET each (--page-fetch http)')
 
     if args.status:
         console.print(tools_module.describe_run_status())
