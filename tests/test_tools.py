@@ -12728,3 +12728,27 @@ async def test_a_card_ruled_out_job_is_not_queued(monkeypatch):
         tools.set_card_rejection(None)
     assert tools._candidates == []
     assert tools._queue_skipped_counts == {'on-site card (card_filter.skip_onsite)': 1}
+
+
+async def test_record_listings_counts_a_card_skip_as_skipped_not_queued(monkeypatch):
+    '''2026-11-06: a card-skipped listing was also counted (and its id listed) as queued.'''
+    async def new(*args, **kwargs):
+        return {'content': [{'type': 'text', 'text': 'new'}]}
+
+    async def rule_out_on_site(title, card_location):
+        return 'on-site card (card_filter.skip_onsite)' if 'On-site' in card_location else ''
+
+    monkeypatch.setattr(tools, 'do_check_and_record_job', new)
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_queue_skipped_counts', {})
+    monkeypatch.setattr(tools, '_listing_records', {})
+    tools.set_card_rejection(rule_out_on_site)
+    try:
+        summary = await tools.do_record_listings([
+            {'id': '1', 'title': 'AI Engineer', 'company': 'Acme', 'location': 'Paris (On-site)'},
+            {'id': '2', 'title': 'AI Engineer', 'company': 'Acme', 'location': 'Paris (Remote)'},
+        ], query='AI Engineer')
+    finally:
+        tools.set_card_rejection(None)
+    assert [c['job_id'] for c in tools._candidates] == ['2']
+    assert '1 queued' in summary and '1 skipped by title or card' in summary

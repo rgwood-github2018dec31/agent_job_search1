@@ -2278,13 +2278,15 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
         if status == 'already_applied':
             applied_companies.append(str(job.get('company') or ''))
         if status == 'new':
+            before = len(_candidates)
             await do_queue_candidate(
                 'linkedin', job_id, job_url('linkedin', job_id), str(job.get('title') or ''),
                 str(job.get('company') or ''), str(job.get('location') or ''),
                 date_posted=str(job.get('posted') or '') or None, query=query,
             )
-            queued += 1
-            queued_ids.append(job_id)
+            if len(_candidates) > before:   # a title or card skip is counted as skipped, not queued
+                queued += 1
+                queued_ids.append(job_id)
     skipped = sum(_queue_skipped_counts.values()) - before_skips
     cap_note = f' (capped from {len(usable)})' if len(usable) > len(capped) else ''
     parts = ', '.join(f'{count} {status}' for status, count in sorted(tally.items()))
@@ -2302,9 +2304,9 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
     )
     queued_note = f' linkedin={",".join(queued_ids)}' if queued_ids else ''
     logger.info(f'record_listings: {len(capped)}{cap_note} recorded — {logged_parts}; '
-                f'{queued} queued{queued_note}, {skipped} skipped by title')
+                f'{queued} queued{queued_note}, {skipped} skipped by title or card')
     return (f'recorded {len(capped)}{cap_note}: {parts}. {queued} queued, '
-            f'{skipped} skipped by title. Continue with the next search.')
+            f'{skipped} skipped by title or card. Continue with the next search.')
 
 
 # --- Tool wrappers (SDK @tool decorators delegate to the implementations above) ---
