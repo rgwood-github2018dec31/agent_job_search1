@@ -3694,15 +3694,20 @@ def _folded_names(classified: dict) -> list[str]:
 async def may_be_within(place: str, area: str) -> bool:
     '''Whether a job listed at `place` may be done in `area` (Reject Card-Ruled-Out Job).
 
-    Yes when `place` lies in `area` ("Vancouver, BC" in Vancouver: `area` is among the place's
-    names), or when `place` is a wider area holding it ("Canada", "British Columbia": the place's
-    own name, listed first, is among `area`'s names). The classifier lists a place's names from
-    the most specific out (Vancouver, British Columbia, Canada).
+    Yes when `place` lies in `area` ("Vancouver, BC" in Vancouver: `area`'s own name is among the
+    place's names), or when `place` is a wider area holding it ("Canada", "British Columbia": the
+    place's own name is among `area`'s names). Either way the place's country, its outermost name,
+    must be among `area`'s names too: a shared town name is not the same place (2026-11-06:
+    Richmond, Virginia matched Richmond, British Columbia; Vancouver, Washington would have matched
+    Vancouver). The classifier lists a place's names from the most specific out (Vancouver, British
+    Columbia, Canada).
     '''
     place_names = _folded_names(await classify_location(place))
     area_names = _folded_names(await classify_location(area))
+    if not place_names or not area_names or place_names[-1] not in area_names:
+        return False
     folded_area = ' '.join(area.split()).casefold()
-    return bool(place_names) and (folded_area in place_names or place_names[0] in area_names)
+    return folded_area in place_names or area_names[0] in place_names or place_names[0] in area_names
 
 
 async def card_rejection_reason(title: str, card_location: str) -> str:

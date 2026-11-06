@@ -12655,6 +12655,10 @@ CARD_NAMES = {   # classify_location's place_names, most specific first
     'Canada': ['Canada'],
     'Toronto, Ontario, Canada': ['Toronto', 'Ontario', 'Canada'],
     'Paris': ['Paris', 'Île-de-France', 'France'],
+    'Richmond, British Columbia': ['Richmond', 'British Columbia', 'Colombie-Britannique', 'Canada'],
+    'Richmond, British Columbia, Canada': ['Richmond', 'British Columbia', 'Canada'],
+    'Richmond, Virginia, United States': ['Richmond', 'Virginia', 'United States'],
+    'Vancouver, Washington, United States': ['Vancouver', 'Washington', 'United States'],
 }
 
 
@@ -12666,7 +12670,7 @@ def card_filter(monkeypatch):
 
     monkeypatch.setattr(agent, 'classify_location', classify)
     monkeypatch.setattr(preferences, 'card_skip_onsite', lambda: True)
-    monkeypatch.setattr(preferences, 'card_hybrid_only_in', lambda: ('Vancouver',))
+    monkeypatch.setattr(preferences, 'card_hybrid_only_in', lambda: ('Vancouver', 'Richmond, British Columbia'))
 
 
 @pytest.mark.parametrize('card', ['Vancouver, British Columbia, Canada (On-site)', 'Paris (On-site)'])
@@ -12681,6 +12685,9 @@ async def test_every_on_site_card_is_skipped(card_filter, card):
     ('Canada (Hybrid)', True),
     ('Toronto, Ontario, Canada (Hybrid)', False),
     ('Paris (Hybrid)', False),
+    ('Richmond, British Columbia, Canada (Hybrid)', True),
+    ('Richmond, Virginia, United States (Hybrid)', False),      # a shared town name, another country
+    ('Vancouver, Washington, United States (Hybrid)', False),
     ('Somewhere Unknown (Hybrid)', True),          # the classifier cannot name it: read the page
 ])
 async def test_a_hybrid_card_is_read_only_where_it_may_be_in_a_listed_place(card_filter, card, read):
