@@ -88,6 +88,27 @@ def test_siblings_under_one_parent_do_not_match():
     assert not identities_match(candidate, applied)
 
 
+def test_a_company_on_the_posters_affiliated_pages_matches():
+    '''Q10c, 2026-11-06: the public page lists affiliated pages without saying which is the parent,
+    and an application to any of them counts. kpmg-canada lists KPMG, KPMG Québec, KPMG Law Canada.'''
+    poster = CompanyIdentity('KPMG Canada', domain='kpmg.ca', source='linkedin',
+                             affiliated=('KPMG', 'KPMG Québec', 'KPMG Law Canada'))
+    assert identities_match(poster, CompanyIdentity('KPMG Québec', source='model'))
+    assert identities_match(CompanyIdentity('KPMG Law Canada', source='model'), CompanyIdentity(
+        'Other', source='model', affiliated=('KPMG Law Canada',)))
+    assert not identities_match(poster, CompanyIdentity('Deloitte', domain='deloitte.com', source='model'))
+
+
+async def test_affiliated_pages_are_cached_and_read_back(monkeypatch):
+    async def no_model(name, stage_stats=None):
+        return CompanyIdentity(name, source='none')
+
+    monkeypatch.setattr(company_domain, 'identity_for_name', no_model)
+    await company_domain.record_linkedin_identity(
+        'kpmg-canada', 'KPMG Canada', 'https://kpmg.com/ca', '', '', affiliated=('KPMG', 'KPMG Québec'))
+    assert company_domain.cached_identity_for_slug('kpmg-canada').affiliated == ('KPMG', 'KPMG Québec')
+
+
 def test_same_named_but_different_domains_do_not_match():
     assert not identities_match(CompanyIdentity('Cohere Health', domain='coherehealth.com', source='model'),
                                 CompanyIdentity('Cohere', domain='cohere.com', source='model'))

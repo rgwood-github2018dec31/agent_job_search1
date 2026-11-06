@@ -15,7 +15,9 @@ What a signed-out visitor sees, measured on 2026-11-06 (Auxo Talent, job 4482929
   ago" where the signed-in page says "6 days ago").
 - `/company/<slug>/about/` redirects a visitor to the login page; `/company/<slug>/` does not, and
   states the Website. Its "Affiliated pages" do not say which one is the parent, so
-  `CompanyAbout.parent_*` stay '' and the model fills what the name says.
+  `CompanyAbout.parent_*` stay '' (the model fills what the name says), and every affiliated page
+  is kept in `CompanyAbout.affiliated`, each matching as the same organization (Match Applied
+  Company).
 
 The public markup is matched on its readable BEM class names and `data-test-id`s (`top-card-layout__
 title`, `about-us__website`), which have been stable for years, unlike the signed-in page's hashed
@@ -86,6 +88,8 @@ _WEBSITE_SELECTOR = '[data-test-id="about-us__website"]'
 # Outbound links: /redir/redirect?url=… on the public page, /safety/go?url=… on the signed-in one.
 _REDIRECT_PATHS = ('/redir/redirect', '/safety/go')
 _REDIRECT_TARGET_KEY = 'url'
+# Each "Affiliated pages" entry is a link tracked under exactly this name ("…_show_more" is the toggle).
+_AFFILIATED_TRACKING_NAME = 'affiliated-pages'
 
 
 class GuestPageError(RuntimeError):
@@ -252,7 +256,18 @@ def parse_company_guest(soup: BeautifulSoup, slug: str) -> CompanyAbout:
         target = outbound_target(str(link['href']))
         if target.startswith(('http://', 'https://')):
             about.website = target
+    about.affiliated = affiliated_pages(soup)
     return about
+
+
+def affiliated_pages(soup: BeautifulSoup) -> tuple[str, ...]:
+    '''The names on "Affiliated pages", in page order, each once. The page does not say which is the parent.'''
+    names: dict[str, None] = {}
+    for link in soup.find_all('a', attrs={'data-tracking-control-name': _AFFILIATED_TRACKING_NAME}):
+        lines = list(link.stripped_strings)
+        if lines and (name := norm(lines[0])):
+            names.setdefault(name, None)
+    return tuple(names)
 
 
 def outbound_target(href: str) -> str:
@@ -264,7 +279,7 @@ def outbound_target(href: str) -> str:
 
 
 async def read_company_guest(slug: str) -> CompanyAbout:
-    '''Fetch the public company page and read its name and Website (never a parent; see the module doc).
+    '''Fetch the public company page: its name, Website and affiliated pages (never a parent; see the module doc).
 
     Raises LinkedInBlockedError on a challenge, NotAnAboutPageError when the page is not a company
     page (kept in COMPANY_ABOUT_FAILURES_DIR), GuestPageError on a transport or HTTP failure.

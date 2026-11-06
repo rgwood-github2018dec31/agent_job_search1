@@ -19,9 +19,12 @@ entry marked `source: manual` is never overwritten. A failed lookup is never cac
 exception: a slug whose page loaded but was not an About page is marked `about_page_unreadable`, so
 it is not visited again. That is not an identity, and removing the entry by hand allows a retry.
 
-The match itself is decided in code (`identities_match`): same name, same domain, or one company
-the other's parent. Two siblings under one parent do not match: applying to one regional arm of a
-group says nothing about another arm that only shares its owner.
+The match itself is decided in code (`identities_match`): same name, same domain, one company
+the other's parent, or one listed among the other's LinkedIn "Affiliated pages". Two siblings that
+only share a parent do not match: applying to one regional arm of a group says nothing about
+another arm that only shares its owner. An affiliated page is the exception, by the user's choice
+(2026-11-06): the public company page lists them without saying which is the parent, and an
+application to any one of them counts for the poster.
 """
 
 import logging
@@ -43,6 +46,8 @@ logger = logging.getLogger(__name__)
 COMPANY_IDENTITY_CACHE_PATH = RUN_DIR / 'company_identities.yaml'
 
 # Bumped when a field is added to a cached entry; an entry under an older schema is a miss.
+# Not bumped for `affiliated` (2026-11-06): an entry without it reads as no affiliated pages, which
+# is what it meant before, and a bump would discard every identity already read off LinkedIn.
 CACHE_SCHEMA_VERSION = 1
 
 SOURCE_LINKEDIN = 'linkedin'
@@ -105,6 +110,7 @@ class CompanyIdentity:
     parent_name: str = ''
     parent_domain: str = ''
     source: str = SOURCE_NONE
+    affiliated: tuple[str, ...] = ()   # names on the LinkedIn page's "Affiliated pages", as written
 
     def own_keys(self) -> set[str]:
         return _keys(self.name, self.domain)
@@ -112,9 +118,13 @@ class CompanyIdentity:
     def parent_keys(self) -> set[str]:
         return _keys(self.parent_name, self.parent_domain)
 
+    def affiliated_keys(self) -> set[str]:
+        return {key for name in self.affiliated for key in _keys(name, '')}
+
     def describe(self) -> str:
         parent = f', parent {self.parent_name or "?"} ({self.parent_domain or "?"})' if self.parent_keys() else ''
-        return f'{self.name} ({self.domain or "no domain"}{parent}; {self.source})'
+        affiliated = f', affiliated {", ".join(self.affiliated)}' if self.affiliated else ''
+        return f'{self.name} ({self.domain or "no domain"}{parent}{affiliated}; {self.source})'
 
 
 def _keys(name: str, domain: str) -> set[str]:
@@ -127,10 +137,14 @@ def _keys(name: str, domain: str) -> set[str]:
 
 
 def identities_match(candidate: CompanyIdentity, applied: CompanyIdentity) -> bool:
-    '''Same organization, or one is the other's parent. Siblings under one parent do not match.'''
+    '''Same organization, one the other's parent, or one on the other's affiliated pages.
+
+    Siblings that only share a parent do not match; an affiliated page does (see the module doc).
+    '''
     own, parent = candidate.own_keys(), candidate.parent_keys()
     applied_own, applied_parent = applied.own_keys(), applied.parent_keys()
-    return bool(own & applied_own or own & applied_parent or parent & applied_own)
+    return bool(own & applied_own or own & applied_parent or parent & applied_own
+                or candidate.affiliated_keys() & applied_own or own & applied.affiliated_keys())
 
 
 # --- Cache -------------------------------------------------------------------------------------
@@ -169,6 +183,7 @@ def _identity_from_entry(name: str, entry: dict) -> CompanyIdentity:
         parent_name=str(entry.get('parent_name') or ''),
         parent_domain=registrable_domain(str(entry.get('parent_domain') or '')),
         source=str(entry.get('source') or SOURCE_NONE),
+        affiliated=tuple(str(name) for name in entry.get('affiliated') or () if name),
     )
 
 
@@ -253,7 +268,7 @@ async def identity_for_name(name: str, stage_stats: dict | None = None) -> Compa
 
 async def record_linkedin_identity(
     slug: str, name: str, website: str, parent_name: str, parent_slug: str,
-    stage_stats: dict | None = None,
+    stage_stats: dict | None = None, affiliated: tuple[str, ...] = (),
 ) -> CompanyIdentity:
     '''Store what a company's About page states, filling only its gaps from the model.
 
@@ -270,6 +285,8 @@ async def record_linkedin_identity(
         'parent_name': parent_name, 'parent_slug': parent_slug, 'parent_domain': '',
         'resolved_on': date.today().isoformat(),
     }
+    if affiliated:
+        entry['affiliated'] = list(affiliated)
     if not entry['domain'] or not entry['parent_name'] or not entry['parent_domain']:
         try:
             model = await identity_for_name(name, stage_stats)

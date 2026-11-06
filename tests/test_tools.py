@@ -12531,7 +12531,7 @@ async def test_page_fetch_http_reads_the_public_company_page_and_never_the_brows
         guest_visits.append(slug)
         return linkedin_page.CompanyAbout(slug=slug, name='Acme', website='https://acme.example.com')
 
-    async def fake_record(slug, name, website, parent_name, parent_slug, stats):
+    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=()):
         return company_domain.CompanyIdentity(name, domain='acme.example.com', source='linkedin')
 
     monkeypatch.setattr(agent, 'COMPANY_ABOUT_VIA_BROWSER', False)

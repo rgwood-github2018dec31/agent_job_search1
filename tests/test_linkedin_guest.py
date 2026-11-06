@@ -41,8 +41,14 @@ COMPANY_HTML = '''<html><head><title>Auxo Talent | LinkedIn</title></head><body>
 <dl><div data-test-id="about-us__website"><dt>Website</dt><dd>
 <a href="https://www.linkedin.com/redir/redirect?url=http%3A%2F%2Fwww%2Eauxotalent%2Ecom&amp;urlhash=6BLl">
 http://www.auxotalent.com</a></dd></div></dl></section>
-<section><h2>Affiliated pages</h2><a href="https://uk.linkedin.com/company/rp-international?trk=affiliated-pages">
-RP International</a></section></main></body></html>'''
+<section><h2>Affiliated pages</h2>
+<a href="https://uk.linkedin.com/company/rp-international?trk=affiliated-pages" data-tracking-control-name="affiliated-pages">
+<h3>RP International</h3><p>Staffing and Recruiting</p><p>London, London</p></a>
+<a href="https://uk.linkedin.com/company/jenrick-e?trk=affiliated-pages" data-tracking-control-name="affiliated-pages">
+<h3>Jenrick</h3><p>Staffing and Recruiting</p></a>
+<button data-tracking-control-name="affiliated-pages_show_more">Show more affiliated pages</button></section>
+<section><h2>Similar pages</h2><a href="https://www.linkedin.com/company/monzo?trk=similar-pages"
+data-tracking-control-name="similar-pages"><h3>Monzo</h3></a></section></main></body></html>'''
 
 
 class FakeResponse:
@@ -143,6 +149,7 @@ async def test_a_public_company_page_gives_the_name_and_the_unwrapped_website(se
     about = await lg.read_company_guest('auxotalent')
     assert (about.name, about.website) == ('Auxo Talent', 'http://www.auxotalent.com')
     assert about.parent_name == ''   # affiliated pages do not say which is the parent
+    assert about.affiliated == ('RP International', 'Jenrick')   # never the similar pages
 
 
 async def test_a_company_page_redirected_to_login_is_not_a_company_page(served):

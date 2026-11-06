@@ -168,6 +168,9 @@ class CompanyAbout:
     website: str = ''
     parent_name: str = ''
     parent_slug: str = ''
+    # The public page's "Affiliated pages", unlabelled: parent, subsidiaries and sister pages
+    # alike. Each counts as the same organization when matching (2026-11-06, the user's choice).
+    affiliated: tuple[str, ...] = ()
 
 
 class NotAnAboutPageError(RuntimeError):
