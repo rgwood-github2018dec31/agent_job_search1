@@ -862,17 +862,20 @@ COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS = 3
 COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES = 3
 # The About page is no longer read through the logged-in browser (2026-11-06): the runs of 11-04 and
 # 11-05 both stopped within two minutes of Stage 2 on a Cloudflare block served on an About page.
-# With --page-fetch http the public company page is read signed out instead (linkedin_guest); with
-# the browser, the company is identified by name. True restores the logged-in About page read.
-COMPANY_ABOUT_VIA_BROWSER = False
+# By default the public company page is read signed out instead (linkedin_signed_out); with
+# `--job-and-company-pages-via signed-in-browser`, the company is identified by name. True restores the logged-in About
+# page read on that setting.
+COMPANY_ABOUT_PAGE_VIA_SIGNED_IN_BROWSER = False
 
-# Signed-out page reads (linkedin_guest, --page-fetch http): one cookie-free GET per page.
-PAGE_FETCH_BROWSER = 'browser'
-PAGE_FETCH_HTTP = 'http'
-PAGE_FETCH_MODES = (PAGE_FETCH_BROWSER, PAGE_FETCH_HTTP)
-LINKEDIN_GUEST_FETCH_TIMEOUT_SECONDS = 30
+# How Stage 2 reads a job page and a company page (--job-and-company-pages-via). Signed out is the default since
+# 2026-11-06: one cookie-free HTTP GET per page (linkedin_signed_out), with no browser and no account.
+LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET = 'signed-out-http-get'
+LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER = 'signed-in-browser'
+LINKEDIN_PAGE_READERS = (LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET, LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER)
+LINKEDIN_PAGE_READER_DEFAULT = LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET
+LINKEDIN_SIGNED_OUT_FETCH_TIMEOUT_SECONDS = 30
 # A desktop browser's ordinary request headers; without a browser User-Agent LinkedIn serves a stub.
-LINKEDIN_GUEST_HEADERS = {
+LINKEDIN_SIGNED_OUT_HEADERS = {
     'User-Agent': ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) '
                    'Chrome/130.0 Safari/537.36'),
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -880,9 +883,9 @@ LINKEDIN_GUEST_HEADERS = {
 }
 # LinkedIn refuses a visitor it is rate-limiting with 429, or with its own non-standard 999.
 LINKEDIN_HTTP_STATUS_REFUSED = 999
-LINKEDIN_GUEST_BLOCK_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, LINKEDIN_HTTP_STATUS_REFUSED})
+LINKEDIN_SIGNED_OUT_BLOCK_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, LINKEDIN_HTTP_STATUS_REFUSED})
 # A redirect to one of these means the page wants a signed-in member.
-LINKEDIN_GUEST_LOGIN_PATH_PREFIXES = ('/uas/login', '/login', '/authwall', '/checkpoint', '/signup')
+LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES = ('/uas/login', '/login', '/authwall', '/checkpoint', '/signup')
 # Model lookups for the applied-job companies run together at load; one cheap call each, once ever.
 COMPANY_IDENTITY_LOOKUP_CONCURRENCY = 8
 # Hosts that serve many unrelated organizations' pages, so their domain identifies nobody and is

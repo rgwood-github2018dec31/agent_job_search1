@@ -9,6 +9,7 @@ from pathlib import Path
 import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools
 import pytest
+import requests
 from agentic_job_search import (
     agent,
     company_domain,
@@ -208,6 +209,23 @@ def fake_classify(text):
         'place_names': list(dict.fromkeys(place_names)),
         'source': 'stub',
     }
+
+
+@pytest.fixture(autouse=True)
+def _no_real_linkedin_request(request, monkeypatch):
+    '''A unit test never reaches LinkedIn. Job and company pages are read with a plain GET by
+    default (2026-11-06), so a test that forgets to stub the read would otherwise fetch a real page.
+    Other hosts pass through; `network`-marked tests are exempt.'''
+    if request.node.get_closest_marker('network'):
+        return
+    real_get = requests.get
+
+    def guarded_get(url, *args, **kwargs):
+        if 'linkedin.com' in str(url):
+            raise AssertionError(f'a unit test made a real LinkedIn request: GET {url}')
+        return real_get(url, *args, **kwargs)
+
+    monkeypatch.setattr(requests, 'get', guarded_get)
 
 
 @pytest.fixture(autouse=True)

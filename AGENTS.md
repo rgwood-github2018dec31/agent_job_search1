@@ -121,7 +121,7 @@ python main.py -n --audit-opus 2  # Non-interactive + re-rate 2 un-surfaced jobs
 python main.py -n --no-version-check  # Skip the startup check for a newer @playwright/mcp than the pin
 python main.py -n --job-audit 4480376713  # Render the end-of-run Job Audit PDF for this job (default: a random rated one)
 python main.py -n --no-job-audit       # Skip the end-of-run Job Audit PDF
-python main.py -n --page-fetch http    # Stage 2 reads job and company pages signed out (plain HTTP), never through the account
+python main.py -n --job-and-company-pages-via signed-in-browser  # Stage 2 reads job pages through the account (default: signed-out HTTP GET)
 python main.py -n --shadow-model mlx-lm-server:<org>/<repo>  # Data collection: a local model answers every single-turn remote call too (run_dir/shadow_calls/)
 python main.py --job-ids FILE  # Diagnostic: rate the listed LinkedIn job ids (job_id[<TAB>title<TAB>company]) into run_dir/replays/; no dedup records, no Telegram
 
@@ -157,7 +157,7 @@ src/agentic_job_search/
   job_audit.py                    # Write Job Audit: choose one rated job per run, render its trace as a PDF
   rating_inputs.py                # Record Rating Inputs: save each part of the rater's input once, for the trace to link
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
-  linkedin_guest.py               # Read Public LinkedIn Page: job and company pages signed out, one cookie-free GET each (--page-fetch http)
+  linkedin_signed_out.py          # Read LinkedIn Page Signed Out: job and company pages, one cookie-free HTTP GET each (the default)
   minimal_archive.py              # The de-cluttered page as small self-contained .min.html + .min.pdf beside the full archive
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent

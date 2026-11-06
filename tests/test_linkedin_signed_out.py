@@ -1,4 +1,4 @@
-'''Read Public LinkedIn Page: a job page and a company page fetched signed out, one GET each.
+'''Read LinkedIn Page Signed Out: a job page and a company page fetched signed out, one GET each.
 
 The fixtures mirror the public markup measured on 2026-11-06 (job 4482929457, company auxotalent).
 '''
@@ -6,8 +6,8 @@ from http import HTTPStatus
 
 import pytest
 import requests
-from agentic_job_search import linkedin_guest as lg
 from agentic_job_search import linkedin_page
+from agentic_job_search import linkedin_signed_out as lg
 from agentic_job_search.config import LINKEDIN_HTTP_STATUS_REFUSED, LINKEDIN_JOB_DESCRIPTION_HEADING
 
 JOB_URL = 'https://www.linkedin.com/jobs/view/4482929457/'
@@ -79,8 +79,8 @@ def served(monkeypatch):
 async def test_a_public_job_page_is_read_into_the_signed_in_shape(served):
     pages, requested = served
     pages[JOB_URL] = FakeResponse(JOB_HTML)
-    page = await lg.read_job_page_guest(CANDIDATE)
-    assert page.source == lg.SOURCE_GUEST
+    page = await lg.read_job_page_signed_out(CANDIDATE)
+    assert page.source == lg.SOURCE_SIGNED_OUT
     assert page.header.title == 'Senior Data Scientist' and page.header.company == 'Auxo Talent'
     assert page.header.location == 'Poland' and page.header.posted == '1 week ago'
     assert page.header.employment_type == 'Contract'
@@ -93,16 +93,16 @@ async def test_a_public_job_page_is_read_into_the_signed_in_shape(served):
     assert any(line.endswith(LINKEDIN_JOB_DESCRIPTION_HEADING) for line in lines)
     assert 'Employment type: Contract' in page.model_text
     # Never a cookie: the request carries the fixed headers and nothing else.
-    assert requested == [(JOB_URL, {'headers': lg.LINKEDIN_GUEST_HEADERS})]
+    assert requested == [(JOB_URL, {'headers': lg.LINKEDIN_SIGNED_OUT_HEADERS})]
 
 
 async def test_the_public_job_page_is_archived_without_scripts_or_images(served, tmp_path):
     pages, _ = served
     pages[JOB_URL] = FakeResponse(JOB_HTML)
-    await lg.read_job_page_guest(CANDIDATE)
+    await lg.read_job_page_signed_out(CANDIDATE)
     archived = linkedin_page.raw_html_path(CANDIDATE).read_text(encoding='utf-8')
     assert '<script' not in archived and 'media.licdn.com/logo.png' not in archived
-    assert 'source: guest' in archived
+    assert f'source: {lg.SOURCE_SIGNED_OUT}' in archived
     assert linkedin_page.raw_html_path(CANDIDATE).with_suffix('.txt').exists()
 
 
@@ -111,42 +111,42 @@ async def test_a_refusing_status_is_a_challenge_and_stops_the_run(served, status
     pages, _ = served
     pages[JOB_URL] = FakeResponse('', status=status)
     with pytest.raises(linkedin_page.LinkedInBlockedError, match=str(int(status))):
-        await lg.read_job_page_guest(CANDIDATE)
+        await lg.read_job_page_signed_out(CANDIDATE)
 
 
 async def test_a_job_page_redirected_to_login_is_a_challenge(served):
     pages, _ = served
     pages[JOB_URL] = FakeResponse('<html></html>', url='https://www.linkedin.com/authwall?trk=x')
     with pytest.raises(linkedin_page.LinkedInBlockedError, match='authwall'):
-        await lg.read_job_page_guest(CANDIDATE)
+        await lg.read_job_page_signed_out(CANDIDATE)
 
 
 async def test_a_page_without_the_job_that_shows_a_block_phrase_is_a_challenge(served):
     pages, _ = served
     pages[JOB_URL] = FakeResponse('<html><body><h1>Sorry, you have been blocked</h1></body></html>')
     with pytest.raises(linkedin_page.LinkedInBlockedError, match='you have been blocked'):
-        await lg.read_job_page_guest(CANDIDATE)
+        await lg.read_job_page_signed_out(CANDIDATE)
 
 
 async def test_a_page_without_the_job_and_no_block_phrase_is_an_ordinary_failure(served):
     pages, _ = served
     pages[JOB_URL] = FakeResponse('<html><body><h1>Something else</h1></body></html>')
-    with pytest.raises(lg.GuestPageError, match='top-card-layout__title'):
-        await lg.read_job_page_guest(CANDIDATE)
+    with pytest.raises(lg.SignedOutPageError, match='top-card-layout__title'):
+        await lg.read_job_page_signed_out(CANDIDATE)
 
 
 async def test_a_transport_failure_names_the_url(served):
     pages, _ = served
     pages[JOB_URL] = requests.ConnectionError('reset by peer')
-    with pytest.raises(lg.GuestPageError, match=f'GET {JOB_URL} failed: ConnectionError: reset by peer'):
-        await lg.read_job_page_guest(CANDIDATE)
+    with pytest.raises(lg.SignedOutPageError, match=f'GET {JOB_URL} failed: ConnectionError: reset by peer'):
+        await lg.read_job_page_signed_out(CANDIDATE)
 
 
 async def test_a_public_company_page_gives_the_name_and_the_unwrapped_website(served):
     pages, _ = served
     url = 'https://www.linkedin.com/company/auxotalent/'
     pages[url] = FakeResponse(COMPANY_HTML, url=url)
-    about = await lg.read_company_guest('auxotalent')
+    about = await lg.read_company_page_signed_out('auxotalent')
     assert (about.name, about.website) == ('Auxo Talent', 'http://www.auxotalent.com')
     assert about.parent_name == ''   # affiliated pages do not say which is the parent
     assert about.affiliated == ('RP International', 'Jenrick')   # never the similar pages
@@ -158,7 +158,7 @@ async def test_a_company_page_redirected_to_login_is_not_a_company_page(served):
     pages[url] = FakeResponse('<html><title>LinkedIn Login</title></html>',
                               url='https://www.linkedin.com/uas/login?session_redirect=x')
     with pytest.raises(linkedin_page.NotAnAboutPageError, match='uas/login'):
-        await lg.read_company_guest('nobody')
+        await lg.read_company_page_signed_out('nobody')
 
 
 async def test_a_company_page_without_the_about_section_is_kept_and_rejected(served):
@@ -166,14 +166,14 @@ async def test_a_company_page_without_the_about_section_is_kept_and_rejected(ser
     url = 'https://www.linkedin.com/company/odd/'
     pages[url] = FakeResponse('<html><title>Odd</title><body><h1>Odd</h1></body></html>', url=url)
     with pytest.raises(linkedin_page.NotAnAboutPageError, match='saved at'):
-        await lg.read_company_guest('odd')
+        await lg.read_company_page_signed_out('odd')
 
 
 @pytest.mark.network
 async def test_live_public_pages_still_have_the_expected_markup():
     '''One GET each of a real public job page and company page; fails when LinkedIn changes the markup.'''
     try:
-        about = await lg.read_company_guest('linkedin')
-    except lg.GuestPageError as ex:
+        about = await lg.read_company_page_signed_out('linkedin')
+    except lg.SignedOutPageError as ex:
         pytest.skip(f'LinkedIn unreachable: {ex}')
     assert about.name == 'LinkedIn' and 'linkedin.com' in about.website

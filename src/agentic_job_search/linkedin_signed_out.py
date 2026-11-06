@@ -3,8 +3,9 @@
 Why (2026-11-06): two runs in a row (11-04, 11-05) stopped within two minutes of Stage 2 starting,
 on a Cloudflare "you have been blocked" page served to the logged-in browser on a company About
 page. Both pages are public: a job page (`/jobs/view/<id>/`) and a company page (`/company/<slug>/`)
-load without signing in, so reading them needs neither the browser nor the account. `--page-fetch
-http` reads them this way; the default stays the logged-in browser for the job page.
+load without signing in, so reading them needs neither the browser nor the account. This is the
+default (`--job-and-company-pages-via`, LINKEDIN_PAGE_READER_DEFAULT); the signed-in browser
+remains available for the job page.
 
 What a signed-out visitor sees, measured on 2026-11-06 (Auxo Talent, job 4482929457):
 
@@ -25,7 +26,7 @@ classes, which are never matched. A missing element is a markup change: the read
 page kept, and the caller falls back as for any failed read.
 
 A challenge stops the run exactly as on the browser path (LinkedInBlockedError): an HTTP status in
-`LINKEDIN_GUEST_BLOCK_STATUSES`, a redirect to a login or checkpoint page for a job page, or a
+`LINKEDIN_SIGNED_OUT_BLOCK_STATUSES`, a redirect to a login or checkpoint page for a job page, or a
 UI_BLOCK_SIGNATURES phrase on a page without the expected content. No cookies are ever sent.
 '''
 import asyncio
@@ -42,11 +43,11 @@ from agentic_job_search import minimal_archive, tools_generic
 from agentic_job_search.config import (
     LINKEDIN_COMPANY_URL,
     LINKEDIN_EMPLOYMENT_TYPES,
-    LINKEDIN_GUEST_BLOCK_STATUSES,
-    LINKEDIN_GUEST_FETCH_TIMEOUT_SECONDS,
-    LINKEDIN_GUEST_HEADERS,
-    LINKEDIN_GUEST_LOGIN_PATH_PREFIXES,
     LINKEDIN_JOB_DESCRIPTION_HEADING,
+    LINKEDIN_SIGNED_OUT_BLOCK_STATUSES,
+    LINKEDIN_SIGNED_OUT_FETCH_TIMEOUT_SECONDS,
+    LINKEDIN_SIGNED_OUT_HEADERS,
+    LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES,
 )
 from agentic_job_search.linkedin_page import (
     _COMPANY_SLUG_RE,
@@ -70,7 +71,7 @@ from agentic_job_search.text_budget import snippet
 
 logger = logging.getLogger(__name__)
 
-SOURCE_GUEST = 'guest'   # JobPage.source on this path
+SOURCE_SIGNED_OUT = 'signed_out'   # JobPage.source on this path
 _TITLE_SELECTOR = '.top-card-layout__title'
 _TOP_CARD_SELECTOR = '.top-card-layout'
 _COMPANY_LINK_SELECTOR = '.topcard__org-name-link'
@@ -92,27 +93,27 @@ _REDIRECT_TARGET_KEY = 'url'
 _AFFILIATED_TRACKING_NAME = 'affiliated-pages'
 
 
-class GuestPageError(RuntimeError):
+class SignedOutPageError(RuntimeError):
     '''The public page could not be fetched or did not have the expected content. Not a challenge.'''
 
 
 def _get(url: str, what: str) -> requests.Response:
-    '''One cookie-free GET. Raises LinkedInBlockedError on a challenge status, GuestPageError otherwise.'''
+    '''One cookie-free GET. Raises LinkedInBlockedError on a challenge status, SignedOutPageError otherwise.'''
     try:
-        resp = requests.get(url, headers=LINKEDIN_GUEST_HEADERS, timeout=LINKEDIN_GUEST_FETCH_TIMEOUT_SECONDS)
+        resp = requests.get(url, headers=LINKEDIN_SIGNED_OUT_HEADERS, timeout=LINKEDIN_SIGNED_OUT_FETCH_TIMEOUT_SECONDS)
     except requests.RequestException as ex:
-        raise GuestPageError(f'{what}: GET {url} failed: {type(ex).__name__}: {ex}') from ex
-    if resp.status_code in LINKEDIN_GUEST_BLOCK_STATUSES:
+        raise SignedOutPageError(f'{what}: GET {url} failed: {type(ex).__name__}: {ex}') from ex
+    if resp.status_code in LINKEDIN_SIGNED_OUT_BLOCK_STATUSES:
         raise LinkedInBlockedError(f'{what}: GET {url} returned HTTP {resp.status_code} {resp.reason}, LinkedIn '
                                    f'refusing a signed-out visitor; body: {snippet(resp.text)!r}')
     if resp.status_code != HTTPStatus.OK:
-        raise GuestPageError(f'{what}: GET {url} returned HTTP {resp.status_code} {resp.reason}; '
+        raise SignedOutPageError(f'{what}: GET {url} returned HTTP {resp.status_code} {resp.reason}; '
                              f'body: {snippet(resp.text)!r}')
     return resp
 
 
 def _redirected_to_login(resp: requests.Response) -> bool:
-    return urlparse(resp.url).path.startswith(LINKEDIN_GUEST_LOGIN_PATH_PREFIXES)
+    return urlparse(resp.url).path.startswith(LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES)
 
 
 def _raise_if_challenge(soup: BeautifulSoup, url: str, what: str, html: str, keep_as: str = '') -> None:
@@ -128,12 +129,12 @@ def _text(root: Tag, selector: str) -> str:
     return norm(el.get_text(' ')) if el is not None else ''
 
 
-def guest_header(soup: BeautifulSoup) -> HeaderCard:
-    '''The public top card. Raises GuestPageError when it has no title (not a job page, or new markup).'''
+def signed_out_header(soup: BeautifulSoup) -> HeaderCard:
+    '''The public top card. Raises SignedOutPageError when it has no title (not a job page, or new markup).'''
     title = _text(soup, _TITLE_SELECTOR)
     if not title:
-        raise GuestPageError(f'no {_TITLE_SELECTOR} on the page')
-    criteria = guest_criteria(soup)
+        raise SignedOutPageError(f'no {_TITLE_SELECTOR} on the page')
+    criteria = signed_out_criteria(soup)
     employment = criteria.get(_CRITERIA_EMPLOYMENT_LABEL, '')
     salary = _text(soup, _SALARY_SELECTOR)
     card = soup.select_one(_TOP_CARD_SELECTOR)
@@ -147,7 +148,7 @@ def guest_header(soup: BeautifulSoup) -> HeaderCard:
     )
 
 
-def guest_criteria(soup: BeautifulSoup) -> dict[str, str]:
+def signed_out_criteria(soup: BeautifulSoup) -> dict[str, str]:
     '''The criteria list under the description: label -> value, as written.'''
     criteria = {}
     for item in soup.select(_CRITERIA_ITEM_SELECTOR):
@@ -157,7 +158,7 @@ def guest_criteria(soup: BeautifulSoup) -> dict[str, str]:
     return criteria
 
 
-def guest_company_slug(soup: BeautifulSoup) -> str:
+def signed_out_company_slug(soup: BeautifulSoup) -> str:
     link = soup.select_one(_COMPANY_LINK_SELECTOR)
     m = _COMPANY_SLUG_RE.search(str(link.get('href', ''))) if link is not None else None
     return m.group('slug') if m else ''
@@ -199,7 +200,7 @@ def _fetch_job(url: str, job_id: str) -> tuple[str, str]:
     return resp.text, resp.url
 
 
-async def read_job_page_guest(candidate: dict) -> JobPage:
+async def read_job_page_signed_out(candidate: dict) -> JobPage:
     '''Fetch the public job page and return what the extractor reads, archived like the browser path.'''
     job_id = str(candidate.get('job_id') or '')
     url = str(candidate['url'])
@@ -207,38 +208,38 @@ async def read_job_page_guest(candidate: dict) -> JobPage:
     soup = BeautifulSoup(html, 'lxml')
     description = soup.select_one(_DESCRIPTION_SELECTOR)
     try:
-        header = guest_header(soup)
+        header = signed_out_header(soup)
         if description is None:
-            raise GuestPageError(f'no {_DESCRIPTION_SELECTOR} on the page')
-    except GuestPageError as ex:
+            raise SignedOutPageError(f'no {_DESCRIPTION_SELECTOR} on the page')
+    except SignedOutPageError as ex:
         _raise_if_challenge(soup, url, f'job {job_id}', html)
-        raise GuestPageError(f'job {job_id}: {url} ({final_url}, {len(html):,} chars) is not a readable public '
+        raise SignedOutPageError(f'job {job_id}: {url} ({final_url}, {len(html):,} chars) is not a readable public '
                              f'job page: {ex}') from ex
-    criteria = guest_criteria(soup)
-    company_slug = guest_company_slug(soup)
+    criteria = signed_out_criteria(soup)
+    company_slug = signed_out_company_slug(soup)
     company = header.company or str(candidate.get('company') or '')
     doc = reading_document(header, criteria, description)
 
     strip_js(soup)
     html_path = raw_html_path(candidate)
     asset_counts = localize_assets(soup, None, html_path)   # no logo kept: every image blanked
-    archive_meta = {'url': url, 'job_id': job_id, 'company': company, 'source': SOURCE_GUEST,
+    archive_meta = {'url': url, 'job_id': job_id, 'company': company, 'source': SOURCE_SIGNED_OUT,
                     'captured': datetime.now().isoformat(timespec='seconds'), 'dom_chars': len(html)}
     save_raw_html(candidate, soup, archive_meta)
 
     main = doc.main
     text = '\n'.join(line for line in (norm(s) for s in main.get_text('\n').split('\n')) if line)
     markdown = minimal_archive.to_markdown(main)
-    tools_generic.save_raw_posting(candidate, markdown, SOURCE_GUEST, len(markdown))
+    tools_generic.save_raw_posting(candidate, markdown, SOURCE_SIGNED_OUT, len(markdown))
     await minimal_archive.save_minimal_archive(doc, html_path, archive_meta, [])
     logger.debug(f'Job page {job_id} (signed out): {len(html):,} chars → {len(text):,} chars of text; '
                  f'assets {asset_counts}')
-    return JobPage(text=text, source=SOURCE_GUEST, company_slug=company_slug, listed_location=header.location,
+    return JobPage(text=text, source=SOURCE_SIGNED_OUT, company_slug=company_slug, listed_location=header.location,
                    header=header, posting_company=company, dom_chars=len(html),
                    removed_chars=len(html) - len(text), markdown=markdown)
 
 
-def parse_company_guest(soup: BeautifulSoup, slug: str) -> CompanyAbout:
+def parse_company_page_signed_out(soup: BeautifulSoup, slug: str) -> CompanyAbout:
     '''Name and Website from the public company page. Raises NotAnAboutPageError when it is not one.
 
     A company page is one with the "About us" section; its <h1> is the name.
@@ -278,11 +279,11 @@ def outbound_target(href: str) -> str:
     return href
 
 
-async def read_company_guest(slug: str) -> CompanyAbout:
+async def read_company_page_signed_out(slug: str) -> CompanyAbout:
     '''Fetch the public company page: its name, Website and affiliated pages (never a parent; see the module doc).
 
     Raises LinkedInBlockedError on a challenge, NotAnAboutPageError when the page is not a company
-    page (kept in COMPANY_ABOUT_FAILURES_DIR), GuestPageError on a transport or HTTP failure.
+    page (kept in COMPANY_ABOUT_FAILURES_DIR), SignedOutPageError on a transport or HTTP failure.
     '''
     url = LINKEDIN_COMPANY_URL.format(slug=slug)
     resp = await asyncio.to_thread(_get, url, f'company {slug}')
@@ -291,7 +292,7 @@ async def read_company_guest(slug: str) -> CompanyAbout:
                                   'signed-in members may see)')
     soup = BeautifulSoup(resp.text, 'lxml')
     try:
-        return parse_company_guest(soup, slug)
+        return parse_company_page_signed_out(soup, slug)
     except NotAnAboutPageError as ex:
         _raise_if_challenge(soup, url, f'company {slug}', resp.text, keep_as=slug)
         raise NotAnAboutPageError(f'{ex}; {url}, {len(resp.text)} chars, '
