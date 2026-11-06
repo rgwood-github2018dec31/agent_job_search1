@@ -181,3 +181,23 @@ def test_a_reply_off_the_schema_is_refused(reply):
 def test_relocation_needs_a_known_basis():
     with pytest.raises(ValueError, match='basis'):
         gate_fields.parse_answer('relocation', _reply('Canada', ['Canada'], basis='because'))
+
+
+async def test_a_quoted_header_fact_from_the_search_card_is_grounded(monkeypatch, countries):
+    '''2026-11-06 (Sii, Mapbox): the signed-out page never says "Remote"; the workplace came from the
+    "(Remote)" search card, and the model quoted it as the header fact it was told. Not a hallucination.'''
+    replies = _hybrid_replies()
+    replies['relocation'] = [_reply('Canada', ['Canada', 'remote'], basis='remote_place_only')]
+    _fake_chat(monkeypatch, replies)
+    extract = {}
+    answers = await gate_fields.ask_gate_fields({}, extract, _page(location='Canada', workplace='remote'), {})
+    assert not answers['relocation'].rejected
+    assert extract['relocation'] == 'Canada'
+
+
+async def test_the_header_facts_sentence_itself_grounds_nothing(monkeypatch, countries):
+    replies = _hybrid_replies()
+    replies['language_requirement'] = [_reply('german', ['workplace type'])]
+    _fake_chat(monkeypatch, replies)
+    answers = await gate_fields.ask_gate_fields({}, {}, _page(), {})
+    assert answers['language_requirement'].rejected

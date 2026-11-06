@@ -212,7 +212,12 @@ async def ask_gate_fields(candidate: dict, extract: dict, page: JobPage, stage_s
     Returns field -> Answer, also recorded as the `gate_fields` Job Trace step.
     '''
     page_text = page.model_text
-    facts = header_facts(page.header.location or page.listed_location, page.header.workplace)
+    location, workplace = page.header.location or page.listed_location, page.header.workplace
+    facts = header_facts(location, workplace)
+    # A quote of a header fact is grounded too: the workplace may come from the search card, not the page
+    # (Read LinkedIn Page Signed Out), and the prompt asks for header facts to be quoted (2026-11-06: Sii,
+    # Mapbox: "remote" from a "(Remote)" card was rejected as not on the signed-out page).
+    grounding_text = '\n'.join([page_text, *(value for value in (location, workplace) if value)])
     subject = f"job {candidate.get('job_id')} {candidate.get('company')}"
     results = await asyncio.gather(*(ask_field(f, page_text, facts, stage_stats) for f in GATE_FIELDS),
                                    return_exceptions=True)
@@ -225,7 +230,7 @@ async def ask_gate_fields(candidate: dict, extract: dict, page: JobPage, stage_s
             answers[field_name] = answer
             continue
         answer = result
-        ground(answer, page_text)
+        ground(answer, grounding_text)
         if answer.rejected:
             evidence.count_rejection(CALL_SITE, field_name)
             logger.warning(
