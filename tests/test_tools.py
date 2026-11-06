@@ -12645,58 +12645,79 @@ async def test_rate_job_override_falls_back_to_the_proven_chain(monkeypatch):
     assert result['rated_by'] == agent.MODEL_NAME_RATING_FALLBACKS[0]
 
 
-# --- Reject Card-Ruled-Out Job (2026-11-06): an On-site/Hybrid card in an excluded place -------------
+# --- Reject Card-Ruled-Out Job (2026-11-06): skip On-site cards; Hybrid only where it may be near ---
+
+CARD_NAMES = {   # classify_location's place_names, most specific first
+    'Vancouver': ['Vancouver', 'British Columbia', 'Canada'],
+    'Vancouver, British Columbia, Canada': ['Vancouver', 'British Columbia', 'Canada'],
+    'Greater Vancouver Metropolitan Area': ['Greater Vancouver', 'Vancouver', 'British Columbia', 'Canada'],
+    'British Columbia, Canada': ['British Columbia', 'Canada'],
+    'Canada': ['Canada'],
+    'Toronto, Ontario, Canada': ['Toronto', 'Ontario', 'Canada'],
+    'Paris': ['Paris', 'Île-de-France', 'France'],
+}
+
 
 @pytest.fixture
-def card_places(monkeypatch):
-    '''rejected_location stubbed: `excluded[place]` is its reason; records the places it was asked.'''
-    asked: list[str] = []
-    excluded: dict[str, str | Exception] = {}
+def card_filter(monkeypatch):
+    '''The user's card filter on, and a classifier that knows CARD_NAMES (empty for anything else).'''
+    async def classify(text):
+        return {'place_names': CARD_NAMES.get(text, [])}
 
-    async def fake_rejected(text, *, residency_spare='none'):
-        asked.append(text)
-        reason = excluded.get(text, '')
-        if isinstance(reason, Exception):
-            raise reason
-        return reason
-
-    monkeypatch.setattr(agent, 'rejected_location', fake_rejected)
-    return asked, excluded
+    monkeypatch.setattr(agent, 'classify_location', classify)
+    monkeypatch.setattr(preferences, 'card_skip_onsite', lambda: True)
+    monkeypatch.setattr(preferences, 'card_hybrid_only_in', lambda: ('Vancouver',))
 
 
-@pytest.mark.parametrize('card', ['Paris (Hybrid)', 'Paris (On-site)'])
-async def test_an_attended_card_in_an_excluded_place_is_ruled_out(card_places, card):
-    asked, excluded = card_places
-    excluded['Paris'] = 'France'
-    reason = await agent.card_rejection_reason('AI Engineer', card)
-    assert 'excluded location: France' in reason and asked == ['Paris']
+@pytest.mark.parametrize('card', ['Vancouver, British Columbia, Canada (On-site)', 'Paris (On-site)'])
+async def test_every_on_site_card_is_skipped(card_filter, card):
+    assert 'on-site' in await agent.card_rejection_reason('AI Engineer', card)
+
+
+@pytest.mark.parametrize('card, read', [
+    ('Vancouver, British Columbia, Canada (Hybrid)', True),
+    ('Greater Vancouver Metropolitan Area (Hybrid)', True),
+    ('British Columbia, Canada (Hybrid)', True),   # a wider area that holds Vancouver: may be there
+    ('Canada (Hybrid)', True),
+    ('Toronto, Ontario, Canada (Hybrid)', False),
+    ('Paris (Hybrid)', False),
+    ('Somewhere Unknown (Hybrid)', True),          # the classifier cannot name it: read the page
+])
+async def test_a_hybrid_card_is_read_only_where_it_may_be_in_a_listed_place(card_filter, card, read):
+    assert (await agent.card_rejection_reason('AI Engineer', card) == '') is read
 
 
 @pytest.mark.parametrize('card', ['Paris (Remote)', 'Paris', ''])
-async def test_a_remote_or_unbadged_card_is_never_ruled_out_by_its_place(card_places, card):
-    asked, excluded = card_places
-    excluded['Paris'] = 'France'
+async def test_a_remote_or_unbadged_card_is_always_read(card_filter, card):
     assert await agent.card_rejection_reason('AI Engineer', card) == ''
-    assert asked == []
 
 
-async def test_a_failed_card_check_reads_the_page(card_places, caplog):
-    _asked, excluded = card_places
-    excluded['Paris'] = RuntimeError('classifier down')
+async def test_with_the_filter_off_nothing_is_skipped(monkeypatch):
+    monkeypatch.setattr(preferences, 'card_skip_onsite', lambda: False)
+    monkeypatch.setattr(preferences, 'card_hybrid_only_in', lambda: ())
+    for card in ('Paris (On-site)', 'Paris (Hybrid)'):
+        assert await agent.card_rejection_reason('AI Engineer', card) == ''
+
+
+async def test_a_failed_card_check_reads_the_page(card_filter, monkeypatch, caplog):
+    async def broken(text):
+        raise RuntimeError('classifier down')
+
+    monkeypatch.setattr(agent, 'classify_location', broken)
     assert await agent.card_rejection_reason('AI Engineer', 'Paris (Hybrid)') == ''
     assert 'reading the page instead' in caplog.text
 
 
 async def test_a_card_ruled_out_job_is_not_queued(monkeypatch):
     async def rule_out(title, card_location):
-        return 'hybrid card in an excluded location: France'
+        return 'on-site card (card_filter.skip_onsite)'
 
     monkeypatch.setattr(tools, '_candidates', [])
     monkeypatch.setattr(tools, '_queue_skipped_counts', {})
     tools.set_card_rejection(rule_out)
     try:
-        await tools.do_queue_candidate('linkedin', '1', 'https://x/1', 'AI Engineer', 'Acme', 'Paris (Hybrid)')
+        await tools.do_queue_candidate('linkedin', '1', 'https://x/1', 'AI Engineer', 'Acme', 'Paris (On-site)')
     finally:
         tools.set_card_rejection(None)
     assert tools._candidates == []
-    assert tools._queue_skipped_counts == {'hybrid card in an excluded location: France': 1}
+    assert tools._queue_skipped_counts == {'on-site card (card_filter.skip_onsite)': 1}

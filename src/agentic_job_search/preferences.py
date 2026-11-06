@@ -88,6 +88,14 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
         # [{'name': ..., 'reason': ..., 'added': 'YYYY-MM-DD'}]; empty = no company is blocked
         'blacklist': [],
     },
+    # Reject Card-Ruled-Out Job (2026-11-06): what the search card alone rules out, before the job's
+    # page is read (a signed-out page costs about a minute). `skip_onsite` skips every On-site card;
+    # `hybrid_only_in` reads a Hybrid card only when its place may be within one of these places
+    # (empty: every Hybrid card is read). Remote and unbadged cards are always read.
+    'card_filter': {
+        'skip_onsite': False,
+        'hybrid_only_in': [],
+    },
     # Stage 2 reading pace (2026-11-04). Each job and About page used to be left 3 s after it loaded,
     # never scrolled, and the next job page followed as soon as processing allowed (median ~25 s
     # apart, as little as 2 s): a fixed, scroll-free dwell is itself a robotic signature. After its
@@ -251,6 +259,19 @@ def not_yet_bucketed() -> tuple[str, ...]:
     no other: it cannot reject a job by appending to it.
     """
     return _places('not_yet_bucketed')
+
+
+def card_skip_onsite() -> bool:
+    '''Whether a job whose search card says On-site is skipped before its page is read.'''
+    value = load_preferences()['card_filter']['skip_onsite']
+    if not isinstance(value, bool):
+        raise ValueError(f'{PREFERENCES_PATH}: `card_filter.skip_onsite` must be true or false, got {value!r}')
+    return value
+
+
+def card_hybrid_only_in() -> tuple[str, ...]:
+    '''Places a Hybrid search card's place must possibly be within for the job to be read; () = all.'''
+    return tuple(str(p).strip() for p in load_preferences()['card_filter']['hybrid_only_in'] if str(p).strip())
 
 
 def would_commute_here() -> tuple[str, ...]:

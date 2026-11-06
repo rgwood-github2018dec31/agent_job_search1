@@ -890,8 +890,10 @@ LINKEDIN_HTTP_STATUS_REFUSED = 999
 LINKEDIN_SIGNED_OUT_BLOCK_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, LINKEDIN_HTTP_STATUS_REFUSED})
 # Company pages are looked up in the Wayback Machine first (2026-11-06, the user's choice: read
 # LinkedIn itself only when no archive has the page). archive.today, the user's first pick, did
-# not answer from this machine: TCP connected and the TLS handshake never completed, on both
-# archive.is and archive.ph. A copy older than COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS is not used: a
+# not answer this program: TCP connected and the TLS handshake never completed, on both archive.is
+# and archive.ph, from Python and from curl, while the same site loads in Firefox and Chrome on the
+# same machine (the user, 2026-11-06). So it refuses non-browser clients, not this network; using
+# it would need a client it accepts. A copy older than COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS is not used: a
 # Website or an affiliated page can change.
 WAYBACK_AVAILABILITY_URL = 'https://archive.org/wayback/available'
 # `id_` asks for the page as captured, without the Wayback toolbar or rewritten links.

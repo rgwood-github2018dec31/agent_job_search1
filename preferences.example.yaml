@@ -156,6 +156,15 @@ companies:
   #     reason: bad Glassdoor reviews
   #     added: 2026-01-01
 
+card_filter:
+  # Skip a job on its search card alone, before its page is read (each signed-out page costs about a
+  # minute). skip_onsite skips every On-site card. hybrid_only_in reads a Hybrid card only when its
+  # place may be within one of these places ("Canada" may be within Vancouver; "Toronto" is not);
+  # empty reads every Hybrid card. Remote cards are always read.
+  skip_onsite: false
+  hybrid_only_in: []
+  # hybrid_only_in: [Example City]
+
 pacing:
   # How Stage 2 reads each LinkedIn page, as [min, max] ranges drawn uniformly (a fixed interval is
   # itself a robotic signature). After its capture a job or company About page stays open for

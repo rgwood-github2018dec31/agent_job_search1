@@ -3687,28 +3687,49 @@ def residency_spare(extract: dict) -> str:
     return {'country_only': 'none', 'area_wide': 'any_area'}.get(derive_residency_scope(extract), 'eu_only')
 
 
-# The card badges whose place alone can rule a job out: the job is done there (2026-11-06, the
-# user's choice). A Remote card never is: where a remote job may be done is in its description.
-CARD_ATTENDED_WORKPLACES = ('onsite', 'hybrid')
+def _folded_names(classified: dict) -> list[str]:
+    return [' '.join(str(name).split()).casefold() for name in classified.get('place_names') or [] if str(name).strip()]
+
+
+async def may_be_within(place: str, area: str) -> bool:
+    '''Whether a job listed at `place` may be done in `area` (Reject Card-Ruled-Out Job).
+
+    Yes when `place` lies in `area` ("Vancouver, BC" in Vancouver: `area` is among the place's
+    names), or when `place` is a wider area holding it ("Canada", "British Columbia": the place's
+    own name, listed first, is among `area`'s names). The classifier lists a place's names from
+    the most specific out (Vancouver, British Columbia, Canada).
+    '''
+    place_names = _folded_names(await classify_location(place))
+    area_names = _folded_names(await classify_location(area))
+    folded_area = ' '.join(area.split()).casefold()
+    return bool(place_names) and (folded_area in place_names or place_names[0] in area_names)
 
 
 async def card_rejection_reason(title: str, card_location: str) -> str:
     '''Why the search card alone rules this job out, or '' to read its page (Reject Card-Ruled-Out Job).
 
-    Only an On-site or Hybrid card, judged as Stage 2 judges an attended job: rejected_location on
-    the card's place, nothing spared. Fails open: a classifier failure reads the page.
+    An On-site card when `card_filter.skip_onsite`; a Hybrid card whose place may not be within any
+    `card_filter.hybrid_only_in` place. Fails open: a place the classifier cannot name, or a failed
+    check, reads the page.
     '''
     workplace = card_workplace(card_location)
-    if workplace not in CARD_ATTENDED_WORKPLACES:
+    if workplace == 'onsite' and preferences.card_skip_onsite():
+        return 'on-site card (card_filter.skip_onsite)'
+    areas = preferences.card_hybrid_only_in()
+    if workplace != 'hybrid' or not areas:
         return ''
     place = card_place(card_location)
     try:
-        reason = await rejected_location(place, residency_spare='none')
+        if not _folded_names(await classify_location(place)):
+            return ''
+        for area in areas:
+            if await may_be_within(place, area):
+                return ''
     except Exception as ex:
         logger.warning(f'Card check for {title!r} ({card_location!r}) failed, reading the page instead: '
                        f'{unwrap_exception(ex)}')
         return ''
-    return f'{workplace} card in an excluded location: {reason}' if reason else ''
+    return f'hybrid card outside card_filter.hybrid_only_in: {place}'
 
 
 async def location_rejection_reason(extract: dict) -> str:
