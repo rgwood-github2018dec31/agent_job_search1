@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
@@ -2179,11 +2180,26 @@ async def do_check_and_record_job(
     return _result('new')
 
 
+# Reject Card-Ruled-Out Job (2026-11-06): set by the run to a check of the search card alone (title
+# and card location, e.g. 'Paris (Hybrid)'), returning the reason to skip the job before its page is
+# read, or ''. A signed-out page costs about a minute, so a job the card already rules out is not read.
+CardRejection = Callable[[str, str], Awaitable[str]]
+_card_rejection: CardRejection | None = None
+
+
+def set_card_rejection(check: CardRejection | None) -> None:
+    global _card_rejection
+    _card_rejection = check
+
+
 async def do_queue_candidate(
     site: str, job_id: str, url: str, title: str, company: str,
     snippet: str, date_posted: str | None = None, query: str | None = None,
 ) -> dict:
-    if (reason := title_rejection_reason(title)):
+    reason = title_rejection_reason(title)
+    if not reason and _card_rejection is not None:
+        reason = await _card_rejection(title, snippet)
+    if reason:
         _queue_skipped_counts[reason] = _queue_skipped_counts.get(reason, 0) + 1
         if (record := _listing_records.get((site, job_id))) is not None:
             record['outcome'] = 'queue_skipped'

@@ -12535,7 +12535,7 @@ async def test_signed_out_reads_the_public_company_page_and_never_the_browser(ab
         signed_out_visits.append(slug)
         return linkedin_page.CompanyAbout(slug=slug, name='Acme', website='https://acme.example.com')
 
-    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=()):
+    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=(), page_url=''):
         return company_domain.CompanyIdentity(name, domain='acme.example.com', source='linkedin')
 
     monkeypatch.setattr(agent, 'COMPANY_ABOUT_PAGE_VIA_SIGNED_IN_BROWSER', False)
@@ -12643,3 +12643,60 @@ async def test_rate_job_override_falls_back_to_the_proven_chain(monkeypatch):
     assert calls == [override, agent.MODEL_NAME_RATING_FALLBACKS[0]]
     assert result['rating'] == 3
     assert result['rated_by'] == agent.MODEL_NAME_RATING_FALLBACKS[0]
+
+
+# --- Reject Card-Ruled-Out Job (2026-11-06): an On-site/Hybrid card in an excluded place -------------
+
+@pytest.fixture
+def card_places(monkeypatch):
+    '''rejected_location stubbed: `excluded[place]` is its reason; records the places it was asked.'''
+    asked: list[str] = []
+    excluded: dict[str, str | Exception] = {}
+
+    async def fake_rejected(text, *, residency_spare='none'):
+        asked.append(text)
+        reason = excluded.get(text, '')
+        if isinstance(reason, Exception):
+            raise reason
+        return reason
+
+    monkeypatch.setattr(agent, 'rejected_location', fake_rejected)
+    return asked, excluded
+
+
+@pytest.mark.parametrize('card', ['Paris (Hybrid)', 'Paris (On-site)'])
+async def test_an_attended_card_in_an_excluded_place_is_ruled_out(card_places, card):
+    asked, excluded = card_places
+    excluded['Paris'] = 'France'
+    reason = await agent.card_rejection_reason('AI Engineer', card)
+    assert 'excluded location: France' in reason and asked == ['Paris']
+
+
+@pytest.mark.parametrize('card', ['Paris (Remote)', 'Paris', ''])
+async def test_a_remote_or_unbadged_card_is_never_ruled_out_by_its_place(card_places, card):
+    asked, excluded = card_places
+    excluded['Paris'] = 'France'
+    assert await agent.card_rejection_reason('AI Engineer', card) == ''
+    assert asked == []
+
+
+async def test_a_failed_card_check_reads_the_page(card_places, caplog):
+    _asked, excluded = card_places
+    excluded['Paris'] = RuntimeError('classifier down')
+    assert await agent.card_rejection_reason('AI Engineer', 'Paris (Hybrid)') == ''
+    assert 'reading the page instead' in caplog.text
+
+
+async def test_a_card_ruled_out_job_is_not_queued(monkeypatch):
+    async def rule_out(title, card_location):
+        return 'hybrid card in an excluded location: France'
+
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_queue_skipped_counts', {})
+    tools.set_card_rejection(rule_out)
+    try:
+        await tools.do_queue_candidate('linkedin', '1', 'https://x/1', 'AI Engineer', 'Acme', 'Paris (Hybrid)')
+    finally:
+        tools.set_card_rejection(None)
+    assert tools._candidates == []
+    assert tools._queue_skipped_counts == {'hybrid card in an excluded location: France': 1}

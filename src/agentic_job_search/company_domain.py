@@ -268,7 +268,7 @@ async def identity_for_name(name: str, stage_stats: dict | None = None) -> Compa
 
 async def record_linkedin_identity(
     slug: str, name: str, website: str, parent_name: str, parent_slug: str,
-    stage_stats: dict | None = None, affiliated: tuple[str, ...] = (),
+    stage_stats: dict | None = None, affiliated: tuple[str, ...] = (), page_url: str = '',
 ) -> CompanyIdentity:
     '''Store what a company's About page states, filling only its gaps from the model.
 
@@ -287,6 +287,8 @@ async def record_linkedin_identity(
     }
     if affiliated:
         entry['affiliated'] = list(affiliated)
+    if page_url:
+        entry['page'] = page_url   # an archived copy of the page, not LinkedIn itself
     if not entry['domain'] or not entry['parent_name'] or not entry['parent_domain']:
         try:
             model = await identity_for_name(name, stage_stats)

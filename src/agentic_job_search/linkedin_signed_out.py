@@ -30,6 +30,9 @@ set by the user after a 429 at ~27 requests in 15 minutes, 2026-11-06). At that 
 pages take about a minute each, so JobPagePrefetcher starts reading them while Stage 1b is still
 searching, in the order the search queues them; Stage 2 takes each page as it reaches the job.
 
+A company page is looked up in the Wayback Machine first and read from LinkedIn only when no
+recent archived copy parses (COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS); the archive has its own pacer.
+
 The workplace the public page lacks is taken from the search card, which carries it after the
 location ("Warsaw (Remote)").
 
@@ -44,7 +47,7 @@ import random
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from urllib.parse import parse_qs, urlparse
 
@@ -53,6 +56,8 @@ from bs4 import BeautifulSoup, Tag
 
 from agentic_job_search import minimal_archive, preferences, tools_generic
 from agentic_job_search.config import (
+    COMPANY_PAGE_ARCHIVE_INTERVAL_SECONDS,
+    COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS,
     LINKEDIN_COMPANY_URL,
     LINKEDIN_EMPLOYMENT_TYPES,
     LINKEDIN_JOB_DESCRIPTION_HEADING,
@@ -62,6 +67,12 @@ from agentic_job_search.config import (
     LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES,
     LINKEDIN_WORKPLACE_BADGES,
     SIGNED_OUT_PREFETCH_POLL_SECONDS,
+    WAYBACK_AVAILABILITY_URL,
+    WAYBACK_FETCH_TIMEOUT_SECONDS,
+    WAYBACK_HEADERS,
+    WAYBACK_RAW_SNAPSHOT_URL,
+    WAYBACK_REFUSAL_STATUSES,
+    WAYBACK_TIMESTAMP_FORMAT,
 )
 from agentic_job_search.linkedin_page import (
     _COMPANY_SLUG_RE,
@@ -115,15 +126,20 @@ class SignedOutPageError(RuntimeError):
     '''The public page could not be fetched or did not have the expected content. Not a challenge.'''
 
 
-class SignedOutPacer:
-    '''Lets one signed-out request start at a time, each a drawn interval after the one before.
+class NoArchivedCopyError(RuntimeError):
+    '''No usable archived copy of a page: none, too old, or the archive could not be read.'''
 
-    The interval is drawn per request from `pacing.signed_out_request_interval_seconds`. One pacer
-    serves the whole process, so the job pages read ahead during Stage 1b and the company pages
-    read in Stage 2 share one pace.
+
+class SignedOutPacer:
+    '''Lets one request to a site start at a time, each a drawn interval after the one before.
+
+    `interval` gives the (min, max) range, drawn per request. One pacer per site serves the whole
+    process: for LinkedIn, `pacing.signed_out_request_interval_seconds`, so the job pages read
+    ahead during Stage 1b and the company pages read in Stage 2 share one pace.
     '''
 
-    def __init__(self) -> None:
+    def __init__(self, interval: Callable[[], tuple[float, float]]) -> None:
+        self._interval = interval
         self._lock = asyncio.Lock()
         self._next_at = 0.0
 
@@ -133,16 +149,22 @@ class SignedOutPacer:
             if delay > 0:
                 logger.debug(f'Signed-out pace: waiting {delay:.0f}s before {what}')
                 await asyncio.sleep(delay)
-            self._next_at = time.monotonic() + random.uniform(*preferences.signed_out_request_interval_seconds())
+            self._next_at = time.monotonic() + random.uniform(*self._interval())
 
 
-pacer = SignedOutPacer()
+pacer = SignedOutPacer(lambda: preferences.signed_out_request_interval_seconds())
+archive_pacer = SignedOutPacer(lambda: COMPANY_PAGE_ARCHIVE_INTERVAL_SECONDS)
 
 
 def card_workplace(card_location: str) -> str:
     '''The workplace the search card states after its location ('remote' for 'Warsaw (Remote)'), or ''.'''
     m = _CARD_WORKPLACE_RE.search(card_location or '')
     return LINKEDIN_WORKPLACE_BADGES[m.group('badge')] if m else ''
+
+
+def card_place(card_location: str) -> str:
+    '''The search card's location without its workplace badge ('Warsaw' for 'Warsaw (Remote)').'''
+    return _CARD_WORKPLACE_RE.sub('', card_location or '').strip()
 
 
 def _get(url: str, what: str) -> requests.Response:
@@ -330,12 +352,99 @@ def outbound_target(href: str) -> str:
     return href
 
 
+class ArchiveRefusedError(NoArchivedCopyError):
+    '''The archive refused us (WAYBACK_REFUSAL_STATUSES): no further lookups this run.'''
+
+
+# Set at the archive's first refusal; from then on every company page goes straight to LinkedIn.
+_archive_refused: str = ''
+
+
+def _raise_if_archive_refuses(resp: requests.Response, what: str) -> None:
+    if resp.status_code in WAYBACK_REFUSAL_STATUSES:
+        raise ArchiveRefusedError(f'{what}: GET {resp.url} returned HTTP {resp.status_code} {resp.reason}; '
+                                  f'body: {snippet(resp.text)!r}')
+
+
+def _archived_company_html(slug: str) -> tuple[str, str]:
+    '''(html, snapshot url) of the newest Wayback copy of the company page. Raises NoArchivedCopyError.'''
+    page = LINKEDIN_COMPANY_URL.format(slug=slug)
+    what = f'archived company page {slug}'
+    try:
+        resp = requests.get(WAYBACK_AVAILABILITY_URL, params={'url': page}, headers=WAYBACK_HEADERS,
+                            timeout=WAYBACK_FETCH_TIMEOUT_SECONDS)
+    except requests.RequestException as ex:
+        raise NoArchivedCopyError(f'{what}: GET {WAYBACK_AVAILABILITY_URL}?url={page} failed: '
+                                  f'{type(ex).__name__}: {ex}') from ex
+    _raise_if_archive_refuses(resp, what)
+    if resp.status_code != HTTPStatus.OK:
+        raise NoArchivedCopyError(f'{what}: GET {resp.url} returned HTTP {resp.status_code} {resp.reason}; '
+                                  f'body: {snippet(resp.text)!r}')
+    try:
+        closest = (resp.json().get('archived_snapshots') or {}).get('closest') or {}
+    except (ValueError, AttributeError) as ex:
+        raise NoArchivedCopyError(f'{what}: {resp.url} did not return a JSON object ({type(ex).__name__}: {ex}); '
+                                  f'body: {snippet(resp.text)!r}') from ex
+    if not closest.get('available') or str(closest.get('status')) != str(int(HTTPStatus.OK)):
+        raise NoArchivedCopyError(f'{what}: the archive has no copy ({snippet(closest)!r})')
+    timestamp = str(closest.get('timestamp') or '')
+    try:
+        captured = datetime.strptime(timestamp, WAYBACK_TIMESTAMP_FORMAT)
+    except ValueError as ex:
+        raise NoArchivedCopyError(f'{what}: unreadable snapshot timestamp {timestamp!r} in {snippet(closest)!r}') from ex
+    if datetime.now() - captured > timedelta(days=COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS):
+        raise NoArchivedCopyError(f'{what}: the newest copy is from {captured:%Y-%m-%d}, older than '
+                                  f'COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS')
+    raw_url = WAYBACK_RAW_SNAPSHOT_URL.format(timestamp=timestamp, url=page)
+    try:
+        raw = requests.get(raw_url, headers=WAYBACK_HEADERS, timeout=WAYBACK_FETCH_TIMEOUT_SECONDS)
+    except requests.RequestException as ex:
+        raise NoArchivedCopyError(f'{what}: GET {raw_url} failed: {type(ex).__name__}: {ex}') from ex
+    _raise_if_archive_refuses(raw, what)
+    if raw.status_code != HTTPStatus.OK:
+        raise NoArchivedCopyError(f'{what}: GET {raw_url} returned HTTP {raw.status_code} {raw.reason}; '
+                                  f'body: {snippet(raw.text)!r}')
+    return raw.text, raw_url
+
+
+async def read_archived_company_page(slug: str) -> CompanyAbout:
+    '''The company page as the Wayback Machine last captured it. Raises NoArchivedCopyError.'''
+    global _archive_refused
+    if _archive_refused:
+        raise NoArchivedCopyError(f'archived company page {slug}: not asked, the archive refused us earlier '
+                                  f'this run ({_archive_refused})')
+    await archive_pacer.wait(f'archived company page {slug}')
+    try:
+        html, raw_url = await asyncio.to_thread(_archived_company_html, slug)
+    except ArchiveRefusedError as ex:
+        _archive_refused = str(ex)
+        logger.warning(f'The archive refused a lookup; company pages are read from LinkedIn for the rest of '
+                       f'the run: {ex}')
+        raise
+    try:
+        about = parse_company_page_signed_out(BeautifulSoup(html, 'lxml'), slug)
+    except NotAnAboutPageError as ex:
+        # The archive keeps whatever LinkedIn served it, a login wall included.
+        raise NoArchivedCopyError(f'archived company page {slug} ({raw_url}) is not a company page: {ex}') from ex
+    about.page_url = raw_url
+    return about
+
+
 async def read_company_page_signed_out(slug: str) -> CompanyAbout:
-    '''Fetch the public company page: its name, Website and affiliated pages (never a parent; see the module doc).
+    '''The public company page: its name, Website and affiliated pages (never a parent; see the module doc).
+
+    A recent archived copy first (read_archived_company_page), LinkedIn itself otherwise.
 
     Raises LinkedInBlockedError on a challenge, NotAnAboutPageError when the page is not a company
     page (kept in COMPANY_ABOUT_FAILURES_DIR), SignedOutPageError on a transport or HTTP failure.
     '''
+    try:
+        about = await read_archived_company_page(slug)
+    except NoArchivedCopyError as ex:
+        logger.info(f'Company page {slug}: reading LinkedIn, no usable archived copy: {ex}')
+    else:
+        logger.debug(f'Company page {slug}: read from {about.page_url}')
+        return about
     url = LINKEDIN_COMPANY_URL.format(slug=slug)
     await pacer.wait(f'company page {slug}')
     resp = await asyncio.to_thread(_get, url, f'company {slug}')

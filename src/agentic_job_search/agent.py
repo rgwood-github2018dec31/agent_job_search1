@@ -181,6 +181,8 @@ from agentic_job_search.linkedin_page import (
 from agentic_job_search.linkedin_signed_out import (
     SOURCE_SIGNED_OUT,
     JobPagePrefetcher,
+    card_place,
+    card_workplace,
     read_company_page_signed_out,
     read_job_page_signed_out,
 )
@@ -2519,7 +2521,7 @@ async def identify_poster(
     stage_stats[ABOUT_FAILURES_IN_A_ROW_KEY] = 0
     identity = await company_domain.record_linkedin_identity(
         slug, about.name, about.website, about.parent_name, about.parent_slug, stage_stats,
-        affiliated=about.affiliated)
+        affiliated=about.affiliated, page_url=about.page_url)
     logger.info(f"Company identity: {candidate['company']} is {identity.describe()} (LinkedIn {slug})")
     return identity
 
@@ -3683,6 +3685,30 @@ def residency_spare(extract: dict) -> str:
     if derive_workplace_type(extract) in {'hybrid', 'onsite'}:
         return 'none'          # an office pins you regardless of what the text says
     return {'country_only': 'none', 'area_wide': 'any_area'}.get(derive_residency_scope(extract), 'eu_only')
+
+
+# The card badges whose place alone can rule a job out: the job is done there (2026-11-06, the
+# user's choice). A Remote card never is: where a remote job may be done is in its description.
+CARD_ATTENDED_WORKPLACES = ('onsite', 'hybrid')
+
+
+async def card_rejection_reason(title: str, card_location: str) -> str:
+    '''Why the search card alone rules this job out, or '' to read its page (Reject Card-Ruled-Out Job).
+
+    Only an On-site or Hybrid card, judged as Stage 2 judges an attended job: rejected_location on
+    the card's place, nothing spared. Fails open: a classifier failure reads the page.
+    '''
+    workplace = card_workplace(card_location)
+    if workplace not in CARD_ATTENDED_WORKPLACES:
+        return ''
+    place = card_place(card_location)
+    try:
+        reason = await rejected_location(place, residency_spare='none')
+    except Exception as ex:
+        logger.warning(f'Card check for {title!r} ({card_location!r}) failed, reading the page instead: '
+                       f'{unwrap_exception(ex)}')
+        return ''
+    return f'{workplace} card in an excluded location: {reason}' if reason else ''
 
 
 async def location_rejection_reason(extract: dict) -> str:
@@ -5810,6 +5836,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
             return
 
         console.print('[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n')
+        tools_module.set_card_rejection(card_rejection_reason)
         if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
             # Signed-out pages are paced at about one a minute, so reading starts with the first job
             # Stage 1b queues rather than after the search.
@@ -5938,6 +5965,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 1 for f in audit_findings if f['verdict'] == 'FALSE NEGATIVE'
             )
     finally:
+        tools_module.set_card_rejection(None)
         if _prefetcher is not None:
             await _prefetcher.stop()
             _prefetcher = None

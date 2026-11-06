@@ -171,6 +171,7 @@ class CompanyAbout:
     # The public page's "Affiliated pages", unlabelled: parent, subsidiaries and sister pages
     # alike. Each counts as the same organization when matching (2026-11-06, the user's choice).
     affiliated: tuple[str, ...] = ()
+    page_url: str = ''   # where it was read when not LinkedIn itself (an archived copy)
 
 
 class NotAnAboutPageError(RuntimeError):

@@ -16,6 +16,7 @@ from agentic_job_search import (
     evidence,
     fx,
     linkedin_page,
+    linkedin_signed_out,
     location,
     location_review,
     salary,
@@ -213,17 +214,24 @@ def fake_classify(text):
 
 
 @pytest.fixture(autouse=True)
+def _no_archive_pacing(monkeypatch):
+    '''The archive's own gap between requests, zeroed so the suite does not sleep; no refusal carried over.'''
+    monkeypatch.setattr(linkedin_signed_out, 'archive_pacer', linkedin_signed_out.SignedOutPacer(lambda: (0, 0)))
+    monkeypatch.setattr(linkedin_signed_out, '_archive_refused', '')
+
+
+@pytest.fixture(autouse=True)
 def _no_real_linkedin_request(request, monkeypatch):
-    '''A unit test never reaches LinkedIn. Job and company pages are read with a plain GET by
-    default (2026-11-06), so a test that forgets to stub the read would otherwise fetch a real page.
+    '''A unit test never reaches LinkedIn or the archive. Job and company pages are read with a plain
+    GET by default (2026-11-06), so a test that forgets to stub the read would otherwise fetch a real page.
     Other hosts pass through; `network`-marked tests are exempt.'''
     if request.node.get_closest_marker('network'):
         return
     real_get = requests.get
 
     def guarded_get(url, *args, **kwargs):
-        if 'linkedin.com' in str(url):
-            raise AssertionError(f'a unit test made a real LinkedIn request: GET {url}')
+        if any(host in str(url) for host in ('linkedin.com', 'archive.org')):
+            raise AssertionError(f'a unit test made a real LinkedIn or archive request: GET {url}')
         return real_get(url, *args, **kwargs)
 
     monkeypatch.setattr(requests, 'get', guarded_get)

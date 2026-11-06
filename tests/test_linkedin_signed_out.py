@@ -3,13 +3,21 @@
 The fixtures mirror the public markup measured on 2026-11-06 (job 4482929457, company auxotalent).
 '''
 import asyncio
+import json
+from datetime import datetime, timedelta
 from http import HTTPStatus
 
 import pytest
 import requests
 from agentic_job_search import linkedin_page
 from agentic_job_search import linkedin_signed_out as lg
-from agentic_job_search.config import LINKEDIN_HTTP_STATUS_REFUSED, LINKEDIN_JOB_DESCRIPTION_HEADING
+from agentic_job_search.config import (
+    COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS,
+    LINKEDIN_HTTP_STATUS_REFUSED,
+    LINKEDIN_JOB_DESCRIPTION_HEADING,
+    WAYBACK_AVAILABILITY_URL,
+    WAYBACK_TIMESTAMP_FORMAT,
+)
 
 JOB_URL = 'https://www.linkedin.com/jobs/view/4482929457/'
 CANDIDATE = {'site': 'linkedin', 'job_id': '4482929457', 'url': JOB_URL, 'company': 'Auxo Talent'}
@@ -58,11 +66,26 @@ class FakeResponse:
         self.reason = HTTPStatus(status).phrase if status in HTTPStatus._value2member_map_ else 'Request denied'
         self.headers = {}
 
+    def json(self):
+        return json.loads(self.text)
+
+
+NO_ARCHIVED_COPY = FakeResponse(json.dumps({'archived_snapshots': {}}), url=WAYBACK_AVAILABILITY_URL)
+
+
+def archived(slug, captured: datetime):
+    '''An availability answer naming a copy of the company page, and the raw copy's URL.'''
+    stamp = captured.strftime(WAYBACK_TIMESTAMP_FORMAT)
+    page = f'https://www.linkedin.com/company/{slug}/'
+    reply = {'archived_snapshots': {'closest': {'available': True, 'status': '200', 'timestamp': stamp,
+                                                'url': f'http://web.archive.org/web/{stamp}/{page}'}}}
+    return FakeResponse(json.dumps(reply), url=WAYBACK_AVAILABILITY_URL), f'https://web.archive.org/web/{stamp}id_/{page}'
+
 
 @pytest.fixture
 def served(monkeypatch):
     '''Serve one response per URL. Records what was requested and with which headers.'''
-    pages: dict[str, FakeResponse | Exception] = {}
+    pages: dict[str, FakeResponse | Exception] = {WAYBACK_AVAILABILITY_URL: NO_ARCHIVED_COPY}
     requested: list[tuple[str, dict]] = []
 
     def fake_get(url, headers=None, timeout=None, **kwargs):
@@ -153,6 +176,42 @@ async def test_a_public_company_page_gives_the_name_and_the_unwrapped_website(se
     assert about.affiliated == ('RP International', 'Jenrick')   # never the similar pages
 
 
+async def test_a_recent_archived_copy_is_read_and_linkedin_is_not_asked(served):
+    pages, requested = served
+    availability, raw = archived('auxotalent', datetime.now() - timedelta(days=30))
+    pages[WAYBACK_AVAILABILITY_URL] = availability
+    pages[raw] = FakeResponse(COMPANY_HTML, url=raw)
+    about = await lg.read_company_page_signed_out('auxotalent')
+    assert (about.name, about.website, about.page_url) == ('Auxo Talent', 'http://www.auxotalent.com', raw)
+    assert not any('linkedin.com/company' in url and 'archive' not in url for url, _ in requested)
+
+
+@pytest.mark.parametrize('copy', ['too old', 'a login wall', 'archive refuses'])
+async def test_without_a_usable_archived_copy_linkedin_is_read(served, copy):
+    pages, requested = served
+    age = COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS + 1 if copy == 'too old' else 1
+    availability, raw = archived('auxotalent', datetime.now() - timedelta(days=age))
+    pages[WAYBACK_AVAILABILITY_URL] = (FakeResponse('', status=HTTPStatus.TOO_MANY_REQUESTS)
+                                       if copy == 'archive refuses' else availability)
+    pages[raw] = FakeResponse('<html><title>LinkedIn Login</title><body><h1>Welcome back</h1></body></html>', url=raw)
+    live = 'https://www.linkedin.com/company/auxotalent/'
+    pages[live] = FakeResponse(COMPANY_HTML, url=live)
+    about = await lg.read_company_page_signed_out('auxotalent')
+    assert about.name == 'Auxo Talent' and about.page_url == ''
+    assert requested[-1][0] == live
+
+
+async def test_after_the_archive_refuses_it_is_not_asked_again_this_run(served):
+    pages, requested = served
+    pages[WAYBACK_AVAILABILITY_URL] = FakeResponse('flagged as bot traffic', status=HTTPStatus.TOO_MANY_REQUESTS)
+    for slug in ('auxotalent', 'other'):
+        live = f'https://www.linkedin.com/company/{slug}/'
+        pages[live] = FakeResponse(COMPANY_HTML, url=live)
+        await lg.read_company_page_signed_out(slug)
+    assert [url for url, _ in requested].count(WAYBACK_AVAILABILITY_URL) == 1
+    assert requested[0][1]['headers'] == lg.WAYBACK_HEADERS   # the archive is asked as the program it is
+
+
 async def test_a_company_page_redirected_to_login_is_not_a_company_page(served):
     pages, _ = served
     url = 'https://www.linkedin.com/company/nobody/'
@@ -207,9 +266,8 @@ async def test_requests_are_spaced_by_the_drawn_interval(monkeypatch):
 
     monkeypatch.setattr(lg.time, 'monotonic', lambda: clock['now'])
     monkeypatch.setattr(lg.asyncio, 'sleep', fake_sleep)
-    monkeypatch.setattr(lg.preferences, 'signed_out_request_interval_seconds', lambda: (61.0, 66.0))
     monkeypatch.setattr(lg.random, 'uniform', lambda low, high: low + 2.5)
-    pacer = lg.SignedOutPacer()
+    pacer = lg.SignedOutPacer(lambda: (61.0, 66.0))
     await pacer.wait('first')     # no wait before the first request
     clock['now'] += 10            # the request and its processing take 10 s
     await pacer.wait('second')

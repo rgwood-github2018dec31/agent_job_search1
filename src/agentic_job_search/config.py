@@ -888,6 +888,24 @@ LINKEDIN_SIGNED_OUT_HEADERS = {
 # LinkedIn refuses a visitor it is rate-limiting with 429, or with its own non-standard 999.
 LINKEDIN_HTTP_STATUS_REFUSED = 999
 LINKEDIN_SIGNED_OUT_BLOCK_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, LINKEDIN_HTTP_STATUS_REFUSED})
+# Company pages are looked up in the Wayback Machine first (2026-11-06, the user's choice: read
+# LinkedIn itself only when no archive has the page). archive.today, the user's first pick, did
+# not answer from this machine: TCP connected and the TLS handshake never completed, on both
+# archive.is and archive.ph. A copy older than COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS is not used: a
+# Website or an affiliated page can change.
+WAYBACK_AVAILABILITY_URL = 'https://archive.org/wayback/available'
+# `id_` asks for the page as captured, without the Wayback toolbar or rewritten links.
+WAYBACK_RAW_SNAPSHOT_URL = 'https://web.archive.org/web/{timestamp}id_/{url}'
+WAYBACK_TIMESTAMP_FORMAT = '%Y%m%d%H%M%S'
+WAYBACK_FETCH_TIMEOUT_SECONDS = 60
+COMPANY_PAGE_ARCHIVE_MAX_AGE_DAYS = 365
+# The archive is asked as the program it is, not as a browser. It answered 429 ("suspected
+# abusive bot traffic") after ~6 quick requests sent with a browser User-Agent (2026-11-06).
+WAYBACK_HEADERS = {'User-Agent': 'agentic-job-search/1.0 (personal job search; about one request a minute)'}
+# A refusal in this set stops archive lookups for the rest of the run; LinkedIn is read instead.
+WAYBACK_REFUSAL_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.FORBIDDEN})
+# The archive answered 429 after ~5 requests within a few seconds (2026-11-06): its own gap.
+COMPANY_PAGE_ARCHIVE_INTERVAL_SECONDS = (5.0, 8.0)
 # How often the read-ahead looks for a newly queued job when it has none to read.
 SIGNED_OUT_PREFETCH_POLL_SECONDS = 2
 # A redirect to one of these means the page wants a signed-in member.
