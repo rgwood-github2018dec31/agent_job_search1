@@ -149,7 +149,9 @@ src/agentic_job_search/
   snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
   evidence.py                     # Verify Source Reference: a prediction stands only on a citation found in its input
+  pdf_ocr.py                      # OCR Scanned PDF: a PDF with no text layer is rendered and read by a local vision model, labelled locally
   gate_fields.py                  # Ask Gate Fields: relocation, residency_scope, language_requirement asked one per call, cited
+  location_model.py               # Job Location (options, working/employment locations) and its eligibility decision; replay only until wired in
   job_trace.py                    # Job Trace: every step of one Stage 2 job, recorded via a ContextVar
   job_audit.py                    # Write Job Audit: choose one rated job per run, render its trace as a PDF
   rating_inputs.py                # Record Rating Inputs: save each part of the rater's input once, for the trace to link
@@ -179,6 +181,7 @@ scripts/
   replay_extract_arbitrate.py     # DeepSeek and GLM extract, DeepSeek per field where they differ; run-to-run variation (costs ~$1)
   local_field_probe.py            # Asks local or OpenRouter models one extract field at a time; compares models and the extractor's runs
   pin_replay_corpus.py            # Copies retained captures into run_dir/replay_corpus/, out of reach of pruning, for the replay scripts
+  replay_location_model.py        # The Job Location model over every retained page, beside the pipeline's decision (costs ~$1 at --repeat 2)
   shadow_replay.py                # Answers a shadow recording's pending calls (or all, with another local model) into a complete copy
   shadow_report.py                # Local vs remote decision agreement per call site, by the local model's confidence
   release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
@@ -201,6 +204,7 @@ run_dir/
   location_cache.yaml             # Cached geography per location string (country/region/languages)
   salary_cache.yaml               # Cached salary reading per salary string (kind/bounds/currency/period)
   fx_rates_cache.yaml             # The day's exchange-rate table against compensation.convert_to
+  pdf_ocr_cache.yaml              # Local OCR transcription per scanned PDF (sha256 of its content); may hold personal documents
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
   company_identities.yaml         # Company identity per LinkedIn slug and per name (domain/parent/source); hand-editable, `source: manual` is kept
   raw_postings/                   # Per job: .html page archive (JS-free) + .min.html/.min.pdf minimal archive + .txt the Markdown the extractor read + .rater_posting.txt the posting the rater read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only

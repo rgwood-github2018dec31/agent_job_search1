@@ -91,6 +91,20 @@ LLM_LOCAL_PURPOSE_TRIAGE = 'job-triage'
 LLM_LOCAL_PURPOSE_RATING = 'job-rating'
 LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY = 'reference-summary'
 LLM_LOCAL_PURPOSE_SHADOW = 'shadow-compare'
+LLM_LOCAL_PURPOSE_PDF_OCR = 'pdf-ocr'
+LLM_LOCAL_PURPOSE_PDF_CATEGORIZE = 'pdf-categorize'
+
+# PDF OCR (2026-11-06). A PDF whose text layer is shorter than PDF_MIN_TEXT_CHARS is a scan or a
+# photo: IMG_5568_IMG_5572.pdf had 44 chars, was sent to a paid model every run, and every run the
+# model's empty quote was rejected. Each page is rendered whole and transcribed by a LOCAL vision
+# model; a document like that one (an identity document) is then categorized locally too, so its
+# text never reaches a remote model. MODEL_NAME_LOCAL_OCR was chosen on that file: of the installed
+# vision models it transcribed most faithfully (one smaller model invented French wording).
+PDF_MIN_TEXT_CHARS = 100
+MODEL_NAME_LOCAL_OCR = 'qwen3.5:9b-q8_0'
+PDF_OCR_RENDER_SCALE = 2          # 144 dpi: small print stays legible to the model
+PDF_OCR_MAX_PAGES = 10
+PDF_OCR_TEMPERATURE = 0.0
 # Wall-clock cap for one LLM call (chat/generate) through the shared MCP client. Its own default
 # (30s) is sized for quick sends like Telegram, and silently applied to every LLM call when this
 # repo moved onto it: a Stage 1b scraper round resending a conversation full of 30k-char snapshots
@@ -620,7 +634,7 @@ REFERENCE_SUMMARY_RETRY_SHARE = 0.4
 #
 # Upgrading is therefore a reviewable edit to this constant, prompted for by
 # check_playwright_mcp_version() rather than taken automatically.
-PLAYWRIGHT_MCP_VERSION = '0.0.83'
+PLAYWRIGHT_MCP_VERSION = '0.0.84'
 PLAYWRIGHT_MCP_PACKAGE = f'@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}'
 # Queried directly over HTTPS rather than via `npm view`, which shells out through the npm cache
 # and can fail for reasons unrelated to the registry (a root-owned cache file, for one).

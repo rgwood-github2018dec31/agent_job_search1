@@ -1108,6 +1108,13 @@ def test_build_reference_block_caps_at_max_pdfs(monkeypatch):
 # _categorize_pdf_text and categorize_save_dir_pdfs
 # ---------------------------------------------------------------------------
 
+
+class _TextLayerPage:
+    '''A page with a real text layer, so categorization takes the remote path, not local OCR.'''
+    def extract_text(self):
+        return 'About the job. Senior AI Engineer, remote. Responsibilities and requirements follow. ' * 3
+
+
 async def test_categorize_pdf_text_saved_jd(monkeypatch):
     _make_sdk_mock(monkeypatch, {'category': 'saved_jd', 'quote': 'job posting text'})
     result = await tools._categorize_pdf_text('job posting text', 'acme_job.pdf')
@@ -1156,7 +1163,7 @@ async def test_categorize_save_dir_pdfs_renames_uncategorized(tmp_path, monkeypa
 
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
     class FakeReader:
-        pages: ClassVar[list] = []
+        pages: ClassVar[list] = [_TextLayerPage()]
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -1174,7 +1181,7 @@ async def test_categorize_save_dir_pdfs_skips_rename_on_error(tmp_path, monkeypa
 
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
     class FakeReader:
-        pages: ClassVar[list] = []
+        pages: ClassVar[list] = [_TextLayerPage()]
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -1216,7 +1223,7 @@ async def test_categorize_save_dir_pdfs_defaults_to_preference(tmp_path, monkeyp
     monkeypatch.setattr(tools.preferences, 'save_dir', lambda: tmp_path)
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
     class FakeReader:
-        pages: ClassVar[list] = []
+        pages: ClassVar[list] = [_TextLayerPage()]
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -5305,6 +5312,18 @@ def test_prune_raw_postings_leaves_anything_that_is_not_a_capture_directory(capl
     assert any('Not a capture directory' in r.message for r in caplog.records)
 
 
+def test_prune_raw_postings_leaves_a_hidden_directory_without_a_warning(caplog):
+    '''A Claude Code session run from raw_postings/ leaves `.claude/` there (2026-11-05).'''
+    hidden = tools.RAW_POSTINGS_DIR / '.claude' / '.cc-writes'
+    hidden.mkdir(parents=True)
+
+    with caplog.at_level(logging.DEBUG):
+        assert tools.prune_raw_postings(today=date(2099, 1, 1)) == 0
+    assert hidden.is_dir()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('Hidden directory' in r.message for r in caplog.records)
+
+
 @pytest.mark.parametrize('salary_text, raw_text, verified', [
     ('CA$208,580–$273,770 annually', 'base pay range CA$208,580.00/yr - CA$273,770.00/yr', True),
     # Separators differ between the page and the extract; the number is the same number.
@@ -9386,6 +9405,18 @@ def test_click_guard_refuses_the_results_list():
         'filter chips sit above the results and must stay clickable'
 
 
+@pytest.mark.parametrize('target', [
+    "getByRole('link', { name: 'Senior AI Engineer' })",
+    "page.get_by_text('Senior AI Engineer')",
+    "locator('li').nth(2)",
+    'By.cssSelector("li")',
+])
+def test_click_guard_refuses_a_locator_target(target):
+    '''@playwright/mcp 0.0.84 accepts locators that name a card by its text, past every substring.'''
+    assert scrape_openrouter._guard_call('browser_click', {'target': target}) is not None
+    assert scrape_openrouter._guard_call('browser_click', {'target': 'button[aria-label="Date posted filter"]'}) is None
+
+
 def test_click_guard_refuses_javascript_that_drives_the_page():
     assert scrape_openrouter._guard_call(
         'browser_evaluate', {'function': '() => document.querySelector("a").click()'}) is not None
@@ -9737,7 +9768,7 @@ async def test_categorize_save_dir_pdfs_aborts_on_api_error(tmp_path, monkeypatc
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
 
     class FakeReader:
-        pages: ClassVar[list] = []
+        pages: ClassVar[list] = [_TextLayerPage()]
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)
@@ -9762,7 +9793,7 @@ async def test_categorize_save_dir_pdfs_continues_past_per_file_error(tmp_path, 
     monkeypatch.setattr(tools, '_categorize_pdf_text', fake_categorize)
 
     class FakeReader:
-        pages: ClassVar[list] = []
+        pages: ClassVar[list] = [_TextLayerPage()]
         def __init__(self, path): pass
 
     monkeypatch.setattr(tools.pypdf, 'PdfReader', FakeReader)

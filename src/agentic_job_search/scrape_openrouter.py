@@ -282,6 +282,10 @@ async def pin_scraper_provider(model: str) -> ProviderPin:
 # Substrings that mean a click would land inside the results list. `Dismiss` is the dangerous one:
 # it is the only real <button> in a card and removes the job from the user's feed permanently.
 FORBIDDEN_CLICK_SUBSTRINGS = ('job-card-component-ref', 'SearchResultsMainContent', 'Dismiss')
+# @playwright/mcp 0.0.84 lets `target` be a JavaScript/Python/Java/C# locator ("getByRole('link',
+# {name: ...})"), which names a node by its text and so passes every substring above. Only the
+# forms 0.0.83 accepted -- a snapshot ref or a CSS selector -- may be clicked (2026-11-06).
+LOCATOR_TARGET_RE = re.compile(r'\b(?:get_?by_?\w+|locator|frame_?locator|nth)\s*\(|\bBy\.\w+\(|\bpage\.', re.IGNORECASE)
 
 # Tools the model may call that are ours rather than the browser's. Every parameter is a DECISION;
 # none carries page or job data. Adding one that does reintroduces the fabrication failure mode and
@@ -331,6 +335,10 @@ def _guard_call(name: str, args: dict) -> str | None:
     Code-enforced rather than prompted: to the model a card and its Dismiss button are the same
     node, so wording cannot prevent this (AGENTS.md, Account safety).
     '''
+    if name in ('browser_click', 'browser_hover') and LOCATOR_TARGET_RE.search(str(args.get('target', ''))):
+        logger.error(f"Stage 1b: REFUSED {name} with a locator target {args.get('target')!r}")
+        return ('REFUSED: target must be a snapshot ref (e.g. e1202) or a CSS selector, not a locator '
+                'expression. Take a snapshot and pass the ref of a filter chip above the results.')
     if name in ('browser_click', 'browser_hover'):
         blob = ' '.join(str(args.get(k, '')) for k in ('target', 'element', 'ref', 'selector'))
         for bad in FORBIDDEN_CLICK_SUBSTRINGS:

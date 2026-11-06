@@ -32,7 +32,7 @@ from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 
 import agentic_job_search.preferences as preferences
-from agentic_job_search import company_domain, evidence, job_trace, location_review
+from agentic_job_search import company_domain, evidence, job_trace, location_review, pdf_ocr
 from agentic_job_search.company_domain import CompanyIdentity, identities_match
 from agentic_job_search.company_domain import normalize_company_name as _normalize_company
 from agentic_job_search.config import (
@@ -709,6 +709,11 @@ def prune_raw_postings(today: date | None = None) -> int:
     for child in sorted(RAW_POSTINGS_DIR.iterdir()):
         if not child.is_dir():
             continue
+        if child.name.startswith('.'):
+            # Tool state such as the `.claude/` a Claude Code session leaves in its cwd: never a
+            # capture, never ours to delete, and not worth a warning on every run (2026-11-05).
+            logger.debug(f'Hidden directory, leaving it alone: {child}')
+            continue
         try:
             captured_on = date.fromisoformat(child.name)
         except ValueError:
@@ -1100,6 +1105,28 @@ async def _categorize_pdf_text(text: str, filename: str) -> str | None:
     return None
 
 
+async def _categorize_scanned_pdf(pdf: Path, pages: list[str]) -> str | None:
+    '''Category for a PDF with no usable text layer, or None to leave it for the next run.
+
+    Never falls back to the remote categorizer: the text layer is too thin for it to cite (each run
+    used to pay for a rejected empty quote), and the transcription may be a personal document.
+    '''
+    try:
+        ocr_pages = await pdf_ocr.ocr_pdf_pages(pdf)
+        text = pages_to_prompt(ocr_pages, f'PDF {pdf.name} (local OCR categorization)', PDF_PROMPT_MAX_CHARS)
+        if pdf_ocr.needs_ocr(ocr_pages):
+            logger.warning(f'PDF OCR found almost no text in {pdf.name} ({sum(map(len, ocr_pages))} chars, '
+                           f'text layer {sum(map(len, pages))}); labelled no_text')
+            return 'no_text'
+        category = await pdf_ocr.categorize_locally(text, pdf.name)
+    except Exception as ex:
+        logger.warning(f'Local OCR categorization failed for {pdf.name} (text layer {sum(map(len, pages))} chars), '
+                       f'leaving it uncategorized for the next run: {type(ex).__name__}: {ex}')
+        console.print(f'[yellow]Warning: local OCR failed for {pdf.name}; see the log[/yellow]')
+        return None
+    return underscorify(category) if category else None
+
+
 async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
     """Rename uncategorized PDFs in the save directory with a cat-<category>- prefix.
 
@@ -1117,6 +1144,14 @@ async def categorize_save_dir_pdfs(save_dir: Path | None = None) -> None:
         except Exception as ex:
             logger.warning(f'Could not read {pdf}, leaving uncategorized: {type(ex).__name__}: {ex}')
             console.print(f'[yellow]Warning: could not read {pdf.name}: {ex}[/yellow]')
+            continue
+        if pdf_ocr.needs_ocr(pages):
+            # A scan or a photo: read and labelled on the local model only (see pdf_ocr).
+            category = await _categorize_scanned_pdf(pdf, pages)
+            if category is not None:
+                new_name = f'cat-{category}-{pdf.name}'
+                logger.info(f'Categorized {new_name!r} (local OCR)')
+                pdf.rename(pdf.parent / new_name)
             continue
         prompt_text = pages_to_prompt(pages, f'PDF {pdf.name} (categorization)', PDF_PROMPT_MAX_CHARS)
         if sum(len(p) for p in pages) > PDF_PROMPT_MAX_CHARS:
@@ -1313,6 +1348,8 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
                 logger.warning(f'Could not read applied-job PDF {pdf}, skipping it: {type(ex).__name__}: {ex}')
                 console.print(f'[yellow]Warning: could not read {pdf.name}: {ex}[/yellow]')
                 continue
+            if pdf_ocr.needs_ocr(pages) and (ocr_pages := pdf_ocr.cached_ocr_pages(pdf)) is not None:
+                pages = ocr_pages  # a scan categorized as a posting: its local transcription is its text
 
             metadata = await _extract_applied_job_metadata(
                 pages_to_prompt(pages, f'PDF {pdf.name} (applied-job metadata)', PDF_PROMPT_MAX_CHARS),
