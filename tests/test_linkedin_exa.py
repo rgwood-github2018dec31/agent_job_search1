@@ -183,3 +183,50 @@ async def test_a_profile_without_a_name_is_not_an_about_page(fetched):
     replies[url] = reply('Page not found', title='', url=url)
     with pytest.raises(linkedin_page.NotAnAboutPageError, match='no "# <name>" heading'):
         await lx.read_company_page_exa('acme-data', None)
+
+
+@pytest.fixture
+def no_retry_delay(monkeypatch):
+    monkeypatch.setattr(lx, 'PAGE_FETCH_RETRY_DELAY_SECONDS', 0)
+
+
+async def test_no_content_from_exa_is_asked_again(monkeypatch, no_retry_delay):
+    """2026-11-07: Exa answers 'no content' now and then and serves the page on a later try."""
+    answers = [json.dumps({'ok': False, 'error': "the fetch did not complete (status='incomplete', "
+                                                 "error='Exa returned no content for this URL.')"}),
+               reply(JOB_CONTENT)]
+    calls = []
+
+    async def call(url, tool, args, timeout_seconds=None):
+        calls.append(args['url'])
+        return answers.pop(0)
+
+    monkeypatch.setattr(lx, 'call_mcp_tool', call)
+    page = await lx.read_job_page_exa(CANDIDATE)
+    assert page.header.company == 'Acme Data' and len(calls) == 2
+
+
+async def test_no_content_on_every_attempt_fails_the_read(monkeypatch, no_retry_delay):
+    calls = []
+
+    async def call(url, tool, args, timeout_seconds=None):
+        calls.append(args['url'])
+        return json.dumps({'ok': False, 'error': "status='incomplete', error='Exa returned no content'"})
+
+    monkeypatch.setattr(lx, 'call_mcp_tool', call)
+    with pytest.raises(lx.ExaPageError, match=f'attempt {lx.PAGE_FETCH_ATTEMPTS} of {lx.PAGE_FETCH_ATTEMPTS}'):
+        await lx.read_job_page_exa(CANDIDATE)
+    assert len(calls) == lx.PAGE_FETCH_ATTEMPTS
+
+
+async def test_any_other_failure_is_not_asked_again(monkeypatch, no_retry_delay):
+    calls = []
+
+    async def call(url, tool, args, timeout_seconds=None):
+        calls.append(args['url'])
+        return json.dumps({'ok': False, 'error': 'the fetched page answered HTTP 404'})
+
+    monkeypatch.setattr(lx, 'call_mcp_tool', call)
+    with pytest.raises(lx.ExaPageError, match='HTTP 404'):
+        await lx.read_job_page_exa(CANDIDATE)
+    assert len(calls) == 1

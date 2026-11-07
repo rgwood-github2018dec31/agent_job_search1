@@ -887,6 +887,11 @@ LINKEDIN_PAGE_READER_DEFAULT = LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER
 PAGE_FETCH_ENGINE = 'exa'
 PAGE_FETCH_ALLOWED_DOMAINS = ('linkedin.com',)
 PAGE_FETCH_TIMEOUT_SECONDS = 180
+# Exa answers "no content" (status 'incomplete') for a page now and then and serves it on a later try: 4 of
+# 10 fetches on 2026-11-07, every one served within two retries 20 s apart. Only that answer is retried.
+PAGE_FETCH_ATTEMPTS = 3
+PAGE_FETCH_RETRY_DELAY_SECONDS = 20
+PAGE_FETCH_RETRYABLE_MARKER = "status='incomplete'"
 LINKEDIN_SIGNED_OUT_FETCH_TIMEOUT_SECONDS = 30
 # A desktop browser's ordinary request headers; without a browser User-Agent LinkedIn serves a stub.
 LINKEDIN_SIGNED_OUT_HEADERS = {

@@ -20,6 +20,7 @@ What Exa returns, measured 2026-11-07:
   as "## Company Details" with "- Homepage: <domain>" and "- LinkedIn: linkedin.com/company/<slug>".
   It has no "Affiliated pages", so CompanyAbout.affiliated stays empty on this path.
 '''
+import asyncio
 import json
 import logging
 import re
@@ -37,7 +38,10 @@ from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
     MODEL_NAME_PAGE_FETCH,
     PAGE_FETCH_ALLOWED_DOMAINS,
+    PAGE_FETCH_ATTEMPTS,
     PAGE_FETCH_ENGINE,
+    PAGE_FETCH_RETRY_DELAY_SECONDS,
+    PAGE_FETCH_RETRYABLE_MARKER,
     PAGE_FETCH_TIMEOUT_SECONDS,
 )
 from agentic_job_search.linkedin_page import (
@@ -86,14 +90,23 @@ async def fetch_page(url: str, what: str, stage_stats: dict | None) -> dict:
     '''
     args = {'url': url, 'model': MODEL_NAME_PAGE_FETCH, 'allowed_domains': list(PAGE_FETCH_ALLOWED_DOMAINS),
             'engine': PAGE_FETCH_ENGINE}
-    raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'web_fetch', args, timeout_seconds=PAGE_FETCH_TIMEOUT_SECONDS)
-    try:
-        data = json.loads(raw)
-    except ValueError as ex:
-        raise ExaPageError(f'{what}: web_fetch {url} via {MODEL_NAME_PAGE_FETCH}/{PAGE_FETCH_ENGINE} replied with '
-                           f'non-JSON ({ex}): {quote_for_error(raw, "web_fetch reply")!r}') from ex
-    if not isinstance(data, dict) or data.get('ok') is not True:
-        raise ExaPageError(f'{what}: web_fetch {url} via {MODEL_NAME_PAGE_FETCH}/{PAGE_FETCH_ENGINE} failed: '
+    for attempt in range(1, PAGE_FETCH_ATTEMPTS + 1):
+        raw = await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'web_fetch', args, timeout_seconds=PAGE_FETCH_TIMEOUT_SECONDS)
+        try:
+            data = json.loads(raw)
+        except ValueError as ex:
+            raise ExaPageError(f'{what}: web_fetch {url} via {MODEL_NAME_PAGE_FETCH}/{PAGE_FETCH_ENGINE} replied with '
+                               f'non-JSON ({ex}): {quote_for_error(raw, "web_fetch reply")!r}') from ex
+        if isinstance(data, dict) and data.get('ok') is True:
+            break
+        error = str(data.get('error') if isinstance(data, dict) else raw)
+        if PAGE_FETCH_RETRYABLE_MARKER in error and attempt < PAGE_FETCH_ATTEMPTS:
+            logger.info(f'{what}: Exa had no content for {url} (attempt {attempt} of {PAGE_FETCH_ATTEMPTS}), '
+                        f'asking again in {PAGE_FETCH_RETRY_DELAY_SECONDS}s')
+            await asyncio.sleep(PAGE_FETCH_RETRY_DELAY_SECONDS)
+            continue
+        raise ExaPageError(f'{what}: web_fetch {url} via {MODEL_NAME_PAGE_FETCH}/{PAGE_FETCH_ENGINE} failed '
+                           f'(attempt {attempt} of {PAGE_FETCH_ATTEMPTS}): '
                            f'{quote_for_error(raw, "web_fetch failure reply")!r}')
     content = data.get('content')
     if not isinstance(content, str) or not content.strip():
