@@ -87,6 +87,7 @@ from agentic_job_search.config import (
     JOB_STALE_AGE_DAYS,
     LINKEDIN_JOB_DESCRIPTION_HEADING,
     LINKEDIN_PAGE_READER_DEFAULT,
+    LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER,
     LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER,
     LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET,
     LINKEDIN_PAGE_READERS,
@@ -165,6 +166,7 @@ from agentic_job_search.extract_openrouter import (
     extract_job_page_openrouter,
 )
 from agentic_job_search.gate_fields import ask_gate_fields
+from agentic_job_search.linkedin_exa import SOURCE_EXA, read_company_page_exa, read_job_page_exa
 from agentic_job_search.linkedin_page import (
     HeaderCard,
     JobPage,
@@ -2437,7 +2439,10 @@ _prefetcher: JobPagePrefetcher | None = None
 async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict) -> JobPage | None:
     """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
     try:
-        if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
+        if _job_and_company_pages_via == LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER:
+            # Fetched by Exa, not from this machine: no LinkedIn pacing applies.
+            page = await read_job_page_exa(candidate, stage_stats)
+        elif _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
             # Paced by linkedin_signed_out.pacer, not by the inter-job pause.
             page = await (_prefetcher.page(candidate) if _prefetcher is not None
                           else read_job_page_signed_out(candidate))
@@ -2460,6 +2465,8 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
     except LinkedInBlockedError:
         raise
     except Exception as ex:
+        if tool_server.outage_url(ex):
+            raise   # the OpenRouter tool server is down (Exa path): Stage 2 waits it out, the job is not failed
         job_trace.record('page_read', url=candidate.get('url'), error=unwrap_exception(ex))
         logger.warning(
             f"Reading the page failed for {candidate['company']} — {candidate['title']} "
@@ -2486,14 +2493,17 @@ async def identify_poster(
     if failures_in_a_row >= COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES:
         logger.debug(f'Company identity: About page reads are stopped for this run, skipping {slug}')
         return None
-    if _job_and_company_pages_via != LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET and not COMPANY_ABOUT_PAGE_VIA_SIGNED_IN_BROWSER:
+    if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER and not COMPANY_ABOUT_PAGE_VIA_SIGNED_IN_BROWSER:
         logger.debug(f"Company identity: {slug} ({candidate['company']}) by name; the About page is not read "
                      'through the signed-in browser (COMPANY_ABOUT_PAGE_VIA_SIGNED_IN_BROWSER), and --job-and-company-pages-via is '
                      f'{_job_and_company_pages_via}')
         return None
-    await _human_pause(COMPANY_ABOUT_PAGE_DELAY_SECONDS, f'the LinkedIn company page of {slug}')
+    if _job_and_company_pages_via != LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER:
+        await _human_pause(COMPANY_ABOUT_PAGE_DELAY_SECONDS, f'the LinkedIn company page of {slug}')
     try:
-        if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
+        if _job_and_company_pages_via == LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER:
+            about = await read_company_page_exa(slug, stage_stats)
+        elif _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
             about = await read_company_page_signed_out(slug)
         else:
             async with mcp_session(playwright_mcp_url) as call:
@@ -2535,7 +2545,7 @@ async def extract_job_page_direct(
         page = await read_page(candidate, playwright_mcp_url, stage_stats)
         if page is None:
             return None
-    what = ('the text of a job posting page, read and de-cluttered by code' if page.source in ('dom', SOURCE_SIGNED_OUT)
+    what = ('the text of a job posting page, read and de-cluttered by code' if page.source in ('dom', SOURCE_SIGNED_OUT, SOURCE_EXA)
             else 'an accessibility snapshot of a job posting page')
     prompt = (
         f'Below is {what}. Extract the facts it states into the structured output; leave a field '
@@ -6255,9 +6265,14 @@ async def main() -> None:
         choices=LINKEDIN_PAGE_READERS,
         default=LINKEDIN_PAGE_READER_DEFAULT,
         help='How Stage 2 reads each job page and company page (the search itself always uses the '
-             f'signed-in browser). {LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET} (default): one plain HTTP '
-             'GET of the public page, no browser, no cookies, never touching the account; the public job '
-             'page has no Remote/Hybrid badge, so the workplace comes from the description. '
+             f'signed-in browser). {LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER} (default): the public page '
+             "fetched by OpenRouter's web fetch tool with the Exa engine, from Exa's servers, so nothing "
+             "reaches LinkedIn from this machine (about $0.001 a page); the company page is then Exa's "
+             'profile (website, no affiliated pages). '
+             f'{LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET}: one plain HTTP '
+             'GET of the public page, no browser, no cookies, never touching the account, paced and '
+             'refused by LinkedIn after about 50 requests; the public job '
+             'page has no Remote/Hybrid badge, so the workplace comes from the search card. '
              f'{LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER}: the job page through the signed-in browser, with '
              'the badge; company pages are then not read and the company is identified by name',
     )

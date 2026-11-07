@@ -442,6 +442,7 @@ MODEL_NAME_SALARY = MODEL_NAME_SINGLE_TURN
 MODEL_NAME_SALARY_ESTIMATE = MODEL_NAME_SINGLE_TURN
 # The extraction loop is a short tool-calling conversation on the flash-tier single-turn model.
 MODEL_NAME_EXTRACTOR = MODEL_NAME_SINGLE_TURN
+MODEL_NAME_PAGE_FETCH = MODEL_NAME_SINGLE_TURN   # issues the web_fetch call (linkedin_exa)
 # Judges a LinkedIn job-page section nobody has classified yet: keep or remove. A judgement, so the
 # intelligence tier; called only for a section signature never seen before, then cached for good.
 MODEL_NAME_PAGE_SECTIONS = MODEL_NAME_SINGLE_TURN
@@ -871,12 +872,21 @@ COMPANY_ABOUT_MAX_CONSECUTIVE_FAILURES = 3
 # page read on that setting.
 COMPANY_ABOUT_PAGE_VIA_SIGNED_IN_BROWSER = False
 
-# How Stage 2 reads a job page and a company page (--job-and-company-pages-via). Signed out is the default since
-# 2026-11-06: one cookie-free HTTP GET per page (linkedin_signed_out), with no browser and no account.
+# How Stage 2 reads a job page and a company page (--job-and-company-pages-via). Since 2026-11-07 the
+# default is OpenRouter's web fetch tool with the Exa engine (linkedin_exa): our own signed-out GETs
+# (linkedin_signed_out) were refused with a 429 after about 27 and then about 53 requests on 2026-11-06,
+# however paced. Exa fetches from its own infrastructure, so nothing reaches LinkedIn from this machine.
+LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER = 'exa-via-openrouter'
 LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET = 'signed-out-http-get'
 LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER = 'signed-in-browser'
-LINKEDIN_PAGE_READERS = (LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET, LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER)
-LINKEDIN_PAGE_READER_DEFAULT = LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET
+LINKEDIN_PAGE_READERS = (LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER, LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET,
+                         LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER)
+LINKEDIN_PAGE_READER_DEFAULT = LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER
+# The OpenRouter tool server's web_fetch (linkedin_exa). The model only issues the fetch call (OpenRouter has
+# no fetch-only call); its reply is discarded. About $0.0012 a job page and $0.0015 a company page (2026-11-07).
+PAGE_FETCH_ENGINE = 'exa'
+PAGE_FETCH_ALLOWED_DOMAINS = ('linkedin.com',)
+PAGE_FETCH_TIMEOUT_SECONDS = 180
 LINKEDIN_SIGNED_OUT_FETCH_TIMEOUT_SECONDS = 30
 # A desktop browser's ordinary request headers; without a browser User-Agent LinkedIn serves a stub.
 LINKEDIN_SIGNED_OUT_HEADERS = {

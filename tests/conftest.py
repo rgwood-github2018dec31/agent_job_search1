@@ -15,6 +15,7 @@ from agentic_job_search import (
     company_domain,
     evidence,
     fx,
+    linkedin_exa,
     linkedin_page,
     linkedin_signed_out,
     location,
@@ -218,6 +219,18 @@ def _no_archive_pacing(monkeypatch):
     '''The archive's own gap between requests, zeroed so the suite does not sleep; no refusal carried over.'''
     monkeypatch.setattr(linkedin_signed_out, 'archive_pacer', linkedin_signed_out.SignedOutPacer(lambda: (0, 0)))
     monkeypatch.setattr(linkedin_signed_out, '_archive_refused', '')
+
+
+@pytest.fixture(autouse=True)
+def _no_real_web_fetch(monkeypatch, request):
+    '''No test may make a real (billed) web_fetch through the OpenRouter tool server unless marked network.'''
+    if request.node.get_closest_marker('network'):
+        return
+
+    async def refuse(url, tool, args, timeout_seconds=None):
+        raise AssertionError(f'test made a real {tool} call to {url} with {args}: patch linkedin_exa.call_mcp_tool')
+
+    monkeypatch.setattr(linkedin_exa, 'call_mcp_tool', refuse)
 
 
 @pytest.fixture(autouse=True)

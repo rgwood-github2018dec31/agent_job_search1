@@ -2139,10 +2139,45 @@ async def test_read_page_logs_and_returns_none_when_the_browser_fails(monkeypatc
         yield  # pragma: no cover
 
     monkeypatch.setattr(agent, 'mcp_session', dead_session)
+    monkeypatch.setattr(agent, '_job_and_company_pages_via', agent.LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER)
     with caplog.at_level(logging.WARNING):
         page = await agent.read_page(_make_candidate(job_id='77'), 'http://localhost:1/mcp', agent.new_stage_stats())
     assert page is None
     assert any('Reading the page failed' in r.message and 'job 77' in r.message for r in caplog.records)
+
+
+async def test_read_page_hands_a_tool_server_outage_to_stage_2(monkeypatch):
+    '''Exa path (2026-11-07): the OpenRouter tool server being down says nothing about the job, so it is
+    raised for Stage 2 to wait out (Wait Out Tool Server Outage), not logged as an unreadable page.'''
+    async def down(candidate, stage_stats=None):
+        raise RuntimeError(f'MCP initialize at {config.LLM_OPENROUTER_MCP_URL} transport failed: ConnectError: '
+                           'All connection attempts failed')
+
+    monkeypatch.setattr(agent, '_job_and_company_pages_via', agent.LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER)
+    monkeypatch.setattr(agent, 'read_job_page_exa', down)
+    with pytest.raises(RuntimeError, match='transport failed'):
+        await agent.read_page(_make_candidate(job_id='78'), 'http://localhost:1/mcp', agent.new_stage_stats())
+
+
+async def test_the_exa_path_reads_the_company_profile_without_a_pause(monkeypatch):
+    pauses, reads = [], []
+
+    async def pause(seconds, what):
+        pauses.append(what)
+
+    async def profile(slug, stage_stats=None):
+        reads.append(slug)
+        return linkedin_page.CompanyAbout(slug=slug, name='Acme', website='acme.example.com')
+
+    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=(), page_url=''):
+        return company_domain.CompanyIdentity(name, domain=website, source='linkedin')
+
+    monkeypatch.setattr(agent, '_job_and_company_pages_via', agent.LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER)
+    monkeypatch.setattr(agent, '_human_pause', pause)
+    monkeypatch.setattr(agent, 'read_company_page_exa', profile)
+    monkeypatch.setattr(company_domain, 'record_linkedin_identity', fake_record)
+    identity = await agent.identify_poster('acme', _POSTER, 'http://x', {})
+    assert identity.domain == 'acme.example.com' and reads == ['acme'] and pauses == []
 
 
 # ---------------------------------------------------------------------------
@@ -12547,9 +12582,10 @@ async def test_signed_out_reads_the_public_company_page_and_never_the_browser(ab
     assert signed_out_visits == ['acme'] and visits == []
 
 
-def test_job_and_company_pages_are_read_signed_out_by_default():
-    '''2026-11-06, the user: the signed-out HTTP GET is the default; the account is used only for search.'''
-    assert agent.LINKEDIN_PAGE_READER_DEFAULT == agent.LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET
+def test_job_and_company_pages_are_read_through_exa_by_default():
+    '''2026-11-07, the user: Exa via OpenRouter is the default (signed-out GETs were refused after ~50
+    requests); the account is used only for search.'''
+    assert agent.LINKEDIN_PAGE_READER_DEFAULT == agent.LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER
 
 
 def test_the_failure_count_stays_out_of_the_public_cost_log():
