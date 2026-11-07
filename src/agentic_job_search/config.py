@@ -892,6 +892,9 @@ PAGE_FETCH_TIMEOUT_SECONDS = 180
 PAGE_FETCH_ATTEMPTS = 3
 PAGE_FETCH_RETRY_DELAY_SECONDS = 20
 PAGE_FETCH_RETRYABLE_MARKER = "status='incomplete'"
+# Stage 2 reads a job page this many times before the job's extract fails (read_page_for_extract). The
+# second read used to happen inside the extract fallback, out of sight of the extractor and the gates.
+STAGE2_PAGE_READS = 2
 LINKEDIN_SIGNED_OUT_FETCH_TIMEOUT_SECONDS = 30
 # A desktop browser's ordinary request headers; without a browser User-Agent LinkedIn serves a stub.
 LINKEDIN_SIGNED_OUT_HEADERS = {

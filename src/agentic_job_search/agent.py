@@ -149,6 +149,7 @@ from agentic_job_search.config import (
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
     SECONDS_PER_MINUTE,
+    STAGE2_PAGE_READS,
     THINKING_MAX_CHARS,
     TOOL_SERVER_WAIT_MAX_SECONDS,
     TRIAGE_DISAGREEMENT_LOG_MIN,
@@ -2536,12 +2537,38 @@ async def identify_poster(
     return identity
 
 
+async def read_page_for_extract(
+    candidate: dict, playwright_mcp_url: str, stage_stats: dict, browser: BrowserServer | None = None,
+) -> JobPage | None:
+    '''Stage 2's read of a job page: read_page, and once more when that failed (STAGE2_PAGE_READS).
+
+    The page must reach Stage 2 itself, not only the extract fallback: before 2026-11-07 a failed first
+    read went to extract_job_page_direct, which read the page again on its own and kept it, so the
+    primary extractor and Ask Gate Fields never saw it (Genesys and EverAI that day, read on the second
+    try after Exa had no content three times). None when every read failed, each logged by read_page.
+    Not read again when `browser` died: Stage 2 restarts it and retries the job.
+    '''
+    for attempt in range(1, STAGE2_PAGE_READS + 1):
+        page = await read_page(candidate, playwright_mcp_url, stage_stats)
+        if page is not None or attempt == STAGE2_PAGE_READS:
+            return page
+        if browser is not None and await browser.confirm_dead():
+            return None
+        logger.info(f"Reading the page of job {candidate.get('job_id')} again (read {attempt} of "
+                    f'{STAGE2_PAGE_READS} failed)')
+    return None
+
+
 async def extract_job_page_direct(
-    candidate: dict, playwright_mcp_url: str, stage_stats: dict, page: JobPage | None = None
+    candidate: dict, playwright_mcp_url: str, stage_stats: dict, page: JobPage | None = None,
+    read_if_missing: bool = True,
 ) -> dict | None:
     '''Fallback for a failed extract, and the audit path: extract the page's facts with one
-    non-agentic Haiku call. Reads the page itself when the caller has not already.'''
+    non-agentic Haiku call. Reads the page itself when the caller has not already, unless the
+    caller already tried (`read_if_missing=False`: Stage 2, whose read_page_for_extract did).'''
     if page is None:
+        if not read_if_missing:
+            return None
         page = await read_page(candidate, playwright_mcp_url, stage_stats)
         if page is None:
             return None
@@ -4925,7 +4952,7 @@ async def _evaluate_candidates(
             # Read once, in code; both extractors below work from the same text, and every field
             # they return is checked against it (verify_extract). The Anthropic agentic extractor,
             # which browsed for itself and kept no text to check against, was removed 2026-10-19.
-            page = await read_page(candidate, playwright_mcp['url'], stage_stats['extraction'])
+            page = await read_page_for_extract(candidate, playwright_mcp['url'], stage_stats['extraction'], browser)
             extract = None
             if page is not None and route_for(MODEL_NAME_EXTRACTOR) == 'openrouter':
                 extract = await extract_job_page_openrouter(
@@ -4936,7 +4963,8 @@ async def _evaluate_candidates(
             resubmitted = extract is not None and EXTRACT_RESUBMIT_UNGROUNDED
             if extract is None:
                 extract = await extract_job_page_direct(
-                    candidate, playwright_mcp['url'], stage_stats['extraction'], page=page)
+                    candidate, playwright_mcp['url'], stage_stats['extraction'], page=page,
+                    read_if_missing=False)
             if extract is not None:
                 await verify_extract(candidate, extract, stage_stats['evidence'], use_llm=not resubmitted)
                 job_trace.record('extract', fields={k: v for k, v in extract.items()

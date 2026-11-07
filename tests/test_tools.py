@@ -2488,7 +2488,7 @@ async def test_extractor_provider_dispatch_openrouter(monkeypatch):
         assert system_prompt is agent.PAGE_EXTRACTOR_INSTRUCTIONS
         return None
 
-    async def fake_direct(candidate, url, stats, page=None):
+    async def fake_direct(candidate, url, stats, page=None, read_if_missing=True):
         called['direct'] += 1
         assert page is not None and page.text == 'the page', 'the fallback reuses the page already read'
         return None
@@ -2513,7 +2513,7 @@ async def test_a_non_openrouter_extractor_reads_the_page_in_code_too(monkeypatch
     page = linkedin_page.JobPage(text='the page', source='dom')
     _stub_read_page(monkeypatch, page=page, calls=reads)
 
-    async def fake_direct(candidate, url, stats, page=None):
+    async def fake_direct(candidate, url, stats, page=None, read_if_missing=True):
         directs.append(page)
         return None
 
@@ -10656,7 +10656,7 @@ def _stage2_with_dying_browser(monkeypatch, browser, dies_on: list[str]):
     async def fake_extract(candidate, page_text, stats, system_prompt):
         return None
 
-    async def fake_direct(candidate, url, stats, page=None):
+    async def fake_direct(candidate, url, stats, page=None, read_if_missing=True):
         return None
 
     monkeypatch.setattr(agent, 'read_page', fake_read_page)
@@ -12788,3 +12788,48 @@ async def test_record_listings_counts_a_card_skip_as_skipped_not_queued(monkeypa
         tools.set_card_rejection(None)
     assert [c['job_id'] for c in tools._candidates] == ['2']
     assert '1 queued' in summary and '1 skipped by title or card' in summary
+
+
+# --- Stage 2 reads the page itself a second time (2026-11-07: Genesys, EverAI) ---
+
+async def test_a_failed_first_read_is_read_again_by_stage_2(monkeypatch):
+    '''The second read used to happen inside the extract fallback, so the extractor and Ask Gate
+    Fields never saw the page it read.'''
+    page = linkedin_page.JobPage(text='Acme\nAI Engineer', source='dom')
+    answers = [None, page]
+
+    async def read(candidate, url, stats):
+        return answers.pop(0)
+
+    monkeypatch.setattr(agent, 'read_page', read)
+    assert await agent.read_page_for_extract(_make_candidate(), 'http://x', {}) is page
+    assert answers == []
+
+
+async def test_stage_2_stops_after_its_reads_and_the_fallback_does_not_read_again(monkeypatch):
+    reads = []
+
+    async def read(candidate, url, stats):
+        reads.append(candidate['job_id'])
+        return None
+
+    monkeypatch.setattr(agent, 'read_page', read)
+    assert await agent.read_page_for_extract(_make_candidate(), 'http://x', {}) is None
+    assert len(reads) == agent.STAGE2_PAGE_READS
+    assert await agent.extract_job_page_direct(_make_candidate(), 'http://x', {}, page=None,
+                                               read_if_missing=False) is None
+    assert len(reads) == agent.STAGE2_PAGE_READS
+
+
+async def test_a_dead_browser_is_not_read_again(monkeypatch):
+    reads = []
+
+    async def read(candidate, url, stats):
+        reads.append(url)
+        return None
+
+    monkeypatch.setattr(agent, 'read_page', read)
+    browser = _FakeBrowser()
+    browser.dead = True
+    assert await agent.read_page_for_extract(_make_candidate(), 'http://x', {}, browser) is None
+    assert len(reads) == 1, 'Stage 2 restarts the browser and retries the job instead'
