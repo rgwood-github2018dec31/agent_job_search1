@@ -167,7 +167,8 @@ from agentic_job_search.extract_openrouter import (
     extract_job_page_openrouter,
 )
 from agentic_job_search.gate_fields import ask_gate_fields
-from agentic_job_search.linkedin_exa import SOURCE_EXA, read_company_page_exa, read_job_page_exa
+from agentic_job_search.job_page_prefetch import JobPagePrefetcher
+from agentic_job_search.linkedin_exa import SOURCE_EXA, fetch_job_page, read_company_page_exa, read_job_page_exa
 from agentic_job_search.linkedin_page import (
     HeaderCard,
     JobPage,
@@ -183,7 +184,6 @@ from agentic_job_search.linkedin_page import (
 )
 from agentic_job_search.linkedin_signed_out import (
     SOURCE_SIGNED_OUT,
-    JobPagePrefetcher,
     card_place,
     card_workplace,
     read_company_page_signed_out,
@@ -542,6 +542,12 @@ For **Date posted** and **Experience level**: click the chip, click the option, 
 `[ref=e1202]`, not the snapshot's display text like `button "Location"`, and there is no `ref`
 parameter. A unique CSS selector also works. If a click fails, re-read the snapshot and use the
 bare ref rather than reformatting the same guess.
+
+**Refs go stale after every action.** A click, typing or a selection re-renders the page, and the
+refs you saw before it no longer exist. After each action, take a fresh full snapshot and use only
+its refs; do not narrow a snapshot to a ref you saw earlier. The chips appear in that snapshot as
+buttons named "Date posted", "Experience level" and so on, so there is no need to guess CSS
+selectors such as `toolbar`.
 
 Two things to keep straight:
 
@@ -2055,6 +2061,8 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
     '''
     async def run_pass(instruction: str) -> int | None:
         query = tools_module._current_query or ''
+        if provider_pin is not None:
+            await provider_pin.start_query()   # a provider a 429 sidelined in an earlier query comes back
         session = scrape_openrouter.ScrapeSession(browser_call, query, provider_pin=provider_pin)
         try:
             await session.run(build_scraper_prompt(), instruction, tools)
@@ -2433,7 +2441,8 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
 
 # --job-and-company-pages-via: how Stage 2 reads job and company pages this run (LINKEDIN_PAGE_READERS), set once in main().
 _job_and_company_pages_via = LINKEDIN_PAGE_READER_DEFAULT
-# The signed-out read-ahead of this run's job pages, started before Stage 1b (run_non_interactive).
+# The read-ahead of this run's job pages (Exa fetches or signed-out pages), started before Stage 1b
+# (run_non_interactive); None on the signed-in browser path and outside a scheduled run.
 _prefetcher: JobPagePrefetcher | None = None
 
 
@@ -2441,8 +2450,10 @@ async def read_page(candidate: dict, playwright_mcp_url: str, stage_stats: dict)
     """Read one posting's page in code (see linkedin_page). None — logged here — when the browser failed."""
     try:
         if _job_and_company_pages_via == LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER:
-            # Fetched by Exa, not from this machine: no LinkedIn pacing applies.
-            page = await read_job_page_exa(candidate, stage_stats)
+            # Fetched by Exa, not from this machine: no LinkedIn pacing applies. Usually fetched
+            # already, while Stage 1b searched; its retries cost Stage 2 nothing then.
+            prefetched = await _prefetcher.page(candidate) if _prefetcher is not None else None
+            page = await read_job_page_exa(candidate, stage_stats, prefetched)
         elif _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
             # Paced by linkedin_signed_out.pacer, not by the inter-job pause.
             page = await (_prefetcher.page(candidate) if _prefetcher is not None
@@ -5901,10 +5912,16 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
         console.print('[yellow]Stage 1b: Scraping LinkedIn for candidates ...[/yellow]\n')
         tools_module.set_card_rejection(card_rejection_reason)
+        # Signed-out pages are paced at about one a minute, and Exa often has no content on its first
+        # try and is asked again PAGE_FETCH_RETRY_DELAY_SECONDS later: reading starts with the first job Stage 1b queues rather
+        # than after the search (Read Job Pages Ahead).
         if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET:
-            # Signed-out pages are paced at about one a minute, so reading starts with the first job
-            # Stage 1b queues rather than after the search.
-            _prefetcher = JobPagePrefetcher(lambda: tools_module._candidates)
+            _prefetcher = JobPagePrefetcher(lambda: tools_module._candidates, read_job_page_signed_out, 'Signed-out')
+        elif _job_and_company_pages_via == LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER:
+            extraction_stats = stage_stats['extraction']
+            _prefetcher = JobPagePrefetcher(lambda: tools_module._candidates,
+                                            lambda candidate: fetch_job_page(candidate, extraction_stats), 'Exa')
+        if _prefetcher is not None:
             _prefetcher.start()
         await run_stage_1b(browser.port, playwright_mcp, queries, stage_stats['scraping'], browser=browser)
 

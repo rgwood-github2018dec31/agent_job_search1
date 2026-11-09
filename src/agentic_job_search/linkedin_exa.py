@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 from bs4 import BeautifulSoup
@@ -82,9 +83,21 @@ class ExaPageError(RuntimeError):
     '''The fetch failed, or what came back does not read as the page asked for.'''
 
 
-async def fetch_page(url: str, what: str, stage_stats: dict | None) -> dict:
+@dataclass(frozen=True)
+class ExaFetch:
+    '''One successful web_fetch: the tool server's reply, the attempt it came on, and when.'''
+    url: str
+    what: str
+    reply: dict
+    attempts: int
+    fetched_at: str
+
+
+async def fetch_page(url: str, what: str, stage_stats: dict | None) -> ExaFetch:
     '''The tool server's web_fetch reply for `url` (ok, content, title, http_status, cost_usd).
 
+    Its cost is added to `stage_stats` here; the job trace step is recorded by `record_fetch`, which the
+    reader calls in the job's own context (a read-ahead fetch has no trace yet).
     Raises ExaPageError naming the request, with the whole reply, on any failure. A failure to reach
     the tool server propagates as call_mcp_tool raised it, so tool_server.outage_url still sees it.
     '''
@@ -116,10 +129,22 @@ async def fetch_page(url: str, what: str, stage_stats: dict | None) -> dict:
         logger.warning(f'{what}: web_fetch {url} reported no cost (counted as $0)')
     if stage_stats is not None:
         stage_stats['cost'] = stage_stats.get('cost', 0.0) + float(cost or 0.0)
-    job_trace.record('web_fetch', url=url, what=what, engine=PAGE_FETCH_ENGINE, model=MODEL_NAME_PAGE_FETCH,
+    return ExaFetch(url=url, what=what, reply=data, attempts=attempt,
+                    fetched_at=datetime.now().isoformat(timespec='seconds'))
+
+
+def record_fetch(fetch: ExaFetch, prefetched: bool) -> None:
+    '''The web_fetch step of the current job's trace; `prefetched` when it was read ahead during Stage 1b.'''
+    data = fetch.reply
+    job_trace.record('web_fetch', url=fetch.url, what=fetch.what, engine=PAGE_FETCH_ENGINE, model=MODEL_NAME_PAGE_FETCH,
                      served_model=data.get('model'), http_status=data.get('http_status'),
-                     title=data.get('title'), chars=len(content), cost_usd=cost)
-    return data
+                     title=data.get('title'), chars=len(str(data.get('content') or '')), cost_usd=data.get('cost_usd'),
+                     attempts=fetch.attempts, fetched_at=fetch.fetched_at, prefetched=prefetched)
+
+
+async def fetch_job_page(candidate: dict, stage_stats: dict | None) -> ExaFetch:
+    '''The job page's fetch alone: what JobPagePrefetcher reads ahead, for read_job_page_exa to parse.'''
+    return await fetch_page(str(candidate['url']), f"job {candidate.get('job_id') or ''}", stage_stats)
 
 
 def without_page_links(content: str) -> str:
@@ -228,11 +253,18 @@ def body_after_heading(content: str) -> str:
     return after.partition('\n')[2]
 
 
-async def read_job_page_exa(candidate: dict, stage_stats: dict | None = None) -> JobPage:
-    '''Fetch the public job page through Exa and return what the extractor reads, archived like the other paths.'''
+async def read_job_page_exa(candidate: dict, stage_stats: dict | None = None,
+                            prefetched: ExaFetch | None = None) -> JobPage:
+    '''The public job page through Exa, as the extractor reads it, archived like the other paths.
+
+    `prefetched` is the fetch JobPagePrefetcher already made (its cost already counted); without it
+    the page is fetched now.
+    '''
     job_id = str(candidate.get('job_id') or '')
     url = str(candidate['url'])
-    data = await fetch_page(url, f'job {job_id}', stage_stats)
+    fetch = prefetched if prefetched is not None else await fetch_job_page(candidate, stage_stats)
+    record_fetch(fetch, prefetched=prefetched is not None)
+    data = fetch.reply
     content = str(data['content'])
     try:
         header = job_header(str(data.get('title') or ''), content, str(candidate.get('company') or ''))
@@ -287,8 +319,9 @@ async def read_company_page_exa(slug: str, stage_stats: dict | None = None) -> C
     COMPANY_ABOUT_FAILURES_DIR), ExaPageError when the fetch failed.
     '''
     url = LINKEDIN_COMPANY_URL.format(slug=slug)
-    data = await fetch_page(url, f'company {slug}', stage_stats)
-    content = str(data['content'])
+    fetch = await fetch_page(url, f'company {slug}', stage_stats)
+    record_fetch(fetch, prefetched=False)
+    content = str(fetch.reply['content'])
     try:
         return parse_company_profile(content, slug)
     except NotAnAboutPageError as ex:

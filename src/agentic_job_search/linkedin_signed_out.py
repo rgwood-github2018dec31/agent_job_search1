@@ -27,7 +27,7 @@ page kept, and the caller falls back as for any failed read.
 
 Every signed-out request waits its turn on one pacer (`pacing.signed_out_request_interval_seconds`,
 set by the user after a 429 at ~27 requests in 15 minutes, 2026-11-06). At that pace a run's job
-pages take about a minute each, so JobPagePrefetcher starts reading them while Stage 1b is still
+pages take about a minute each, so job_page_prefetch.JobPagePrefetcher starts reading them while Stage 1b is still
 searching, in the order the search queues them; Stage 2 takes each page as it reaches the job.
 
 A company page is looked up in the Wayback Machine first and read from LinkedIn only when no
@@ -66,7 +66,6 @@ from agentic_job_search.config import (
     LINKEDIN_SIGNED_OUT_HEADERS,
     LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES,
     LINKEDIN_WORKPLACE_BADGES,
-    SIGNED_OUT_PREFETCH_POLL_SECONDS,
     WAYBACK_AVAILABILITY_URL,
     WAYBACK_FETCH_TIMEOUT_SECONDS,
     WAYBACK_HEADERS,
@@ -459,99 +458,3 @@ async def read_company_page_signed_out(slug: str) -> CompanyAbout:
         raise NotAnAboutPageError(f'{ex}; {url}, {len(resp.text)} chars, '
                                   f'{_keep_unreadable_about_page(slug, resp.text)}') from ex
 
-
-class JobPagePrefetcher:
-    '''Reads queued job pages signed out, one per pacer turn, from the moment Stage 1b queues them.
-
-    `candidates` returns the run's live candidate list; pages are read in its order, except that a
-    page Stage 2 is waiting for goes first. A read's failure is kept for that job and raised to
-    Stage 2 when it asks (where it is logged, as for any page read). A challenge stops all reading:
-    it is raised for that job and for every job asked for after it, and no request is made again.
-    '''
-
-    def __init__(self, candidates: Callable[[], list[dict]]) -> None:
-        self._candidates = candidates
-        self._results: dict[str, asyncio.Future] = {}
-        self._wanted: list[str] = []
-        self._blocked: LinkedInBlockedError | None = None
-        self._task: asyncio.Task | None = None
-
-    def start(self) -> None:
-        self._task = asyncio.create_task(self._run(), name='signed-out job page prefetch')
-
-    async def stop(self) -> None:
-        '''Stop reading. Pages read but never asked for are reported; their files stay on disk.'''
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-        unused = [job_id for job_id, fut in self._results.items()
-                  if fut.done() and not fut.cancelled() and job_id not in self._wanted]
-        for job_id in unused:
-            if (ex := self._results[job_id].exception()) is not None:
-                logger.info(f'Signed-out prefetch: job {job_id} was never reached in Stage 2; its read had '
-                            f'failed: {type(ex).__name__}: {ex}')
-        if unused:
-            logger.info(f'Signed-out prefetch: {len(unused)} page(s) read but never reached in Stage 2')
-
-    def _future(self, job_id: str) -> asyncio.Future:
-        return self._results.setdefault(job_id, asyncio.get_running_loop().create_future())
-
-    def _next(self) -> dict | None:
-        by_id = {str(c.get('job_id')): c for c in self._candidates()}
-        for job_id in self._wanted:
-            if job_id in by_id and not self._future(job_id).done():
-                return by_id[job_id]
-        for job_id, candidate in by_id.items():
-            if job_id not in self._results or not self._results[job_id].done():
-                return candidate
-        return None
-
-    async def _run(self) -> None:
-        while True:
-            candidate = self._next()
-            if candidate is None:
-                await asyncio.sleep(SIGNED_OUT_PREFETCH_POLL_SECONDS)
-                continue
-            job_id = str(candidate.get('job_id'))
-            future = self._future(job_id)
-            try:
-                page = await read_job_page_signed_out(candidate)
-            except LinkedInBlockedError as ex:
-                self._blocked = ex
-                future.set_exception(ex)
-                logger.error(f'Signed-out prefetch stopped, no further signed-out requests this run: {ex}')
-                return
-            except Exception as ex:
-                # Kept for Stage 2, which logs it with the job when it reaches the job (or stop() does).
-                future.set_exception(ex)
-            else:
-                future.set_result(page)
-
-    async def page(self, candidate: dict) -> JobPage:
-        '''The job's page, waiting for it to be read if it has not been yet.'''
-        job_id = str(candidate.get('job_id'))
-        if job_id not in self._wanted:
-            self._wanted.append(job_id)
-        future = self._future(job_id)
-        if not future.done():
-            if self._blocked is not None:
-                raise LinkedInBlockedError(f'job {job_id} not read: signed-out reading stopped earlier this run '
-                                           f'({self._blocked})')
-            if self._task is None or self._task.done():
-                raise RuntimeError(f'job {job_id}: the signed-out prefetch is not running ({self._task_state()})')
-            await asyncio.wait({future, self._task}, return_when=asyncio.FIRST_COMPLETED)
-            if not future.done():
-                if self._blocked is not None:
-                    raise LinkedInBlockedError(f'job {job_id} not read: signed-out reading stopped ({self._blocked})')
-                raise RuntimeError(f'job {job_id}: the signed-out prefetch ended before reading it '
-                                   f'({self._task_state()})')
-        return future.result()
-
-    def _task_state(self) -> str:
-        if self._task is None:
-            return 'never started'
-        if self._task.cancelled():
-            return 'cancelled'
-        if self._task.done() and (ex := self._task.exception()) is not None:
-            return f'{type(ex).__name__}: {ex}'
-        return 'stopped'

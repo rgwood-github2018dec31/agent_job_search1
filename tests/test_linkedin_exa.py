@@ -5,8 +5,8 @@ The fixtures mirror what Exa returned on 2026-11-07 for a public job page and a 
 import json
 
 import pytest
+from agentic_job_search import job_trace, linkedin_page
 from agentic_job_search import linkedin_exa as lx
-from agentic_job_search import linkedin_page
 from agentic_job_search.config import (
     LINKEDIN_JOB_DESCRIPTION_HEADING,
     LLM_OPENROUTER_MCP_URL,
@@ -116,6 +116,27 @@ async def test_a_job_page_is_read_into_the_signed_in_shape(fetched):
     assert calls == [(LLM_OPENROUTER_MCP_URL, 'web_fetch', {
         'url': JOB_URL, 'model': MODEL_NAME_PAGE_FETCH, 'allowed_domains': list(PAGE_FETCH_ALLOWED_DOMAINS),
         'engine': PAGE_FETCH_ENGINE})]
+
+
+async def test_a_prefetched_fetch_is_parsed_without_fetching_again_and_traced(fetched, tmp_path):
+    '''Read Job Pages Ahead: the fetch was made during Stage 1b, with no job trace; Stage 2 records it.'''
+    replies, calls = fetched
+    replies[JOB_URL] = reply(JOB_CONTENT)
+    prefetch_stats = {'cost': 0.0}
+    fetch = await lx.fetch_job_page(CANDIDATE, prefetch_stats)
+    assert prefetch_stats['cost'] == pytest.approx(0.0012) and fetch.attempts == 1
+    stage2_stats = {'cost': 0.0}
+    trace_path = tmp_path / 'linkedin-4484344124.jsonl'
+    _trace, token = job_trace.start(trace_path, 'linkedin', '4484344124')
+    try:
+        page = await lx.read_job_page_exa(CANDIDATE, stage2_stats, fetch)
+    finally:
+        job_trace.finish(token)
+    assert len(calls) == 1, 'fetched once, during the read-ahead'
+    assert stage2_stats['cost'] == 0.0, 'the cost was counted when it was fetched'
+    assert page.header.company == 'Acme Data'
+    [step] = [s for s in job_trace.load(trace_path) if s['kind'] == 'web_fetch']
+    assert step['prefetched'] is True and step['attempts'] == 1 and step['url'] == JOB_URL
 
 
 async def test_the_fetch_is_kept_as_exa_returned_it(fetched):

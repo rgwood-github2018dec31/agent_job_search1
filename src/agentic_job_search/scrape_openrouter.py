@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 _FIND_TOOL_NAME = 'browser_find'
 _SNAPSHOT_TOOL_NAME = 'browser_snapshot'
+_SNAPSHOT_TARGET_ARG = 'target'   # narrows a snapshot to one element (a ref or a CSS selector)
 _FILENAME_ARG = 'filename'
 FIND_CAPTURE_DIR = RUN_DIR / 'find_captures'
 
@@ -191,6 +192,12 @@ class ProviderPin:
     failed: list[str] = field(default_factory=list)
     # A 429 is the provider's limit, shared by all its endpoints (see endpoint_pin.is_rate_limited).
     rate_limited_providers: set[str] = field(default_factory=set)
+    # A first 429 sidelines its provider for the rest of that query only (2026-11-09): on 2026-11-07
+    # one 429 from morph/fp8 in the first query kept all six on baidu/fp8 at ~1.7x the price, and
+    # scraping cost $0.27 instead of ~$0.09. Provider -> the endpoint tags it failed with, which
+    # start_query takes back out of `failed`. A provider let back that answers 429 again stays out.
+    sidelined_for_query: dict[str, list[str]] = field(default_factory=dict)
+    let_back: set[str] = field(default_factory=set)
     switches: int = 0
 
     async def choose(self, announce: bool = True) -> bool:
@@ -239,8 +246,13 @@ class ProviderPin:
             return False
         failed_tag = self.tag
         self.failed.append(failed_tag)
+        scope = 'for the rest of the run'
         if is_rate_limited(error):
-            self.rate_limited_providers.add(provider_of(failed_tag))
+            provider = provider_of(failed_tag)
+            self.rate_limited_providers.add(provider)
+            if provider not in self.let_back:
+                self.sidelined_for_query.setdefault(provider, []).append(failed_tag)
+                scope = 'for the rest of this query'
         if self.switches >= SCRAPER_PROVIDER_MAX_SWITCHES:
             logger.warning(f'Stage 1b: {failed_tag} failed and the {SCRAPER_PROVIDER_MAX_SWITCHES}-switch '
                            f'cap is used up: {compact_error(error)}')
@@ -256,11 +268,42 @@ class ProviderPin:
             logger.warning(f'Stage 1b: {failed_tag} failed and no other usable endpoint is left: {compact_error(error)}')
             return False
         detail = (f'{failed_tag} failed ({compact_error(error)}); switched to {self.tag} '
-                  f'(est. {price_text(self.estimate_per_million)}) for the rest of the run')
+                  f'(est. {price_text(self.estimate_per_million)}) {scope}')
         logger.warning(f'Stage 1b: {detail}')
         tools_generic._ui_alerts.append({'kind': 'provider_switch', 'query': query, 'region': '(all)', 'detail': detail,
                                          'from': failed_tag, 'to': self.tag, 'reason': compact_error(error)})
         return True
+
+
+    async def start_query(self) -> None:
+        '''At the start of a query, let back the providers a first 429 sidelined, and re-pin the cheapest.
+
+        A query starts a fresh conversation, so moving endpoints here loses no prompt cache. When the
+        ranking fails or finds nothing, the current endpoint is kept.
+        '''
+        if not self.sidelined_for_query:
+            return
+        returning = sorted(self.sidelined_for_query)
+        released = {tag for tags in self.sidelined_for_query.values() for tag in tags}
+        self.failed = [tag for tag in self.failed if tag not in released]
+        self.rate_limited_providers.difference_update(returning)
+        self.let_back.update(returning)
+        self.sidelined_for_query.clear()
+        previous = (self.tag, self.quantization, self.estimate_per_million)
+        try:
+            chose = await self.choose(announce=False)
+        except Exception as ex:
+            logger.warning(f'Stage 1b: could not re-rank after letting {", ".join(returning)} back from a 429; '
+                           f'staying on {previous[0]}: {type(ex).__name__}: {ex}')
+            return
+        if not chose:
+            self.tag, self.quantization, self.estimate_per_million = previous
+            logger.warning(f'Stage 1b: no usable endpoint after letting {", ".join(returning)} back from a 429; '
+                           f'staying on {previous[0]}')
+            return
+        logger.info(f'Stage 1b: {", ".join(returning)} let back after a 429 in an earlier query; pinned {self.tag} '
+                    f'(est. {price_text(self.estimate_per_million)}'
+                    + (f', was {previous[0]})' if self.tag != previous[0] else ', unchanged)'))
 
 
 async def pin_scraper_provider(model: str) -> ProviderPin:
@@ -446,6 +489,47 @@ class ScrapeSession:
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
         self._started_at = time.monotonic()
         self._last_info_at = self._started_at
+
+    async def _call_browser_tool(self, name: str, args: dict) -> str:
+        '''One browser tool call's result for the model, or its error as text.
+
+        A snapshot of one element (`target`) that fails is answered with a full snapshot instead
+        (2026-11-09). Once browser_find was taken away (7b539a3), the model narrowed snapshots to a
+        ref from before its last click, which the re-rendered page no longer has: 31 failed calls
+        on 2026-11-07, each one an iteration re-sending ~60k prompt tokens only to be told to
+        snapshot again. Code takes that snapshot; the model still chooses every action.
+        '''
+        try:
+            out = await self._browser(name, args)
+        except Exception as ex:
+            target = args.get(_SNAPSHOT_TARGET_ARG) if name == _SNAPSHOT_TOOL_NAME else None
+            if not target:
+                logger.warning(
+                    f'Stage 1b: browser tool {name} failed for query {self.query!r} '
+                    f'(args {snippet(args)}): {type(ex).__name__}: {browser_error_for_log(ex)}'
+                )
+                return f'ERROR calling {name}: {ex}'
+            whole_page = {k: v for k, v in args.items() if k != _SNAPSHOT_TARGET_ARG}
+            try:
+                out = await self._browser(name, whole_page)
+            except Exception as retry_ex:
+                logger.warning(
+                    f'Stage 1b: browser tool {name} failed for query {self.query!r} (args {snippet(args)}): '
+                    f'{type(ex).__name__}: {browser_error_for_log(ex)}; the full snapshot instead failed too: '
+                    f'{type(retry_ex).__name__}: {browser_error_for_log(retry_ex)}'
+                )
+                return f'ERROR calling {name}: {ex}\nA full snapshot (no target) also failed: {retry_ex}'
+            logger.info(f'Stage 1b: browser_snapshot target {target!r} failed for query {self.query!r} '
+                        f'({browser_error_for_log(ex)}); returned a full snapshot instead')
+            note = (f'NOTE: browser_snapshot with target {target!r} failed ({browser_error_for_log(ex)}). '
+                    f'The page has changed since that ref was shown, so here is a full snapshot instead. '
+                    f'Only refs from this snapshot are valid now.\n\n')
+            return note + drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
+        if name == _FIND_TOOL_NAME:
+            _capture_oversized_find(out, self.query)
+        if name in (_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME):
+            out = drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
+        return out
 
     def _log_step(self, name: str, args: dict) -> None:
         '''One DEBUG line naming the step just taken, if SCRAPER_PROGRESS_LOG_SECONDS passed in silence.
@@ -694,19 +778,7 @@ class ScrapeSession:
                         dropped = args.pop(_FILENAME_ARG)
                         logger.warning(f'Stage 1b: dropped filename={dropped!r} from {name} for query '
                                        f'{self.query!r} so the result is returned, not written to disk')
-                    try:
-                        out = await self._browser(name, args)
-                    except Exception as ex:
-                        logger.warning(
-                            f'Stage 1b: browser tool {name} failed for query {self.query!r} '
-                            f'(args {snippet(args)}): {type(ex).__name__}: {browser_error_for_log(ex)}'
-                        )
-                        out = f'ERROR calling {name}: {ex}'
-                    else:
-                        if name == _FIND_TOOL_NAME:
-                            _capture_oversized_find(out, self.query)
-                        if name in (_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME):
-                            out = drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
+                    out = await self._call_browser_tool(name, args)
                 self._log_step(name, args)
                 messages.append({'role': 'tool', 'tool_call_id': call.get('id', ''),
                                  'content': truncate_reported(out, _result_cap(name),

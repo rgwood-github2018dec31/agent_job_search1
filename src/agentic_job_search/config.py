@@ -926,8 +926,8 @@ WAYBACK_HEADERS = {'User-Agent': 'agentic-job-search/1.0 (personal job search; a
 WAYBACK_REFUSAL_STATUSES = frozenset({HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.FORBIDDEN})
 # The archive answered 429 after ~5 requests within a few seconds (2026-11-06): its own gap.
 COMPANY_PAGE_ARCHIVE_INTERVAL_SECONDS = (5.0, 8.0)
-# How often the read-ahead looks for a newly queued job when it has none to read.
-SIGNED_OUT_PREFETCH_POLL_SECONDS = 2
+# How often the read-ahead (job_page_prefetch) looks for a newly queued job when it has none to read.
+JOB_PAGE_PREFETCH_POLL_SECONDS = 2
 # A redirect to one of these means the page wants a signed-in member.
 LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES = ('/uas/login', '/login', '/authwall', '/checkpoint', '/signup')
 # Model lookups for the applied-job companies run together at load; one cheap call each, once ever.

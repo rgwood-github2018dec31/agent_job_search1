@@ -2149,7 +2149,7 @@ async def test_read_page_logs_and_returns_none_when_the_browser_fails(monkeypatc
 async def test_read_page_hands_a_tool_server_outage_to_stage_2(monkeypatch):
     '''Exa path (2026-11-07): the OpenRouter tool server being down says nothing about the job, so it is
     raised for Stage 2 to wait out (Wait Out Tool Server Outage), not logged as an unreadable page.'''
-    async def down(candidate, stage_stats=None):
+    async def down(candidate, stage_stats=None, prefetched=None):
         raise RuntimeError(f'MCP initialize at {config.LLM_OPENROUTER_MCP_URL} transport failed: ConnectError: '
                            'All connection attempts failed')
 
@@ -10872,6 +10872,68 @@ def test_scraper_snapshot_drops_the_detail_pane_and_keeps_every_card(monkeypatch
     assert 'About the job' not in content and '[job detail pane omitted: ' in content
     assert '[truncated' not in content
     assert not any('Truncating' in m for m in _warnings(caplog))
+
+
+def _run_scraper_with_one_snapshot(monkeypatch, args: dict, browser) -> str:
+    '''Run a ScrapeSession whose model calls browser_snapshot once with `args`; return its tool reply.'''
+    call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
+                       'tool_calls': [{'id': 'c1', 'function': {'name': 'browser_snapshot',
+                                                                'arguments': json.dumps(args)}}]})
+    sent = []
+
+    async def fake_call_mcp_tool(url, name, chat_args, timeout_seconds=None):
+        sent.append(chat_args)
+        return [call, _CHAT_DONE][len(sent) - 1]
+
+    monkeypatch.setattr(scrape_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
+    asyncio.run(scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer').run('sys', 'user', []))
+    return sent[1]['messages'][-1]['content']
+
+
+STALE_REF_ERROR = 'Error: Ref f78e1176 not found in the current page snapshot. Try capturing new snapshot.'
+
+
+def test_scraper_stale_snapshot_target_is_answered_with_a_full_snapshot(monkeypatch, caplog):
+    '''2026-11-07: 31 targeted snapshots failed on refs from before the last click, an iteration each.'''
+    calls = []
+
+    async def browser(name, args):
+        calls.append(dict(args))
+        if 'target' in args:
+            raise RuntimeError(STALE_REF_ERROR)
+        return '- button "Date posted" [ref=f80e12]'
+
+    with caplog.at_level(logging.INFO):
+        content = _run_scraper_with_one_snapshot(monkeypatch, {'target': 'f78e1176', 'depth': 6}, browser)
+
+    assert calls == [{'target': 'f78e1176', 'depth': 6}, {'depth': 6}], 'retried once, depth kept, target dropped'
+    assert content.startswith('NOTE: browser_snapshot with target ')
+    assert "'f78e1176'" in content and 'Only refs from this snapshot are valid' in content
+    assert '- button "Date posted" [ref=f80e12]' in content
+    assert not _warnings(caplog), 'a recovered snapshot is not a warning'
+    assert any('returned a full snapshot instead' in r.message for r in caplog.records)
+
+
+def test_scraper_snapshot_failure_without_a_target_is_not_retried(monkeypatch, caplog):
+    calls = []
+
+    async def browser(name, args):
+        calls.append(dict(args))
+        raise RuntimeError('browser closed')
+
+    content = _run_scraper_with_one_snapshot(monkeypatch, {}, browser)
+    assert calls == [{}]
+    assert content == 'ERROR calling browser_snapshot: browser closed'
+    assert any('browser closed' in m for m in _warnings(caplog))
+
+
+def test_scraper_failed_full_snapshot_after_a_stale_target_reports_both_errors(monkeypatch, caplog):
+    async def browser(name, args):
+        raise RuntimeError(STALE_REF_ERROR if 'target' in args else 'browser closed')
+
+    content = _run_scraper_with_one_snapshot(monkeypatch, {'target': 'toolbar'}, browser)
+    assert 'f78e1176 not found' in content and 'browser closed' in content
+    assert any('f78e1176 not found' in m and 'browser closed' in m for m in _warnings(caplog))
 
 
 def test_scraper_evaluate_result_over_the_shared_cap_still_warns(monkeypatch, caplog):

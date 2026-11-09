@@ -2,7 +2,6 @@
 
 The fixtures mirror the public markup measured on 2026-11-06 (job 4482929457, company auxotalent).
 '''
-import asyncio
 import json
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -273,63 +272,3 @@ async def test_requests_are_spaced_by_the_drawn_interval(monkeypatch):
     await pacer.wait('second')
     assert slept == [53.5]        # 61 + 2.5 drawn, less the 10 s already gone
 
-
-def _candidate(job_id):
-    return {'site': 'linkedin', 'job_id': job_id, 'url': f'https://www.linkedin.com/jobs/view/{job_id}/'}
-
-
-@pytest.fixture
-def fake_reads(monkeypatch):
-    '''read_job_page_signed_out stubbed: records the order of reads; `fail[job_id]` raises instead.'''
-    order: list[str] = []
-    fail: dict[str, Exception] = {}
-
-    async def read(candidate):
-        job_id = candidate['job_id']
-        order.append(job_id)
-        await asyncio.sleep(0)
-        if job_id in fail:
-            raise fail[job_id]
-        return linkedin_page.JobPage(text=f'page {job_id}', source=lg.SOURCE_SIGNED_OUT)
-
-    monkeypatch.setattr(lg, 'read_job_page_signed_out', read)
-    monkeypatch.setattr(lg, 'SIGNED_OUT_PREFETCH_POLL_SECONDS', 0)
-    return order, fail
-
-
-async def test_pages_are_read_ahead_in_queue_order_as_jobs_are_queued(fake_reads):
-    order, _ = fake_reads
-    queued = [_candidate('1')]
-    prefetcher = lg.JobPagePrefetcher(lambda: queued)
-    prefetcher.start()
-    assert (await prefetcher.page(queued[0])).text == 'page 1'
-    queued.append(_candidate('2'))   # queued later, while Stage 1b searches on
-    assert (await prefetcher.page(queued[1])).text == 'page 2'
-    await prefetcher.stop()
-    assert order == ['1', '2']
-
-
-async def test_a_failed_read_is_raised_for_its_job_only(fake_reads):
-    _order, fail = fake_reads
-    fail['1'] = lg.SignedOutPageError('no title')
-    queued = [_candidate('1'), _candidate('2')]
-    prefetcher = lg.JobPagePrefetcher(lambda: queued)
-    prefetcher.start()
-    with pytest.raises(lg.SignedOutPageError, match='no title'):
-        await prefetcher.page(queued[0])
-    assert (await prefetcher.page(queued[1])).text == 'page 2'
-    await prefetcher.stop()
-
-
-async def test_a_challenge_stops_all_reading_and_is_raised_for_every_later_job(fake_reads):
-    order, fail = fake_reads
-    fail['1'] = linkedin_page.LinkedInBlockedError('HTTP 429')
-    queued = [_candidate('1'), _candidate('2'), _candidate('3')]
-    prefetcher = lg.JobPagePrefetcher(lambda: queued)
-    prefetcher.start()
-    with pytest.raises(linkedin_page.LinkedInBlockedError, match='429'):
-        await prefetcher.page(queued[0])
-    with pytest.raises(linkedin_page.LinkedInBlockedError, match='stopped earlier'):
-        await prefetcher.page(queued[2])
-    await prefetcher.stop()
-    assert order == ['1']   # nothing was requested after the challenge

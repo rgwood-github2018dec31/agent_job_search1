@@ -433,3 +433,72 @@ async def test_a_non_json_rank_providers_reply_names_the_model_and_leaves_the_ru
         pin = await REAL_PIN_SCRAPER_PROVIDER(model)
     assert pin.tag is None
     assert [a['kind'] for a in tools._ui_alerts] == ['provider_unpinned']
+
+
+# --- a 429 sidelines a provider for one query (2026-11-09) ---------------------------------------
+
+TOO_MANY = '429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions'
+
+
+async def _query(pin):
+    '''One query as run_pass runs it: start_query, then one session.'''
+    await pin.start_query()
+    await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+
+
+async def test_a_429_sidelines_the_provider_for_that_query_only(monkeypatch, caplog):
+    '''2026-11-07: one 429 from morph/fp8 kept all six queries on baidu/fp8, scraping $0.27 vs ~$0.09.'''
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    sent = []
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE),
+          [_chat(error=TOO_MANY), _chat(provider='DeepInfra'), _chat()], sent)
+    with caplog.at_level(logging.INFO):
+        await _query(pin)
+        await _query(pin)
+    assert [args['provider'] for tool, args in sent if tool == 'chat'] == \
+        ['streamlake/fp8', 'deepinfra/fp8', 'streamlake/fp8']
+    assert pin.tag == 'streamlake/fp8' and pin.failed == [] and pin.rate_limited_providers == set()
+    assert 'for the rest of this query' in tools._ui_alerts[0]['detail']
+    assert any('let back after a 429' in r.message and 'was deepinfra/fp8' in r.message for r in caplog.records)
+
+
+async def test_a_provider_let_back_that_429s_again_stays_out_for_the_run(monkeypatch):
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    sent = []
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE),
+          [_chat(error=TOO_MANY), _chat(provider='DeepInfra'), _chat(error=TOO_MANY), _chat(provider='DeepInfra'),
+           _chat(provider='DeepInfra')], sent)
+    for _ in range(3):
+        await _query(pin)
+    assert [args['provider'] for tool, args in sent if tool == 'chat'] == \
+        ['streamlake/fp8', 'deepinfra/fp8', 'streamlake/fp8', 'deepinfra/fp8', 'deepinfra/fp8']
+    assert pin.tag == 'deepinfra/fp8' and pin.failed == ['streamlake/fp8'] and pin.switches == 2
+    assert 'for the rest of the run' in tools._ui_alerts[1]['detail']
+
+
+async def test_a_failure_that_is_not_a_429_is_never_let_back(monkeypatch):
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    monkeypatch.setattr(so, 'TRANSIENT_RETRY_DELAY_SECONDS', 0)
+    down = _chat(error='OpenRouter chat failed: 503 Server Error: Service Unavailable for url: x')
+    sent = []
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE), [down, down, _chat(provider='DeepInfra'),
+                                                          _chat(provider='DeepInfra')], sent)
+    await _query(pin)
+    await _query(pin)
+    assert pin.tag == 'deepinfra/fp8' and pin.failed == ['streamlake/fp8']
+    assert [tool for tool, _args in sent].count('rank_providers') == 1, 'start_query had nothing to let back'
+
+
+async def test_a_failed_re_rank_keeps_the_current_endpoint(monkeypatch, caplog):
+    pin = await _pinned(monkeypatch, _listing(DEEPINFRA, STREAMLAKE))
+    monkeypatch.setattr(tools, '_ui_alerts', [])
+    _wire(monkeypatch, _listing(DEEPINFRA, STREAMLAKE), [_chat(error=TOO_MANY), _chat(provider='DeepInfra')])
+    await so.ScrapeSession(_no_browser, 'q', provider_pin=pin).run('sys', 'user', [])
+    _wire(monkeypatch, {'ok': False, 'error': 'HTTP 503'})
+    with caplog.at_level(logging.WARNING):
+        await pin.start_query()
+    assert pin.tag == 'deepinfra/fp8'
+    assert any('staying on deepinfra/fp8' in r.message and 'HTTP 503' in r.message for r in caplog.records)

@@ -160,6 +160,7 @@ src/agentic_job_search/
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
   linkedin_exa.py                 # Read LinkedIn Page via Exa: job and company pages fetched by Exa through OpenRouter's web_fetch (the default)
   linkedin_signed_out.py          # Read LinkedIn Page Signed Out: job and company pages, one cookie-free HTTP GET each
+  job_page_prefetch.py            # Read Job Pages Ahead: queued jobs' pages read during Stage 1b (Exa or signed-out)
   minimal_archive.py              # The de-cluttered page as small self-contained .min.html + .min.pdf beside the full archive
   config.py                       # Model/provider constants and Stage 2 tuning (nothing personal)
   preferences.py                  # Loads run_dir/preferences.yaml; neutral defaults if absent
