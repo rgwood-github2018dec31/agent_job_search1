@@ -546,8 +546,8 @@ bare ref rather than reformatting the same guess.
 **Refs go stale after every action.** A click, typing or a selection re-renders the page, and the
 refs you saw before it no longer exist. After each action, take a fresh full snapshot and use only
 its refs; do not narrow a snapshot to a ref you saw earlier. The chips appear in that snapshot as
-buttons named "Date posted", "Experience level" and so on, so there is no need to guess CSS
-selectors such as `toolbar`.
+buttons named "Date posted", "Experience level" and so on: click them by the refs that snapshot
+shows.
 
 Two things to keep straight:
 
