@@ -28,6 +28,12 @@ during a 40-minute run, makes the machine hard to use. `python main.py -n` alrea
 misbehaves headless), and `visible` only for a POC the user is actively watching. The scratchpad
 POC harness defaults to `minimized` and takes `PW_BROWSER_MODE` to override.
 
+**Never start a live run without a go-ahead given for it.** Before launching `main.py` (or any
+script that drives the LinkedIn account or spends money), say so on its own line: the command,
+about how long it takes and what it costs, and wait for the user to say go. An approved plan that
+lists the run is not that go-ahead: on 2026-11-10 a verification run started from a plan step,
+mentioned only after launch, and the user, unaware, started their own run into its lock.
+
 ## Always-on invariants
 
 The full text and the history behind each rule are in the linked doc. Read it before changing

@@ -176,6 +176,26 @@ def _usable_bound(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
 
+def amount_for_comparison(amount: float | None, currency: str, to_currency: str) -> float | None:
+    """`amount` in `to_currency`, unrounded, for code to compare against a target; None when it cannot.
+
+    Unlike convert_bounds this ignores `keep_currencies`: keeping a currency as written is a display
+    choice, and it left a EUR estimate with no figure to compare (job 4487361414, 2026-11-07), so
+    the rater's pay guess stayed beside an estimate that reached the target. Only for the target
+    currency the rate table is kept in (`convert_to`), so asking never refetches the table for
+    another base. Its one use is estimate_meets_target, which can only DROP a rater bullet.
+    """
+    conversion = preferences.salary_conversion()
+    if conversion is None or conversion[0] != to_currency or not currency or not _usable_bound(amount):
+        return None
+    if currency == to_currency:
+        return float(amount)
+    entry = (rates_for(to_currency) or {}).get(currency)
+    if not isinstance(entry, dict) or not _usable_bound(entry.get('rate')):
+        return None
+    return float(amount) / float(entry['rate'])
+
+
 def convert_bounds(
     minimum: float | None, maximum: float | None, currency: str, text: str = ''
 ) -> dict[str, Any] | None:

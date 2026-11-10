@@ -6630,6 +6630,29 @@ def test_estimate_meets_target_reads_an_estimate_in_the_target_currency(salary_t
     assert agent.estimate_meets_target(_make_extract(salary_estimate=estimate)) is True
 
 
+@pytest.mark.parametrize('maximum_eur, expected', [(150_000.0, True), (120_000.0, False)])
+def test_estimate_meets_target_converts_a_kept_currency_for_the_comparison(
+    salary_target_set, monkeypatch, maximum_eur, expected,
+):
+    """Job 4487361414 (2026-11-07): EUR is kept as written, so the estimate carried no conversion
+    and the rater's guess stayed beside it. The comparison uses the day's rate regardless."""
+    monkeypatch.setattr(preferences, 'salary_conversion', lambda: (TEST_TARGET_CURRENCY, ['EUR']))
+    eur_per_target_unit = 0.62  # EUR 150k -> 242k and 120k -> 194k, either side of TEST_BASE_TARGET
+    monkeypatch.setattr(
+        agent.fx, 'rates_for', lambda base: {'EUR': {'rate': eur_per_target_unit, 'date': '2026-11-07'}})
+    estimate = {'currency': 'EUR', 'minimum': 110_000.0, 'maximum': maximum_eur, 'period': 'year',
+                'conversion': None}
+    assert agent.estimate_meets_target(_make_extract(salary_estimate=estimate)) is expected
+
+
+def test_estimate_meets_target_stays_undecided_without_a_rate(salary_target_set, monkeypatch):
+    monkeypatch.setattr(preferences, 'salary_conversion', lambda: (TEST_TARGET_CURRENCY, ['EUR']))
+    monkeypatch.setattr(agent.fx, 'rates_for', lambda base: None)
+    estimate = {'currency': 'EUR', 'minimum': 110_000.0, 'maximum': 150_000.0, 'period': 'year',
+                'conversion': None}
+    assert agent.estimate_meets_target(_make_extract(salary_estimate=estimate)) is None
+
+
 def test_a_raters_pay_guess_loses_a_leading_absence_joined_by_and():
     """The 2026-10-26 Proxify replay: 'No pay figure and contractor marketplace rates …'."""
     merged = agent.merge_warnings(

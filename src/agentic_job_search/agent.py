@@ -3930,10 +3930,12 @@ def estimate_meets_target(extract: dict) -> bool | None:
     UPPER bound -- salary_meets_target's rule; None when code cannot decide.
 
     Read from the estimate's own figures when it is in the target currency, else from its
-    code-computed conversion into that currency. Annual only. None -- no estimate, no target,
-    another period, no conversion -- keeps the rater's labelled guess visible, so a failure shows
-    more rather than less. Its one use is to DROP that guess (merge_salary_warning); it never adds
-    a warning, a cap or a gate, and it runs after rating, so it never reaches the rater.
+    code-computed conversion into that currency, else from the day's rate even for a currency the
+    user keeps as written (fx.amount_for_comparison; job 4487361414, 2026-11-07: a EUR estimate had
+    no conversion to compare). Annual only. None -- no estimate, no target, another period, no
+    rate -- keeps the rater's labelled guess visible, so a failure shows more rather than less.
+    Its one use is to DROP that guess (merge_salary_warning); it never adds a warning, a cap or a
+    gate, and it runs after rating, so it never reaches the rater.
     """
     target = preferences.salary_target()
     estimate = extract.get('salary_estimate')
@@ -3941,9 +3943,12 @@ def estimate_meets_target(extract: dict) -> bool | None:
         return None
     amount, currency = target
     figures = estimate if estimate.get('currency') == currency else estimate.get('conversion')
-    if not figures or figures.get('currency') != currency or figures.get('maximum') is None:
+    if figures and figures.get('currency') == currency and figures.get('maximum') is not None:
+        return figures['maximum'] >= amount
+    maximum = fx.amount_for_comparison(estimate.get('maximum'), estimate.get('currency') or '', currency)
+    if maximum is None:
         return None
-    return figures['maximum'] >= amount
+    return maximum >= amount
 
 
 def below_target_salary_warning(extract: dict) -> str | None:

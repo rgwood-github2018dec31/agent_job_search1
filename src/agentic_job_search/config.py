@@ -641,7 +641,7 @@ REFERENCE_SUMMARY_RETRY_SHARE = 0.4
 #
 # Upgrading is therefore a reviewable edit to this constant, prompted for by
 # check_playwright_mcp_version() rather than taken automatically.
-PLAYWRIGHT_MCP_VERSION = '0.0.84'
+PLAYWRIGHT_MCP_VERSION = '0.0.85'
 PLAYWRIGHT_MCP_PACKAGE = f'@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}'
 # Queried directly over HTTPS rather than via `npm view`, which shells out through the npm cache
 # and can fail for reasons unrelated to the registry (a root-owned cache file, for one).
