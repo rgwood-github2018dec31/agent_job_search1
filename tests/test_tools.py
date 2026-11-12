@@ -36,7 +36,7 @@ from agentic_job_search import (
 )
 from agentic_job_search import tools_generic as tools
 from claude_agent_sdk import ResultMessage, SdkMcpTool
-from fakes import chat_reply
+from fakes import chat_reply, openrouter_tool_reply
 from utils_tools_n_agents_common.models import (
     ANTHROPIC_MODEL_NAME_LOW,
     ANTHROPIC_MODEL_NAME_MEDIUM,
@@ -8466,14 +8466,14 @@ async def test_rate_with_openrouter_retries_once_on_truncation(monkeypatch):
 
     temperatures = []
 
-    async def fake_chat(prompt, system='', model='', max_tokens=None, temperature=None):
-        attempts.append(max_tokens)
-        temperatures.append(temperature)
-        if len(attempts) == 1:
-            raise triage.TruncatedResponseError('truncated', max_tokens=None)
-        return chat_reply('{"rating": 5, "reasoning": "great"}', 0.002)
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        attempts.append(args.get('max_tokens'))
+        temperatures.append(args.get('temperature'))
+        return openrouter_tool_reply(triage.RATING_TOOL_NAME, _rating_arguments(5), 0.002,
+                                     finish_reason='length' if len(attempts) == 1 else 'tool_calls')
 
-    monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
+    monkeypatch.setattr(config, 'SHADOW_MODEL', None)
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
     result, _ = await triage.rate_with_openrouter('sys', 'user')
     assert result['rating'] == 5
     assert len(attempts) == 2, 'exactly one retry'
@@ -12374,13 +12374,84 @@ def test_release_errored_job_counts_per_job(tmp_path, monkeypatch):
 UNCLOSED_ARRAY_REPLY = '{"rating": 5, "reasoning": "near-perfect", "warnings": ["verify remote flexibility"}'
 
 
-async def test_rate_with_openrouter_names_a_malformed_reply_and_does_not_repair_it(monkeypatch):
-    async def fake_chat(prompt, system='', model='', max_tokens=None, temperature=None):
-        return chat_reply(UNCLOSED_ARRAY_REPLY, 0.002)
+def _rating_arguments(rating: int, reasoning: str = 'great') -> str:
+    return json.dumps({'reasoning': reasoning, 'rating': rating, 'summary': 'engineer', 'pros': [], 'warnings': []})
 
-    monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
-    with pytest.raises(triage.MalformedRatingReplyError, match='No JSON object found'):
+
+def _rating_server(monkeypatch, arguments_by_model: dict[str, str]) -> list[str]:
+    '''The OpenRouter tool server answering each model: a submit_rating call carrying its entry, or, for
+    a MODEL_NAME_RATING_TEXT_REPLY model, its entry as the reply text. Returns the models asked.'''
+    asked: list[str] = []
+    monkeypatch.setattr(config, 'SHADOW_MODEL', None)
+
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        model = args['model']
+        asked.append(model)
+        if model in triage.MODEL_NAME_RATING_TEXT_REPLY:
+            assert 'tools' not in args
+            return json.dumps({'ok': True, 'content': arguments_by_model[model], 'cost_usd': 0.002, 'model': model,
+                               'provider': 'P', 'finish_reason': 'stop', 'usage': {}})
+        assert args['tool_choice'] == {'type': 'function', 'function': {'name': triage.RATING_TOOL_NAME}}
+        return openrouter_tool_reply(triage.RATING_TOOL_NAME, arguments_by_model[model], 0.002, model=model)
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    return asked
+
+
+@pytest.mark.parametrize(('arguments', 'problem'), [
+    (UNCLOSED_ARRAY_REPLY, 'arguments are not JSON'),          # the 2026-10-08 slip, as a function call
+    (_rating_arguments(7), 'arguments break the schema at rating'),
+    ('{"rating": 4}', "'reasoning' is a required property"),
+])
+async def test_rate_with_openrouter_names_a_malformed_call_and_does_not_repair_it(monkeypatch, arguments, problem):
+    _rating_server(monkeypatch, {config.MODEL_NAME_SINGLE_TURN: arguments})
+    with pytest.raises(triage.MalformedRatingReplyError, match=problem):
         await triage.rate_with_openrouter('sys', 'user')
+
+
+async def test_rate_with_openrouter_asks_for_a_submit_rating_call_reasoning_first(monkeypatch):
+    sent = []
+
+    async def fake_call(url, tool, args, timeout_seconds=None):
+        sent.append(args)
+        return openrouter_tool_reply(triage.RATING_TOOL_NAME, _rating_arguments(4))
+
+    monkeypatch.setattr(config, 'SHADOW_MODEL', None)
+    monkeypatch.setattr(triage, 'call_mcp_tool', fake_call)
+    result, _ = await triage.rate_with_openrouter('sys', 'user')
+    assert result['rating'] == 4
+    prompt = sent[0]['messages'][-1]['content']
+    assert prompt.endswith(triage.RATING_TOOL_INSTRUCTIONS) and 'JSON' not in prompt
+    parameters = sent[0]['tools'][0]['function']['parameters']
+    assert list(parameters['properties'])[:2] == ['reasoning', 'rating'], 'with rating first, ratings ran high'
+    assert parameters['properties']['rating']['maximum'] == config.RATING_MAX
+
+
+async def test_both_rating_forms_are_traced_under_the_raters_own_name(monkeypatch, tmp_path):
+    '''The Job Path places a call by its call_site; a helper in between would rename it.'''
+    glm = config.OPENROUTER_MODEL_NAME_GLM_53_FLASH
+    _rating_server(monkeypatch, {config.MODEL_NAME_SINGLE_TURN: _rating_arguments(4), glm: '{"rating": 3, "reasoning": "r"}'})
+    path = tmp_path / 'x.trace.jsonl'
+    _, token = job_trace.start(path, 'linkedin', '1')
+    try:
+        await triage.rate_with_openrouter('sys', 'user')
+        await triage.rate_with_openrouter('sys', 'user', model=glm)
+    finally:
+        job_trace.finish(token)
+    sites = [s['call_site'] for s in job_trace.load(path) if s['kind'] == 'llm_call']
+    assert sites == ['rate_with_openrouter', 'rate_with_openrouter']
+
+
+async def test_glm_rates_in_text_not_by_function_call(monkeypatch):
+    '''2026-11-12: as a function call glm-5.3-flash timed out on 3 of 10 saved rater inputs, in text on none.'''
+    assert config.OPENROUTER_MODEL_NAME_GLM_53_FLASH in config.MODEL_NAME_RATING_TEXT_REPLY
+    model = config.OPENROUTER_MODEL_NAME_GLM_53_FLASH
+    _rating_server(monkeypatch, {model: '{"rating": 3, "reasoning": "fine"}'})
+    result, _ = await triage.rate_with_openrouter('sys', 'user', model=model)
+    assert result['rating'] == 3
+    _rating_server(monkeypatch, {model: UNCLOSED_ARRAY_REPLY})
+    with pytest.raises(triage.MalformedRatingReplyError, match='No JSON object found'):
+        await triage.rate_with_openrouter('sys', 'user', model=model)
 
 
 async def test_rate_with_ollama_names_a_reply_without_a_rating(monkeypatch):
@@ -12392,22 +12463,15 @@ async def test_rate_with_ollama_names_a_reply_without_a_rating(monkeypatch):
         await triage.rate_with_ollama('sys', 'user')
 
 
-GOOD_RATING_REPLY = '{"rating": 4, "reasoning": "from a fallback"}'
+GOOD_RATING_REPLY = _rating_arguments(4, 'from a fallback')
 
 
 def _rating_models(monkeypatch, replies: dict[str, str]) -> list[str]:
-    '''Three rating models on OpenRouter, each answering with its entry in `replies`.'''
-    asked: list[str] = []
+    '''Three rating models on OpenRouter, each calling submit_rating with its entry in `replies`.'''
     monkeypatch.setattr(agent, 'MODEL_NAME_RATING', 'vendor/first')
     monkeypatch.setattr(agent, 'MODEL_NAME_RATING_FALLBACKS', ('vendor/second', 'vendor/third'))
     monkeypatch.setattr(agent, 'route_for', lambda model: 'openrouter')
-
-    async def fake_chat(prompt, system='', model='', max_tokens=None, temperature=None):
-        asked.append(model)
-        return chat_reply(replies[model], 0.002)
-
-    monkeypatch.setattr(triage, 'chat_openrouter', fake_chat)
-    return asked
+    return _rating_server(monkeypatch, replies)
 
 
 async def test_rate_job_asks_a_different_model_when_the_rater_reply_is_malformed(monkeypatch, caplog):
@@ -12432,7 +12496,7 @@ async def test_rate_job_works_down_the_whole_list(monkeypatch):
 
 
 async def test_rate_job_does_not_ask_a_fallback_when_the_rater_answers(monkeypatch):
-    asked = _rating_models(monkeypatch, {'vendor/first': '{"rating": 5, "reasoning": "great"}'})
+    asked = _rating_models(monkeypatch, {'vendor/first': _rating_arguments(5)})
     result = await agent.rate_job('system', 'job text', agent.new_stage_stats())
     assert asked == ['vendor/first']
     assert result['rating'] == 5 and result['rated_by'] == 'vendor/first'

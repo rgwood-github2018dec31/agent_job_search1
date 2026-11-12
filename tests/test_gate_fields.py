@@ -3,9 +3,8 @@ import json
 import re
 
 import pytest
-from agentic_job_search import evidence, gate_fields
+from agentic_job_search import config, evidence, gate_fields, triage
 from agentic_job_search.linkedin_page import HeaderCard, JobPage
-from fakes import chat_reply
 
 PAGE = '''Acme
 Senior Data Scientist
@@ -35,19 +34,35 @@ def _reply(value: str, quotes: list[str], basis: str | None = None) -> str:
     return json.dumps(reply)
 
 
+def _server(monkeypatch, answer) -> None:
+    '''The OpenRouter tool server behind chat_openrouter_tool: `answer(prompt)` gives the submit_answer
+    arguments as the model wrote them (a JSON string, possibly broken), or raises.'''
+    monkeypatch.setattr(config, 'SHADOW_MODEL', None)
+
+    async def call(url, tool, args, timeout_seconds=None):
+        assert args['tool_choice'] == {'type': 'function', 'function': {'name': gate_fields.TOOL_NAME}}
+        arguments = answer(args['messages'][-1]['content'])
+        return json.dumps({'ok': True, 'content': None, 'cost_usd': 0.001, 'model': 'm', 'provider': 'P',
+                           'finish_reason': 'tool_calls', 'usage': {}, 'tool_calls': [
+                               {'id': 'c1', 'type': 'function',
+                                'function': {'name': gate_fields.TOOL_NAME, 'arguments': arguments}}]})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', call)
+
+
 def _fake_chat(monkeypatch, replies: dict[str, list[str]]) -> list[str]:
     '''Each field's replies, served in turn; returns the fields asked, in call order.'''
     asked = []
 
-    async def chat(prompt, system, model, temperature=None):
+    def answer(prompt):
         field_name = _FIELD_RE.search(prompt).group(1)
         asked.append(field_name)
         reply = replies[field_name].pop(0)
         if isinstance(reply, Exception):
             raise reply
-        return chat_reply(reply, cost_usd=0.001)
+        return reply
 
-    monkeypatch.setattr(gate_fields, 'chat_openrouter', chat)
+    _server(monkeypatch, answer)
     return asked
 
 
@@ -90,13 +105,31 @@ async def test_a_cited_answer_reaches_the_extract_as_the_gates_read_it(monkeypat
 async def test_the_prompt_states_the_header_facts_code_read(monkeypatch, countries):
     prompts = []
 
-    async def chat(prompt, system, model, temperature=None):
+    def answer(prompt):
         prompts.append(prompt)
-        return chat_reply(_reply(gate_fields.NOT_KNOWN[_FIELD_RE.search(prompt).group(1)], [], basis=''))
+        field_name = _FIELD_RE.search(prompt).group(1)
+        return _reply(gate_fields.NOT_KNOWN[field_name], [], basis='' if field_name == 'relocation' else None)
 
-    monkeypatch.setattr(gate_fields, 'chat_openrouter', chat)
+    _server(monkeypatch, answer)
     await gate_fields.ask_gate_fields({}, {}, _page(workplace='remote'), {})
     assert all('location "Vancouver, BC"; workplace type "remote"' in p for p in prompts)
+    assert all(f'Answer by calling {gate_fields.TOOL_NAME}' in p and 'JSON' not in p for p in prompts)
+
+
+def test_the_text_question_for_a_model_without_function_calls_asks_for_json():
+    '''scripts/local_field_probe.py asks local models, which have no function calls.'''
+    text = gate_fields.question(PAGE, 'facts', 'relocation')
+    assert 'Reply with only a JSON object' in text and gate_fields.TOOL_NAME not in text
+
+
+async def test_an_answer_off_the_schema_is_asked_again_and_its_cost_counted(monkeypatch, countries):
+    replies = _hybrid_replies()
+    replies['residency_scope'].insert(0, _reply('everywhere', ['Hybrid']))   # outside the enum
+    _fake_chat(monkeypatch, replies)
+    stats = {'cost': 0.0}
+    answers = await gate_fields.ask_gate_fields({}, {}, _page(), stats)
+    assert answers['residency_scope'].attempt == 2
+    assert stats['cost'] == pytest.approx(0.004), 'the refused call was paid for too'
 
 
 async def test_not_known_is_absent(monkeypatch, countries):

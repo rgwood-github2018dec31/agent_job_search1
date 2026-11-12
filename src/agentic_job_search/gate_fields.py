@@ -7,7 +7,8 @@ stated as facts, a few reading rules and an explicit "not known" answer, the sam
 and agreed with a second model on all but 2 of 117 fields (scripts/local_field_probe.py, which tunes
 these definitions and imports them from here).
 
-Each answer is {quotes, reason, value}, in that order, so the model copies the page's words and says why
+Each answer is {quotes, reason, value}, in that order, the arguments of a forced `submit_answer` call
+(2026-11-12; before that a JSON object in the reply text, which the local probes still ask for), so the model copies the page's words and says why
 before it commits. A stated value stands only on quotes code finds in the page the model was shown
 (Verify Source Reference); otherwise it is absent. What a value MEANS for the gates is decided here in
 code, not left to the model: a remote job naming only an EU place leaves relocation empty, so the
@@ -26,7 +27,7 @@ from agentic_job_search import evidence, job_trace
 from agentic_job_search.config import GATE_FIELDS_ATTEMPTS, GATE_FIELDS_TEMPERATURE, MODEL_NAME_GATE_FIELDS
 from agentic_job_search.linkedin_page import JobPage
 from agentic_job_search.location import classify_location, is_eu_member
-from agentic_job_search.triage import chat_openrouter, extract_json_object
+from agentic_job_search.triage import UnusableToolCallError, chat_openrouter_tool, extract_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -103,15 +104,36 @@ def header_facts(location: str, workplace: str) -> str:
             f'workplace type "{workplace or "not shown"}".')
 
 
-def question(page_text: str, facts: str, field_name: str) -> str:
-    keys = '"quotes", "reason", "value"' + (', "basis"' if field_name == 'relocation' else '')
+TOOL_NAME = 'submit_answer'
+TOOL_DESCRIPTION = 'Submit the answer about one field of the job posting, with the passages of the page that give it.'
+ANSWER_PARTS = ('"quotes" is a list of the passages of the page that give the value, each copied exactly from one '
+                'place on the page (for a header fact, the page\'s own words, such as "Vancouver, BC" or "On-site"), '
+                '[] when nothing on the page states it; "reason" is one sentence on why those passages and the header '
+                'facts give the value; "value" is the field\'s value, never "".')
+
+
+def _question_head(page_text: str, facts: str, field_name: str) -> str:
     return (f'--- PAGE ---\n{page_text}\n--- END PAGE ---\n\n{facts}\n\n{READING_RULES}\n\n'
-            f'Field `{field_name}`: {DEFINITIONS[field_name]}\n'
-            f'Reply with only a JSON object with these keys, in this order: {keys}. "quotes" is a list of the '
-            'passages of the page that give the value, each copied exactly from one place on the page (for a header '
-            'fact, the page\'s own words, such as "Vancouver, BC" or "On-site"), [] when nothing on the page states '
-            'it; "reason" is one sentence on why those passages and the header facts give the value; "value" is the '
-            'field\'s value, never "".')
+            f'Field `{field_name}`: {DEFINITIONS[field_name]}\n')
+
+
+def answer_request(field_name: str, as_tool: bool) -> str:
+    '''The question's last paragraph: how to answer, by calling TOOL_NAME or as a JSON object in text.'''
+    keys = '"quotes", "reason", "value"' + (', "basis"' if field_name == 'relocation' else '')
+    if as_tool:
+        return f'Answer by calling {TOOL_NAME} with {keys}, in this order. {ANSWER_PARTS}'
+    return f'Reply with only a JSON object with these keys, in this order: {keys}. {ANSWER_PARTS}'
+
+
+def question(page_text: str, facts: str, field_name: str) -> str:
+    '''The question with the answer asked as a JSON object in text: for a model with no function calls
+    (scripts/local_field_probe.py).'''
+    return _question_head(page_text, facts, field_name) + answer_request(field_name, as_tool=False)
+
+
+def tool_question(page_text: str, facts: str, field_name: str) -> str:
+    '''The question as Ask Gate Fields sends it: answered by calling TOOL_NAME.'''
+    return _question_head(page_text, facts, field_name) + answer_request(field_name, as_tool=True)
 
 
 @dataclass
@@ -130,8 +152,14 @@ class Answer:
 
 
 def parse_answer(field_name: str, content: str) -> Answer:
-    '''The reply as an Answer. Raises ValueError naming what is wrong; the caller adds the reply metadata.'''
-    reply = extract_json_object(content)
+    '''A text reply as an Answer (a model with no function calls). Raises ValueError naming what is wrong;
+    the caller adds the reply metadata.'''
+    return answer_from(field_name, extract_json_object(content))
+
+
+def answer_from(field_name: str, reply: dict) -> Answer:
+    '''The answer's fields as an Answer. Raises ValueError naming what is wrong. The schema already holds
+    for a function call's arguments; the meaning checks (a value never "") are code's own.'''
     missing = [key for key in output_schema(field_name)['required'] if key not in reply]
     if missing:
         raise ValueError(f'reply lacks {missing}')
@@ -155,16 +183,21 @@ async def ask_field(field_name: str, page_text: str, facts: str, stage_stats: di
     failures = []
     for attempt in range(1, GATE_FIELDS_ATTEMPTS + 1):
         try:
-            reply = await chat_openrouter(question(page_text, facts, field_name), SYSTEM, MODEL_NAME_GATE_FIELDS,
-                                          temperature=GATE_FIELDS_TEMPERATURE)
+            arguments, reply = await chat_openrouter_tool(
+                tool_question(page_text, facts, field_name), TOOL_NAME, TOOL_DESCRIPTION, output_schema(field_name),
+                system=SYSTEM, model=MODEL_NAME_GATE_FIELDS, temperature=GATE_FIELDS_TEMPERATURE)
+        except UnusableToolCallError as ex:   # already names the call, its metadata and its arguments
+            stage_stats['cost'] = stage_stats.get('cost', 0.0) + ex.cost_usd
+            failures.append(f'attempt {attempt}: unusable reply ({ex})')
+            continue
         except Exception as ex:
             failures.append(f'attempt {attempt}: {type(ex).__name__}: {ex}')
             continue
         stage_stats['cost'] = stage_stats.get('cost', 0.0) + reply.cost_usd
         try:
-            answer = parse_answer(field_name, reply.content)
+            answer = answer_from(field_name, arguments)
         except ValueError as ex:
-            failures.append(f'attempt {attempt}: unusable reply ({ex}; {reply.describe()}): {reply.content!r}')
+            failures.append(f'attempt {attempt}: unusable reply ({ex}; {reply.describe()}): {arguments!r}')
             continue
         answer.attempt = attempt
         if attempt > 1:

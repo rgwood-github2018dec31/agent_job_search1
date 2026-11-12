@@ -1,8 +1,11 @@
 '''Shadow Local Model: ask a local model every single-turn remote question too, and record both answers.
 
-Every `chat_openrouter` prompt, on every run, asks for a final `CONFIDENCE: <1-5>` line, which is
-stripped from the reply before any caller sees it. Run-scoped and off by default (`--shadow-model`):
-while shadow mode is on, the same prompt and system message are also queued for the local model. One background
+Run-scoped and off by default (`--shadow-model`). While shadow mode is on, every `chat_openrouter`
+prompt asks for a final `CONFIDENCE: <1-5>` line, stripped from the reply before any caller sees it,
+and every `chat_openrouter_tool` schema gains an optional `confidence` argument, cut the same way
+(asked only in shadow mode since 2026-11-12; before that, on every run). The same prompt and system
+message are also queued for the local model; a forced function call's prompt reaches it as a request
+for the same arguments as a JSON object in text, since a local sidecar model has no function calls. One background
 worker answers the queue in order, since the local server runs one model call at a time, and never
 holds up the pipeline. Each pair is appended to `run_dir/shadow_calls/shadow-<run>.jsonl`; what is
 still queued when the run ends is written as `pending` for `scripts/shadow_replay.py` to finish.
@@ -43,6 +46,12 @@ CONFIDENCE_INSTRUCTION = (
     '\n\nAfter your answer, on a final line of its own, write CONFIDENCE: <1-5> — how sure you are '
     'that your answer is right (1 = a guess, 5 = certain). Nothing may follow that line.'
 )
+CONFIDENCE_KEY = 'confidence'
+CONFIDENCE_MIN, CONFIDENCE_MAX = 1, 5
+CONFIDENCE_PROPERTY = {
+    'type': 'integer', 'minimum': CONFIDENCE_MIN, 'maximum': CONFIDENCE_MAX,
+    'description': f'How sure you are that your answer is right ({CONFIDENCE_MIN} = a guess, {CONFIDENCE_MAX} = certain)',
+}
 _CONFIDENCE_LINE_RE = re.compile(r'^[ \t*_`]*CONFIDENCE[ \t*_`]*:[ \t*_`]*([1-5])\b[^\n]*$', re.IGNORECASE | re.MULTILINE)
 
 STATUS_PAIRED = 'paired'
@@ -74,6 +83,20 @@ def activate(model: str, run_stamp: str) -> Path:
 
 def with_confidence_request(prompt: str) -> str:
     return prompt + CONFIDENCE_INSTRUCTION
+
+
+def with_confidence_property(parameters: dict) -> dict:
+    '''A function's JSON schema with an optional `confidence` argument added (the original is not changed).'''
+    return {**parameters, 'properties': {**parameters.get('properties', {}), CONFIDENCE_KEY: CONFIDENCE_PROPERTY}}
+
+
+def as_text_request(prompt: str, tool_name: str, parameters: dict) -> str:
+    '''A forced function call's prompt as the local model gets it: the arguments asked as a JSON object
+    in text, its confidence on the final line (the remote model gives it as an argument).'''
+    plain = {**parameters, 'properties': {k: v for k, v in parameters.get('properties', {}).items()
+                                          if k != CONFIDENCE_KEY}}
+    return (f'{prompt}\n\nInstead of calling {tool_name}, reply with ONLY a JSON object holding its arguments, '
+            f'matching this JSON schema: {json.dumps(plain, ensure_ascii=False)}' + CONFIDENCE_INSTRUCTION)
 
 
 def split_confidence(content: str) -> tuple[str, int | None]:

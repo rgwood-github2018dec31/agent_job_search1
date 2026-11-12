@@ -129,7 +129,7 @@ python main.py -n --job-audit 4480376713  # Render the end-of-run Job Audit PDF 
 python main.py -n --no-job-audit       # Skip the end-of-run Job Audit PDF
 python main.py -n --job-and-company-pages-via signed-out-http-get  # Stage 2 reads pages with our own signed-out GET (default: Exa via OpenRouter)
 python main.py -n --job-and-company-pages-via signed-in-browser  # Stage 2 reads job pages through the account
-python main.py -n --shadow-model mlx-lm-server:<org>/<repo>  # Data collection: a local model answers every single-turn remote call too (run_dir/shadow_calls/)
+python main.py -n --shadow-model mlx-lm-server:<org>/<repo>  # Data collection: a local model answers every single-turn remote call too, and the remote model gives its confidence (run_dir/shadow_calls/)
 python main.py --job-ids FILE  # Diagnostic: rate the listed LinkedIn job ids (job_id[<TAB>title<TAB>company]) into run_dir/replays/; no dedup records, no Telegram
 
 # Tests
@@ -198,6 +198,7 @@ scripts/
   replay_location_model.py        # The Job Location model over every retained page, beside the pipeline's decision (costs ~$1 at --repeat 2)
   shadow_replay.py                # Answers a shadow recording's pending calls (or all, with another local model) into a complete copy
   shadow_report.py                # Local vs remote decision agreement per call site, by the local model's confidence
+  replay_forced_tool_ab.py        # JSON in text vs a forced function call, rater and gate fields, on saved calls (costs cents)
   release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
 tests/
   test_tools.py                   # Unit tests for all tools
@@ -209,6 +210,7 @@ tests/
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
   requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)
+  queue.md                        # Planned work approved to queue but not yet carried out, newest last
 run_dir/
   JOB_REQUIREMENTS.md             # Agent-managed job preferences (interactive mode)
   applied_jobs/                   # Applied-job PDFs, date-prefixed, + index.yaml metadata

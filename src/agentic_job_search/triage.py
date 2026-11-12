@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
+import jsonschema
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool, unwrap_exception
 from utils_tools_n_agents_common.models import OLLAMA_MODEL_NAME_TRIAGE
 
@@ -32,6 +33,7 @@ from agentic_job_search.config import (
     LLM_OPENROUTER_MCP_URL,
     LOCAL_LLM_TEMPERATURE,
     LOG_SNIPPET_MAX_CHARS,
+    MODEL_NAME_RATING_TEXT_REPLY,
     MODEL_NAME_SINGLE_TURN,
     RATING_MAX,
     RATING_MIN,
@@ -151,8 +153,11 @@ class ChatReply:
     served_quantization: str
     finish_reason: str
     usage: dict = field(default_factory=dict)
-    # The model's own CONFIDENCE line (1-5), cut from `content`; None when it wrote none.
+    # The model's own confidence (1-5): its CONFIDENCE line cut from `content`, or the `confidence`
+    # argument of a forced tool call. Asked only in shadow mode (2026-11-12); None otherwise.
     confidence: int | None = None
+    # The function calls the model made, as the server returned them; empty for a text answer.
+    tool_calls: list = field(default_factory=list)
 
     def describe(self) -> str:
         '''The call's metadata in one line, for log lines and exception messages.'''
@@ -176,6 +181,45 @@ class ChatReply:
                 f'content: {quote_for_error(self.content, f"unusable OpenRouter {what} from {self.model}")!r}'
             ) from ex
 
+    def tool_arguments(self, name: str, parameters: dict) -> dict:
+        '''The arguments of the one call to `name`, checked against its JSON schema `parameters`.
+
+        Raises UnusableToolCallError naming what is wrong (no call, another function, arguments that
+        are not a JSON object or break the schema), with the call's metadata and the raw arguments.
+        '''
+        def unusable(problem: str, raw: str) -> UnusableToolCallError:
+            return UnusableToolCallError(
+                f'OpenRouter {name} call unusable: {problem} — {self.describe()}; '
+                f'arguments: {quote_for_error(raw, f"{name} arguments from {self.model}")!r}',
+                cost_usd=self.cost_usd)
+        calls = [c.get('function') or {} for c in self.tool_calls if isinstance(c, dict)]
+        if not calls:
+            raise unusable('the model answered in text and called no function', self.content)
+        mine = [c for c in calls if c.get('name') == name]
+        if len(mine) != 1:
+            raise unusable(f'{len(mine)} calls to {name} among {[c.get("name") for c in calls]}', json.dumps(calls))
+        raw = mine[0].get('arguments') or ''
+        try:
+            arguments = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError as ex:
+            raise unusable(f'arguments are not JSON ({ex})', raw) from ex
+        if not isinstance(arguments, dict):
+            raise unusable(f'arguments are a {type(arguments).__name__}, not an object', str(raw))
+        try:
+            jsonschema.validate(arguments, parameters)
+        except jsonschema.ValidationError as ex:
+            where = '/'.join(str(part) for part in ex.absolute_path) or '(top level)'
+            raise unusable(f'arguments break the schema at {where}: {ex.message}', str(raw)) from ex
+        return arguments
+
+
+class UnusableToolCallError(ValueError):
+    '''A complete reply to a forced function call that holds no usable call (ChatReply.tool_arguments).'''
+
+    def __init__(self, message: str, cost_usd: float = 0.0):
+        super().__init__(message)
+        self.cost_usd = cost_usd   # the call was paid for all the same
+
 
 def _field(data: dict, key: str, kinds: type | tuple[type, ...], raw: str) -> Any:
     '''data[key] when it has one of `kinds`; raises naming the field, with the whole reply.'''
@@ -193,10 +237,12 @@ async def chat_openrouter(
     '''One completion via the OpenRouter MCP server, recorded in the current Job Trace in full:
     prompt, reply or error, who served it, tokens, cost and latency (see _chat_openrouter).'''
     call_site = job_trace.caller_name()
-    # Every remote answer comes with the model's own confidence (2026-11-04, recorded in the Job
-    # Trace and, in shadow mode, beside the local model's): the line is cut off again below, so no
-    # caller ever sees it.
-    prompt = shadow.with_confidence_request(prompt)
+    # In shadow mode the remote answer comes with the model's own confidence, recorded beside the
+    # local model's; the line is cut off again below, so no caller ever sees it. Asked only then
+    # (2026-11-12): it changed every production prompt to collect data nothing in a run reads.
+    shadowing = shadow.active()
+    if shadowing:
+        prompt = shadow.with_confidence_request(prompt)
     started = time.monotonic()
     try:
         reply = await _chat_openrouter(prompt, system, model, max_tokens, timeout_seconds, temperature)
@@ -205,9 +251,9 @@ async def chat_openrouter(
                          prompt=prompt, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
         raise
     seconds = round(time.monotonic() - started, 2)
-    content, confidence = shadow.split_confidence(reply.content)
+    content, confidence = shadow.split_confidence(reply.content) if shadowing else (reply.content, None)
     reply = dataclasses.replace(reply, content=content, confidence=confidence)
-    if shadow.active():
+    if shadowing:
         shadow.enqueue(call_site=call_site, system=system, prompt=prompt, temperature=temperature, remote={
             'model': model, 'served_model': reply.model, 'provider': reply.provider, 'content': content,
             'confidence': confidence, 'finish_reason': reply.finish_reason, 'cost_usd': reply.cost_usd,
@@ -219,9 +265,65 @@ async def chat_openrouter(
     return reply
 
 
+async def chat_openrouter_tool(
+    prompt: str, tool_name: str, tool_description: str, parameters: dict, system: str = '',
+    model: str = MODEL_NAME_SINGLE_TURN, max_tokens: int | None = None,
+    timeout_seconds: float = LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS, temperature: float | None = None,
+) -> tuple[dict, ChatReply]:
+    '''One completion that must answer by calling `tool_name` (forced through `tool_choice`):
+    (its arguments, checked against the JSON schema `parameters`; the reply).
+
+    The answer arrives as structured arguments, not as JSON dug out of prose (2026-11-12): no
+    fence, no prose around it, no half-closed object, and the schema is checked here rather than
+    field by field at each call site. A reply with no usable call raises UnusableToolCallError.
+    Recorded in the Job Trace like chat_openrouter, the arguments as the reply.
+
+    In shadow mode the schema gains an optional `confidence`, cut from the arguments into
+    `reply.confidence`; the local model, which has no function calls, is asked for the same
+    arguments as a JSON object in text.
+    '''
+    call_site = job_trace.caller_name()
+    shadowing = shadow.active()
+    if shadowing:
+        parameters = shadow.with_confidence_property(parameters)
+    tools = [{'type': 'function', 'function': {'name': tool_name, 'description': tool_description,
+                                               'parameters': parameters}}]
+    tool_choice = {'type': 'function', 'function': {'name': tool_name}}
+    started = time.monotonic()
+    trace = {'transport': 'openrouter', 'call_site': call_site, 'model': model, 'system': system, 'prompt': prompt,
+             'tool': tool_name}
+    try:
+        reply = await _chat_openrouter(prompt, system, model, max_tokens, timeout_seconds, temperature,
+                                       tools=tools, tool_choice=tool_choice)
+    except Exception as ex:
+        job_trace.record('llm_call', **trace, error=unwrap_exception(ex), seconds=round(time.monotonic() - started, 2))
+        raise
+    seconds = round(time.monotonic() - started, 2)
+    served = {'served_model': reply.model, 'provider': reply.provider, 'quantization': reply.served_quantization,
+              'finish_reason': reply.finish_reason, 'usage': reply.usage, 'cost_usd': reply.cost_usd,
+              'seconds': seconds}
+    try:
+        arguments = reply.tool_arguments(tool_name, parameters)
+    except UnusableToolCallError as ex:
+        job_trace.record('llm_call', **trace, **served, reply=reply.content, tool_calls=reply.tool_calls,
+                         error=unwrap_exception(ex))
+        raise
+    confidence = arguments.pop(shadow.CONFIDENCE_KEY, None) if shadowing else None
+    reply = dataclasses.replace(reply, confidence=confidence)
+    answer = json.dumps(arguments, ensure_ascii=False)
+    if shadowing:
+        shadow.enqueue(call_site=call_site, system=system, prompt=shadow.as_text_request(prompt, tool_name, parameters),
+                       temperature=temperature, remote={
+                           'model': model, 'served_model': reply.model, 'provider': reply.provider, 'content': answer,
+                           'confidence': confidence, 'finish_reason': reply.finish_reason,
+                           'cost_usd': reply.cost_usd, 'seconds': seconds, 'tool': tool_name})
+    job_trace.record('llm_call', **trace, **served, reply=answer, confidence=confidence)
+    return arguments, reply
+
+
 async def _chat_openrouter(
     prompt: str, system: str, model: str, max_tokens: int | None, timeout_seconds: float,
-    temperature: float | None = None,
+    temperature: float | None = None, tools: list[dict] | None = None, tool_choice: dict | None = None,
 ) -> ChatReply:
     """One completion via the OpenRouter MCP server, with who served it (ChatReply).
 
@@ -246,6 +348,9 @@ async def _chat_openrouter(
     # None is not sent: the provider's default applies.
     if temperature is not None:
         args['temperature'] = temperature
+    if tools:
+        args['tools'] = tools
+        args['tool_choice'] = tool_choice
     retried = False
     while True:
         routing = routing_for(model)
@@ -272,6 +377,7 @@ async def _chat_openrouter(
         # The whole reply, not just `error`: the server's other fields say who failed.
         raise provider_error(f'OpenRouter chat failed for {model}', quote_for_error(raw, 'OpenRouter chat failure reply'))
     _field(data, 'content', (str, type(None)), raw)
+    _field(data, 'tool_calls', (list, type(None)), raw)
     usage = data.get('usage') or {}
     if data.get('cost_usd') is None:
         logger.warning(f'OpenRouter reported no cost for a {model} call (counted as $0): '
@@ -281,6 +387,7 @@ async def _chat_openrouter(
         requested_model=model, model=str(data.get('model') or model), provider=str(data.get('provider') or ''),
         served_quantization=str(data.get('served_quantization') or ''),
         finish_reason=str(data.get('finish_reason') or ''), usage=usage if isinstance(usage, dict) else {},
+        tool_calls=data.get('tool_calls') or [],
     )
     # Checked BEFORE the content test, and regardless of whether content is empty: a truncated
     # non-empty body is the case that used to reach the JSON parser disguised as a parse failure.
@@ -290,7 +397,7 @@ async def _chat_openrouter(
             f'content_chars={len(reply.content)} — {reply.describe()}',
             max_tokens=max_tokens,
         )
-    if not reply.content:
+    if not reply.content and not reply.tool_calls:
         raise RuntimeError(f'OpenRouter chat returned empty content — {reply.describe()}; '
                            f'reply: {quote_for_error(raw, "OpenRouter empty-content reply")!r}')
     return reply
@@ -485,6 +592,62 @@ def triage_rejects(triage_result: dict | None) -> bool:
     return triage_result is not None and triage_result['score'] <= TRIAGE_THRESHOLD
 
 
+# A rater's pro or warning: the phrase, and the words of the posting it stands on (Verify Source Reference).
+CITED_ITEM_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'text': {'type': 'string', 'description': 'Short phrase'},
+        'quote': {'type': 'string', 'description': 'Words of the job posting that show it, copied as written'},
+    },
+    'required': ['text', 'quote'],
+}
+
+# No company or title (2026-10-29): code reads both off the page header and nothing read the
+# rater's copies back, so asking for them only invited a restatement of data code already has.
+RATING_OUTPUT_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'rating': {'type': 'integer', 'description': 'Job fit rating, 1-5'},
+        'reasoning': {'type': 'string', 'description': '2-3 sentences on the fit'},
+        'summary': {'type': 'string', 'description': 'Short label for the job, used in the saved filename'},
+        'pros': {
+            'type': 'array', 'items': CITED_ITEM_SCHEMA,
+            'description': '2-4 short bullet phrases naming concrete strengths of the role, each citing the posting',
+        },
+        'warnings': {
+            'type': 'array', 'items': CITED_ITEM_SCHEMA,
+            'description': '0-4 short bullet phrases naming anything conflicting with the requirements, each citing the posting',
+        },
+    },
+    'required': ['rating', 'reasoning', 'summary', 'pros', 'warnings'],
+}
+
+
+
+def reasoning_first(parameters: dict) -> dict:
+    '''The same schema with `reasoning` as its first property (a model fills them in order).'''
+    order = ['reasoning', *(k for k in parameters['properties'] if k != 'reasoning')]
+    return {**parameters, 'properties': {k: parameters['properties'][k] for k in order},
+            'required': [k for k in order if k in parameters['required']]}
+
+
+# The rater's function (rate_with_openrouter): the same arguments, with the rating's range checked and
+# `reasoning` ahead of `rating`. With `rating` first, DeepSeek rated 15 of 120 asks a point higher than
+# the run and 1 lower, crossing RATING_NOTIFICATION_THRESHOLD twice; reasoning first, it moved like the
+# text form asked again (+0.05 on average, no crossing; 2026-11-12, scripts/replay_forced_tool_ab.py).
+RATING_TOOL_NAME = 'submit_rating'
+RATING_TOOL_DESCRIPTION = "Submit the job posting's fit rating, with the posting's own words behind each pro and warning."
+RATING_TOOL_PARAMETERS_RATING_FIRST = {**RATING_OUTPUT_SCHEMA, 'properties': {
+    **RATING_OUTPUT_SCHEMA['properties'],
+    'rating': {**RATING_OUTPUT_SCHEMA['properties']['rating'], 'minimum': RATING_MIN, 'maximum': RATING_MAX}}}
+RATING_TOOL_PARAMETERS = reasoning_first(RATING_TOOL_PARAMETERS_RATING_FIRST)
+RATING_TOOL_INSTRUCTIONS = (
+    f'Answer by calling {RATING_TOOL_NAME}. Each quote is copied from the job posting text above, as written. '
+    'Code looks it up there and drops any pro or warning whose quote it cannot find.'
+)
+
+# The rater's reply as JSON in text: MODEL_NAME_RATING_TEXT_REPLY on OpenRouter, and rate_with_ollama (a
+# sidecar model has no function calls).
 RATING_JSON_INSTRUCTIONS = (
     'Respond with ONLY a JSON object: '
     '{"rating": <1-5>, '
@@ -503,7 +666,8 @@ _TRUNCATION_RETRY_MAX_TOKENS = 32_000
 
 
 class MalformedRatingReplyError(ValueError):
-    '''A rating reply that arrived whole but holds no JSON object with an integer `rating`.'''
+    '''A rating reply that arrived whole but holds no usable rating (no JSON object with an integer
+    `rating`, or no usable submit_rating call).'''
 
 
 def parse_rating_reply(content: str) -> dict:
@@ -517,7 +681,8 @@ def parse_rating_reply(content: str) -> dict:
 
 
 async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str = MODEL_NAME_SINGLE_TURN) -> tuple[dict, float]:
-    '''Rate a job via OpenRouter. Returns (rating dict, cost_usd).
+    '''Rate a job via OpenRouter: a forced submit_rating call, or JSON in the reply text for
+    MODEL_NAME_RATING_TEXT_REPLY. Returns (rating dict, cost_usd).
 
     Retries once on truncation because losing this call is costly: the job was written to
     processed_jobs/ back in Stage 1b. A posting the model had scored 5 was lost that way on
@@ -525,23 +690,40 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
 
     A complete reply that is not a usable rating raises MalformedRatingReplyError and is never
     repaired; `rate_job` then asks MODEL_NAME_RATING_FALLBACKS. On 2026-10-08 a reply holding
-    `"rating": 5` left its last array unclosed.
+    `"rating": 5` left its last array unclosed, which a function call's checked arguments rule out
+    (2026-11-12, chat_openrouter_tool).
     '''
-    prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS}'
+    # Called here, not from a helper: the Job Trace names a call by the function that made it
+    # (job_trace.caller_name), and the Job Path places `rate_with_openrouter` at the rate stage.
+    as_text = model in MODEL_NAME_RATING_TEXT_REPLY
+    prompt = f'{user_prompt}\n\n{RATING_JSON_INSTRUCTIONS if as_text else RATING_TOOL_INSTRUCTIONS}'
+    tool = {'tool_name': RATING_TOOL_NAME, 'tool_description': RATING_TOOL_DESCRIPTION,
+            'parameters': RATING_TOOL_PARAMETERS}
+    call = {'system': system_prompt, 'model': model, 'temperature': RATING_TEMPERATURE}
+    result = None
     try:
-        reply = await chat_openrouter(prompt, system=system_prompt, model=model, temperature=RATING_TEMPERATURE)
-    except TruncatedResponseError as ex:
-        logger.warning(f'Rating call truncated, retrying once with max_tokens={_TRUNCATION_RETRY_MAX_TOKENS}: {ex}')
-        reply = await chat_openrouter(
-            prompt, system=system_prompt, model=model, max_tokens=_TRUNCATION_RETRY_MAX_TOKENS,
-            temperature=RATING_TEMPERATURE,
-        )
-    try:
-        return parse_rating_reply(reply.content), reply.cost_usd
-    except MalformedRatingReplyError as ex:
-        raise MalformedRatingReplyError(
-            f'{ex} — {reply.describe()}; content: {quote_for_error(reply.content, f"malformed rating reply from {reply.model}")!r}'
-        ) from ex
+        try:
+            if as_text:
+                reply = await chat_openrouter(prompt, **call)
+            else:
+                result, reply = await chat_openrouter_tool(prompt, **tool, **call)
+        except TruncatedResponseError as ex:
+            logger.warning(f'Rating call truncated, retrying once with max_tokens={_TRUNCATION_RETRY_MAX_TOKENS}: {ex}')
+            if as_text:
+                reply = await chat_openrouter(prompt, **call, max_tokens=_TRUNCATION_RETRY_MAX_TOKENS)
+            else:
+                result, reply = await chat_openrouter_tool(prompt, **tool, **call,
+                                                           max_tokens=_TRUNCATION_RETRY_MAX_TOKENS)
+    except UnusableToolCallError as ex:
+        raise MalformedRatingReplyError(str(ex)) from ex
+    if result is None:
+        try:
+            result = parse_rating_reply(reply.content)
+        except MalformedRatingReplyError as ex:
+            raise MalformedRatingReplyError(
+                f'{ex} — {reply.describe()}; content: '
+                f'{quote_for_error(reply.content, f"malformed rating reply from {reply.model}")!r}') from ex
+    return result, reply.cost_usd
 
 
 async def rate_with_ollama(system_prompt: str, user_prompt: str, model: str = OLLAMA_MODEL_NAME_TRIAGE) -> dict:

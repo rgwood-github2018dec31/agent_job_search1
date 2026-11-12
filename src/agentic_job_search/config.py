@@ -422,6 +422,13 @@ MODEL_NAME_RATING = MODEL_NAME_SINGLE_TURN
 # already runs on, the entry stopped being a different model at all. The remaining entry is the
 # GLM intelligence default, so a fallback is still a genuinely different model.
 MODEL_NAME_RATING_FALLBACKS = (OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,)
+# Rating models that answer as JSON in the reply text (RATING_JSON_INSTRUCTIONS) instead of a forced
+# submit_rating call. A GLM-only problem (2026-11-12, scripts/replay_forced_tool_ab.py): asked as a
+# function call, glm-5.3-flash timed out at LLM_MCP_SINGLE_TURN_TIMEOUT_SECONDS on 3 of 10 saved rater
+# inputs, and on none in text; DeepSeek answered all 240 of its asks in either form. Why is not yet
+# known (docs/requirements.md, Known open issues). Named by its own id, not by the default it is today.
+OPENROUTER_MODEL_NAME_GLM_53_FLASH = 'z-ai/glm-5.3-flash'
+MODEL_NAME_RATING_TEXT_REPLY = (OPENROUTER_MODEL_NAME_GLM_53_FLASH,)
 # Run-scoped override for the PRIMARY rating model (CLI --rating-model, agent.py). None
 # keeps MODEL_NAME_RATING. The fallback chain is deliberately unchanged: a test run of a
 # new rater still falls back to the proven chain, and `rated_by` in the trace names which

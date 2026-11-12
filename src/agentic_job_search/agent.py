@@ -220,6 +220,7 @@ from agentic_job_search.tools_generic import (
     title_rejection_reason,
 )
 from agentic_job_search.triage import (
+    RATING_OUTPUT_SCHEMA,
     ProviderUnavailableError,
     chat_openrouter,
     generate_local,
@@ -791,35 +792,6 @@ def build_evaluator_instructions() -> str:
 
 EXTRACT_OUTPUT_SCHEMA = {'type': 'object', 'properties': EXTRACT_PROPERTIES, 'required': list(EXTRACT_REQUIRED_FIELDS)}
 
-# A rater's pro or warning: the phrase, and the words of the posting it stands on (Verify Source Reference).
-_CITED_ITEM_SCHEMA = {
-    'type': 'object',
-    'properties': {
-        'text': {'type': 'string', 'description': 'Short phrase'},
-        'quote': {'type': 'string', 'description': 'Words of the job posting that show it, copied as written'},
-    },
-    'required': ['text', 'quote'],
-}
-
-# No company or title (2026-10-29): code reads both off the page header and nothing read the
-# rater's copies back, so asking for them only invited a restatement of data code already has.
-RATING_OUTPUT_SCHEMA = {
-    'type': 'object',
-    'properties': {
-        'rating': {'type': 'integer', 'description': 'Job fit rating, 1-5'},
-        'reasoning': {'type': 'string', 'description': '2-3 sentences on the fit'},
-        'summary': {'type': 'string', 'description': 'Short label for the job, used in the saved filename'},
-        'pros': {
-            'type': 'array', 'items': _CITED_ITEM_SCHEMA,
-            'description': '2-4 short bullet phrases naming concrete strengths of the role, each citing the posting',
-        },
-        'warnings': {
-            'type': 'array', 'items': _CITED_ITEM_SCHEMA,
-            'description': '0-4 short bullet phrases naming anything conflicting with the requirements, each citing the posting',
-        },
-    },
-    'required': ['rating', 'reasoning', 'summary', 'pros', 'warnings'],
-}
 
 
 # Resume discovery. Both directories are searched, but with different patterns. The save directory
