@@ -2101,6 +2101,27 @@ def parse_posting_date(date_posted: str | None, as_of: datetime | None = None) -
     )
 
 
+DAYS_PER_WEEK = 7
+# One step of each relative unit, and how many days that step spans as a band of uncertainty:
+# "2 weeks ago" is anywhere in a 7-day band; an age in minutes or hours is treated as a 1-day band.
+_RELATIVE_UNIT_STEP = {'minute': timedelta(minutes=1), 'hour': timedelta(hours=1), 'day': timedelta(days=1),
+                       'week': timedelta(days=DAYS_PER_WEEK), 'month': timedelta(days=DAYS_PER_MONTH_APPROX)}
+_RELATIVE_UNIT_BAND_DAYS = {'minute': 1, 'hour': 1, 'day': 1, 'week': DAYS_PER_WEEK, 'month': DAYS_PER_MONTH_APPROX}
+
+
+def relative_posting_age(date_posted: str | None) -> tuple[timedelta, int] | None:
+    """(how old the posting says it is, the width in days of its unit) for an age such as '2 weeks ago'.
+
+    None when the text holds no "N units ago": an absolute date or a phrase says nothing about how
+    precise it is, so nothing is compared against it.
+    """
+    m = _RELATIVE_DATE_RE.search((date_posted or '').strip().lower())
+    if m is None:
+        return None
+    unit = m.group('unit')
+    return _RELATIVE_UNIT_STEP[unit] * int(m.group('count')), _RELATIVE_UNIT_BAND_DAYS[unit]
+
+
 # Outcomes record_listings reports on one line per search, carrying every job id, instead of one
 # line per listing: both mean "seen before, nothing to decide", and on a saturated search they
 # are most of the page.

@@ -17,7 +17,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, aclosing
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 from urllib.parse import quote_plus
@@ -216,6 +216,7 @@ from agentic_job_search.tools_generic import (
     log_run_cost,
     make_job_search_server,
     parse_posting_date,
+    relative_posting_age,
     title_rejection_reason,
 )
 from agentic_job_search.triage import (
@@ -3024,6 +3025,22 @@ def _rejected_extract_value(field: str, candidate: dict) -> Any:
     return ''
 
 
+def page_copy_lag_days(page_posted: str, card_posted: str) -> int:
+    """How many days older the page read is than the search card, judged by the ages the two show.
+
+    The card is read live in the signed-in search; a page fetched by Exa is Exa's copy, of unknown
+    age (web_fetch returns no crawl date, 2026-11-12). A copy shows the job younger than the card
+    does by about the copy's age. 0 when either age is not "N units ago", or when they differ by no
+    more than the coarser unit spans ("2 weeks ago" against "10 days ago" is not a stale copy).
+    """
+    on_page, on_card = relative_posting_age(page_posted), relative_posting_age(card_posted)
+    if on_page is None or on_card is None:
+        return 0
+    (page_age, page_band_days), (card_age, card_band_days) = on_page, on_card
+    lag = card_age - page_age
+    return round(lag / timedelta(days=1)) if lag > timedelta(days=max(page_band_days, card_band_days)) else 0
+
+
 def read_header_fields(candidate: dict, extract: dict) -> dict[str, str]:
     """Fill the fields code reads off the job page instead of asking a model, from the header card
     the page reader put in `extract['page_header']`, else from the search card. Returns field ->
@@ -3037,10 +3054,21 @@ def read_header_fields(candidate: dict, extract: dict) -> dict[str, str]:
     header = extract.pop('page_header', None) or HeaderCard()
     page_text = extract.get('page_plain_text') or extract.get('page_text') or ''
     sources: dict[str, str] = {}
+    page_posted = header.posted or posted_age_from_page(page_text)
+    if lag := page_copy_lag_days(page_posted, str(candidate.get('date_posted') or '')):
+        # The page is a copy older than the search (Exa's; 2026-11-12): its age and its open/closed
+        # state are as of that copy. The card's age was read live, this run.
+        extract['page_copy_lag_days'] = lag
+        logger.warning(f"Job {candidate.get('job_id')} {candidate.get('company')}: the page read says posted "
+                       f"{page_posted!r} but the search card said {candidate.get('date_posted')!r}, so the page "
+                       f'is a copy about {lag} days old; the posting age is taken from the card')
+        job_trace.record('page_copy_stale', page_posted=page_posted, card_posted=candidate.get('date_posted'),
+                         lag_days=lag)
+        page_posted = ''
     for field, on_page, on_card in (
             ('title', header.title, candidate.get('title')),
             ('company', header.company, candidate.get('company')),
-            ('date_posted', header.posted or posted_age_from_page(page_text), candidate.get('date_posted'))):
+            ('date_posted', page_posted, candidate.get('date_posted'))):
         extract[field] = on_page or str(on_card or '')
         sources[field] = 'read_by_code' if on_page else 'search_card'
     extract['closed'] = header.closed or is_closed_text(page_text)
@@ -4017,6 +4045,10 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
         if not commute_location_is_acceptable(extract.get('location', ''), extract.get('place_names') or ()):
             warning += ' (not somewhere you would commute)'
         warnings.append(warning)
+
+    if lag := extract.get('page_copy_lag_days'):
+        warnings.append(f'Page read from a copy about {lag} days old — the posting may have closed since; '
+                        'its age is from the search card')
 
     if extract.get('listed_location_mismatch'):
         warnings.append(f"Location mismatch — LinkedIn lists \"{extract.get('listed_location')}\"; "

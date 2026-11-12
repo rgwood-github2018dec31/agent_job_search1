@@ -5454,6 +5454,33 @@ async def test_verify_extract_reads_the_header_fields_off_the_page_card(no_reloc
     assert 'page_header' not in extract
 
 
+async def test_a_page_younger_than_its_search_card_is_an_old_copy_and_the_card_age_is_used(no_relocation):
+    """2026-11-12: Exa's copy carries no crawl date. Job 4488866240's page said "4 hours ago" while the live
+    search card said "2 days ago"; the copy's age would let a stale posting pass the stale rule."""
+    header = linkedin_page.HeaderCard(company='Overstory', title='Staff Machine Learning Engineer - Wildfire',
+                                      posted='4 hours ago')
+    extract = _make_extract(page_text=OVERSTORY_PAGE_TEXT, page_header=header)
+    statuses = await agent.verify_extract(_make_candidate(date_posted='2 days ago'), extract, agent.new_stage_stats())
+    assert (extract['date_posted'], statuses['date_posted']) == ('2 days ago', 'search_card')
+    assert extract['page_copy_lag_days'] == 2
+    assert any('copy about 2 days old' in w for w in agent.build_deterministic_warnings(_make_candidate(), extract))
+
+
+@pytest.mark.parametrize(('on_page', 'on_card', 'lag'), [
+    ('4 hours ago', '2 days ago', 2),
+    ('1 day ago', '9 days ago', 8),
+    ('3 days ago', '3 days ago', 0),
+    ('1 day ago', '2 days ago', 0),            # within a day: the card was read earlier in the run
+    ('2 weeks ago', '10 days ago', 0),          # a week spans 7 days: no sign of a stale copy
+    ('1 week ago', '3 weeks ago', 14),
+    ('2 days ago', '1 day ago', 0),             # a page OLDER than the card is not a stale copy
+    ('', '2 days ago', 0),
+    ('Reposted 4 days ago', '2026-10-01', 0),   # an absolute date says nothing about its precision
+])
+def test_page_copy_lag_days(on_page, on_card, lag):
+    assert agent.page_copy_lag_days(on_page, on_card) == lag
+
+
 async def test_a_closed_notice_in_either_wording_fires_the_closed_rule():
     extract = _make_extract(description='Build agents. Not currently accepting applications.')
     assert 'closed' in (await agent.apply_hard_rules(_make_candidate(), extract) or '')
