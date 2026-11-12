@@ -56,13 +56,16 @@ from reportlab.platypus import (
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR / 'src'))
+sys.path.insert(0, str(PROJECT_DIR / 'scripts'))
 
 from agentic_job_search import agent as A  # noqa: E402
 from agentic_job_search import config as C  # noqa: E402
+from agentic_job_search import job_path  # noqa: E402
 from agentic_job_search import job_trace as T  # noqa: E402
 from agentic_job_search import linkedin_page as LP  # noqa: E402
 from agentic_job_search import tools_generic as TG  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
+from job_path_drawing import path_flowables  # noqa: E402
 
 RUN_DIR = PROJECT_DIR / 'run_dir'
 WRAP = 108
@@ -309,18 +312,6 @@ def as_text(value: object) -> str:
 
 def cell(value: object) -> str:
     return as_text(value) if value not in (None, '', [], {}) else '—'
-
-
-def _reply_meta(step: dict) -> dict:
-    '''Cost, provider and finish_reason from a raw MCP reply (the extract loop records it whole).'''
-    if 'raw_reply' not in step:
-        return {}
-    try:
-        data = json.loads(step['raw_reply'])
-    except (TypeError, ValueError):
-        return {}
-    return {'cost_usd': data.get('cost_usd'), 'provider': data.get('provider'),
-            'finish_reason': data.get('finish_reason')} if isinstance(data, dict) else {}
 
 
 SUMMARY_CHARS = 240   # how much of a prompt or reply the step-by-step table quotes
@@ -801,6 +792,9 @@ def poster_rows(company: str, page_step: dict, fields: dict) -> list[tuple[str, 
 def decision_path(steps: list[dict]) -> list:
     '''The trace boiled down to what decided the rating, each line pointing at its full step.'''
     story: list = [h1('Decision path (from the Job Trace)'), rule()]
+    nodes = job_path.overlay(steps, job_path.rule_order([steps]))
+    story += [label(f'The path through Stage 2 — outcome: {job_path.outcome(nodes)}'),
+              *path_flowables(nodes, (_SANS, _SANS_BOLD)), Spacer(1, 3 * mm)]
     extract = next((s['fields'] for s in steps if s['kind'] == 'extract'), {})
     statuses = extract.get('evidence') or {}
     quotes = extract.get('quotes') or {}
@@ -832,7 +826,7 @@ def decision_path(steps: list[dict]) -> list:
         story += [grid([('Call', 'Field', 'Value', 'Cited')] + [
             (s['call_site'], v['field'], cell(v['value']), cell(v['quote']))
             for s in steps if s['kind'] == 'evidence' for v in s['verdicts'] if v['status'] == 'rejected'])]
-    calls = [dict(s, **_reply_meta(s)) for s in steps if s['kind'] == 'llm_call']
+    calls = [dict(s, **T.reply_meta(s)) for s in steps if s['kind'] == 'llm_call']
     story += [label(f'LLM calls for this job: {len(calls)} (each in full in the last section)'), grid(
         [('#', 'Call site', 'Model / served by', 'Seconds', 'Cost', 'Outcome')] + [
             (str(n), c['call_site'], f"{c.get('model')} / {c.get('provider') or c.get('transport')}",

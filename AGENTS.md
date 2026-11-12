@@ -162,6 +162,7 @@ src/agentic_job_search/
   location_model.py               # Job Location (options, working/employment locations) and its eligibility decision; replay only until wired in
   job_trace.py                    # Job Trace: every step of one Stage 2 job, recorded via a ContextVar
   job_audit.py                    # Write Job Audit: choose one rated job per run, render its trace as a PDF
+  job_path.py                     # Job Path: one Job Trace over a fixed map of Stage 2, exits read from its outcome step
   rating_inputs.py                # Record Rating Inputs: save each part of the rater's input once, for the trace to link
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
   linkedin_exa.py                 # Read LinkedIn Page via Exa: job and company pages fetched by Exa through OpenRouter's web_fetch (the default)
@@ -187,6 +188,8 @@ scripts/
   replay_evidence.py              # Re-extracts retained pages live; per-field citation outcomes (costs cents)
   release_stuck_eval_errors.py    # One-time release of jobs stuck in processed_jobs/ by a pre-2026-10-09 eval_error
   job_trace_report.py             # Job Audit PDF for one job (uv run --with reportlab)
+  job_trace_graph.py              # Decision Graph PDF (POC): every Job Trace of one date over Stage 2, counted
+  job_path_drawing.py             # Job Path as reportlab flowables, one per stage (Job Audit and Decision Graph)
   minimal_archive_replay.py       # Rebuilds the minimal archive from saved full archives (check a change, or --in-place backfill)
   replay_markdown_ab.py           # Plain text vs Markdown for the extractor and the rater, with repeats to measure noise (costs ~$1)
   replay_extract_arbitrate.py     # DeepSeek and GLM extract, DeepSeek per field where they differ; run-to-run variation (costs ~$1)
@@ -202,6 +205,7 @@ tests/
   test_cache_io.py                # cache_io fail-open contract: missing/empty/unreadable/non-mapping loads, unwritable saves
   test_evidence.py                # Citation matching, LLM relocation, rejection
   test_job_audit.py               # Job choice, render failure, report rendering (with reportlab)
+  test_job_path.py                # Job Path overlay, exits, aggregate (no reportlab)
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
   requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)

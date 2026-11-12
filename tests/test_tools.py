@@ -21,6 +21,7 @@ from agentic_job_search import (
     evidence,
     extract_openrouter,
     fx,
+    job_path,
     job_trace,
     linkedin_page,
     location,
@@ -6282,7 +6283,7 @@ async def test_every_stage_2_job_leaves_a_job_trace_of_each_step(monkeypatch):
     for kind in ('origin', 'extract', 'evidence', 'classified', 'hard_rule', 'rating', 'saved', 'notification'):
         assert kind in kinds, kind
     rules = [s['rule'] for s in steps if s['kind'] == 'hard_rule']
-    assert rules == ['blacklist', 'closed', 'stale', 'sponsorship', 'language', 'location', 'relocation', 'degree']
+    assert rules == list(job_path.HARD_RULES), 'the Job Path draws the rules in this order'
     # Sent after the job's trace closed (the queue flushes at the end of Stage 2), and still in it.
     sent = next(s for s in steps if s['kind'] == 'notification')
     assert notifications and sent['text'] == notifications[0] and sent['sent'] is True

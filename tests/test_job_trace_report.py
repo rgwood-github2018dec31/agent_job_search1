@@ -19,9 +19,11 @@ RUN_DATE = '2026-10-25'
 @pytest.fixture
 def report(monkeypatch):
     for name in ('reportlab', 'reportlab.lib', 'reportlab.lib.colors', 'reportlab.lib.pagesizes',
-                 'reportlab.lib.styles', 'reportlab.lib.units', 'reportlab.pdfbase',
+                 'reportlab.lib.styles', 'reportlab.lib.units', 'reportlab.lib.utils', 'reportlab.pdfbase',
                  'reportlab.pdfbase.pdfmetrics', 'reportlab.pdfbase.ttfonts', 'reportlab.platypus'):
         monkeypatch.setitem(sys.modules, name, MagicMock())
+    # Imported by the report; stubbed with it, so no module built on the stubs outlives this test.
+    monkeypatch.setitem(sys.modules, 'job_path_drawing', MagicMock())
     spec = importlib.util.spec_from_file_location('job_trace_report_under_test', SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

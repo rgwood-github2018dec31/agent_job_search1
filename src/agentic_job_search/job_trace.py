@@ -90,6 +90,22 @@ def caller_name(depth: int = 2) -> str:
     return frame.f_code.co_name if frame is not None else '?'
 
 
+def reply_meta(step: dict) -> dict:
+    """Cost, provider and finish_reason from an `llm_call` step's raw MCP reply, which the extract
+    loop records whole instead of as fields. {} when the step has no raw reply; a reply that does not
+    parse says so under `raw_reply_unreadable`, so a report shows it rather than dropping it."""
+    if 'raw_reply' not in step:
+        return {}
+    try:
+        data = json.loads(step['raw_reply'])
+    except (TypeError, ValueError) as ex:
+        return {'raw_reply_unreadable': f'{type(ex).__name__}: {ex}'}
+    if not isinstance(data, dict):
+        return {'raw_reply_unreadable': f'a JSON {type(data).__name__}, not an object'}
+    return {'cost_usd': data.get('cost_usd'), 'provider': data.get('provider'),
+            'finish_reason': data.get('finish_reason')}
+
+
 def load(path: Path) -> list[dict]:
     '''A trace's steps from its JSONL file. A bad line raises, naming the file and line.'''
     steps = []
