@@ -63,6 +63,9 @@ _FIND_TOOL_NAME = 'browser_find'
 _SNAPSHOT_TOOL_NAME = 'browser_snapshot'
 _SNAPSHOT_TARGET_ARG = 'target'   # narrows a snapshot to one element (a ref or a CSS selector)
 _FILENAME_ARG = 'filename'
+# Browser tools that leave the page as it was, so the refs of the last full snapshot stay valid.
+# Every other browser tool (click, type, select, key press, navigate, wait) may re-render it.
+_REF_PRESERVING_TOOL_NAMES = frozenset({_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME, 'browser_evaluate'})
 FIND_CAPTURE_DIR = RUN_DIR / 'find_captures'
 
 
@@ -489,6 +492,10 @@ class ScrapeSession:
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
         self._started_at = time.monotonic()
         self._last_info_at = self._started_at
+        # True until a full snapshot is taken and again after any page-changing browser tool:
+        # a snapshot narrowed to a ref is then sent without its target (_call_browser_tool).
+        self._refs_stale = True
+        self._last_browser_tool = ''
 
     async def _call_browser_tool(self, name: str, args: dict) -> str:
         '''One browser tool call's result for the model, or its error as text.
@@ -498,11 +505,38 @@ class ScrapeSession:
         ref from before its last click, which the re-rendered page no longer has: 31 failed calls
         on 2026-11-07, each one an iteration re-sending ~60k prompt tokens only to be told to
         snapshot again. Code takes that snapshot; the model still chooses every action.
+
+        Since 2026-11-11 code does not wait for that failure. The prompt tells the model refs go
+        stale after every action, yet it still narrowed to old refs 13 times in one run. Code knows
+        when the page may have changed (any tool outside _REF_PRESERVING_TOOL_NAMES since the last
+        full snapshot), so such a snapshot is sent whole from the start. The fallback stays for a
+        ref that went stale without an action, and its INFO line names the tool before it.
         '''
+        previous_tool = self._last_browser_tool
+        self._last_browser_tool = name
+        target = args.get(_SNAPSHOT_TARGET_ARG) if name == _SNAPSHOT_TOOL_NAME else None
+        if target and self._refs_stale:
+            whole_page = {k: v for k, v in args.items() if k != _SNAPSHOT_TARGET_ARG}
+            try:
+                out = await self._browser(name, whole_page)
+            except Exception as ex:
+                logger.warning(
+                    f'Stage 1b: browser tool {name} failed for query {self.query!r} (args {snippet(whole_page)}, '
+                    f'target {target!r} dropped as stale after {previous_tool or "no snapshot yet"}): '
+                    f'{type(ex).__name__}: {browser_error_for_log(ex)}'
+                )
+                return f'ERROR calling {name}: {ex}'
+            self._refs_stale = False
+            logger.debug(f'Stage 1b: browser_snapshot target {target!r} for query {self.query!r} sent as a '
+                         f'full snapshot: the page may have changed since ({previous_tool or "no snapshot yet"})')
+            return self._full_snapshot_reply(
+                name, target, 'the page may have changed since that ref was shown (an action ran after '
+                'the last full snapshot)', out)
         try:
             out = await self._browser(name, args)
         except Exception as ex:
-            target = args.get(_SNAPSHOT_TARGET_ARG) if name == _SNAPSHOT_TOOL_NAME else None
+            if name not in _REF_PRESERVING_TOOL_NAMES:
+                self._refs_stale = True
             if not target:
                 logger.warning(
                     f'Stage 1b: browser tool {name} failed for query {self.query!r} '
@@ -519,17 +553,26 @@ class ScrapeSession:
                     f'{type(retry_ex).__name__}: {browser_error_for_log(retry_ex)}'
                 )
                 return f'ERROR calling {name}: {ex}\nA full snapshot (no target) also failed: {retry_ex}'
+            self._refs_stale = False
             logger.info(f'Stage 1b: browser_snapshot target {target!r} failed for query {self.query!r} '
-                        f'({browser_error_for_log(ex)}); returned a full snapshot instead')
-            note = (f'NOTE: browser_snapshot with target {target!r} failed ({browser_error_for_log(ex)}). '
-                    f'The page has changed since that ref was shown, so here is a full snapshot instead. '
-                    f'Only refs from this snapshot are valid now.\n\n')
-            return note + drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
+                        f'({browser_error_for_log(ex)}) with no page-changing action since the last full '
+                        f'snapshot (previous tool: {previous_tool}); returned a full snapshot instead')
+            return self._full_snapshot_reply(name, target, f'failed ({browser_error_for_log(ex)})', out)
+        if name not in _REF_PRESERVING_TOOL_NAMES:
+            self._refs_stale = True
+        elif name == _SNAPSHOT_TOOL_NAME and not target:
+            self._refs_stale = False
         if name == _FIND_TOOL_NAME:
             _capture_oversized_find(out, self.query)
         if name in (_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME):
             out = drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
         return out
+
+    def _full_snapshot_reply(self, name: str, target: str, why: str, out: str) -> str:
+        '''A full snapshot given in place of one narrowed to `target`, with a note telling the model so.'''
+        note = (f'NOTE: browser_snapshot with target {target!r} was not used: {why}. '
+                f'Here is a full snapshot instead. Only refs from this snapshot are valid now.\n\n')
+        return note + drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
 
     def _log_step(self, name: str, args: dict) -> None:
         '''One DEBUG line naming the step just taken, if SCRAPER_PROGRESS_LOG_SECONDS passed in silence.

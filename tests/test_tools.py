@@ -10897,44 +10897,99 @@ def test_scraper_snapshot_drops_the_detail_pane_and_keeps_every_card(monkeypatch
     assert not any('Truncating' in m for m in _warnings(caplog))
 
 
-def _run_scraper_with_one_snapshot(monkeypatch, args: dict, browser) -> str:
-    '''Run a ScrapeSession whose model calls browser_snapshot once with `args`; return its tool reply.'''
-    call = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
-                       'tool_calls': [{'id': 'c1', 'function': {'name': 'browser_snapshot',
-                                                                'arguments': json.dumps(args)}}]})
+def _run_scraper_with_browser_calls(monkeypatch, calls: list[tuple[str, dict]], browser) -> str:
+    '''Run a ScrapeSession whose model makes `calls` (tool name, args) in one turn; return the last tool reply.'''
+    tool_calls = [{'id': f'c{index}', 'function': {'name': name, 'arguments': json.dumps(args)}}
+                  for index, (name, args) in enumerate(calls)]
+    reply = json.dumps({'ok': True, 'content': '', 'finish_reason': 'tool_calls', 'usage': {},
+                        'tool_calls': tool_calls})
     sent = []
 
     async def fake_call_mcp_tool(url, name, chat_args, timeout_seconds=None):
         sent.append(chat_args)
-        return [call, _CHAT_DONE][len(sent) - 1]
+        return [reply, _CHAT_DONE][len(sent) - 1]
 
     monkeypatch.setattr(scrape_openrouter, 'call_mcp_tool', fake_call_mcp_tool)
     asyncio.run(scrape_openrouter.ScrapeSession(browser, 'Staff AI Engineer').run('sys', 'user', []))
     return sent[1]['messages'][-1]['content']
 
 
+def _run_scraper_with_one_snapshot(monkeypatch, args: dict, browser) -> str:
+    '''Run a ScrapeSession whose model calls browser_snapshot once with `args`; return its tool reply.'''
+    return _run_scraper_with_browser_calls(monkeypatch, [('browser_snapshot', args)], browser)
+
+
 STALE_REF_ERROR = 'Error: Ref f78e1176 not found in the current page snapshot. Try capturing new snapshot.'
+SNAPSHOT_TEXT = '- button "Date posted" [ref=f80e12]'
+
+
+def _recording_browser(calls: list, fail_targets: bool = False):
+    async def browser(name, args):
+        calls.append((name, dict(args)))
+        if fail_targets and 'target' in args:
+            raise RuntimeError(STALE_REF_ERROR)
+        return SNAPSHOT_TEXT
+    return browser
+
+
+def test_scraper_snapshot_target_after_an_action_is_sent_as_a_full_snapshot(monkeypatch, caplog):
+    '''2026-11-11: the model still narrowed to refs from before its last click, 13 times in one run.'''
+    calls = []
+    with caplog.at_level(logging.DEBUG):
+        content = _run_scraper_with_browser_calls(monkeypatch, [
+            ('browser_snapshot', {}),
+            ('browser_click', {'target': 'f80e12', 'element': 'Date posted'}),
+            ('browser_snapshot', {'target': 'f80e12', 'depth': 6}),
+        ], _recording_browser(calls, fail_targets=True))
+
+    assert calls[-1] == ('browser_snapshot', {'depth': 6}), 'target dropped up front, depth kept'
+    assert len(calls) == 3, 'no failing targeted call was sent'
+    assert content.startswith('NOTE: browser_snapshot with target ')
+    assert "'f80e12'" in content and 'Only refs from this snapshot are valid' in content
+    assert SNAPSHOT_TEXT in content
+    assert not any('returned a full snapshot instead' in r.message for r in caplog.records)
+    assert any(r.levelno == logging.DEBUG and 'sent as a full snapshot' in r.message for r in caplog.records)
+
+
+def test_scraper_first_snapshot_with_a_target_is_sent_whole(monkeypatch):
+    '''No full snapshot yet means no ref the model holds can be current.'''
+    calls = []
+    content = _run_scraper_with_one_snapshot(monkeypatch, {'target': 'e1202'}, _recording_browser(calls))
+    assert calls == [('browser_snapshot', {})]
+    assert content.startswith('NOTE: browser_snapshot with target ')
+
+
+def test_scraper_snapshot_target_right_after_a_full_snapshot_is_kept(monkeypatch):
+    calls = []
+    content = _run_scraper_with_browser_calls(monkeypatch, [
+        ('browser_snapshot', {}),
+        ('browser_evaluate', {'function': '() => 1'}),
+        ('browser_snapshot', {'target': 'f80e12'}),
+    ], _recording_browser(calls))
+    assert calls[-1] == ('browser_snapshot', {'target': 'f80e12'})
+    assert content == SNAPSHOT_TEXT
 
 
 def test_scraper_stale_snapshot_target_is_answered_with_a_full_snapshot(monkeypatch, caplog):
-    '''2026-11-07: 31 targeted snapshots failed on refs from before the last click, an iteration each.'''
+    '''2026-11-07: 31 targeted snapshots failed on refs from before the last click, an iteration each.
+
+    Since 2026-11-11 only a ref that went stale with no action since the last full snapshot gets here.
+    '''
     calls = []
-
-    async def browser(name, args):
-        calls.append(dict(args))
-        if 'target' in args:
-            raise RuntimeError(STALE_REF_ERROR)
-        return '- button "Date posted" [ref=f80e12]'
-
     with caplog.at_level(logging.INFO):
-        content = _run_scraper_with_one_snapshot(monkeypatch, {'target': 'f78e1176', 'depth': 6}, browser)
+        content = _run_scraper_with_browser_calls(monkeypatch, [
+            ('browser_snapshot', {}),
+            ('browser_snapshot', {'target': 'f78e1176', 'depth': 6}),
+        ], _recording_browser(calls, fail_targets=True))
 
-    assert calls == [{'target': 'f78e1176', 'depth': 6}, {'depth': 6}], 'retried once, depth kept, target dropped'
+    assert [args for _, args in calls] == [{}, {'target': 'f78e1176', 'depth': 6}, {'depth': 6}], \
+        'retried once, depth kept, target dropped'
     assert content.startswith('NOTE: browser_snapshot with target ')
     assert "'f78e1176'" in content and 'Only refs from this snapshot are valid' in content
-    assert '- button "Date posted" [ref=f80e12]' in content
+    assert SNAPSHOT_TEXT in content
     assert not _warnings(caplog), 'a recovered snapshot is not a warning'
-    assert any('returned a full snapshot instead' in r.message for r in caplog.records)
+    assert any('returned a full snapshot instead' in r.message and 'previous tool: browser_snapshot' in r.message
+               for r in caplog.records)
 
 
 def test_scraper_snapshot_failure_without_a_target_is_not_retried(monkeypatch, caplog):
@@ -10951,10 +11006,18 @@ def test_scraper_snapshot_failure_without_a_target_is_not_retried(monkeypatch, c
 
 
 def test_scraper_failed_full_snapshot_after_a_stale_target_reports_both_errors(monkeypatch, caplog):
-    async def browser(name, args):
-        raise RuntimeError(STALE_REF_ERROR if 'target' in args else 'browser closed')
+    full_snapshots = []
 
-    content = _run_scraper_with_one_snapshot(monkeypatch, {'target': 'toolbar'}, browser)
+    async def browser(name, args):
+        if 'target' in args:
+            raise RuntimeError(STALE_REF_ERROR)
+        full_snapshots.append(args)
+        if len(full_snapshots) > 1:
+            raise RuntimeError('browser closed')
+        return SNAPSHOT_TEXT
+
+    content = _run_scraper_with_browser_calls(
+        monkeypatch, [('browser_snapshot', {}), ('browser_snapshot', {'target': 'toolbar'})], browser)
     assert 'f78e1176 not found' in content and 'browser closed' in content
     assert any('f78e1176 not found' in m and 'browser closed' in m for m in _warnings(caplog))
 
