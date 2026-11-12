@@ -5,7 +5,7 @@ The fixtures mirror what Exa returned on 2026-11-07 for a public job page and a 
 import json
 
 import pytest
-from agentic_job_search import job_trace, linkedin_page
+from agentic_job_search import company_domain, job_trace, linkedin_page
 from agentic_job_search import linkedin_exa as lx
 from agentic_job_search.config import (
     LINKEDIN_JOB_DESCRIPTION_HEADING,
@@ -14,6 +14,7 @@ from agentic_job_search.config import (
     PAGE_FETCH_ALLOWED_DOMAINS,
     PAGE_FETCH_ENGINE,
 )
+from agentic_job_search.linkedin_signed_out import NoArchivedCopyError
 
 JOB_URL = 'https://www.linkedin.com/jobs/view/4484344124/'
 CANDIDATE = {'site': 'linkedin', 'job_id': '4484344124', 'url': JOB_URL, 'company': 'Acme Data',
@@ -180,17 +181,46 @@ def test_a_company_name_with_at_in_it_is_split_on_the_card_company():
     assert (header.title, header.company, header.location) == ('Data Lead', 'Work at Home Co', 'Canada')
 
 
-async def test_a_company_profile_gives_the_name_and_website(fetched):
+@pytest.fixture
+def archived(monkeypatch):
+    '''read_archived_company_page answering from `copies` (slug -> CompanyAbout); no copy otherwise.'''
+    copies, asked = {}, []
+
+    async def read(slug):
+        asked.append(slug)
+        if slug not in copies:
+            raise NoArchivedCopyError(f'archived company page {slug}: the archive has no copy')
+        return copies[slug]
+
+    monkeypatch.setattr(lx, 'read_archived_company_page', read)
+    return copies, asked
+
+
+async def test_a_company_profile_gives_the_name_and_website(fetched, archived):
     replies, _ = fetched
     url = 'https://www.linkedin.com/company/acme-data/'
     replies[url] = reply(COMPANY_CONTENT, title='Acme Data', url=url)
     stats = {'cost': 0.0}
     about = await lx.read_company_page_exa('acme-data', stats)
     assert (about.name, about.website, about.affiliated) == ('Acme Data', 'acmedata.example', ())
+    assert about.source == company_domain.SOURCE_EXA   # Exa's profile, not LinkedIn's page
     assert stats['cost'] == pytest.approx(0.0012)
+    assert archived[1] == ['acme-data']   # the archive was asked first
 
 
-async def test_a_profile_of_another_company_is_not_an_about_page(fetched):
+async def test_an_archived_linkedin_page_is_read_before_exa(fetched, archived):
+    """2026-11-12: the archived copy is LinkedIn's own page, with the affiliated pages Exa's profile lacks."""
+    _, calls = fetched
+    copies, _ = archived
+    raw = 'https://web.archive.org/web/20261101000000id_/https://www.linkedin.com/company/acme-data/'
+    copies['acme-data'] = linkedin_page.CompanyAbout(
+        slug='acme-data', name='Acme Data', website='acmedata.example', affiliated=('Acme Holdings',), page_url=raw)
+    about = await lx.read_company_page_exa('acme-data', {'cost': 0.0})
+    assert (about.affiliated, about.page_url, about.source) == (('Acme Holdings',), raw, company_domain.SOURCE_LINKEDIN)
+    assert calls == []   # Exa was not asked, and nothing was billed
+
+
+async def test_a_profile_of_another_company_is_not_an_about_page(fetched, archived):
     replies, _ = fetched
     url = 'https://www.linkedin.com/company/acme/'
     replies[url] = reply(COMPANY_CONTENT, title='Acme Data', url=url)
@@ -198,7 +228,7 @@ async def test_a_profile_of_another_company_is_not_an_about_page(fetched):
         await lx.read_company_page_exa('acme', None)
 
 
-async def test_a_profile_without_a_name_is_not_an_about_page(fetched):
+async def test_a_profile_without_a_name_is_not_an_about_page(fetched, archived):
     replies, _ = fetched
     url = 'https://www.linkedin.com/company/acme-data/'
     replies[url] = reply('Page not found', title='', url=url)

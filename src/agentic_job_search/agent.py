@@ -2543,7 +2543,7 @@ async def identify_poster(
     stage_stats[ABOUT_FAILURES_IN_A_ROW_KEY] = 0
     identity = await company_domain.record_linkedin_identity(
         slug, about.name, about.website, about.parent_name, about.parent_slug, stage_stats,
-        affiliated=about.affiliated, page_url=about.page_url)
+        affiliated=about.affiliated, page_url=about.page_url, source=about.source)
     logger.info(f"Company identity: {candidate['company']} is {identity.describe()} (LinkedIn {slug})")
     return identity
 

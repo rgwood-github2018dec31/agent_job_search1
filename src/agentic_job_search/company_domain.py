@@ -50,7 +50,10 @@ COMPANY_IDENTITY_CACHE_PATH = RUN_DIR / 'company_identities.yaml'
 # is what it meant before, and a bump would discard every identity already read off LinkedIn.
 CACHE_SCHEMA_VERSION = 1
 
-SOURCE_LINKEDIN = 'linkedin'
+SOURCE_LINKEDIN = 'linkedin'   # LinkedIn's company page, read live or from an archived copy of it
+# Exa's own profile of the company page (2026-11-12), not LinkedIn's page: it states a name and a
+# homepage, never a parent or affiliated pages, so matching on those cannot work for such an entry.
+SOURCE_EXA = 'exa'
 SOURCE_MODEL = 'model'
 SOURCE_MANUAL = 'manual'
 SOURCE_NONE = 'none'   # asked, and nobody knew: the name is all there is
@@ -269,8 +272,12 @@ async def identity_for_name(name: str, stage_stats: dict | None = None) -> Compa
 async def record_linkedin_identity(
     slug: str, name: str, website: str, parent_name: str, parent_slug: str,
     stage_stats: dict | None = None, affiliated: tuple[str, ...] = (), page_url: str = '',
+    source: str = SOURCE_LINKEDIN,
 ) -> CompanyIdentity:
     '''Store what a company's About page states, filling only its gaps from the model.
+
+    `source` names where the page came from: SOURCE_LINKEDIN for LinkedIn's page (live or an archived
+    copy, whose URL is `page_url`), SOURCE_EXA for Exa's own profile of it.
 
     The page wins on every field it states. A page with no Website field (NTT DATA Europe & Latam
     has none) takes the model's domain; a page with no Parent entry takes the model's parent. A
@@ -280,7 +287,7 @@ async def record_linkedin_identity(
     if isinstance(previous, dict) and previous.get('source') == SOURCE_MANUAL:
         return _identity_from_entry(slug, previous)
     entry = {
-        'schema': CACHE_SCHEMA_VERSION, 'source': SOURCE_LINKEDIN, 'name': name,
+        'schema': CACHE_SCHEMA_VERSION, 'source': source, 'name': name,
         'domain': registrable_domain(website), 'website': website,
         'parent_name': parent_name, 'parent_slug': parent_slug, 'parent_domain': '',
         'resolved_on': date.today().isoformat(),
@@ -288,7 +295,7 @@ async def record_linkedin_identity(
     if affiliated:
         entry['affiliated'] = list(affiliated)
     if page_url:
-        entry['page'] = page_url   # an archived copy of the page, not LinkedIn itself
+        entry['page'] = page_url   # where the page was read when not LinkedIn itself (an archived copy)
     if not entry['domain'] or not entry['parent_name'] or not entry['parent_domain']:
         try:
             model = await identity_for_name(name, stage_stats)
@@ -309,7 +316,7 @@ async def record_linkedin_identity(
                 entry['parent_domain'] = model.parent_domain
                 filled.append('parent_domain')
             if filled:
-                entry['source'] = f'{SOURCE_LINKEDIN}+{SOURCE_MODEL}'
+                entry['source'] = f'{source}+{SOURCE_MODEL}'
                 entry['model_filled'] = filled
     _load_cache()['by_slug'][slug] = entry
     _write_cache()

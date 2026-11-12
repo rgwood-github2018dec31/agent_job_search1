@@ -18,7 +18,11 @@ What Exa returns, measured 2026-11-07:
   workplace is taken from the search card ("Warsaw (Remote)").
 - A company page is Exa's own company profile, not LinkedIn's page: "# <name>", then sections such
   as "## Company Details" with "- Homepage: <domain>" and "- LinkedIn: linkedin.com/company/<slug>".
-  It has no "Affiliated pages", so CompanyAbout.affiliated stays empty on this path.
+  It has no "Affiliated pages" and no Parent. So a recent Wayback Machine copy of LinkedIn's own
+  company page is read first (linkedin_signed_out.read_archived_company_page, the same lookup as the
+  signed-out path; nothing reaches LinkedIn), and Exa's profile only when there is none. An identity
+  from Exa's profile is recorded with source `exa`, not `linkedin` (2026-11-12: 33 were cached as
+  `linkedin` with no affiliated pages, so the affiliated match never applied to them).
 '''
 import asyncio
 import json
@@ -32,6 +36,7 @@ from markdown_it import MarkdownIt
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
 
 from agentic_job_search import job_trace, minimal_archive, tools_generic
+from agentic_job_search.company_domain import SOURCE_EXA as IDENTITY_SOURCE_EXA
 from agentic_job_search.config import (
     LINKEDIN_COMPANY_URL,
     LINKEDIN_EMPLOYMENT_TYPES,
@@ -56,7 +61,7 @@ from agentic_job_search.linkedin_page import (
     norm,
     raw_html_path,
 )
-from agentic_job_search.linkedin_signed_out import card_workplace
+from agentic_job_search.linkedin_signed_out import NoArchivedCopyError, card_workplace, read_archived_company_page
 from agentic_job_search.text_budget import quote_for_error
 
 logger = logging.getLogger(__name__)
@@ -309,15 +314,24 @@ def parse_company_profile(content: str, slug: str) -> CompanyAbout:
                                       f'({linked.group("url")})')
     homepage = _COMPANY_HOMEPAGE_RE.search(content)
     return CompanyAbout(slug=slug, name=norm(name.group('name')), website=homepage.group('site') if homepage else '',
-                        page_url=LINKEDIN_COMPANY_URL.format(slug=slug))
+                        source=IDENTITY_SOURCE_EXA)
 
 
 async def read_company_page_exa(slug: str, stage_stats: dict | None = None) -> CompanyAbout:
-    '''The company's name and Website from Exa's profile of its LinkedIn page (no affiliated pages; see the module doc).
+    '''LinkedIn's company page from a recent archived copy, else Exa's profile of it (see the module doc).
 
+    The archived copy has the Website and the affiliated pages; Exa's profile only the name and
+    Website, recorded with source `exa`.
     Raises NotAnAboutPageError when the profile does not read as this company's (kept in
     COMPANY_ABOUT_FAILURES_DIR), ExaPageError when the fetch failed.
     '''
+    try:
+        about = await read_archived_company_page(slug)
+    except NoArchivedCopyError as ex:
+        logger.info(f'Company page {slug}: asking Exa, no usable archived copy: {ex}')
+    else:
+        logger.debug(f'Company page {slug}: read from {about.page_url}')
+        return about
     url = LINKEDIN_COMPANY_URL.format(slug=slug)
     fetch = await fetch_page(url, f'company {slug}', stage_stats)
     record_fetch(fetch, prefetched=False)

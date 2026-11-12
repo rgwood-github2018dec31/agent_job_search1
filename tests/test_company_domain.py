@@ -182,6 +182,18 @@ async def test_a_linktree_website_is_no_domain_and_the_model_fills_it(model_answ
     assert (identity.domain, identity.source) == ('gevernova.com', 'linkedin+model')
 
 
+async def test_an_identity_from_exas_profile_is_recorded_as_exa_not_linkedin(model_answers):
+    """2026-11-12: Exa's own profile has no parent or affiliated pages; 33 such identities had been
+    cached as `linkedin`, which claimed LinkedIn's page had been read."""
+    answers, _asked = model_answers
+    answers['Acme Data'] = _identity_reply(domain='acmedata.example.com', parent_name='Acme Holdings',
+                                         parent_domain='acmeholdings.com')
+    identity = await company_domain.record_linkedin_identity(
+        'acme-data', 'Acme Data', 'acmedata.example.com', '', '', source=company_domain.SOURCE_EXA)
+    assert (identity.parent_name, identity.source) == ('Acme Holdings', 'exa+model')
+    assert company_domain.cached_identity_for_slug('acme-data').source == 'exa+model'
+
+
 def test_a_cached_linktree_domain_matches_nobody():
     '''An entry cached before NON_COMPANY_DOMAINS existed must not join two companies on linktree.com.'''
     company_domain.COMPANY_IDENTITY_CACHE_PATH.write_text(yaml.safe_dump({'by_name': {}, 'by_slug': {

@@ -42,6 +42,7 @@ from bs4 import BeautifulSoup, Tag
 from utils_tools_n_agents_common.mcp_client import unwrap_exception
 
 from agentic_job_search import evidence, minimal_archive, preferences, tools_generic
+from agentic_job_search.company_domain import SOURCE_LINKEDIN
 from agentic_job_search.config import (
     COMPANY_ABOUT_PAGE_RENDER_WAIT_SECONDS,
     EXTRACT_PAGE_RENDER_WAIT_SECONDS,
@@ -172,6 +173,9 @@ class CompanyAbout:
     # alike. Each counts as the same organization when matching (2026-11-06, the user's choice).
     affiliated: tuple[str, ...] = ()
     page_url: str = ''   # where it was read when not LinkedIn itself (an archived copy)
+    # The Company Identity source to record (company_domain.SOURCE_*): LinkedIn's page, live or
+    # archived, unless a reader read something else (Exa's own profile, 2026-11-12).
+    source: str = SOURCE_LINKEDIN
 
 
 class NotAnAboutPageError(RuntimeError):

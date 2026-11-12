@@ -2169,8 +2169,9 @@ async def test_the_exa_path_reads_the_company_profile_without_a_pause(monkeypatc
         reads.append(slug)
         return linkedin_page.CompanyAbout(slug=slug, name='Acme', website='acme.example.com')
 
-    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=(), page_url=''):
-        return company_domain.CompanyIdentity(name, domain=website, source='linkedin')
+    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=(), page_url='',
+                          source=''):
+        return company_domain.CompanyIdentity(name, domain=website, source=source)
 
     monkeypatch.setattr(agent, '_job_and_company_pages_via', agent.LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER)
     monkeypatch.setattr(agent, '_human_pause', pause)
@@ -2178,6 +2179,7 @@ async def test_the_exa_path_reads_the_company_profile_without_a_pause(monkeypatc
     monkeypatch.setattr(company_domain, 'record_linkedin_identity', fake_record)
     identity = await agent.identify_poster('acme', _POSTER, 'http://x', {})
     assert identity.domain == 'acme.example.com' and reads == ['acme'] and pauses == []
+    assert identity.source == company_domain.SOURCE_LINKEDIN   # what the reader said it read, passed on
 
 
 # ---------------------------------------------------------------------------
@@ -12731,8 +12733,9 @@ async def test_signed_out_reads_the_public_company_page_and_never_the_browser(ab
         signed_out_visits.append(slug)
         return linkedin_page.CompanyAbout(slug=slug, name='Acme', website='https://acme.example.com')
 
-    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=(), page_url=''):
-        return company_domain.CompanyIdentity(name, domain='acme.example.com', source='linkedin')
+    async def fake_record(slug, name, website, parent_name, parent_slug, stats, affiliated=(), page_url='',
+                          source=''):
+        return company_domain.CompanyIdentity(name, domain='acme.example.com', source=source)
 
     monkeypatch.setattr(agent, 'COMPANY_ABOUT_PAGE_VIA_SIGNED_IN_BROWSER', False)
     monkeypatch.setattr(agent, '_job_and_company_pages_via', agent.LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET)
