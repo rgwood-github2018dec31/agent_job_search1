@@ -56,8 +56,19 @@ def load_traces(run_date: str) -> dict[str, list[dict]]:
     paths = sorted(folder.glob(f'*{TRACE_SUFFIX}'))
     if not paths:
         raise SystemExit(f'No Job Traces in {folder}')
-    traces = {p.name.removesuffix(TRACE_SUFFIX): T.load(p) for p in paths}
-    return {key: steps for key, steps in traces.items() if steps}
+    traces = {}
+    for path in paths:
+        try:
+            steps = T.load(path)
+        except (OSError, ValueError) as ex:
+            # One trace (a run still writing it, a cut file) must not cost the whole date's graph.
+            logger.warning(f'Decision graph: skipped {path}: {type(ex).__name__}: {ex}')
+            continue
+        if steps:
+            traces[path.name.removesuffix(TRACE_SUFFIX)] = steps
+    if not traces:
+        raise SystemExit(f'No readable Job Trace in {folder}')
+    return traces
 
 
 def main() -> None:

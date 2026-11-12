@@ -55,3 +55,17 @@ def test_a_clean_log_skips_nothing(report, tmp_path, monkeypatch):
     monkeypatch.setattr(report, 'RUN_DIR', tmp_path)
     assert json.loads(report.stage_cost(RUN_DATE, 'rating')) == {'cost': 1}
     assert not report.SKIPPED_LOG_LINES
+
+
+def test_a_path_that_cannot_be_drawn_costs_only_its_own_section(report, monkeypatch, caplog):
+    '''The path is a reading aid: a trace it cannot lay out must not cost the rest of the Job Audit.'''
+    def broken(steps, rules):
+        raise KeyError('kind')
+
+    monkeypatch.setattr(report.job_path, 'overlay', broken)
+    notes = []
+    monkeypatch.setattr(report, 'note', lambda text: notes.append(text) or text)
+    with caplog.at_level(logging.WARNING):
+        report.decision_path([{'kind': 'origin'}])
+    assert any('could not be drawn' in n and 'KeyError' in n for n in notes)
+    assert any('path through Stage 2 could not be drawn' in r.getMessage() for r in caplog.records)

@@ -62,7 +62,7 @@ SHORT_CHARS = 60    # a value quoted inside a note, a box title
 TOP_REASONS = 3     # distinct exit reasons listed on an aggregate exit box
 
 # Emoji and their joiners, which the embedded fonts have no glyph for (a Telegram text is full of them).
-_EMOJI = re.compile('[\U0001F000-\U0001FFFF☀-➿⬀-⯿️‍]')
+_EMOJI = re.compile('[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]')
 
 
 @dataclass
@@ -222,6 +222,9 @@ def _exit(steps: list[dict], nodes: list[Node]) -> tuple[str, str, list[str]] | 
     if outcome is None:
         outcome = _outcome_stated_by_other_steps(steps)
     if outcome is None:
+        # Every exit but extract-failed saves the job, so a `saved` step is how it left, not a stage
+        # it reached: the exit sits at the last stage before it.
+        last_reached = next((n.id for n in reversed(nodes) if n.id != 'save' and n.steps), 'queued')
         saved = next((s for s in reversed(steps) if s['kind'] == 'saved'), None)
         return last_reached, 'outcome not recorded', [
             *([f"saved as: {cut(saved.get('summary'))}"] if saved else []),
@@ -245,7 +248,7 @@ def _exit(steps: list[dict], nodes: list[Node]) -> tuple[str, str, list[str]] | 
         if not final.get('sent'):
             return 'notify', 'notification NOT delivered', [cut(final['text'])]
         return None
-    return last_reached, f'{name}', [reason]
+    return last_reached, name, [reason]
 
 
 def overlay(steps: list[dict], rules: list[str]) -> list[Node]:
@@ -270,9 +273,12 @@ def overlay(steps: list[dict], rules: list[str]) -> list[Node]:
         node.state = 'taken' if node.steps else 'skipped'
         if node.exit_label:
             node.exit_state = 'not_taken'
+    exit_id = exit_at[0] if exit_at else ''
     for node in (by_id['applied_client'], by_id['applied_domain']):
-        if node.state == 'skipped':   # these checks record a step only when they match
-            node.state, node.notes = 'taken', ['passed or not applicable (records a step only on a match)']
+        # These checks record no step of their own; a match shows only as the job's outcome, drawn as
+        # this node's exit. Reached and not the exit, the check passed or did not apply.
+        if node.state == 'skipped' and node.id != exit_id:
+            node.state, node.notes = 'taken', ['passed or not applicable (the check records no step)']
     if by_id['triage'].state == 'skipped':
         by_id['triage'].notes = ['not run']
 
@@ -292,7 +298,7 @@ def overlay(steps: list[dict], rules: list[str]) -> list[Node]:
         return nodes
     node_id, label, notes = exit_at
     node = by_id[node_id]
-    node.state = 'taken' if node.steps else node.state
+    node.state = 'taken'   # the job reached the stage it left from, steps or not (an applied check has none)
     node.exit_state, node.exit_label, node.exit_notes = 'taken', label or node.exit_label, notes
     for later in nodes[end + 1:]:
         later.state, later.exit_state, later.notes = 'not_reached', '', []
@@ -303,7 +309,9 @@ def outcome(nodes: list[Node]) -> str:
     '''A short name for where a job ended, used to pick one example of each.'''
     exited = next((n for n in nodes if n.exit_state == 'taken'), None)
     if exited:
-        return exited.id if exited.id.startswith('rule:') else exited.exit_label
+        # A rule's own exit is named by the rule; a trace that only stopped at a rule stage is not its rejection.
+        fired_rule = exited.id.startswith('rule:') and exited.exit_label == f"rejected: {exited.id.removeprefix('rule:')}"
+        return exited.id if fired_rule else exited.exit_label
     return 'notified' + (' (capped)' if any(n.exit_state == 'detour' for n in nodes) else '')
 
 
@@ -321,7 +329,8 @@ def aggregate(all_nodes: list[list[Node]], rules: list[str]) -> list[Node]:
         if exits:
             node.exit_state = 'detour' if all(n.exit_state == 'detour' for n in exits) else 'taken'
             labels = Counter(n.exit_label for n in exits)
-            node.exit_label = f'{len(exits)} × ' + (node.exit_label if len(labels) > 1 else exits[0].exit_label)
+            mixed = node.exit_label or ' / '.join(label for label, _ in labels.most_common())
+            node.exit_label = f'{len(exits)} × ' + (mixed if len(labels) > 1 else exits[0].exit_label)
             reasons = Counter(n.exit_notes[0] if n.exit_notes else n.exit_label for n in exits)
             node.exit_notes = [f'{c} × {r}' for r, c in reasons.most_common(TOP_REASONS)]
             if len(reasons) > TOP_REASONS:

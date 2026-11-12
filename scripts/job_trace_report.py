@@ -792,9 +792,15 @@ def poster_rows(company: str, page_step: dict, fields: dict) -> list[tuple[str, 
 def decision_path(steps: list[dict]) -> list:
     '''The trace boiled down to what decided the rating, each line pointing at its full step.'''
     story: list = [h1('Decision path (from the Job Trace)'), rule()]
-    nodes = job_path.overlay(steps, job_path.rule_order([steps]))
-    story += [label(f'The path through Stage 2 — outcome: {job_path.outcome(nodes)}'),
-              *path_flowables(nodes, (_SANS, _SANS_BOLD)), Spacer(1, 3 * mm)]
+    try:
+        nodes = job_path.overlay(steps, job_path.rule_order([steps]))
+        story += [label(f'The path through Stage 2 — outcome: {job_path.outcome(nodes)}'),
+                  *path_flowables(nodes, (_SANS, _SANS_BOLD)), Spacer(1, 3 * mm)]
+    except Exception as ex:
+        # The drawing is a reading aid: a trace it cannot lay out must not cost the rest of the audit.
+        logger.warning(f'Job Audit: the path through Stage 2 could not be drawn: {type(ex).__name__}: {ex}')
+        story += [note(f'The path through Stage 2 could not be drawn ({type(ex).__name__}: {ex}); '
+                       'the tables below and the verbatim trace are complete.')]
     extract = next((s['fields'] for s in steps if s['kind'] == 'extract'), {})
     statuses = extract.get('evidence') or {}
     quotes = extract.get('quotes') or {}

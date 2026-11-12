@@ -111,9 +111,10 @@ def test_an_eval_error_exits_where_the_trace_stops_with_its_reason():
 
 def test_a_trace_without_an_outcome_says_so_rather_than_guessing():
     nodes = _overlay(*_head(), *_rules(), ('saved', {'rating': 1, 'summary': 'already applied to end client X'}))
-    assert nodes['save'].exit_label == 'outcome not recorded'
-    assert nodes['save'].exit_notes[0] == 'saved as: already applied to end client X'
-    assert nodes['save'].exit_notes[1].startswith('the trace has no outcome step')
+    stopped = nodes['rule:degree']   # the last stage reached: `saved` is how the job left, not a stage
+    assert stopped.exit_label == 'outcome not recorded'
+    assert stopped.exit_notes[0] == 'saved as: already applied to end client X'
+    assert stopped.exit_notes[1].startswith('the trace has no outcome step')
 
 
 def test_a_trace_without_an_outcome_still_reads_a_fired_rule_and_a_rating():
@@ -147,3 +148,35 @@ def test_the_run_view_counts_jobs_per_stage_and_per_exit():
 
 def test_emoji_are_dropped_from_notes():
     assert job_path.cut('⭐ 4/5 — 🧑‍💼 Recruiter') == '4/5 — Recruiter'
+
+
+def test_the_already_applied_check_that_matched_is_not_also_labelled_passed():
+    nodes = _overlay(*_head(), *_left('already_applied', 'Pharma Co already applied to', 'end_client'))
+    applied = nodes['applied_client']
+    assert (applied.state, applied.exit_state) == ('taken', 'taken')
+    assert not any('passed' in note for note in applied.notes)
+
+
+def test_an_old_trace_ending_saved_exits_at_its_last_real_stage():
+    '''Before 2026-11-12 an applied or triage exit left only `saved`; the stages after the last
+    real one were drawn as passed and skipped, though the job never reached them.'''
+    nodes = _overlay(*_head(), *_rules(), ('saved', {'rating': 1, 'summary': 'already applied to Y'}))
+    assert nodes['rule:degree'].exit_label == 'outcome not recorded'
+    assert {nodes[n].state for n in ('triage', 'applied_domain', 'rate', 'caps', 'save')} == {'not_reached'}
+
+
+def test_mixed_exit_labels_at_one_stage_are_named_in_the_run_view():
+    rules = list(job_path.HARD_RULES)
+    failed = [('llm_call', {'call_site': 'rate_with_openrouter', 'error': 'e'})]
+    jobs = [job_path.overlay(_steps(*_head(), *_rules(), *failed, ('outcome', {'outcome': name, 'reason': name})),
+                             rules) for name in ('eval_error', 'tool_server_down')]
+    rate = {n.id: n for n in job_path.aggregate(jobs, rules)}['rate']
+    assert rate.exit_label in ('2 × eval_error / tool_server_down', '2 × tool_server_down / eval_error')
+
+
+def test_a_trace_that_stops_at_a_rule_stage_is_not_named_as_that_rules_rejection():
+    '''2026-11-04, job 4487299706: the run stopped after the degree rule passed; the outcome list said rule:degree.'''
+    stopped = job_path.overlay(_steps(*_head(), *_rules()), list(job_path.HARD_RULES))
+    assert job_path.outcome(stopped) == 'outcome not recorded'
+    rejected = job_path.overlay(_steps(*_head(), *_rules('degree')), list(job_path.HARD_RULES))
+    assert job_path.outcome(rejected) == 'rule:degree'
