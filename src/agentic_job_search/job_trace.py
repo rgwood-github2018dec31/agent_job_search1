@@ -19,6 +19,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Set on every step by JobTrace.add; a step's own data may not use them.
+STEP_KEYS = frozenset({'kind', 'at', 'elapsed_s'})
+
 _current: contextvars.ContextVar['JobTrace | None'] = contextvars.ContextVar('job_trace', default=None)
 
 
@@ -33,6 +36,14 @@ class JobTrace:
         self.started = time.monotonic()
 
     def add(self, kind: str, data: dict[str, Any]) -> None:
+        '''Append a step. Raises ValueError when `data` names a key the step itself sets (STEP_KEYS).
+
+        Until 2026-11-12 a notification's `kind='follow-up'` replaced the step's kind, so the Job
+        Audit, which looks for `notification`, never showed a follow-up's message.
+        '''
+        if clash := STEP_KEYS & data.keys():
+            raise ValueError(f'Job trace for {self.site}/{self.job_id}: a {kind!r} step may not set '
+                             f'{sorted(clash)}, which the step itself sets')
         step = {'kind': kind, 'at': datetime.now().isoformat(timespec='milliseconds'),
                 'elapsed_s': round(time.monotonic() - self.started, 3), **data}
         self.steps.append(step)

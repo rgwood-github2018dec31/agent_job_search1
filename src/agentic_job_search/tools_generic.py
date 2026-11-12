@@ -1598,8 +1598,19 @@ def job_url(site: str, job_id: str) -> str:
     return f'({site} job {job_id})'
 
 
-def record_job_outcome(site: str, job_id: str, outcome: str, rating: int | None = None, summary: str = '') -> None:
-    """Attach a Stage 2 result to the listing's audit record."""
+def record_job_outcome(site: str, job_id: str, outcome: str, rating: int | None = None, summary: str = '',
+                       check: str = '') -> None:
+    """Attach a Stage 2 result to the listing's audit record, and to the job's own Job Trace.
+
+    Every way a job leaves Stage 2 comes through here, so the trace says how it left rather than
+    leaving a reader to infer it from where the steps stop (2026-11-12, the Decision Graph). `check`
+    names which of two checks with one outcome decided it (`already_applied`: `end_client` or
+    `company_identity`). The step goes only to the trace of this job: the jobs released when Stage 2
+    stops are recorded here too, while another job's trace is open.
+    """
+    trace = job_trace.current()
+    if trace is not None and (trace.site, trace.job_id) == (site, job_id):
+        trace.add('outcome', {'outcome': outcome, 'check': check, 'rating': rating, 'reason': summary})
     record = _listing_records.get((site, job_id))
     if record is None:
         logger.warning(f'record_job_outcome: no listing record for {site}/{job_id} ({outcome})')

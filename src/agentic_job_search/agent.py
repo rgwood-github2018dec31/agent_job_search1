@@ -4838,7 +4838,7 @@ class NotificationQueue:
                 failed.append(job_ids)
             for posting in group.postings:
                 if posting.trace is not None:
-                    posting.trace.add('notification', {'text': text, 'sent': sent, 'kind': kind,
+                    posting.trace.add('notification', {'text': text, 'sent': sent, 'message_kind': kind,
                                                        'job_ids': job_ids})
         logger.info(
             f'Stage 2 notifications: {len(groups) - len(failed)} of {len(groups)} message(s) sent'
@@ -5090,7 +5090,7 @@ async def _evaluate_candidates(
                     )
                     tools_module.record_job_outcome(
                         candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
-                        summary=f'end client {end_client} already applied to',
+                        summary=f'end client {end_client} already applied to', check='end_client',
                     )
                     continue
 
@@ -5160,6 +5160,7 @@ async def _evaluate_candidates(
                     tools_module.record_job_outcome(
                         candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
                         summary=f"{candidate['company']} matches {matched_pdf} by domain or parent",
+                        check='company_identity',
                     )
                     continue
 

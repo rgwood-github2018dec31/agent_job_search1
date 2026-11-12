@@ -6287,6 +6287,42 @@ async def test_every_stage_2_job_leaves_a_job_trace_of_each_step(monkeypatch):
     sent = next(s for s in steps if s['kind'] == 'notification')
     assert notifications and sent['text'] == notifications[0] and sent['sent'] is True
     assert job_trace.current() is None, 'the trace is closed when Stage 2 ends'
+    rated = next(s for s in steps if s['kind'] == 'rating')
+    assert [(s['outcome'], s['rating']) for s in steps if s['kind'] == 'outcome'] == [('rated', rated['capped_rating'])]
+
+
+async def test_an_already_applied_end_client_is_recorded_as_the_jobs_outcome_with_its_check(monkeypatch):
+    '''2026-11-12: the trace said nothing of how such a job left Stage 2; the Decision Graph had to guess.'''
+    _stage2_stubs(monkeypatch, _agency_extract(end_client='Pharma Co'))
+
+    async def applied(name, identity=None):
+        return 'pharma-co.pdf' if name == 'Pharma Co' else None
+
+    monkeypatch.setattr(tools, 'company_matches_applied', applied)
+    candidate = _make_candidate(job_id='4480376714', company='Archer Recruitment')
+    await _run_stage2(candidate, {})
+    outcomes = [s for s in job_trace.load(tools.job_trace_path(candidate)) if s['kind'] == 'outcome']
+    assert [(s['outcome'], s['check']) for s in outcomes] == [('already_applied', 'end_client')]
+    assert 'Pharma Co' in outcomes[0]['reason']
+
+
+def test_an_outcome_for_another_job_stays_out_of_the_open_trace(tmp_path):
+    """Stage 2 releases the rest of its queue while one job's trace is open (a challenge page, an outage)."""
+    trace, token = job_trace.start(tmp_path / 't.jsonl', 'linkedin', '1')
+    try:
+        tools.record_job_outcome('linkedin', '2', 'blocked', summary='released')
+        tools.record_job_outcome('linkedin', '1', 'eval_error', summary='boom')
+    finally:
+        job_trace.finish(token)
+    assert [(s['kind'], s['outcome']) for s in trace.steps] == [('outcome', 'eval_error')]
+
+
+def test_a_step_may_not_replace_its_own_kind(tmp_path):
+    """2026-11-12: `kind='follow-up'` replaced a notification step's kind, hiding it from the Job Audit."""
+    trace = job_trace.JobTrace(tmp_path / 't.jsonl', 'linkedin', '1')
+    with pytest.raises(ValueError, match=r"may not set \['kind'\]"):
+        trace.add('notification', {'kind': 'follow-up', 'text': 'hi'})
+    assert trace.steps == []
 
 
 async def test_stage_2_notifies_and_records_a_first_agency_posting(monkeypatch):

@@ -66,6 +66,8 @@ from bs4 import BeautifulSoup  # noqa: E402
 
 RUN_DIR = PROJECT_DIR / 'run_dir'
 WRAP = 108
+# A notification step; traces written before 2026-11-12 recorded a follow-up's under kind `follow-up`.
+NOTIFICATION_STEP_KINDS = ('notification', 'follow-up')
 
 
 # --- rendering helpers -------------------------------------------------------
@@ -747,7 +749,7 @@ def step_by_step(steps: list[dict], found: str) -> list:
             saved_as = re.search(r'Saved: (\S+)', as_text(s.get('result')))
             row = ('Saved job', 'code', params([('rating', s.get('rating')), ('summary', s.get('summary'))]),
                    params([('file', saved_as.group(1) if saved_as else s.get('result'))]))
-        elif kind == 'notification':
+        elif kind in NOTIFICATION_STEP_KINDS:
             row = ('Notification', 'code', params([('job_ids', s.get('job_ids'))]),
                    params([('sent', s.get('sent')), ('text', shorten(s['text'], SUMMARY_CHARS))]) if s.get('text')
                    else params([('sent', 'no'), ('why', s.get('why'))]))
@@ -907,7 +909,7 @@ def build(job_id: str, run_date: str, out: Path, trace: Path | None = None) -> P
     raw_html = RUN_DIR / 'raw_postings' / run_date / f'linkedin-{job_id}.html'
     trace_path = trace or RUN_DIR / 'raw_postings' / run_date / f'linkedin-{job_id}.trace.jsonl'
     steps = T.load(trace_path) if trace_path.exists() else []
-    sent = next((s for s in steps if s['kind'] == 'notification'), None)
+    sent = next((s for s in steps if s['kind'] in NOTIFICATION_STEP_KINDS), None)
 
     # The page read stamps its own capture time; that is what anchors which run this is.
     captured = None
