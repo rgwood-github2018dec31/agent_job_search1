@@ -262,3 +262,52 @@ async def test_a_non_429_failure_drops_only_that_endpoint(monkeypatch):
     await _pin_from(monkeypatch, ranked)
     endpoint_pin.endpoint_failed('m/1', endpoint_pin.routing_for('m/1'), 'timed out after 180.0s')
     assert endpoint_pin.routing_for('m/1')['provider'] == 'inference-net/fp8'
+
+
+SUBMIT_CALL = [{'id': 'c1', 'type': 'function', 'function': {'name': 'submit', 'arguments': '{"value": "x"}'}}]
+SUBMIT_PARAMETERS = {'type': 'object', 'properties': {'value': {'type': 'string'}}, 'required': ['value']}
+
+
+async def test_a_forced_call_answered_in_text_drops_the_endpoint_and_asks_the_next(monkeypatch):
+    '''2026-11-12: an endpoint that ignores `tool_choice` would fail every forced call of the run,
+    since the unusable reply is raised after the transport has returned and never moved the pin.'''
+    await _pin_from(monkeypatch, RANKED_2026_10_18)
+    sent = []
+
+    async def text_then_call(url, tool_name, args, timeout_seconds=None):
+        sent.append(args.get('provider'))
+        if len(sent) == 1:
+            return json.dumps({**CHAT_OK, 'content': '{"value": "x"}', 'tool_calls': None, 'cost_usd': 0.0002})
+        return json.dumps({**CHAT_OK, 'content': '', 'tool_calls': SUBMIT_CALL, 'cost_usd': 0.0001})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', text_then_call)
+    arguments, reply = await triage.chat_openrouter_tool('hi', 'submit', 'Submit it.', SUBMIT_PARAMETERS, model='m/1')
+    assert arguments == {'value': 'x'}
+    assert sent == ['deepinfra/fp8', 'morph/fp8']
+    assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8'
+    assert reply.cost_usd == pytest.approx(0.0003), 'the text answer was paid for too'
+
+
+async def test_a_forced_call_answered_in_text_twice_raises_unusable(monkeypatch):
+    await _pin_from(monkeypatch, RANKED_2026_10_18)
+
+    async def always_text(url, tool_name, args, timeout_seconds=None):
+        return json.dumps({**CHAT_OK, 'content': 'no call', 'tool_calls': None})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', always_text)
+    with pytest.raises(triage.UnusableToolCallError, match='called no function'):
+        await triage.chat_openrouter_tool('hi', 'submit', 'Submit it.', SUBMIT_PARAMETERS, model='m/1')
+    assert endpoint_pin.routing_for('m/1')['provider'] == 'morph/fp8', 'dropped once, not once per failure'
+
+
+async def test_an_unpinned_forced_call_answered_in_text_is_not_asked_again(monkeypatch):
+    sent = []
+
+    async def always_text(url, tool_name, args, timeout_seconds=None):
+        sent.append(args)
+        return json.dumps({**CHAT_OK, 'content': 'no call', 'tool_calls': None})
+
+    monkeypatch.setattr(triage, 'call_mcp_tool', always_text)
+    with pytest.raises(triage.UnusableToolCallError):
+        await triage.chat_openrouter_tool('hi', 'submit', 'Submit it.', SUBMIT_PARAMETERS, model='m/1')
+    assert len(sent) == 1, 'with no pin there is no endpoint to drop'

@@ -12487,6 +12487,14 @@ async def test_rate_job_asks_a_different_model_when_the_rater_reply_is_malformed
     assert 'MalformedRatingReplyError' in warning
 
 
+async def test_a_malformed_rating_is_counted_in_the_stage_cost(monkeypatch):
+    '''2026-11-12: the unusable call's cost was dropped with it, so the run's rating cost read low.'''
+    _rating_models(monkeypatch, {'vendor/first': UNCLOSED_ARRAY_REPLY, 'vendor/second': GOOD_RATING_REPLY})
+    stats = agent.new_stage_stats()
+    await agent.rate_job('system', 'job text', stats)
+    assert stats['cost'] == pytest.approx(0.004), 'both calls were paid for, at 0.002 each'
+
+
 async def test_rate_job_works_down_the_whole_list(monkeypatch):
     asked = _rating_models(monkeypatch, {
         'vendor/first': UNCLOSED_ARRAY_REPLY, 'vendor/second': 'no json at all', 'vendor/third': GOOD_RATING_REPLY})

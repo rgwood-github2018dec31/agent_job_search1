@@ -352,6 +352,7 @@ async def _chat_openrouter(
         args['tools'] = tools
         args['tool_choice'] = tool_choice
     retried = False
+    discarded_cost = 0.0   # a forced call answered in text, then asked again: paid all the same
     while True:
         routing = routing_for(model)
         try:
@@ -370,6 +371,18 @@ async def _chat_openrouter(
         if not isinstance(data, dict):
             raise ValueError(f'OpenRouter chat reply for {model} is not an object: {quote_for_error(raw, "OpenRouter chat reply")!r}')
         if data.get('ok') is True:
+            # A forced call answered in text: the endpoint ignores `tool_choice` (rank_providers checks
+            # only that it lists `tools`). Left on the pin, every forced call of the run would fail the
+            # same way, each gate field keeping the extractor's value and each rating going to a
+            # fallback model, so the endpoint is dropped and the call asked once more (2026-11-12).
+            if tools and not data.get('tool_calls') and not retried and endpoint_failed(
+                    model, routing, f'answered in text although {tool_choice} was forced'):
+                discarded_cost += float(data.get('cost_usd') or 0.0)
+                logger.warning(f"Forced function call to {model} on {routing.get('provider')} came back as text "
+                               f"(${data.get('cost_usd') or 0:.5f}, counted with the call); asking again on the "
+                               f'next endpoint')
+                retried = True
+                continue
             break
         if endpoint_failed(model, routing, str(data.get('error') or raw)) and not retried:
             retried = True
@@ -383,7 +396,7 @@ async def _chat_openrouter(
         logger.warning(f'OpenRouter reported no cost for a {model} call (counted as $0): '
                        f'{quote_for_error(raw, "OpenRouter chat reply with no cost")}')
     reply = ChatReply(
-        content=data.get('content') or '', cost_usd=float(data.get('cost_usd') or 0.0),
+        content=data.get('content') or '', cost_usd=float(data.get('cost_usd') or 0.0) + discarded_cost,
         requested_model=model, model=str(data.get('model') or model), provider=str(data.get('provider') or ''),
         served_quantization=str(data.get('served_quantization') or ''),
         finish_reason=str(data.get('finish_reason') or ''), usage=usage if isinstance(usage, dict) else {},
@@ -667,7 +680,11 @@ _TRUNCATION_RETRY_MAX_TOKENS = 32_000
 
 class MalformedRatingReplyError(ValueError):
     '''A rating reply that arrived whole but holds no usable rating (no JSON object with an integer
-    `rating`, or no usable submit_rating call).'''
+    `rating`, or no usable submit_rating call). `cost_usd` is what the call cost all the same.'''
+
+    def __init__(self, message: str, cost_usd: float = 0.0):
+        super().__init__(message)
+        self.cost_usd = cost_usd
 
 
 def parse_rating_reply(content: str) -> dict:
@@ -715,14 +732,15 @@ async def rate_with_openrouter(system_prompt: str, user_prompt: str, model: str 
                 result, reply = await chat_openrouter_tool(prompt, **tool, **call,
                                                            max_tokens=_TRUNCATION_RETRY_MAX_TOKENS)
     except UnusableToolCallError as ex:
-        raise MalformedRatingReplyError(str(ex)) from ex
+        raise MalformedRatingReplyError(str(ex), cost_usd=ex.cost_usd) from ex
     if result is None:
         try:
             result = parse_rating_reply(reply.content)
         except MalformedRatingReplyError as ex:
             raise MalformedRatingReplyError(
                 f'{ex} — {reply.describe()}; content: '
-                f'{quote_for_error(reply.content, f"malformed rating reply from {reply.model}")!r}') from ex
+                f'{quote_for_error(reply.content, f"malformed rating reply from {reply.model}")!r}',
+                cost_usd=reply.cost_usd) from ex
     return result, reply.cost_usd
 
 

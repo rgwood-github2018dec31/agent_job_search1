@@ -221,6 +221,7 @@ from agentic_job_search.tools_generic import (
 )
 from agentic_job_search.triage import (
     RATING_OUTPUT_SCHEMA,
+    MalformedRatingReplyError,
     ProviderUnavailableError,
     chat_openrouter,
     generate_local,
@@ -4611,8 +4612,12 @@ async def _rate_with(model: str, evaluator_prompt: str, extract_text: str, stage
     """One non-agentic rating call; the model's family prefix picks the route (route_for)."""
     route = route_for(model)
     if route == 'openrouter':
-        result, cost_usd = await rate_with_openrouter(
-            evaluator_prompt, rating_user_message(extract_text), model=model)
+        try:
+            result, cost_usd = await rate_with_openrouter(
+                evaluator_prompt, rating_user_message(extract_text), model=model)
+        except MalformedRatingReplyError as ex:
+            stage_stats['cost'] += ex.cost_usd   # a reply with no usable rating is paid for all the same
+            raise
         stage_stats['cost'] += cost_usd
         return result
     if route == 'ollama':
