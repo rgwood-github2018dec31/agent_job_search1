@@ -405,9 +405,24 @@ def _guard_call(name: str, args: dict) -> str | None:
     return None
 
 
+def _schema_without_filename(schema: dict | None) -> dict:
+    '''A tool's input schema with no `filename` property, so the model is never offered it.'''
+    schema = dict(schema or {'type': 'object', 'properties': {}})
+    if isinstance(schema.get('properties'), dict) and _FILENAME_ARG in schema['properties']:
+        schema['properties'] = {k: v for k, v in schema['properties'].items() if k != _FILENAME_ARG}
+    if isinstance(schema.get('required'), list):
+        schema['required'] = [k for k in schema['required'] if k != _FILENAME_ARG]
+    return schema
+
+
 def browser_tool_defs(mcp_tools: list[dict]) -> list[dict]:
     """Convert the Playwright server's own schemas (mcp_client.list_tools dicts:
-    name / description / inputSchema) into OpenAI-style function definitions."""
+    name / description / inputSchema) into OpenAI-style function definitions.
+
+    `filename` is taken out of every schema (2026-11-12). It diverts a result to disk, so run()
+    already drops it from every call, but the model kept offering it: 43 times in one run, each a
+    WARNING burying the ones that matter. Not offered, it is not sent; the drop stays as backstop.
+    """
     disallowed = {t.replace('mcp__playwright__', '') for t in SCRAPER_DISALLOWED_BROWSER_TOOLS}
     return [
         {'type': 'function', 'function': {
@@ -415,7 +430,7 @@ def browser_tool_defs(mcp_tools: list[dict]) -> list[dict]:
             'description': truncate_reported(
                 t['description'] or '', OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS,
                 f"description of browser tool {t['name']}"),
-            'parameters': t['inputSchema'] or {'type': 'object', 'properties': {}}}}
+            'parameters': _schema_without_filename(t['inputSchema'])}}
         for t in mcp_tools if t['name'] not in disallowed
     ]
 

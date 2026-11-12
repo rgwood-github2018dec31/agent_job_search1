@@ -9738,6 +9738,19 @@ def test_browser_tool_defs_drop_disallowed_and_keep_required():
         assert required.replace('mcp__playwright__', '') in exposed, required
 
 
+def test_browser_tool_defs_never_offer_filename():
+    '''2026-11-11: the model sent `filename` 43 times in one run; a schema without it cannot invite it.'''
+    schema = {'type': 'object', 'required': ['target', 'filename'],
+              'properties': {'target': {'type': 'string'}, 'depth': {'type': 'number'},
+                             'filename': {'type': 'string'}}}
+    tool = {'name': 'browser_snapshot', 'description': 'd', 'inputSchema': schema}
+    [definition] = scrape_openrouter.browser_tool_defs([tool])
+    parameters = definition['function']['parameters']
+    assert set(parameters['properties']) == {'target', 'depth'}
+    assert parameters['required'] == ['target']
+    assert 'filename' in schema['properties'], "the server's own schema is not mutated"
+
+
 # ---------------------------------------------------------------------------
 # API-level error surfacing (_raise_if_result_error / AgentApiError)
 # ---------------------------------------------------------------------------
