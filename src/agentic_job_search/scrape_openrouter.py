@@ -68,6 +68,31 @@ _FILENAME_ARG = 'filename'
 _REF_PRESERVING_TOOL_NAMES = frozenset({_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME, 'browser_evaluate'})
 FIND_CAPTURE_DIR = RUN_DIR / 'find_captures'
 
+# Choose Chip Option (2026-11-13): the date filter's radio input is hidden and its rows share hashed
+# class names, so the model clicked `input[aria-label="Past week"]` (not visible) or a class
+# selector (matched every row) until "Principal AI Engineer" hit the iteration cap with its EU
+# search unrun. Code recognises the two errors and names the click that works; the model still
+# chooses every action.
+# 2026-11-16: also a selector that matched nothing (`button:has([aria-label="Filter by Date posted"])`
+# on a chip that is a div, `input[aria-label="Location"]`), and the same for browser_type.
+_HINTED_TOOL_NAMES = frozenset({'browser_click', 'browser_type'})
+_SELECTOR_ERRORS = (
+    'element is not visible',         # the radio input under an option row is hidden
+    'strict mode violation',          # a shared hashed class matched every row
+    'does not match any elements',    # a guessed tag or aria-label the page does not have
+)
+CLICK_FAILURE_HINT = (
+    '\nHint: that selector matched a hidden element, several elements, or none. Take a fresh full '
+    'snapshot and use the ref it shows for the element, or click the visible row or label by its '
+    'text, e.g. label:has-text("<option name>"). Do not retry the same selector.')
+
+
+def click_failure_hint(tool_name: str, error_text: str) -> str:
+    '''CLICK_FAILURE_HINT for a click or type whose selector matched a hidden element, several or none, else ''.'''
+    if tool_name in _HINTED_TOOL_NAMES and any(error in error_text for error in _SELECTOR_ERRORS):
+        return CLICK_FAILURE_HINT
+    return ''
+
 
 def _capture_oversized_find(out: str, query: str | None) -> None:
     '''TEMPORARY: save a large raw browser_find result for inspection (see FIND_CAPTURE_MAX_FILES).'''
@@ -557,7 +582,7 @@ class ScrapeSession:
                     f'Stage 1b: browser tool {name} failed for query {self.query!r} '
                     f'(args {snippet(args)}): {type(ex).__name__}: {browser_error_for_log(ex)}'
                 )
-                return f'ERROR calling {name}: {ex}'
+                return f'ERROR calling {name}: {ex}{click_failure_hint(name, str(ex))}'
             whole_page = {k: v for k, v in args.items() if k != _SNAPSHOT_TARGET_ARG}
             try:
                 out = await self._browser(name, whole_page)

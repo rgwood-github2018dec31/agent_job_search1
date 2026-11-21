@@ -1,7 +1,6 @@
 '''Company identity: domain folding, the match rule, the cache, the About page, and the wiring.'''
 import json
 
-import agentic_job_search.tools_generic as tools
 import pytest
 import yaml
 from agentic_job_search import company_domain, linkedin_page
@@ -110,8 +109,8 @@ async def test_affiliated_pages_are_cached_and_read_back(monkeypatch):
 
 
 def test_same_named_but_different_domains_do_not_match():
-    assert not identities_match(CompanyIdentity('Cohere Health', domain='coherehealth.com', source='model'),
-                                CompanyIdentity('Cohere', domain='cohere.com', source='model'))
+    assert not identities_match(CompanyIdentity('Kohera Health', domain='coherehealth.com', source='model'),
+                                CompanyIdentity('Kohera', domain='kohera.com', source='model'))
 
 
 # --- Model lookup and the cache ----------------------------------------------------------------
@@ -296,45 +295,7 @@ def test_the_poster_slug_comes_from_the_about_the_company_card_only():
     assert linkedin_page.posting_company_slug(soup) == 'example-data-europe'
 
 
-# --- company_matches_applied -------------------------------------------------------------------
-
-@pytest.fixture
-def applied_ntt(monkeypatch):
-    monkeypatch.setattr(tools, '_applied_companies', {'NTT DATA, Inc.': 'ntt.pdf'})
-    monkeypatch.setattr(tools, '_applied_identities', {
-        'NTT DATA, Inc.': CompanyIdentity('NTT DATA, Inc.', domain='nttdata.com', source='model')})
-
-
-@pytest.fixture
-def name_match_calls(monkeypatch):
-    calls = []
-
-    async def fake_by_name(candidate):
-        calls.append(candidate)
-        return 'ntt.pdf'
-    monkeypatch.setattr(tools, '_company_matches_by_name', fake_by_name)
-    return calls
-
-
-async def test_an_identity_match_needs_no_name_match(applied_ntt, name_match_calls):
-    identity = CompanyIdentity('NTT DATA Europe & Latam', parent_name='NTT DATA, Inc.', source='linkedin')
-    assert await tools.company_matches_applied('NTT DATA Europe & Latam', identity) == 'ntt.pdf'
-    assert name_match_calls == []
-
-
-async def test_a_resolved_non_match_is_no_without_asking_by_name(applied_ntt, name_match_calls, model_answers):
-    answers, _asked = model_answers
-    answers['IXOPAY'] = _identity_reply(domain='ixopay.com')
-    assert await tools.company_matches_applied('IXOPAY') is None
-    assert name_match_calls == []
-
-
-async def test_an_unidentified_name_falls_back_to_one_name_match_per_run(applied_ntt, name_match_calls):
-    '''2026-10-19: the same name got two different answers in one run. Now it gets one.'''
-    # The autouse stub makes the identity lookup fail, as an outage would.
-    assert await tools.company_matches_applied('NTT DATA Europe & Latam') == 'ntt.pdf'
-    assert await tools.company_matches_applied('NTT DATA Europe & Latam') == 'ntt.pdf'
-    assert name_match_calls == ['NTT DATA Europe & Latam']
+# company_matches_applied and Search Organization are tested in tests/test_organization_search.py (2026-11-19).
 
 
 # --- The About page as LinkedIn serves it since 2026-10-30: no <h1>, no <dt>, no <section> --------

@@ -33,6 +33,8 @@ CALL_SITE_NODES = {
     'triage_job_fit': 'triage',
     'rate_with_openrouter': 'rate', 'rate_with_ollama': 'rate', '_rate_with_anthropic': 'rate',
     '_repost_match_openrouter': 'save', 'estimate_salary': 'save',
+    # Search Organization (2026-11-19), and its quote relocation, in the already-applied check before rating.
+    '_ask_organization_options': 'applied_domain',
 }
 # Call sites that run inside whichever check is current (a company-name match, a company identity
 # lookup, the blacklist confirmation): they belong to the node of the step before them.
@@ -41,12 +43,14 @@ CALL_SITES_OF_THE_STEP_BEFORE = frozenset({
 })
 # The node a citation check belongs to, by its call site.
 EVIDENCE_NODES = {'extract': 'extract', 'location_classify': 'classify', 'salary_classify': 'classify',
-                  'triage': 'triage', 'rating_pros': 'rate', 'rating_warnings': 'rate'}
+                  'triage': 'triage', 'rating_pros': 'rate', 'rating_warnings': 'rate',
+                  'organization_search': 'applied_domain'}
 # The node of every other step kind. `outcome` is not placed: it says where the job left.
 STEP_KIND_NODES = {
     'origin': 'queued', 'web_fetch': 'page', 'page_read': 'page', 'extract': 'extract',
     'page_copy_stale': 'extract', 'gate_fields': 'gate', 'classified': 'classify',
     'rating_inputs': 'rate', 'rating': 'rate', 'saved': 'save', 'notification': 'notify',
+    'organization_search': 'applied_domain', 'web_search': 'applied_domain',
 }
 OUTCOME_STEP_KIND = 'outcome'
 # A notification step; traces written before 2026-11-12 recorded a follow-up's under kind `follow-up`.
@@ -89,7 +93,8 @@ def skeleton(rules: list[str]) -> list[Node]:
         Node('applied_client', 'Already applied? (end client)', 'already applied (end client)'),
         *[Node(f'rule:{r}', f'Hard rule: {r}', f'rejected: {r}') for r in rules],
         Node('triage', 'Triage (local score)', 'triaged out'),
-        Node('applied_domain', 'Already applied? (company identity)', 'already applied (company identity)'),
+        # Since 2026-11-19 Search Organization only warns; the exit stays for traces written before.
+        Node('applied_domain', 'Already applied? (Search Organization, warns)', 'already applied (company identity)'),
         Node('rate', 'Rate job fit (LLM)'),
         Node('caps', 'Rating caps (code)'),
         Node('save', 'Save job + post-rating checks'),
@@ -140,6 +145,11 @@ def step_note(step: dict) -> str | None:
         return llm_note(step)
     if kind == 'evidence':
         return evidence_note(step)
+    if kind == 'organization_search':
+        found = f"may be {step['record']}" if step.get('record') else 'no applied organization'
+        return f"{step.get('name')}: {found} ({step.get('step')}{', cached' if step.get('cached') else ''}) — {cut(step.get('reason') or '', SHORT_CHARS)}"
+    if kind == 'web_search':
+        return f"web search {step.get('query')!r}: {len(step.get('results') or [])} result(s)"
     if kind == 'origin':
         listing = step.get('listing') or {}
         return f"{listing.get('company')} — {listing.get('title')} (position {step.get('position')})"

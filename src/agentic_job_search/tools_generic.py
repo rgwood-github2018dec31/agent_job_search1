@@ -1,5 +1,4 @@
 
-import asyncio
 import json
 import logging
 import os
@@ -33,16 +32,16 @@ from utils_tools_n_agents_common.mcp_client import unwrap_exception
 from utils_tools_n_agents_common.models import ANTHROPIC_MODEL_NAME_LOW, route_for
 
 import agentic_job_search.preferences as preferences
-from agentic_job_search import company_domain, evidence, job_trace, location_review, pdf_ocr
-from agentic_job_search.company_domain import CompanyIdentity, identities_match
+from agentic_job_search import applied_organizations, company_overlap, evidence, job_trace, location_review, pdf_ocr
+from agentic_job_search.applied_organizations import SOURCE_APPLIED, AppliedOrganization, fold_exact
 from agentic_job_search.company_domain import normalize_company_name as _normalize_company
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
     BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS,
-    COMPANY_IDENTITY_LOOKUP_CONCURRENCY,
     EVAL_ERROR_MAX_RELEASES,
     JOB_MAX_AGE_DAYS,
     MODEL_NAME_COMPANY_MATCH,
+    ORGANIZATION_CONFIDENCE_MAX,
     PDF_PROMPT_MAX_CHARS,
     RAW_POSTING_MAX_CHARS,
     RAW_POSTINGS_RETENTION_DAYS,
@@ -114,11 +113,19 @@ _processed_jobs: set[tuple[str, str]] = set()
 _candidates: list[dict] = []
 _candidates_per_query: dict[str, int] = {}
 _applied_companies: dict[str, str] = {}  # company_name -> PDF filename
-# company_name -> who it is (domain, parent); resolved once at load, see company_domain.py
-_applied_identities: dict[str, CompanyIdentity] = {}
-# Normalized name -> the LLM name-match verdict, for a name with no identity. Per run, so one
-# name gets one answer: uncached, NTT DATA Europe & Latam got two in one run (2026-10-19).
-_company_match_verdicts: dict[str, str | None] = {}
+# applied company name -> its Applied Organization (names, domains, slugs); see applied_organizations.py.
+# Names only until build_applied_organizations() runs.
+_applied_records: dict[str, AppliedOrganization] = {}
+# fold_exact(name) -> (applied company name, where the name came from): Stage 1's skip list
+_applied_name_index: dict[str, tuple[str, str]] = {}
+# applied company name -> the job titles applied to there, to find each one's saved posting
+_applied_titles: dict[str, list[str]] = {}
+# First normalized word -> (listed name, applied organization), for Decide Company Overlap.
+_applied_overlap_index: dict[str, list[tuple[str, str]]] = {}
+# Applied company -> the LinkedIn pages its applied PDFs link to as their posting company.
+_applied_pdf_slugs: dict[str, list[str]] = {}
+# The index entry key holding an applied PDF's posting-company LinkedIn slug ('' when it links none).
+APPLIED_PDF_LINKEDIN_SLUG_KEY = 'company_linkedin_slug'
 # Per-page extracted text of each in-horizon applied job, newest first, for the reference profile.
 # Kept as pages until a prompt serializes it (text_budget.pages_to_prompt), so size is reportable.
 _reference_job_pages: list[list[str]] = []
@@ -176,6 +183,13 @@ _current_region: str | None = None
 
 # queue-time skip reason -> count; folded into the run funnel.
 _queue_skipped_counts: dict[str, int] = {}
+
+# Collapse Duplicate Listings (2026-11-13): one posting listed once per city arrives under a
+# separate job id each time (MongoDB, 16 copies in one search, all read and rated 2/5). The first copy
+# queued in a run stands for the rest. Maps (normalized company, normalized title) -> its job id.
+_queued_listing_keys: dict[tuple[str, str], str] = {}
+# representative job id -> the job ids collapsed into it this run.
+_duplicate_listings: dict[str, list[str]] = {}
 
 # Titles that are unambiguously below the target seniority. LinkedIn used to enforce this
 # server-side via `f_E=4%2C5%2C6`, but it now ignores filter params in the search URL, so these
@@ -362,126 +376,39 @@ def _require_fields(raw: dict, **kinds: type) -> dict:
     return raw
 
 
-async def _company_matches_openrouter(candidate: str, companies_list: str) -> dict:
-    '''Fuzzy company match via the OpenRouter MCP server. Raises on any failure.'''
-    reply = await chat_openrouter(
-        f'Does "{candidate}" refer to the same organization as any of these companies?\n\n'
-        f'{companies_list}\n\n'
-        'Respond with ONLY a JSON object: '
-        '{"matches": <true|false>, "matched_company_name": "<exact name from the list, or empty string>"}',
-        model=MODEL_NAME_COMPANY_MATCH,
-    )
-    return reply.parse(lambda raw: _require_fields(raw, matches=bool, matched_company_name=str),
-                       f'company match for {candidate!r}')
+async def company_matches_applied(candidate: str, title: str = '') -> str | None:
+    '''The applied-job PDF when `candidate` is exactly (case, spacing and trademark signs aside) a name of an applied
+    organization, else None. Stage 1's whole already-applied check (the user's rule, 2026-11-19).
 
-
-async def company_matches_applied(candidate: str, identity: CompanyIdentity | None = None) -> str | None:
-    '''Return the source PDF filename if candidate matches a previously applied-to company, else None.
-
-    Tries an exact normalized string match first — that resolves the overwhelming majority of
-    listings for free and, more importantly, without a per-listing network round-trip that would
-    otherwise dominate Stage 1b wall-clock. Then the companies' identities (domain and parent,
-    company_domain.py), compared in code: `identity` when the caller read it off LinkedIn,
-    else the cached or model-resolved one for the name. Only a name nobody could identify falls
-    back to the LLM name match, and its verdict is kept for the run.
+    The names are each Applied Organization's (applied_organizations.py): the applied name, its
+    LinkedIn page's name, parent and affiliated pages, and the relatives a web search names. No
+    model is asked here. Until 2026-11-19 a name nobody could identify was matched by a model against
+    every applied name, and all 23 such matches measured that day were wrong, each hiding jobs.
+    Whatever is not on the list goes on to Stage 2, whose Search Organization only warns.
     '''
     if not _applied_companies:
         return None
-
-    normalized = {_normalize_company(name): name for name in _applied_companies}
-    exact = normalized.get(_normalize_company(candidate))
-    if exact:
-        logger.debug(f'company_matches_applied: exact normalized match {candidate!r} -> {exact!r} (no LLM call)')
-        return _applied_companies[exact]
-
-    if identity is None:
-        try:
-            identity = await company_domain.identity_for_name(candidate)
-        except Exception as ex:
-            logger.warning(f'company_matches_applied: could not identify {candidate!r}, matching by name '
-                           f'instead: {unwrap_exception(ex)}')
-    if identity is not None and identity.source != company_domain.SOURCE_NONE:
-        for name, applied in _applied_identities.items():
-            if identities_match(identity, applied):
-                logger.debug(f'company_matches_applied: {identity.describe()} matches applied '
-                             f'{applied.describe()} (no LLM call)')
-                return _applied_companies[name]
-        return None
-
-    folded = _normalize_company(candidate)
-    if folded in _company_match_verdicts:
-        return _company_match_verdicts[folded]
-    verdict = await _company_matches_by_name(candidate)
-    _company_match_verdicts[folded] = verdict
-    return verdict
-
-
-async def _company_matches_by_name(candidate: str) -> str | None:
-    '''The LLM name match against every applied company: for a name with no identity.'''
-    companies_list = '\n'.join(f'- {name}' for name in _applied_companies)
-
-    if route_for(MODEL_NAME_COMPANY_MATCH) == 'openrouter':
-        try:
-            structured = await _company_matches_openrouter(candidate, companies_list)
-            if not structured.get('matches'):
-                return None
-            return _applied_match_from_list(candidate, structured.get('matched_company_name', ''))
-        except Exception as ex:
-            logger.warning(f'company_matches_applied via OpenRouter failed for {candidate!r}, falling back to '
-                           f'Anthropic: {unwrap_exception(ex)}')
-
-    options = ClaudeAgentOptions(
-        model=ANTHROPIC_MODEL_NAME_LOW,
-        tools=[],
-        permission_mode='bypassPermissions',
-        setting_sources=[],
-        strict_mcp_config=True,
-        skills=[],
-        output_format={
-            'type': 'json_schema',
-            'schema': {
-                'type': 'object',
-                'properties': {
-                    'matches': {'type': 'boolean', 'description': 'True if same organization'},
-                    'matched_company_name': {'type': 'string', 'description': 'Matching name from the list, or empty string'},
-                },
-                'required': ['matches', 'matched_company_name'],
-            },
-        },
-        cwd=str(PROJECT_DIR),
-    )
-    structured: dict | None = None
-    async with aclosing(sdk_query(
-            prompt=f'Does "{candidate}" refer to the same organization as any of these companies?\n\n{companies_list}',
-            options=options,
-        )) as stream:
-        async for msg in stream:
-            if not isinstance(msg, ResultMessage):
-                continue
-            _raise_if_result_error(msg, f'Company match check failed for {candidate!r}')
-            if msg.structured_output:
-                structured = msg.structured_output
-                job_trace.record('llm_call', transport='claude_agent_sdk', call_site='company_matches_applied',
-                                 model=ANTHROPIC_MODEL_NAME_LOW, prompt=f'{candidate}\n\n{companies_list}',
-                                 structured_output=structured)
-    if not structured or not structured.get('matches'):
-        return None
-    return _applied_match_from_list(candidate, structured.get('matched_company_name', ''))
-
-
-def _applied_match_from_list(candidate: str, matched: str) -> str | None:
-    '''The applied-job PDF for the company a model named, or None when it named no listed company.
-
-    Verify Source Reference for the fuzzy match: the list shown to the model is its whole input,
-    so a name not on it is a hallucination. Until 2026-10-19 such a name still counted as a match
-    ('<unknown PDF>') and auto-rejected the job as already applied.
-    '''
-    if matched in _applied_companies:
-        return _applied_companies[matched]
-    evidence.count_rejection('applied_company_match', 'matched_company_name')
-    logger.warning(f'Hallucination rejected (applied_company_match, {candidate!r}): matched_company_name '
-                   f'{matched!r} is not one of the {len(_applied_companies)} applied companies shown — no match')
-    return None
+    index = _applied_name_index or {fold_exact(name): (name, SOURCE_APPLIED) for name in _applied_companies}
+    hit = index.get(fold_exact(candidate))
+    if hit is None:
+        # A name that only overlaps a listed one: a model decides (Decide Company Overlap, 2026-11-19).
+        records = _applied_records or {name: AppliedOrganization(key=name, pdf=pdf, names=(name,))
+                                       for name, pdf in _applied_companies.items()}
+        overlap_index = _applied_overlap_index or company_overlap.overlap_index(records)
+        verdict = await company_overlap.match_by_overlap(candidate, title, records, overlap_index)
+        if verdict is None:
+            return None
+        pdf = _applied_companies.get(verdict.key, '') or records[verdict.key].pdf
+        logger.info(f'company_matches_applied: {candidate!r} is {verdict.matched_name!r} of applied organization '
+                    f'{verdict.key!r} by the overlap model ({verdict.confidence}/{ORGANIZATION_CONFIDENCE_MAX}: '
+                    f'{verdict.reasoning}) -> {pdf}')
+        return pdf or None
+    key, source = hit
+    pdf = _applied_companies.get(key, '')
+    if fold_exact(candidate) != fold_exact(key):
+        logger.info(f'company_matches_applied: {candidate!r} is listed for applied organization {key!r} '
+                    f'({source}) -> {pdf}')
+    return pdf or None
 
 
 def _blacklist_confirm_prompt(company: str, entry_name: str, reason: str, context: str) -> str:
@@ -513,7 +440,7 @@ async def company_blacklist_reason(company: str, context: str = '', description:
     lowercased name and fuzzy-matches by default, both of which are wrong for a standing
     user-authored blacklist. Here the trigger is a **case-sensitive exact** name match, which
     costs nothing and cannot over-block, followed by one cheap LLM call to confirm the posting is
-    really that organization rather than a same-named one ("Cohere" the AI lab is not Cohere
+    really that organization rather than a same-named one ("Kohera" the AI lab is not Kohera
     Health). No name hit means no LLM call at all, so the gate is free on almost every posting.
 
     Ambiguity resolves toward rejecting: if the confirmation call fails for any reason, the exact
@@ -938,7 +865,8 @@ async def recruiter_repost_of(
     # not grow this prompt without bound.
     priors = [
         e for e in load_recruiter_notifications()
-        if e.get('agency_key') == agency_key and str(e.get('job_id') or '') != job_id
+        # Folded again from the name as written: a stored key was folded by the rules of its day.
+        if _normalize_company(str(e.get('agency') or '')) == agency_key and str(e.get('job_id') or '') != job_id
     ][:RECRUITER_REPOST_MAX_PRIORS]
     if not priors:
         return None
@@ -1311,7 +1239,9 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     metadata LLM call only runs for new or changed PDFs. Records applied to longer ago than
     APPLIED_JOBS_HORIZON_DAYS stay on disk but are not read into any global.
     '''
-    global _applied_companies, _applied_identities, _reference_job_pages, _reference_job_files, _applied_jobs
+    global _applied_companies, _applied_records, _applied_name_index, _applied_titles, _applied_pdf_slugs
+    global _applied_overlap_index
+    global _reference_job_pages, _reference_job_files, _applied_jobs
 
     applied_to_dir = applied_to_dir or APPLIED_JOBS_DIR
     index_file = index_path or (applied_to_dir / APPLIED_JOBS_INDEX_NAME)
@@ -1342,6 +1272,10 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
                 'is_agency': bool(entry.get('is_agency', False)),
                 'end_client': entry.get('end_client', ''),
             }
+            if APPLIED_PDF_LINKEDIN_SLUG_KEY not in entry:   # indexed before 2026-11-19: read the link now
+                entry[APPLIED_PDF_LINKEDIN_SLUG_KEY] = _applied_pdf_linkedin_slug(pdf)
+                index_dirty = True
+            metadata[APPLIED_PDF_LINKEDIN_SLUG_KEY] = entry[APPLIED_PDF_LINKEDIN_SLUG_KEY]
         else:
             try:
                 pages = read_pdf_pages(pdf)
@@ -1356,6 +1290,7 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
                 pages_to_prompt(pages, f'PDF {pdf.name} (applied-job metadata)', PDF_PROMPT_MAX_CHARS),
                 pdf.name,
             )
+            metadata[APPLIED_PDF_LINKEDIN_SLUG_KEY] = _applied_pdf_linkedin_slug(pdf)
             index[pdf.name] = {
                 'applied_date': applied_date,
                 'mtime': mtime,
@@ -1388,8 +1323,18 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
         index_file.write_text(yaml.dump(index, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
     _applied_companies = companies
-    _applied_identities = await _identify_applied_companies(companies)
-    _company_match_verdicts.clear()
+    _applied_titles = {}
+    _applied_pdf_slugs = {}
+    for job in jobs:
+        if job['company'] and not job['is_agency'] and job['job_title']:
+            _applied_titles.setdefault(job['company'], []).append(job['job_title'])
+        # The PDF's company link is its poster's page: an agency's, never its end client's.
+        slug = job.get(APPLIED_PDF_LINKEDIN_SLUG_KEY) if job['company'] and not job['is_agency'] else ''
+        if slug and slug not in _applied_pdf_slugs.setdefault(job['company'], []):
+            _applied_pdf_slugs[job['company']].append(slug)
+    _applied_records = {name: AppliedOrganization(key=name, pdf=pdf, names=(name,)) for name, pdf in companies.items()}
+    _applied_name_index = applied_organizations.name_index(_applied_records)
+    _applied_overlap_index = company_overlap.overlap_index(_applied_records)
     # NEWEST first. Consumers cap this at MAX_REFERENCE_JOBS, and taking the OLDEST N meant a
     # newly applied job could never influence the ideal-role profile — it only entered once older
     # records aged out of the horizon, so the rater calibrated against jobs the user had moved on
@@ -1405,30 +1350,34 @@ async def load_applied_jobs(applied_to_dir: Path | None = None, index_path: Path
     )
 
 
-async def _identify_applied_companies(companies: dict[str, str]) -> dict[str, CompanyIdentity]:
-    '''Each applied company's identity, from the cache or one model call each (once, ever).
+def _applied_pdf_linkedin_slug(pdf: Path) -> str:
+    '''The posting company's LinkedIn slug the applied PDF links to; '' (logged) when unreadable.'''
+    try:
+        return applied_organizations.linkedin_slug_of_pdf(pdf)
+    except Exception as ex:
+        logger.warning(f'Applied job {pdf.name}: could not read its company link, so its record finds its '
+                       f'LinkedIn page another way: {type(ex).__name__}: {ex}')
+        return ''
 
-    A company that cannot be identified keeps its name alone, so it still matches by name; the
-    failure is logged, and the next run asks again.
-    '''
-    semaphore = asyncio.Semaphore(COMPANY_IDENTITY_LOOKUP_CONCURRENCY)
-    failures: list[str] = []
 
-    async def identify(name: str) -> tuple[str, CompanyIdentity]:
-        async with semaphore:
-            try:
-                return name, await company_domain.identity_for_name(name)
-            except Exception as ex:
-                failures.append(f'{name!r}: {unwrap_exception(ex)}')
-                return name, CompanyIdentity(name=name)
+async def build_applied_organizations(
+    stage_stats: dict, read_linkedin_page: applied_organizations.LinkedInPageReader | None = None,
+    read_job_page_slug: applied_organizations.JobPageSlugReader | None = None, only: set[str] | None = None,
+) -> None:
+    '''Build (once each, then from the file) the Applied Organization record of every applied
+    company loaded by load_applied_jobs, and Stage 1's name list from them. `read_linkedin_page`
+    reads a company page not cached yet (agent.py passes its About-page reader).'''
+    global _applied_records, _applied_name_index, _applied_overlap_index
+    _applied_records = await applied_organizations.build_records(
+        _applied_companies, _applied_titles, stage_stats, pdf_slugs=_applied_pdf_slugs,
+        read_linkedin_page=read_linkedin_page, read_job_page_slug=read_job_page_slug, only=only)
+    _applied_name_index = applied_organizations.name_index(_applied_records)
+    _applied_overlap_index = company_overlap.overlap_index(_applied_records)
 
-    identities = dict(await asyncio.gather(*(identify(name) for name in companies)))
-    if failures:
-        logger.warning(f'Could not identify {len(failures)} of {len(companies)} applied companies, matching '
-                       f'them by name alone this run: {"; ".join(failures)}')
-    known = sum(1 for identity in identities.values() if identity.source != company_domain.SOURCE_NONE)
-    logger.info(f'Applied companies identified: {known} of {len(companies)} by domain or parent')
-    return identities
+
+def applied_records() -> dict[str, AppliedOrganization]:
+    '''The Applied Organization records, for Stage 2's Search Organization.'''
+    return _applied_records
 
 
 def applied_jobs_summary() -> str:
@@ -2172,7 +2121,7 @@ async def do_check_and_record_job(
     if key in _processed_jobs:
         return _result('already_processed')
 
-    matched_pdf = await company_matches_applied(company)
+    matched_pdf = await company_matches_applied(company, description)
     if matched_pdf is not None:
         logger.debug(f'Skipping {company} [{site}/{job_id}] — already applied ({matched_pdf})')
         return _result('already_applied')
@@ -2224,6 +2173,11 @@ def set_card_rejection(check: CardRejection | None) -> None:
     _card_rejection = check
 
 
+def listing_duplicate_key(company: str, title: str) -> tuple[str, str]:
+    '''The key two listings share when they are one posting under two job ids (one per city).'''
+    return _normalize_company(company), ' '.join(title.split()).casefold()
+
+
 async def do_queue_candidate(
     site: str, job_id: str, url: str, title: str, company: str,
     snippet: str, date_posted: str | None = None, query: str | None = None,
@@ -2239,7 +2193,31 @@ async def do_queue_candidate(
             record['url'] = url or record['url']
             record['summary'] = reason
         logger.info(f'queue_candidate: SKIPPED {company} — {title} [{site}/{job_id}]: {reason}')
+        # Not left processed (2026-11-13): both screens read preferences, so a skip recorded for
+        # good outlived the preference that caused it. Both are cheap to repeat (a regex and the
+        # cached location classifier), so the next run screens the card again.
+        if (site, job_id) in _processed_jobs:
+            forget_processed_job(site, job_id)
         return {'content': [{'type': 'text', 'text': f'Skipped (not queued): {reason}. Continue with the next listing.'}]}
+    listing_key = listing_duplicate_key(company, title)
+    # A card with no company or no title says nothing about being a copy; it is never collapsed.
+    collapsible = all(listing_key)
+    representative = _queued_listing_keys.get(listing_key) if collapsible else None
+    if representative is not None and representative != job_id:
+        _duplicate_listings.setdefault(representative, []).append(job_id)
+        if (record := _listing_records.get((site, job_id))) is not None:
+            record['outcome'] = 'duplicate_listing'
+            record['query'] = _current_query or query
+            record['url'] = url or record['url']
+            record['summary'] = f'same company and title as {site}/{representative}'
+        # Left processed: the representative is rated, and this copy would only be rated again.
+        logger.debug(f'queue_candidate: DUPLICATE {company} — {title} [{site}/{job_id}] '
+                     f'of {site}/{representative}')
+        return {'content': [{'type': 'text', 'text': (
+            f'Skipped (not queued): same company and title as job {representative}, already queued. '
+            'Continue with the next listing.')}]}
+    if collapsible:
+        _queued_listing_keys.setdefault(listing_key, job_id)
     _candidates.append({
         'site': site, 'job_id': job_id, 'url': url,
         'title': title, 'company': company,
@@ -2291,6 +2269,7 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
 
     capped = usable[:SCRAPER_MAX_LISTINGS_PER_SEARCH]
     before_skips = sum(_queue_skipped_counts.values())
+    before_duplicates = {rep: len(ids) for rep, ids in _duplicate_listings.items()}
     tally: dict[str, int] = {}
     folded_ids: dict[str, list[str]] = {}
     applied_companies: list[str] = []
@@ -2320,6 +2299,12 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
                 queued += 1
                 queued_ids.append(job_id)
     skipped = sum(_queue_skipped_counts.values()) - before_skips
+    # This search's duplicates, grouped by the queued listing they collapsed into; every id is logged.
+    new_duplicates = {rep: ids[before_duplicates.get(rep, 0):] for rep, ids in _duplicate_listings.items()}
+    new_duplicates = {rep: ids for rep, ids in new_duplicates.items() if ids}
+    duplicates = sum(len(ids) for ids in new_duplicates.values())
+    duplicate_note = ''.join(f'; {len(ids)} duplicate(s) of linkedin={rep}: {",".join(ids)}'
+                             for rep, ids in new_duplicates.items())
     cap_note = f' (capped from {len(usable)})' if len(usable) > len(capped) else ''
     parts = ', '.join(f'{count} {status}' for status, count in sorted(tally.items()))
     for status in RECORD_LISTINGS_FOLDED_STATUSES:
@@ -2336,9 +2321,11 @@ async def do_record_listings(jobs: list[dict], query: str | None = None) -> str:
     )
     queued_note = f' linkedin={",".join(queued_ids)}' if queued_ids else ''
     logger.info(f'record_listings: {len(capped)}{cap_note} recorded — {logged_parts}; '
-                f'{queued} queued{queued_note}, {skipped} skipped by title or card')
+                f'{queued} queued{queued_note}, {skipped} skipped by title or card, '
+                f'{duplicates} duplicate listing(s){duplicate_note}')
     return (f'recorded {len(capped)}{cap_note}: {parts}. {queued} queued, '
-            f'{skipped} skipped by title or card. Continue with the next search.')
+            f'{skipped} skipped by title or card, {duplicates} duplicate listing(s) of one already '
+            'queued. Continue with the next search.')
 
 
 # --- Tool wrappers (SDK @tool decorators delegate to the implementations above) ---

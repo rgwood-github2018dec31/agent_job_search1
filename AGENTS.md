@@ -84,6 +84,10 @@ anything a rule covers.
 
 ## Project Purpose
 
+**Goal: get the user a job, and save the user's time getting it.** Review every change against
+both halves: a good job never shown is the costliest failure, and every notification spends the
+user's attention. See Goal in [docs/requirements.md](docs/requirements.md#goal).
+
 This is a personal autonomous job search agent built on the Claude Agent SDK. It:
 1. Reads the user's resume
 2. Searches LinkedIn for relevant job postings
@@ -174,6 +178,10 @@ src/agentic_job_search/
   location.py                     # Cached geographic classifier for a job's location
   location_review.py              # Advisory hygiene check of the country lists in preferences (recommends, never enforces)
   company_domain.py               # Company identity (domain, parent) for already-applied matching; cached, LinkedIn About page first
+  applied_organizations.py        # Applied Organization records: every name/domain an applied company goes by; Stage 1 skips exact names only
+  organization_search.py          # Search Organization: Stage 2's already-applied check (domains, org database, web search); warns only
+  company_overlap.py              # Decide Company Overlap: Stage 1 asks a model only when a card's name overlaps a listed one
+  web_search.py                   # Search the Web: one query through the OpenRouter tool server's web_search
   salary.py                       # Salary reading: deterministic tiers, cached LLM only for the rest
   fx.py                           # Display-only currency conversion of a salary: daily rate table, fails open
   salary_estimate.py              # Model pay estimate for a notified posting with no salary; cached per job, gates nothing
@@ -200,6 +208,7 @@ scripts/
   shadow_report.py                # Local vs remote decision agreement per call site, by the local model's confidence
   replay_forced_tool_ab.py        # JSON in text vs a forced function call, rater and gate fields, on saved calls (costs cents)
   release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
+  compare_company_overlap_models.py  # Local vs remote models on Decide Company Overlap over the labelled overlap pairs (costs cents)
 tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
@@ -224,12 +233,16 @@ run_dir/
   pdf_ocr_cache.yaml              # Local OCR transcription per scanned PDF (sha256 of its content); may hold personal documents
   salary_estimate_cache.yaml      # Model pay estimate per job (bounds/currency/period/basis/model)
   company_identities.yaml         # Company identity per LinkedIn slug and per name (domain/parent/source); hand-editable, `source: manual` is kept
+  applied_organizations.yaml      # Applied Organization per applied company: names (Stage 1's skip list), domains, slugs, each with its source; hand-editable
+  organization_matches.yaml       # Search Organization answers per slug or name, with the options, step and reason; stale when the records change
+  company_overlap_verdicts.yaml   # Decide Company Overlap verdicts per card company and applied organization; hand-editable, `source: manual` decides
   raw_postings/                   # Per job: .html page archive (JS-free) + .min.html/.min.pdf minimal archive + .txt the Markdown the extractor read + .rater_posting.txt the posting the rater read + .trace.jsonl Job Trace; {date}/assets/ holds the stylesheet once; pruned to RAW_POSTINGS_RETENTION_DAYS; audit only
   company_assets/                 # Posting companies' logos, one folder per company (name as written), reused across runs
   linkedin_page_sections.yaml     # Verdicts on job-page sections LinkedIn added (keep/remove); hand-editable
   location_recommendations.yaml   # Advisory hygiene warnings on the place lists (recommend-only, hand-edited)
   recruiter_notifications.yaml    # Postings already notified, any poster (RECRUITER_REPOST_WINDOW_DAYS); suppresses repost pings
-  eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error (EVAL_ERROR_MAX_RELEASES)
+  eval_error_releases.yaml        # Times each job was released for another run after a Stage 2 error or failed page read (EVAL_ERROR_MAX_RELEASES)
+  notification_outbox.yaml        # Job-match messages whose Telegram send failed; the next run sends them (NOTIFICATION_OUTBOX_MAX_AGE_DAYS)
   preferences.yaml                # Personal preferences (regions, gates, titles) — gitignored
   logs/                           # Per-run log files (rejection reasons, extract sizes, ratings)
   about_page_failures/            # Pages that did not read as a company's About page, one per slug and day
@@ -258,7 +271,7 @@ measurements) are in git history: `git show dd14c73:docs/diagnoses/README.md`.
 | Salary parsing, `salary.py`, `fx.py`, `salary_estimate.py`, the `💰` line, raw-posting retention | Classify Salary, Convert Salary Currency, Estimate Pay Range, Retain Raw Posting Text, Check Salary Provenance, Build Deterministic Warnings, Notify User of Match; NFRs A matching rule fails silently permissive, No silent truncation |
 | `call_mcp_tool`, triage, the local model, OpenRouter errors and fallbacks, `tool_server.py` | Wait Out Tool Server Outage; NFRs Resilience, Observability |
 | A new `ClaudeAgentOptions` / `sdk_query` site, or an SDK tool schema | NFRs Cost efficiency, Observability, Anti-fabrication |
-| Already-applied matching, `company_domain.py`, LinkedIn company About pages | Resolve Company Identity, Match Applied Company, Deduplicate by Poster Identity; NFR Account safety |
+| Already-applied matching, `applied_organizations.py`, `organization_search.py`, `company_overlap.py`, `company_domain.py`, LinkedIn company About pages | Match Applied Company, Decide Company Overlap, Build Applied Organization Record, Search Organization, Warn of Applied Organization, Resolve Company Identity; NFR Account safety |
 | Applied-job ingest or the reference profile | [docs/architecture.md](docs/architecture.md); Summarize Reference Jobs |
 | Tests or test fixtures | NFR Tests must be able to fail |
 | `PLAYWRIGHT_MCP_VERSION`, the `mcp` pin, startup checks | Check Browser Toolchain Version; NFR Dependency pinning |

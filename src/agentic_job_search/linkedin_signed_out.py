@@ -269,6 +269,17 @@ def _fetch_job(url: str, job_id: str) -> tuple[str, str]:
     return resp.text, resp.url
 
 
+async def read_job_company_slug_signed_out(url: str, job_id: str) -> str:
+    '''The company slug a public job page links to, from one paced cookie-free GET ('' when the page
+    links none). Raises LinkedInBlockedError on a challenge or a login redirect, SignedOutPageError
+    on any other failure.'''
+    await pacer.wait(f'job page {job_id} (company link)')
+    html, final_url = await asyncio.to_thread(_fetch_job, url, job_id)
+    soup = BeautifulSoup(html, 'lxml')
+    _raise_if_challenge(soup, final_url, f'job {job_id}', html)
+    return signed_out_company_slug(soup)
+
+
 async def read_job_page_signed_out(candidate: dict) -> JobPage:
     '''Fetch the public job page and return what the extractor reads, archived like the browser path.'''
     job_id = str(candidate.get('job_id') or '')

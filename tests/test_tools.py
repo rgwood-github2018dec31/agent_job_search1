@@ -16,6 +16,7 @@ import requests
 import yaml
 from agentic_job_search import (
     agent,
+    applied_organizations,
     company_domain,
     config,
     evidence,
@@ -711,25 +712,45 @@ def _make_sdk_mock(monkeypatch, structured_output: dict):
     monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
 
 
-async def test_company_matches_applied_returns_filename_on_yes(monkeypatch):
+async def test_company_matches_applied_matches_only_an_exact_name_case_and_spacing_aside(monkeypatch):
+    '''Stage 1, the user's rule (2026-11-19): an exact name or a listed relative; nothing else, no model.'''
     monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
-    _make_sdk_mock(monkeypatch, {'matches': True, 'matched_company_name': 'Shopify'})
-    result = await tools.company_matches_applied('Shopify Inc.')
-    assert result == 'shopify_jd.pdf'
-
-
-async def test_company_matches_applied_rejects_a_company_not_on_the_list(monkeypatch):
-    '''Verify Source Reference: a matched name the model was never shown is a hallucination, not
-    an "already applied" — until 2026-10-19 it auto-rejected the job as '<unknown PDF>'.'''
-    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
-    hallucinated = {'matches': True, 'matched_company_name': 'Shopify Payments Ltd'}
-
-    async def openrouter_names_an_unlisted_company(candidate, companies_list):
-        return hallucinated
-
-    monkeypatch.setattr(tools, '_company_matches_openrouter', openrouter_names_an_unlisted_company)
-    _make_sdk_mock(monkeypatch, hallucinated)   # the Anthropic route, if routing sends it there
+    assert await tools.company_matches_applied('shopify') == 'shopify_jd.pdf'
+    assert await tools.company_matches_applied('  Shopify ') == 'shopify_jd.pdf'
     assert await tools.company_matches_applied('Shopify Payments') is None
+    assert await tools.company_matches_applied('Shopify Inc.') is None   # unless its record lists it
+    assert await tools.company_matches_applied('Shopify®') == 'shopify_jd.pdf'
+    assert await tools.company_matches_applied('Inc.') is None   # was skipped: it normalized to nothing
+
+
+async def test_company_matches_applied_skips_a_relative_its_record_lists(monkeypatch):
+    '''The user's example: an application to Orbiq Spain skips an Orbiq America card in Stage 1.'''
+    record = applied_organizations.AppliedOrganization(
+        key='Orbiq Spain', pdf='2026-09-24-orbiq.pdf', names=('Orbiq Spain', 'Orbiq', 'Orbiq America, Inc.',
+                                                                 'Orbiq America'),
+        sources={'Orbiq America': applied_organizations.SOURCE_LEGAL_SUFFIX})
+    monkeypatch.setattr(tools, '_applied_companies', {'Orbiq Spain': '2026-09-24-orbiq.pdf'})
+    monkeypatch.setattr(tools, '_applied_name_index', applied_organizations.name_index({'Orbiq Spain': record}))
+
+    assert await tools.company_matches_applied('Orbiq America') == '2026-09-24-orbiq.pdf'
+    assert await tools.company_matches_applied('ORBIQ') == '2026-09-24-orbiq.pdf'
+    assert await tools.company_matches_applied('Orbiq Japan') is None   # not listed: Stage 2 warns
+    assert await tools.company_matches_applied('Vorlix') is None
+
+
+@pytest.mark.parametrize('name', [
+    'Codesearch AI', 'EggML Technologies', 'EviSmart™', 'LABHOUSE', 'MLG International', 'Molaris AI', 'Moxie',
+    'Nexaminds', 'OXARO', 'Recrucial', 'Remobi', 'SNI', 'Senovo IT', 'Sixone', 'Taleo Project Services',
+    'Techmunity', 'The Quality Group', 'Truvio', 'Vasa Digital Architects', 'Vorlix', 'WW Talents',
+    'dexter health', 'vector8',
+])
+async def test_company_matches_applied_never_guesses_the_23_names_a_model_matched_wrongly(monkeypatch, name):
+    '''2026-11-12: a model matched each of these to an applied company (Vorlix → Veltra, …), all wrong.'''
+    applied = ['Veltra', 'Verilioo', 'Florest', 'WELD Health', 'Orbiq', 'MyTalkBot', 'QData AI', 'Mythos',
+               'Synthesus', 'Quartz Consulting', 'HXLTech', 'Fujiko', 'Bena Health', 'VRAZE', 'McAllister Boyd',
+               'Bridgeline']
+    monkeypatch.setattr(tools, '_applied_companies', {company: f'{company}.pdf' for company in applied})
+    assert await tools.company_matches_applied(name) is None
 
 
 async def test_company_matches_applied_returns_none_on_no(monkeypatch):
@@ -744,7 +765,7 @@ async def test_check_and_record_job_skips_applied_company(tmp_path, monkeypatch)
     monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
     monkeypatch.setattr(tools, '_processed_jobs', set())
 
-    async def fake_matches(candidate):
+    async def fake_matches(candidate, title=''):
         return 'shopify_job.pdf'
 
     monkeypatch.setattr(tools, 'company_matches_applied', fake_matches)
@@ -1039,7 +1060,7 @@ async def test_load_applied_jobs_blocklists_end_client_not_agency(tmp_path, monk
 
 def test_applied_jobs_summary_renders_titles_dates_and_agency(monkeypatch):
     monkeypatch.setattr(tools, '_applied_jobs', [
-        {'filename': 'a.pdf', 'applied_date': date(2026, 5, 13), 'company': 'BMC Software',
+        {'filename': 'a.pdf', 'applied_date': date(2026, 5, 13), 'company': 'DMX Software',
          'job_title': 'Principal Agentic AI Engineer', 'is_agency': False, 'end_client': ''},
         {'filename': 'b.pdf', 'applied_date': date(2026, 7, 20), 'company': 'AgencyCorp',
          'job_title': 'Staff AI Engineer', 'is_agency': True, 'end_client': 'EndClientCo'},
@@ -1051,7 +1072,7 @@ def test_applied_jobs_summary_renders_titles_dates_and_agency(monkeypatch):
     assert lines[0].startswith('- Staff AI Engineer — AgencyCorp (2026-07-20)'), 'newest first'
     assert '[via agency]' in lines[0]
     assert '[hiring company: EndClientCo]' in lines[0]
-    assert lines[1] == '- Principal Agentic AI Engineer — BMC Software (2026-05-13)'
+    assert lines[1] == '- Principal Agentic AI Engineer — DMX Software (2026-05-13)'
 
 
 def test_applied_jobs_summary_empty_when_no_jobs(monkeypatch):
@@ -1635,6 +1656,36 @@ def test_derive_education_requirement_detects_hard_requirements(description, exp
 ])
 def test_derive_education_requirement_ignores_soft_and_irrelevant_mentions(description):
     assert agent.derive_education_requirement(_make_extract(description=description)) == ''
+
+
+def test_derive_education_requirement_checks_the_extractors_value_against_its_quote():
+    '''The extractor's "master" must survive the same softener checks a scanned sentence does.'''
+    softened = _make_extract(
+        education_requirement='master',
+        description='MSc in computer science, statistics or similar (PhD preferred). Python daily.',
+        quotes={'education_requirement': 'MSc in computer science, statistics or similar'},
+    )
+    hard = _make_extract(
+        education_requirement='master',
+        description='Requirements: MSc in Computer Science. Python daily.',
+        quotes={'education_requirement': 'MSc in Computer Science'},
+    )
+    assert agent.derive_education_requirement(softened) == ''
+    assert agent.derive_education_requirement(hard) == 'master'
+
+
+@pytest.mark.parametrize('education_requirement', ['master', ''])
+def test_derive_education_requirement_a_stated_bachelors_bar_is_never_an_advanced_degree_gate(
+        education_requirement):
+    '''McKesson 4463144062 (2026-09-30): rejected for a master's while asking for a bachelor's.'''
+    extract = _make_extract(
+        education_requirement=education_requirement,
+        description=("Basic requirements: 10+ years in solution architecture (fewer years if relevant "
+                     "Master's/Doctorate); Bachelor's degree in Computer Science, or equivalent experience. "
+                     "Master's degree required for the research track."),
+        quotes={'education_requirement': "Master's degree required for the research track"},
+    )
+    assert agent.derive_education_requirement(extract) == ''
 
 
 async def test_apply_hard_rules_derives_degree_from_description():
@@ -2909,49 +2960,20 @@ async def test_categorize_pdf_text_live_other():
     assert category != 'saved_jd', f'expected non-jd category, got {category!r}'
 
 
-@pytest.mark.live_agent_claude
-async def test_company_matches_applied_live(monkeypatch):
-    monkeypatch.setattr(tools, '_applied_companies', {'BMO Financial Group': 'bmo_job.pdf'})
-    result = await tools.company_matches_applied('BMO')
-    assert result is not None
-
-
 # ---------------------------------------------------------------------------
 # company normalization / exact-match short circuit
 # ---------------------------------------------------------------------------
 
 def test_normalize_company_strips_suffixes_and_punctuation():
     assert tools._normalize_company('Datadog, Inc.') == tools._normalize_company('Datadog')
-    assert tools._normalize_company('Acme Technologies Ltd') == 'acme'
-    assert tools._normalize_company('The Vista Group') == 'vista'
-
-
-async def test_company_matches_applied_exact_match_skips_llm(monkeypatch):
-    '''The per-listing LLM round trip is the Stage 1b bottleneck; exact matches must not pay it.'''
-    monkeypatch.setattr(tools, '_applied_companies', {'Datadog': 'datadog.pdf'})
-    called = []
-
-    async def fail_openrouter(*args, **kwargs):
-        called.append(True)
-        raise AssertionError('should not be called')
-
-    monkeypatch.setattr(tools, '_company_matches_openrouter', fail_openrouter)
-
-    assert await tools.company_matches_applied('Datadog, Inc.') == 'datadog.pdf'
-    assert called == []
-
-
-async def test_company_matches_applied_falls_back_to_anthropic(monkeypatch):
-    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify.pdf'})
-    monkeypatch.setattr(tools, 'MODEL_NAME_COMPANY_MATCH', OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE)
-
-    async def broken_openrouter(candidate, companies_list):
-        raise RuntimeError('OpenRouter MCP server down')
-
-    monkeypatch.setattr(tools, '_company_matches_openrouter', broken_openrouter)
-    _make_sdk_mock(monkeypatch, {'matches': True, 'matched_company_name': 'Shopify'})
-
-    assert await tools.company_matches_applied('Shopify Commerce') == 'shopify.pdf'
+    assert tools._normalize_company('Acme Technologies Ltd') == 'acme technologies'   # descriptive words stay
+    assert tools._normalize_company('The Vista Group') == 'vista group'
+    assert tools._normalize_company('Axiōma Search') == 'axioma search'   # accents fold, not vanish
+    assert tools._normalize_company('Málaga S.A.') == tools._normalize_company('Malaga')
+    assert tools._normalize_company('Orbiq Deutschland B.V. & Co. KG') == 'orbiq deutschland'
+    assert tools._normalize_company('株式会社メルカリ') == '株式会社メルカリ'
+    assert tools._normalize_company('Inc.') == 'inc', 'a name that is only a legal form keeps it'
+    assert tools._normalize_company('Acme Software') != tools._normalize_company('Acme Group')
 
 
 # ---------------------------------------------------------------------------
@@ -4735,6 +4757,28 @@ def test_title_rejection_reason(title, expect_skip):
     assert (reason is not None) == expect_skip, f'{title!r} -> {reason!r}'
 
 
+async def test_queue_candidate_skip_does_not_leave_the_job_processed(tmp_path, monkeypatch):
+    '''A title or card skip reads preferences, so it must not outlive them: the next run screens again.'''
+    monkeypatch.setattr(tools, 'RUN_DIR', tmp_path)
+    monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+    monkeypatch.setattr(tools, '_processed_jobs', set())
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_candidates_per_query', {})
+    monkeypatch.setattr(tools, '_queue_skipped_counts', {})
+    monkeypatch.setattr(tools, '_listing_records', {})
+
+    for job_id, title in (('111', 'Junior ML Engineer'), ('222', 'Staff ML Engineer')):
+        await tools.do_check_and_record_job('linkedin', job_id, 'BigCo', title, date_posted=_recent_date())
+        await tools.do_queue_candidate('linkedin', job_id, 'https://example.com', title, 'BigCo', 'snip', query='Q')
+
+    assert ('linkedin', '111') not in tools._processed_jobs
+    assert not list((tmp_path / 'processed_jobs').glob('job_posting-linkedin-111-*.yaml'))
+    assert ('linkedin', '222') in tools._processed_jobs, 'a queued job stays processed'
+    again = await tools.do_check_and_record_job(
+        'linkedin', '111', 'BigCo', 'Junior ML Engineer', date_posted=_recent_date())
+    assert again['content'][0]['text'] == 'new'
+
+
 async def test_queue_candidate_skips_below_seniority_titles(monkeypatch):
     '''LinkedIn no longer enforces f_E server-side, so junk reaches the queue -- and each queued
     job costs a Stage 2a extract plus a rating call. The skip is $0 and must be auditable.'''
@@ -5964,7 +6008,7 @@ async def test_agency_posting_is_not_hard_ruled():
     ('CyberCoders', '', ''),
     # Measured on real jobs: glm echoes the poster back as end_client for direct postings.
     ('lululemon', 'lululemon', ''),
-    ('Workday', 'Workday, Inc.', ''),
+    ('Worktide', 'Worktide, Inc.', ''),
 ])
 def test_derive_end_client_ignores_the_poster_echoed_back(company, end_client, expected):
     assert agent.derive_end_client(_make_extract(company=company, end_client=end_client)) == expected
@@ -6292,19 +6336,26 @@ async def test_every_stage_2_job_leaves_a_job_trace_of_each_step(monkeypatch):
     assert [(s['outcome'], s['rating']) for s in steps if s['kind'] == 'outcome'] == [('rated', rated['capped_rating'])]
 
 
-async def test_an_already_applied_end_client_is_recorded_as_the_jobs_outcome_with_its_check(monkeypatch):
-    '''2026-11-12: the trace said nothing of how such a job left Stage 2; the Decision Graph had to guess.'''
-    _stage2_stubs(monkeypatch, _agency_extract(end_client='Pharma Co'))
+def _applied_record(key: str, pdf: str, names: tuple = (), domains: tuple = (), slugs: tuple = ()):
+    return applied_organizations.AppliedOrganization(key=key, pdf=pdf, names=(key, *names), domains=domains,
+                                                     slugs=slugs)
 
-    async def applied(name, identity=None):
-        return 'pharma-co.pdf' if name == 'Pharma Co' else None
 
-    monkeypatch.setattr(tools, 'company_matches_applied', applied)
+async def test_an_already_applied_end_client_warns_and_the_job_is_still_rated(monkeypatch):
+    '''2026-11-19, the user's rule: a Stage 2 match warns; it no longer rejects the job.'''
+    notifications, _saved = _stage2_stubs(monkeypatch, _agency_extract(end_client='Pharma Co'))
+    monkeypatch.setattr(tools, '_applied_records', {'Pharma Co': _applied_record('Pharma Co', '2026-10-01-pharma.pdf')})
     candidate = _make_candidate(job_id='4480376714', company='Archer Recruitment')
-    await _run_stage2(candidate, {})
-    outcomes = [s for s in job_trace.load(tools.job_trace_path(candidate)) if s['kind'] == 'outcome']
-    assert [(s['outcome'], s['check']) for s in outcomes] == [('already_applied', 'end_client')]
-    assert 'Pharma Co' in outcomes[0]['reason']
+    funnel: dict = {}
+
+    await _run_stage2(candidate, funnel)
+
+    steps = job_trace.load(tools.job_trace_path(candidate))
+    assert [s['outcome'] for s in steps if s['kind'] == 'outcome'] == ['rated']
+    assert funnel.get('already_applied_warned') == 1
+    assert notifications and 'Possibly applied already: Pharma Co (2026-10-01)' in notifications[0]
+    search = next(s for s in steps if s['kind'] == 'organization_search')
+    assert (search['name'], search['step'], search['record']) == ('Pharma Co', 'domain', 'Pharma Co')
 
 
 def test_an_outcome_for_another_job_stays_out_of_the_open_trace(tmp_path):
@@ -6429,30 +6480,33 @@ _SUBSIDIARY_ABOUT = linkedin_page.CompanyAbout(
     parent_slug='example-data-inc')
 
 
-async def test_stage_2_skips_a_subsidiary_of_a_company_already_applied_to(monkeypatch):
-    """2026-10-19: Stage 1b saw only the card's name; the About page names the parent."""
+async def test_stage_2_warns_on_a_subsidiary_of_a_company_already_applied_to(monkeypatch):
+    """2026-10-19: Stage 1b saw only the card's name; the About page names the parent. Since 2026-11-19
+    the match warns and the job is still rated."""
     notifications, saved = _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
     visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
     monkeypatch.setattr(tools, '_applied_companies', {'Example Data, Inc.': 'example.pdf'})
-    monkeypatch.setattr(tools, '_applied_identities', {
-        'Example Data, Inc.': company_domain.CompanyIdentity('Example Data, Inc.', domain='exampledata.com', source='model')})
+    # Its record lists the subsidiary (2026-11-19: the page's Parent alone no longer counts).
+    monkeypatch.setattr(tools, '_applied_records', {
+        'Example Data, Inc.': _applied_record('Example Data, Inc.', 'example.pdf', names=('Example Data Europe',),
+                                              domains=('exampledata.com',))})
     funnel: dict = {}
 
     await _run_stage2(_make_candidate(job_id='4459979218', company='Example Data Europe'), funnel)
 
     assert visits == ['example-data-europe']
-    assert funnel.get('poster_identity_already_applied') == 1
-    assert notifications == []
-    assert saved and saved[0]['rating'] == agent.RATING_AUTO_REJECT
-    assert 'Matched applied-job record: example.pdf' in saved[0]['content']
+    assert funnel.get('already_applied_warned') == 1
+    assert 'poster_identity_already_applied' not in funnel
+    assert saved and saved[0]['rating'] != agent.RATING_AUTO_REJECT
+    assert notifications and 'Possibly applied already: Example Data, Inc.' in notifications[0]
 
 
 async def test_stage_2_visits_a_company_page_once_ever(monkeypatch):
     _stage2_stubs(monkeypatch, _make_extract(company='Example Data Europe', is_agency=False))
     visits = _stub_company_about(monkeypatch, _SUBSIDIARY_ABOUT)
     monkeypatch.setattr(tools, '_applied_companies', {'Other Co': 'other.pdf'})
-    monkeypatch.setattr(tools, '_applied_identities', {
-        'Other Co': company_domain.CompanyIdentity('Other Co', domain='other.example', source='model')})
+    monkeypatch.setattr(tools, '_applied_records', {'Other Co': _applied_record('Other Co', 'other.pdf',
+                                                                                domains=('other.example',))})
 
     await _run_stage2(_make_candidate(job_id='1', company='Example Data Europe'), {})
     await _run_stage2(_make_candidate(job_id='2', company='Example Data Europe'), {})
@@ -6779,7 +6833,7 @@ def test_merge_warnings_leaves_bullets_that_only_mention_pay(warning):
 
 
 def test_merge_warnings_drops_the_unclear_if_it_meets_target_restatement():
-    '''The 2026-09-14 BairesDev pair.'''
+    '''The 2026-09-14 PampasDev pair.'''
     merged = agent.merge_warnings(['No salary listed'], ['No salary listed — unclear if it meets the CAD $210K+ target'])
     assert merged == ['No salary listed']
 
@@ -9712,7 +9766,7 @@ async def test_record_listings_logs_no_already_processed_line_when_all_are_new(m
 async def test_record_listings_logs_already_applied_on_one_line(monkeypatch, tmp_path, caplog):
     _fresh_listing_state(monkeypatch, tmp_path, processed={('linkedin', '333')})
 
-    async def applied(company):
+    async def applied(company, title=''):
         return '2026-01-01-acme.pdf' if company == 'Acme' else None
     monkeypatch.setattr(tools, 'company_matches_applied', applied)
     jobs = [*json.loads(_two_jobs())['jobs'],
@@ -9955,20 +10009,6 @@ async def test_extract_applied_job_metadata_raises_on_api_error(monkeypatch):
         await tools._extract_applied_job_metadata('text', 'acme.pdf')
 
 
-async def test_company_matches_applied_raises_on_api_error(monkeypatch):
-    monkeypatch.setattr(tools, '_applied_companies', {'Shopify': 'shopify_jd.pdf'})
-    # Force the Anthropic path: the OpenRouter branch swallows every exception by design, and
-    # a name that normalizes to an exact match would short-circuit before any LLM call at all.
-    monkeypatch.setattr(tools, 'MODEL_NAME_COMPANY_MATCH', ANTHROPIC_MODEL_NAME_LOW)
-
-    async def fake_sdk_query(**kwargs):
-        yield _errored_result(401)
-
-    monkeypatch.setattr(tools, 'sdk_query', fake_sdk_query)
-    with pytest.raises(tools.AgentApiError):
-        await tools.company_matches_applied('Acme Data Systems')
-
-
 # ---------------------------------------------------------------------------
 # Context-leak guard: every ClaudeAgentOptions site must limit what it loads
 # ---------------------------------------------------------------------------
@@ -10000,7 +10040,8 @@ def test_every_claude_agent_options_site_limits_context():
             if missing := (required - passed):
                 offenders.append(f'{path.relative_to(source_dir)}:{node.lineno} missing {sorted(missing)}')
 
-    assert sites >= 12, f'expected to find the known option sites, found {sites}'
+    # 11 since 2026-11-19: the applied-company name match's Anthropic fallback was removed.
+    assert sites >= 11, f'expected to find the known option sites, found {sites}'
     assert not offenders, 'ClaudeAgentOptions sites that leak context:\n' + '\n'.join(offenders)
 
 
@@ -10788,8 +10829,25 @@ async def test_stage2_restarts_a_dead_browser_and_retries_the_same_job(monkeypat
     assert browser.restarts == 1
     assert 'eval_error' not in funnel, "a dead browser is not the job's fault"
     assert funnel.get('extract_failed') == 2
-    assert released == []
+    assert released == ['1', '2'], 'a failed page read is released for the next run, like an eval_error'
+    assert funnel.get('extract_failed_released') == 2
     assert [a['kind'] for a in agent.tools_module._ui_alerts] == ['browser_restarted']
+
+
+async def test_stage2_extract_failure_is_released_at_most_eval_error_max_releases_times(monkeypatch):
+    '''A page that never reads must not be opened on every run: the release count is capped.'''
+    browser = _FakeBrowser()
+    _stage2_with_dying_browser(monkeypatch, browser, dies_on=[])
+    released = []
+    monkeypatch.setattr(agent.tools_module, 'forget_processed_job', lambda s, j: released.append(j))
+    stats = {'extraction': agent.new_stage_stats(), 'rating': agent.new_stage_stats()}
+
+    for _ in range(agent.tools_module.EVAL_ERROR_MAX_RELEASES + 1):
+        await agent.evaluate_all_candidates(
+            [_make_candidate(job_id='7')], browser.mcp, 'prompt', 'profile', stats, funnel={}, browser=browser,
+        )
+
+    assert released == ['7'] * agent.tools_module.EVAL_ERROR_MAX_RELEASES
 
 
 async def test_stage2_stops_and_releases_jobs_when_the_browser_stays_dead(monkeypatch, caplog):
@@ -10807,7 +10865,8 @@ async def test_stage2_stops_and_releases_jobs_when_the_browser_stays_dead(monkey
         )
 
     assert [job for job, _ in calls] == ['1', '1', '2'], 'nothing may run after the browser stays dead'
-    assert released == ['2', '3', '4'], 'every unevaluated job, including the failing one, goes back'
+    # Job 1's page read failed after the restart, so it is released as an extract failure too.
+    assert released == ['1', '2', '3', '4'], 'every unevaluated job, including the failing one, goes back'
     assert funnel['browser_dead'] == 3
     assert 'eval_error' not in funnel
     stop_lines = [r for r in caplog.records if 'Stage 2 stopped' in r.message]
@@ -12702,10 +12761,10 @@ async def test_replay_writes_notifications_instead_of_sending(tmp_path, monkeypa
 
 def test_read_job_ids_file(tmp_path):
     path = tmp_path / 'ids.tsv'
-    path.write_text('# header\n4464225365\tLead AI Engineer\tAltus Group\n\n4464225365\n4466355340\n')
+    path.write_text('# header\n4464225365\tLead AI Engineer\tAltair Group\n\n4464225365\n4466355340\n')
     jobs = agent.read_job_ids_file(path)
     assert [(j['job_id'], j['title'], j['company']) for j in jobs] == [
-        ('4464225365', 'Lead AI Engineer', 'Altus Group'),
+        ('4464225365', 'Lead AI Engineer', 'Altair Group'),
         ('4466355340', '(job 4466355340)', '(unknown company)'),
     ]
     assert jobs[0]['url'] == tools.job_url('linkedin', '4464225365')
@@ -13133,3 +13192,153 @@ async def test_a_dead_browser_is_not_read_again(monkeypatch):
     browser.dead = True
     assert await agent.read_page_for_extract(_make_candidate(), 'http://x', {}, browser) is None
     assert len(reads) == 1, 'Stage 2 restarts the browser and retries the job instead'
+
+
+async def test_failed_notification_is_kept_and_sent_by_the_next_flush(monkeypatch):
+    '''Resend Failed Notification: a match whose send failed is not lost; the next run sends it.'''
+    sent: list[str] = []
+    telegram_up = False
+
+    async def fake_send(text):
+        if not telegram_up:
+            raise ConnectionError('tools_telegram :8004 refused the connection')
+        sent.append(text)
+    monkeypatch.setattr(agent, 'telegram_send_message', fake_send)
+
+    first_run = agent.NotificationQueue()
+    first_run.add(_queued('1', 'Barcelona, Spain'), None)
+    await first_run.flush()
+    assert sent == []
+    assert [entry['job_ids'] for entry in agent._load_notification_outbox()] == ['1']
+
+    telegram_up = True
+    await agent.NotificationQueue().flush()   # a later run with no matches of its own
+    assert len(sent) == 1 and sent[0].startswith('⏳ Delayed from ') and 'Mimica' in sent[0]
+    assert not agent.NOTIFICATION_OUTBOX_PATH.exists(), 'a sent message leaves the outbox'
+
+
+async def test_notification_outbox_drops_messages_older_than_the_max_age(monkeypatch, caplog):
+    sent: list[str] = []
+
+    async def fake_send(text):
+        sent.append(text)
+    monkeypatch.setattr(agent, 'telegram_send_message', fake_send)
+    stale = (date.today() - timedelta(days=config.NOTIFICATION_OUTBOX_MAX_AGE_DAYS + 1)).isoformat()
+    agent._save_notification_outbox([{'text': 'Old match', 'job_ids': '9', 'kind': 'notification', 'queued_on': stale}])
+
+    with caplog.at_level(logging.ERROR):
+        await agent.resend_notification_outbox()
+
+    assert sent == []
+    assert any('dropped the notification for job(s) 9' in r.getMessage() for r in caplog.records)
+    assert not agent.NOTIFICATION_OUTBOX_PATH.exists()
+
+
+async def test_replay_leaves_the_notification_outbox_alone(tmp_path, monkeypatch):
+    agent._save_notification_outbox([{'text': 'Waiting', 'job_ids': '9', 'kind': 'notification',
+                                      'queued_on': date.today().isoformat()}])
+    _replay_on(tmp_path, monkeypatch)
+    await agent.resend_notification_outbox()
+    assert agent._load_notification_outbox()[0]['text'] == 'Waiting'
+
+
+# --- Collapse Duplicate Listings (2026-11-13: MongoDB, one posting queued 16 times) ---
+
+async def _record_new(monkeypatch, listings):
+    async def new(*args, **kwargs):
+        return {'content': [{'type': 'text', 'text': 'new'}]}
+
+    monkeypatch.setattr(tools, 'do_check_and_record_job', new)
+    monkeypatch.setattr(tools, '_candidates', [])
+    monkeypatch.setattr(tools, '_queue_skipped_counts', {})
+    monkeypatch.setattr(tools, '_listing_records', {
+        ('linkedin', job['id']): {'outcome': 'new', 'url': ''} for job in listings})
+    return await tools.do_record_listings(listings, query='Principal Data Scientist')
+
+
+async def test_same_company_and_title_is_queued_once(monkeypatch, caplog):
+    listings = [
+        {'id': '1', 'title': 'Principal GTM Operations Analyst', 'company': 'MongoDB', 'location': 'Toronto'},
+        {'id': '2', 'title': 'principal  GTM operations analyst', 'company': 'MongoDB, Inc.', 'location': 'Ottawa'},
+        {'id': '3', 'title': 'Principal GTM Operations Analyst', 'company': 'MongoDB', 'location': 'Calgary'},
+    ]
+    with caplog.at_level(logging.INFO, logger=tools.logger.name):
+        summary = await _record_new(monkeypatch, listings)
+    assert [c['job_id'] for c in tools._candidates] == ['1']
+    assert tools._duplicate_listings == {'1': ['2', '3']}
+    assert tools._listing_records[('linkedin', '2')]['outcome'] == 'duplicate_listing'
+    assert tools._listing_records[('linkedin', '3')]['summary'] == 'same company and title as linkedin/1'
+    assert '1 queued' in summary and '2 duplicate listing(s)' in summary
+    assert '2 duplicate(s) of linkedin=1: 2,3' in caplog.text
+
+
+async def test_same_title_at_another_company_is_not_a_duplicate(monkeypatch):
+    listings = [
+        {'id': '1', 'title': 'Staff AI Engineer', 'company': 'Acme', 'location': 'Remote'},
+        {'id': '2', 'title': 'Staff AI Engineer', 'company': 'Globex', 'location': 'Remote'},
+        {'id': '3', 'title': 'Senior AI Engineer', 'company': 'Acme', 'location': 'Remote'},
+    ]
+    summary = await _record_new(monkeypatch, listings)
+    assert [c['job_id'] for c in tools._candidates] == ['1', '2', '3']
+    assert '0 duplicate listing(s)' in summary
+
+
+async def test_a_listing_with_no_company_is_never_collapsed(monkeypatch):
+    listings = [
+        {'id': '1', 'title': 'Staff AI Engineer', 'company': '', 'location': 'Remote'},
+        {'id': '2', 'title': 'Staff AI Engineer', 'company': '', 'location': 'Remote'},
+    ]
+    await _record_new(monkeypatch, listings)
+    assert [c['job_id'] for c in tools._candidates] == ['1', '2']
+
+
+async def test_a_card_skipped_twin_does_not_become_the_representative(monkeypatch):
+    '''The first copy is ruled out by its card; the next copy is still queued, not collapsed.'''
+    async def rule_out_on_site(title, card_location):
+        return 'on-site card' if 'On-site' in card_location else ''
+
+    tools.set_card_rejection(rule_out_on_site)
+    try:
+        await _record_new(monkeypatch, [
+            {'id': '1', 'title': 'AI Engineer', 'company': 'Acme', 'location': 'Paris (On-site)'},
+            {'id': '2', 'title': 'AI Engineer', 'company': 'Acme', 'location': 'Madrid (Remote)'},
+            {'id': '3', 'title': 'AI Engineer', 'company': 'Acme', 'location': 'Lisbon (Remote)'},
+        ])
+    finally:
+        tools.set_card_rejection(None)
+    assert [c['job_id'] for c in tools._candidates] == ['2']
+    assert tools._duplicate_listings == {'2': ['3']}
+
+
+# --- Choose Chip Option (2026-11-13: "Past week" clicked on its hidden input until the cap) ---
+
+@pytest.mark.parametrize('error', [
+    'TimeoutError: Timeout 5000ms exceeded. - waiting for element to be visible, enabled and stable - element is not visible',
+    "Error: strict mode violation: locator('div.jkflis.jkfgjh.jkfljc') resolved to 3 elements",
+])
+def test_a_hidden_or_ambiguous_click_gets_the_option_hint(error):
+    assert scrape_openrouter.click_failure_hint('browser_click', error) == scrape_openrouter.CLICK_FAILURE_HINT
+
+
+@pytest.mark.parametrize(('tool', 'error'), [
+    ('browser_click', 'Error: "button:has([aria-label="Filter by Date posted"])" does not match any elements.'),
+    ('browser_type', 'Error: "input[aria-label="Location"]" does not match any elements.'),
+])
+def test_a_selector_that_matches_nothing_gets_the_hint(tool, error):
+    '''2026-11-16: the chips are divs and the Location box has no such aria-label.'''
+    assert scrape_openrouter.click_failure_hint(tool, error) == scrape_openrouter.CLICK_FAILURE_HINT
+
+
+def test_other_failures_get_no_click_hint():
+    assert scrape_openrouter.click_failure_hint('browser_click', 'Ref f84e175 not found in the current page snapshot') == ''
+    assert scrape_openrouter.click_failure_hint('browser_navigate', 'does not match any elements') == ''
+
+
+def test_a_failed_click_returns_the_hint_to_the_model():
+    async def browser(name, args):
+        raise RuntimeError("MCP tool 'browser_click' returned an error: element is not visible")
+
+    session = scrape_openrouter.ScrapeSession(browser, 'Principal AI Engineer')
+    reply = asyncio.run(session._call_browser_tool('browser_click', {'target': 'input[aria-label="Past week"]'}))
+    assert reply.startswith('ERROR calling browser_click')
+    assert reply.endswith(scrape_openrouter.CLICK_FAILURE_HINT)

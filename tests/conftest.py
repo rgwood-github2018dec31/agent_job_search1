@@ -12,7 +12,9 @@ import pytest
 import requests
 from agentic_job_search import (
     agent,
+    applied_organizations,
     company_domain,
+    company_overlap,
     evidence,
     fx,
     linkedin_exa,
@@ -20,10 +22,12 @@ from agentic_job_search import (
     linkedin_signed_out,
     location,
     location_review,
+    organization_search,
     salary,
     salary_estimate,
     scrape_openrouter,
     triage,
+    web_search,
 )
 from agentic_job_search.agent import load_env
 from agentic_job_search.config import COMPANY_BLACKLIST_EXPIRY_DAYS
@@ -222,6 +226,13 @@ def _no_archive_pacing(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_duplicate_listings_carried_over(monkeypatch):
+    '''Collapse Duplicate Listings is per run: a listing queued in one test is not a twin in the next.'''
+    monkeypatch.setattr(tools, '_queued_listing_keys', {})
+    monkeypatch.setattr(tools, '_duplicate_listings', {})
+
+
+@pytest.fixture(autouse=True)
 def _no_real_web_fetch(monkeypatch, request):
     '''No test may make a real (billed) web_fetch through the OpenRouter tool server unless marked network.'''
     if request.node.get_closest_marker('network'):
@@ -409,8 +420,31 @@ def _isolated_company_identities(monkeypatch, tmp_path):
     monkeypatch.setattr(linkedin_page, 'COMPANY_ABOUT_FAILURES_DIR', tmp_path / 'about_page_failures')
     monkeypatch.setattr(company_domain, '_cache', None)
     monkeypatch.setattr(company_domain, 'chat_openrouter', _no_network)
-    monkeypatch.setattr(tools, '_applied_identities', {})
-    monkeypatch.setattr(tools, '_company_match_verdicts', {})
+    monkeypatch.setattr(tools, '_applied_records', {})
+    monkeypatch.setattr(tools, '_applied_name_index', {})
+    monkeypatch.setattr(tools, '_applied_titles', {})
+
+
+@pytest.fixture(autouse=True)
+def _isolated_organization_search(monkeypatch, tmp_path):
+    '''No test may read or write the real applied_organizations.yaml or organization_matches.yaml,
+    or run a real (paid) web search or org-search model call. Tests of them patch these themselves.'''
+    async def _no_web_search(*args, **kwargs):
+        raise AssertionError('a unit test tried to run a web search')
+
+    async def _no_model(*args, **kwargs):
+        raise AssertionError('a unit test tried to ask the OpenRouter MCP server')
+
+    monkeypatch.setattr(applied_organizations, 'APPLIED_ORGANIZATIONS_PATH', tmp_path / 'applied_organizations.yaml')
+    monkeypatch.setattr(applied_organizations, 'SAVED_POSTINGS_ROOT', tmp_path)
+    monkeypatch.setattr(organization_search, 'ORGANIZATION_MATCHES_PATH', tmp_path / 'organization_matches.yaml')
+    monkeypatch.setattr(web_search, 'call_mcp_tool', _no_web_search)
+    monkeypatch.setattr(applied_organizations, 'chat_openrouter_tool', _no_model)
+    monkeypatch.setattr(organization_search, 'chat_openrouter_tool', _no_model)
+    monkeypatch.setattr(company_overlap, 'COMPANY_OVERLAP_VERDICTS_PATH', tmp_path / 'company_overlap_verdicts.yaml')
+    monkeypatch.setattr(company_overlap, 'chat_openrouter_tool', _no_model)
+    company_overlap.counts.clear()
+    monkeypatch.setattr(tools, '_applied_overlap_index', {})
 
 
 @pytest.fixture(autouse=True)
@@ -579,6 +613,13 @@ def _isolated_eval_error_releases(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(tools, 'EVAL_ERROR_RELEASES_PATH', tmp_path / 'eval_error_releases.yaml')
     monkeypatch.setattr(tools, 'PROCESSED_JOBS_DIR', tmp_path / 'processed_jobs')
+
+
+@pytest.fixture(autouse=True)
+def _isolated_notification_outbox(monkeypatch, tmp_path):
+    '''No test may read or write the developer's real run_dir/notification_outbox.yaml.'''
+    from agentic_job_search import agent
+    monkeypatch.setattr(agent, 'NOTIFICATION_OUTBOX_PATH', tmp_path / 'notification_outbox.yaml')
 
 
 @pytest.fixture(autouse=True)

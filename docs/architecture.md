@@ -27,8 +27,8 @@ or changed PDFs):
 
 - `_applied_jobs` — feeds `applied_jobs_summary()` into the Stage 1a query prompt
 - `_reference_job_pages` — per-page text of each job, feeding the ideal-role profile used by the rater. Pages are joined only when a prompt is built, by `text_budget.pages_to_prompt()`, which logs chars per page and normalizes, then truncates, only past the cap, with a WARNING each time. Ordered **newest applied first**, sorted by `applied_date` rather than filename, because both consumers cap it at `MAX_REFERENCE_JOBS` and taking the oldest `MAX_REFERENCE_JOBS` meant a newly applied job could never influence the profile (2026-08-25; see Summarize Reference Jobs in [requirements.md](requirements.md))
-- `_applied_companies` — the already-applied blocklist used by `check_and_record_job`
-- `_applied_identities` — each blocklisted company's Company Identity (domain, parent), resolved at load by `company_domain.py`, so `company_matches_applied` compares organizations rather than names. A job page's poster is resolved from its LinkedIn About page in Stage 2 (see Resolve Company Identity and Match Applied Company in [requirements.md](requirements.md))
+- `_applied_companies` — applied company name -> one of its PDFs; the keys of the Applied Organizations
+- `_applied_records` / `_applied_name_index` — each applied company's Applied Organization (names, domains, LinkedIn slugs; `applied_organizations.py`), built once by `build_applied_organizations()` right after the load, and the names Stage 1 skips on: `company_matches_applied` matches a card's name exactly (case, spacing and trademark signs aside), and asks `company_overlap.py`'s model only when the name overlaps a listed one (`_applied_overlap_index`). A parent is never one of the names. Stage 2's Search Organization (`organization_search.py`) compares the poster's LinkedIn page, then asks a model, then searches the web, and only warns (see Match Applied Company, Build Applied Organization Record and Search Organization in [requirements.md](requirements.md))
 
 Only records within `APPLIED_JOBS_HORIZON_DAYS` populate these; older PDFs stay on disk but
 are never read.

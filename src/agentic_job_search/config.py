@@ -54,6 +54,10 @@ RATING_MAX = 5
 # repost checks, Opus-audit FALSE NEGATIVE verdicts). If this ever moves off 4, update the
 # "rated 4 or 5" prose in AGENTS.md and docs/requirements.md to match.
 RATING_NOTIFICATION_THRESHOLD = 4
+# A job-match message whose Telegram send failed waits in the notification outbox and is sent again
+# by the next run, until it is this old; then it is dropped with an ERROR naming its jobs, since a
+# week-old posting may well be closed. (Resend Failed Notification, 2026-11-13.)
+NOTIFICATION_OUTBOX_MAX_AGE_DAYS = 7
 # The rating recorded for every deterministic rejection (hard rules, already-applied): the job
 # is saved and audited, never notified.
 RATING_AUTO_REJECT = RATING_MIN
@@ -410,6 +414,14 @@ SINGLE_TURN_CACHED_PROMPT_SHARE = 0.0
 SINGLE_TURN_MIN_BITS_PER_WEIGHT = 8
 MODEL_NAME_QUERY = MODEL_NAME_SINGLE_TURN
 MODEL_NAME_COMPANY_MATCH = MODEL_NAME_SINGLE_TURN
+# Applied Organization records and Search Organization (2026-11-19): the related organizations a
+# web search names, and the Stage 2 org-database search, each one forced function call.
+MODEL_NAME_RELATED_ORGANIZATIONS = MODEL_NAME_SINGLE_TURN
+MODEL_NAME_ORGANIZATION_SEARCH = MODEL_NAME_SINGLE_TURN
+# Decide Company Overlap (Stage 1): is a card's company, whose name only overlaps a listed one, that
+# organization? Chosen from scripts/compare_company_overlap_models.py.
+MODEL_NAME_COMPANY_OVERLAP = MODEL_NAME_SINGLE_TURN
+MODEL_NAME_WEB_SEARCH = MODEL_NAME_SINGLE_TURN   # only issues the tool server's web_search call
 MODEL_NAME_COMPANY_IDENTITY = MODEL_NAME_SINGLE_TURN
 MODEL_NAME_RATING = MODEL_NAME_SINGLE_TURN
 # Asked in order when the MODEL_NAME_RATING call fails or its reply is not a usable rating: a
@@ -719,7 +731,7 @@ LINKEDIN_PDF_FURNITURE_LINE_PATTERNS = (
 )
 # The description shown to the blacklist confirmation call alongside company/location/title. Sized
 # above the longest description measured, so in practice it is whole: the call runs only on an
-# exact name hit, and more of the posting is what tells "Cohere" the AI lab from Cohere Health.
+# exact name hit, and more of the posting is what tells "Kohera" the AI lab from Kohera Health.
 # Raised from 8,000 when the description became the posting's own text (2026-10-28): the longest of
 # 252 retained postings is 24,803 chars.
 BLACKLIST_CONTEXT_DESCRIPTION_MAX_CHARS = 32_000
@@ -939,6 +951,28 @@ JOB_PAGE_PREFETCH_POLL_SECONDS = 2
 LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES = ('/uas/login', '/login', '/authwall', '/checkpoint', '/signup')
 # Model lookups for the applied-job companies run together at load; one cheap call each, once ever.
 COMPANY_IDENTITY_LOOKUP_CONCURRENCY = 8
+# Applied Organization records (2026-11-19): bumped when a record's fields change; an older record
+# is rebuilt (its `manual` entries kept). 2: slugs carry their source and how the page was found.
+APPLIED_ORGANIZATION_SCHEMA_VERSION = 2
+# Job pages read, per applied company no other way links to a LinkedIn page, to find its page from the
+# jobs recommended there (Build Applied Organization Record).
+APPLIED_RECOMMENDATION_PAGE_READS = 2
+# Company pages read, from the results of one web search for an applied company's name, when neither its
+# records nor its recommended jobs link it to a LinkedIn page (Build Applied Organization Record).
+APPLIED_WEB_SEARCH_PAGE_CANDIDATES = 3
+# The tool server's web_search (Search the Web): engine, results per search, and the wait for one.
+WEB_SEARCH_ENGINE = 'exa'
+WEB_SEARCH_MAX_RESULTS = 5
+WEB_SEARCH_TIMEOUT_SECONDS = 180
+# Search Organization: an option at or above this confidence (of 1..5) is "high"; exactly one
+# high option decides, and "no match" is always one of the options.
+ORGANIZATION_CONFIDENCE_MIN = 1
+ORGANIZATION_CONFIDENCE_MAX = 5
+ORGANIZATION_MATCH_HIGH_CONFIDENCE = 4
+# Decide Company Overlap: an organization's names shown to the model (its own and the overlapping ones
+# first), and the overlapping organizations asked about per card (complete overlaps first).
+COMPANY_OVERLAP_MAX_LISTED_NAMES = 40
+COMPANY_OVERLAP_MAX_RECORDS_PER_CARD = 3
 # Hosts that serve many unrelated organizations' pages, so their domain identifies nobody and is
 # never a company domain. GE Vernova's About page gave https://linktree.com/gevernova (2026-10-23);
 # kept as its domain, any other company on a Linktree page would have "matched" it.

@@ -25,10 +25,17 @@ only share a parent do not match: applying to one regional arm of a group says n
 another arm that only shares its owner. An affiliated page is the exception, by the user's choice
 (2026-11-06): the public company page lists them without saying which is the parent, and an
 application to any one of them counts for the poster.
+
+Amended 2026-11-19, the user's choice: an application to any arm of a group now counts for every
+relative its Applied Organization record lists (applied_organizations.py), siblings included, and
+never for a parent.
+`identities_match` itself is no longer used for already-applied matching; this module supplies the
+identities that the records and Search Organization (organization_search.py) compare.
 """
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -63,10 +70,16 @@ SOURCE_ABOUT_UNREADABLE = 'about_page_unreadable'   # by_slug only: visited, and
 # being reachable, and the suffixes that matter here do not change between releases.
 _domain_extractor = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 
-_COMPANY_NOISE_WORDS = {
-    'inc', 'llc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company',
-    'group', 'holdings', 'gmbh', 'sa', 'bv', 'plc', 'the', 'technologies', 'software',
-}
+# Legal-entity forms, written without their dots ("S.A." is compared as "sa"). Only legal forms are
+# dropped: until 2026-11-19 descriptive words were too ("Software", "Technologies", "Group",
+# "Holdings"), which made "Acme Software" and "Acme Group" one company.
+_COMPANY_LEGAL_FORMS = frozenset({
+    'inc', 'incorporated', 'llc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company', 'gmbh', 'ag',
+    'se', 'sa', 'sl', 'srl', 'sas', 'spa', 'nv', 'bv', 'ab', 'oy', 'oyj', 'as', 'asa', 'kk', 'pty', 'pte',
+    'plc', 'llp', 'lp', 'ulc', 'ug', 'kg', 'sarl',
+})
+_COMPANY_LEADING_ARTICLE = 'the'
+
 
 _PROMPT = '''Identify the organization named below.
 
@@ -90,9 +103,19 @@ Rules:
 
 
 def normalize_company_name(name: str) -> str:
-    """Strip punctuation and common legal/entity suffixes so 'Datadog, Inc.' == 'Datadog'."""
-    cleaned = re.sub(r'[^a-z0-9 ]+', ' ', name.lower())
-    words = [w for w in cleaned.split() if w not in _COMPANY_NOISE_WORDS]
+    """The form two company names are compared in: 'Datadog, Inc.' == 'Datadog', 'Axiōma S.A.' ==
+    'Axioma'. Accents are folded (until 2026-11-19 an accented letter was deleted, so 'Axiōma'
+    became 'axi ma'), dots inside a word are dropped ('S.A.' is 'sa', 'Petition.org' is 'petitionorg'),
+    other punctuation separates words, a leading 'The' and trailing legal forms are dropped, and
+    every other word, descriptive ones included, is kept. Letters of any script are kept."""
+    decomposed = unicodedata.normalize('NFKD', name.casefold())
+    folded = ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
+    cleaned = re.sub(r'[^\w ]+|_', ' ', folded.replace('.', ''))
+    words = cleaned.split()
+    if len(words) > 1 and words[0] == _COMPANY_LEADING_ARTICLE:
+        words = words[1:]
+    while len(words) > 1 and words[-1] in _COMPANY_LEGAL_FORMS:
+        words = words[:-1]
     return ' '.join(words)
 
 
@@ -205,6 +228,12 @@ def cached_identity_for_slug(slug: str) -> CompanyIdentity | None:
     if about_page_unreadable(slug):
         return None
     return _identity_from_entry(slug, entry) if _usable(entry) else None
+
+
+def slug_entries() -> dict[str, dict]:
+    '''Every cached LinkedIn page, slug -> its entry as stored (name, website, domain, parent_name,
+    parent_slug, affiliated, source). Read-only for the caller.'''
+    return {slug: entry for slug, entry in _load_cache()['by_slug'].items() if isinstance(entry, dict)}
 
 
 def about_page_unreadable(slug: str) -> bool:

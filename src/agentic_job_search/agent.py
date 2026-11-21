@@ -63,6 +63,7 @@ from agentic_job_search import (
     job_trace,
     location,
     location_review,
+    organization_search,
     rating_inputs,
     scrape_openrouter,
     shadow,
@@ -70,6 +71,7 @@ from agentic_job_search import (
     tool_server,
 )
 from agentic_job_search import config as config_module
+from agentic_job_search.applied_organizations import fold_exact
 from agentic_job_search.company_domain import CompanyIdentity
 from agentic_job_search.config import (
     APPLIED_JOBS_HORIZON_DAYS,
@@ -106,6 +108,7 @@ from agentic_job_search.config import (
     NARRATION_CONDUCT_ALERT_KINDS,
     NARRATION_MESSAGE_MAX_LINES,
     NARRATION_WARNING_REPLAY_MAX_CHARS,
+    NOTIFICATION_OUTBOX_MAX_AGE_DAYS,
     NOTIFICATION_POSTED_MAX_CHARS,
     NOTIFICATION_RECRUITER_MARKER,
     NOTIFICATION_SALARY_MAX_CHARS,
@@ -168,7 +171,13 @@ from agentic_job_search.extract_openrouter import (
 )
 from agentic_job_search.gate_fields import ask_gate_fields
 from agentic_job_search.job_page_prefetch import JobPagePrefetcher
-from agentic_job_search.linkedin_exa import SOURCE_EXA, fetch_job_page, read_company_page_exa, read_job_page_exa
+from agentic_job_search.linkedin_exa import (
+    SOURCE_EXA,
+    fetch_job_page,
+    job_company_slug,
+    read_company_page_exa,
+    read_job_page_exa,
+)
 from agentic_job_search.linkedin_page import (
     HeaderCard,
     JobPage,
@@ -187,6 +196,7 @@ from agentic_job_search.linkedin_signed_out import (
     card_place,
     card_workplace,
     read_company_page_signed_out,
+    read_job_company_slug_signed_out,
     read_job_page_signed_out,
 )
 from agentic_job_search.location import classify_location, is_eu_member, location_token_matches
@@ -254,6 +264,8 @@ PLAYWRIGHT_OUTPUT_DIR = Path(tempfile.gettempdir()) / 'linkedin-agent-playwright
 REFERENCE_SUMMARY_CACHE_PATH = RUN_DIR / 'reference_summary_cache.yaml'
 # Every input of the rating call, saved once per version for the Job Trace to link (rating_inputs.py).
 RATING_INPUTS_DIR = RUN_DIR / 'rating_inputs'
+# Job-match messages whose Telegram send failed, kept for the next run to send (Resend Failed Notification).
+NOTIFICATION_OUTBOX_PATH = RUN_DIR / 'notification_outbox.yaml'
 
 
 async def _send_pipeline_notification(text: str) -> bool:
@@ -278,6 +290,79 @@ async def _send_pipeline_notification(text: str) -> bool:
         console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
         return False
     return True
+
+
+def _load_notification_outbox() -> list[dict]:
+    '''The messages waiting in the outbox. Raises when the file is not a YAML list of mappings.'''
+    if not NOTIFICATION_OUTBOX_PATH.exists():
+        return []
+    loaded = yaml.safe_load(NOTIFICATION_OUTBOX_PATH.read_text(encoding='utf-8')) or []
+    if not isinstance(loaded, list) or not all(isinstance(entry, dict) and entry.get('text') for entry in loaded):
+        raise ValueError(f'{NOTIFICATION_OUTBOX_PATH} must hold a YAML list of messages with a text, '
+                         f'got {snippet(str(loaded))!r}')
+    return loaded
+
+
+def _save_notification_outbox(entries: list[dict]) -> None:
+    if not entries:
+        NOTIFICATION_OUTBOX_PATH.unlink(missing_ok=True)
+        return
+    NOTIFICATION_OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    NOTIFICATION_OUTBOX_PATH.write_text(yaml.safe_dump(entries, sort_keys=False, allow_unicode=True),
+                                        encoding='utf-8')
+
+
+def add_to_notification_outbox(text: str, job_ids: str, kind: str) -> None:
+    '''Keep a message whose send failed, for the next run. Logs an ERROR, never raises: the
+    message is then lost, and the log line is its only copy.'''
+    try:
+        entries = _load_notification_outbox()
+        entries.append({'text': text, 'job_ids': job_ids, 'kind': kind, 'queued_on': date.today().isoformat()})
+        _save_notification_outbox(entries)
+    except Exception as ex:
+        logger.error(f'Notification outbox: could not keep the {kind} for job(s) {job_ids}, so it is lost '
+                     f'({type(ex).__name__}: {ex}); its text: {text!r}')
+        return
+    logger.warning(f'Notification outbox: kept the {kind} for job(s) {job_ids} for the next run')
+
+
+async def resend_notification_outbox() -> None:
+    '''Resend Failed Notification: send every message an earlier run could not, oldest first.
+
+    One still failing stays for the next run; one older than NOTIFICATION_OUTBOX_MAX_AGE_DAYS is
+    dropped with an ERROR. Never raises. A --job-ids replay leaves the outbox alone.
+    '''
+    if tools_module._replay_dir is not None:
+        return
+    try:
+        entries = _load_notification_outbox()
+    except Exception as ex:
+        logger.error(f'Notification outbox unreadable, nothing resent and the file left as it is: '
+                     f'{type(ex).__name__}: {ex}')
+        return
+    if not entries:
+        return
+    kept: list[dict] = []
+    for entry in entries:
+        queued_on = date.fromisoformat(str(entry.get('queued_on') or date.today().isoformat()))
+        age_days = (date.today() - queued_on).days
+        job_ids = entry.get('job_ids', '?')
+        if age_days > NOTIFICATION_OUTBOX_MAX_AGE_DAYS:
+            logger.error(f'Notification outbox: dropped the {entry.get("kind")} for job(s) {job_ids}, unsent for '
+                         f'{age_days} days (NOTIFICATION_OUTBOX_MAX_AGE_DAYS); its text: {entry["text"]!r}')
+            continue
+        text = f'⏳ Delayed from {queued_on.isoformat()} (Telegram send failed then)\n\n{entry["text"]}'
+        if await _send_pipeline_notification(text):
+            logger.info(f'Notification outbox: sent the delayed {entry.get("kind")} for job(s) {job_ids}')
+        else:
+            kept.append(entry)
+    try:
+        _save_notification_outbox(kept)
+    except Exception as ex:
+        logger.error(f'Notification outbox: could not rewrite {NOTIFICATION_OUTBOX_PATH} after resending '
+                     f'({type(ex).__name__}: {ex}); messages already sent may be sent again')
+    if kept:
+        logger.warning(f'Notification outbox: {len(kept)} message(s) still unsent, kept for the next run')
 
 
 # --- Prompt construction ---
@@ -540,6 +625,14 @@ For the **location**: click the location chip (it shows the current region next 
 count), clear it, type the region name, then pick the matching suggestion from the autocomplete.
 For **Date posted** and **Experience level**: click the chip, click the option, then click
 "Show results".
+
+**How to click an option in a chip's panel.** Each option is a radio button drawn as a row with
+its name as text. The radio `input` itself is hidden, so a click on `input[aria-label="…"]` always
+times out with "element is not visible". Every row also shares the same scrambled class names, so
+a CSS class selector matches all of them. Click the option's **visible row or label by its
+text** instead: use the ref the fresh snapshot gives that option, or a text selector such as
+`label:has-text("<option name>")`. If one way fails, switch to the other. Do not retry the same
+selector.
 
 `target` takes the **bare ref exactly as the snapshot shows it**, e.g. `target: "e1202"` — not
 `[ref=e1202]`, not the snapshot's display text like `button "Location"`, and there is no `ref`
@@ -2522,6 +2615,69 @@ async def identify_poster(
     return identity
 
 
+async def read_applied_company_page(slug: str, company: str, stage_stats: dict | None = None) -> None:
+    '''Read an applied company's LinkedIn page into the identity cache, for its Applied Organization
+    record (Build Applied Organization Record), the way Stage 2 reads a poster's page. Not through the
+    signed-in browser: the records are built before the browser starts.'''
+    if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER:
+        logger.debug(f'Applied organizations: {company} ({slug}): its page is not read through the signed-in '
+                     f'browser; its record uses the cached pages only')
+        return
+    stage_stats = stage_stats if stage_stats is not None else {}
+    if _job_and_company_pages_via == LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER:
+        await identify_poster(slug, {'company': company}, '', stage_stats)
+        return
+    async with _applied_company_page_lock:   # our own GETs to LinkedIn: one at a time, each paced
+        await identify_poster(slug, {'company': company}, '', stage_stats)
+
+
+async def read_recommended_job_company_slug(url: str, job_id: str, company: str, stage_stats: dict | None = None) -> str:
+    '''The company slug a recommended job's page links to, for an applied company's record when nothing
+    else links it to a page; '' (logged) when the page gives none. Through Exa first (on the Exa path);
+    when Exa has no page or no company link, one paced cookie-free GET of the public page. Never through
+    the signed-in browser: the records are built before the browser starts. After LinkedIn refuses a
+    signed-out read, no more are made for the records this run (never retry into a challenge).'''
+    global _applied_signed_out_refused
+    if _job_and_company_pages_via == LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER:
+        logger.debug(f'Applied organizations: {company}: recommended job {url} not read ({_job_and_company_pages_via})')
+        return ''
+    if _job_and_company_pages_via == LINKEDIN_PAGE_READER_EXA_VIA_OPENROUTER:
+        try:
+            fetch = await fetch_job_page({'url': url, 'job_id': job_id, 'company': company}, stage_stats or {})
+        except Exception as ex:
+            logger.warning(f'Applied organizations: {company}: Exa could not read recommended job {url} for its '
+                           f'company link, trying a signed-out read: {unwrap_exception(ex)}')
+        else:
+            if slug := job_company_slug(str(fetch.reply.get('content') or '')):
+                return slug
+            logger.info(f'Applied organizations: {company}: recommended job {url} shows no company link via Exa, '
+                        f'trying a signed-out read')
+    if _applied_signed_out_refused:
+        logger.info(f'Applied organizations: {company}: recommended job {url} not read signed out: LinkedIn refused '
+                    f'an earlier signed-out read this run')
+        return ''
+    try:
+        async with _applied_company_page_lock:
+            slug = await read_job_company_slug_signed_out(url, job_id)
+    except LinkedInBlockedError as ex:
+        _applied_signed_out_refused = True
+        logger.warning(f'Applied organizations: LinkedIn refused a signed-out read of recommended job {url} '
+                       f'({company}); no more signed-out reads for the records this run: {unwrap_exception(ex)}')
+        return ''
+    except Exception as ex:
+        logger.warning(f'Applied organizations: {company}: could not read recommended job {url} signed out for its '
+                       f'company link: {unwrap_exception(ex)}')
+        return ''
+    if not slug:
+        logger.info(f'Applied organizations: {company}: recommended job {url} shows no company link signed out')
+    return slug
+
+
+# Signed-out reads of applied companies' pages run one at a time (the records build concurrently).
+_applied_company_page_lock = asyncio.Lock()
+_applied_signed_out_refused = False   # set when LinkedIn refuses one: no more signed-out record reads
+
+
 async def read_page_for_extract(
     candidate: dict, playwright_mcp_url: str, stage_stats: dict, browser: BrowserServer | None = None,
 ) -> JobPage | None:
@@ -2864,8 +3020,33 @@ _DEGREE_NEGATION_RE = re.compile(
     r"|\bdo(?:es)?\s+not\s+require\b",
     re.IGNORECASE,
 )
+# A bachelor's degree or equivalent experience stated as the bar: no advanced degree is then a hard gate.
+_BACHELOR_OR_EQUIVALENT_RE = re.compile(
+    r"\bbachelor'?s?\b|\bb\.?sc\.?\b|\bequivalent\s+(?:practical\s+|professional\s+|work\s+)?experience\b",
+    re.IGNORECASE,
+)
 # Split on sentence-final periods only (followed by whitespace or end), so 'Ph.D.' survives intact.
 _SENTENCE_SPLIT_RE = re.compile(r'[;•\n\r]|\.(?=\s|$)|(?<=[a-z])\s*[-–—]\s+')
+
+
+def _degree_is_softened(quote: str, sentences: list[str]) -> bool:
+    """Whether the posting lets something other than an advanced degree through.
+
+    True when the extractor's quote, or a sentence holding it, carries a softener or a negation, or
+    when any sentence names a bachelor's degree or equivalent experience: an advanced degree cannot
+    be mandatory where a bachelor's is accepted. No requirement word is asked for there, since
+    a list item ("; Bachelor's degree in CS, or equivalent experience") is split from its heading,
+    and wrongly rejecting a job costs more than wrongly reading it.
+    """
+    folded_quote = ' '.join(quote.lower().split())
+    for sentence in sentences:
+        folded = ' '.join(sentence.lower().split())
+        holds_quote = bool(folded_quote) and (folded_quote in folded or folded in folded_quote)
+        if holds_quote and (_DEGREE_SOFTENER_RE.search(sentence) or _DEGREE_NEGATION_RE.search(sentence)):
+            return True
+        if _BACHELOR_OR_EQUIVALENT_RE.search(sentence):
+            return True
+    return bool(folded_quote) and bool(_DEGREE_SOFTENER_RE.search(quote) or _DEGREE_NEGATION_RE.search(quote))
 
 
 def derive_education_requirement(extract: dict) -> str:
@@ -2877,15 +3058,23 @@ def derive_education_requirement(extract: dict) -> str:
     ('No PhD required'). Those two checks are the load-bearing part: an advanced-degree rule is an
     unappealable auto-reject, so a posting that would take experience instead must never match.
     """
+    haystack = f"{extract.get('location', '')}\n{regex_source_text(extract)}"
+    sentences = _SENTENCE_SPLIT_RE.split(haystack)
     explicit = str(extract.get('education_requirement') or '').strip().lower()
     if explicit:
+        # The extractor's value passes the same two checks as a scanned sentence (2026-11-13):
+        # until then it won unchecked, and McKesson 4463144062, which asks for "Bachelor's degree
+        # ... or equivalent experience", was rejected for a master's.
+        if _degree_is_softened(str((extract.get('quotes') or {}).get('education_requirement') or ''), sentences):
+            return ''
         if _PHD_RE.search(explicit):
             return 'phd'
         if _MASTERS_RE.search(explicit) or explicit in {'master', 'ms', 'ma'}:
             return 'master'
 
-    haystack = f"{extract.get('location', '')}\n{regex_source_text(extract)}"
-    for sentence in _SENTENCE_SPLIT_RE.split(haystack):
+    if _degree_is_softened('', sentences):
+        return ''
+    for sentence in sentences:
         if not _DEGREE_REQUIRED_RE.search(sentence):
             continue
         if _DEGREE_SOFTENER_RE.search(sentence) or _DEGREE_NEGATION_RE.search(sentence):
@@ -4002,6 +4191,35 @@ def salary_figure_listed(extract: dict) -> bool:
     return salary_facts_of(extract)['kind'] != 'absent'
 
 
+async def already_applied_warnings(candidate: dict, extract: dict, extract_text: str, page,
+                                   playwright_mcp_url: str, stage_stats: dict) -> tuple[list[str], dict[str, int]]:
+    '''Search Organization for the poster (unless an agency) and the end client: (the warning lines,
+    the funnel counters it raised: organization_search_undecided, organization_search_failed).
+
+    The poster's LinkedIn About page is read here (identify_poster: cached per slug, once ever) so
+    its Website, Parent and Affiliated pages reach step 1. A LinkedInBlockedError propagates.
+    '''
+    records = tools_module.applied_records()
+    search_stats: dict = {}
+    warnings = []
+    if not derive_agency_posting(extract):
+        slug = page.company_slug if page is not None else ''
+        identity = (await identify_poster(slug, candidate, playwright_mcp_url, stage_stats['extraction'])
+                    if slug else None)
+        if warning := await organization_search.warn_if_applied(
+                candidate['company'], slug, identity, extract_text, records, search_stats, 'poster'):
+            warnings.append(warning)
+    end_client = derive_end_client(extract)
+    end_client_warning = ''
+    if end_client and fold_exact(end_client) != fold_exact(candidate['company']):
+        end_client_warning = await organization_search.warn_if_applied(
+            end_client, '', None, extract_text, records, search_stats, 'end client')
+    if end_client_warning:
+        warnings.append(end_client_warning)
+    stage_stats['extraction']['cost'] = stage_stats['extraction'].get('cost', 0.0) + search_stats.pop('cost', 0.0)
+    return warnings, search_stats
+
+
 def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     """Warnings derived in code from the extract, independent of what the rater chose to report.
 
@@ -4009,6 +4227,9 @@ def build_deterministic_warnings(candidate: dict, extract: dict) -> list[str]:
     for the DevologyX posting and still rated it 4/5 without warning.
     """
     warnings: list[str] = []
+
+    # Search Organization's matches (2026-11-19): a Stage 2 match warns, it no longer rejects.
+    warnings.extend(extract.get('already_applied_warnings') or [])
 
     workplace_type = derive_workplace_type(extract)
     if workplace_type in {'hybrid', 'onsite'}:
@@ -4797,8 +5018,10 @@ class NotificationQueue:
             self._followups.setdefault(prior_id, NotificationGroup([], prior=repost)).postings.append(posting)
 
     async def flush(self) -> None:
-        '''Send every queued message, this run's first, then the follow-ups. Never raises: each
-        failed send is logged by _send_pipeline_notification and the rest still go.'''
+        '''Send what earlier runs could not, then every queued message, this run's first, then the
+        follow-ups. Never raises: each failed send is logged by _send_pipeline_notification, kept in
+        the notification outbox for the next run, and the rest still go.'''
+        await resend_notification_outbox()
         groups = [*self._this_run.values(), *self._followups.values()]
         self._this_run, self._followups = {}, {}
         if not groups:
@@ -4813,6 +5036,7 @@ class NotificationQueue:
                 logger.info(f'Sent the {kind} for job(s) {job_ids}')
             else:
                 failed.append(job_ids)
+                add_to_notification_outbox(text, job_ids, kind)
             for posting in group.postings:
                 if posting.trace is not None:
                     posting.trace.add('notification', {'text': text, 'sent': sent, 'message_kind': kind,
@@ -5002,11 +5226,21 @@ async def _evaluate_candidates(
                 continue
             if extract is None:
                 bump('extract_failed')
+                # Released like an eval_error (2026-11-13): left processed, a page Exa could not
+                # read once was never read again, and 5 of 51 replayed jobs ended this way.
+                try:
+                    retry_note = tools_module.release_errored_job(candidate['site'], candidate['job_id'])
+                except Exception as release_ex:
+                    retry_note = (f'NOT retried: could not release it '
+                                  f'({type(release_ex).__name__}: {release_ex})')
+                if retry_note.startswith('released'):
+                    bump('extract_failed_released')
                 tools_module.record_job_outcome(
-                    candidate['site'], candidate['job_id'], 'extract_failed', summary='page extraction failed'
+                    candidate['site'], candidate['job_id'], 'extract_failed',
+                    summary=f'page extraction failed; {retry_note}'
                 )
                 logger.warning(f"Extract failed (both paths): job {candidate['job_id']} "
-                               f"{candidate['company']} — {candidate['title']}")
+                               f"{candidate['company']} — {candidate['title']}; {retry_note}")
                 continue
             bump('extract_ok')
             # Before anything reads `location`: it may be filled from the header card here.
@@ -5035,41 +5269,6 @@ async def _evaluate_candidates(
                 workplace_type=derive_workplace_type(extract), education_requirement=derive_education_requirement(extract),
                 is_agency=derive_agency_posting(extract), end_client=derive_end_client(extract),
                 extract_text=extract_text)
-
-            # Already-applied, checked against the END CLIENT only.
-            #
-            # Stage 1b's check ran against the poster's name, which for a recruiter is the agency —
-            # so a recruiter reposting a role at a company the user already applied to directly
-            # sails through. The end client is only knowable after the extract, hence here.
-            #
-            # Deliberately NOT extended to the agency's own name: applying once through a staffing
-            # firm must never suppress every other company it posts for. That is the whole reason
-            # load_applied_jobs() keeps agency names out of _applied_companies
-            # (tools_generic.py:486-491), and re-adding it here would undo it. Agency status never
-            # changes the rating and never rejects on its own.
-            end_client = derive_end_client(extract)
-            # nested (not combined) deliberately: a 20-line gate body reads better
-            # one level deeper than folded into a single 100-char condition
-            if end_client:  # noqa: SIM102
-                if matched_pdf := await tools_module.company_matches_applied(end_client):
-                    bump('end_client_already_applied')
-                    logger.info(
-                        f"Already applied via end client: {candidate['company']} — "
-                        f"{candidate['title']}: hiring company {end_client!r} matches {matched_pdf}"
-                    )
-                    await _save_job(
-                        candidate, rating=RATING_AUTO_REJECT,
-                        summary=f'already applied to end client {end_client}',
-                        content=(
-                            f"# Already applied — posted by {candidate['company']} on behalf of "
-                            f"{end_client}\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"
-                        ),
-                    )
-                    tools_module.record_job_outcome(
-                        candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
-                        summary=f'end client {end_client} already applied to', check='end_client',
-                    )
-                    continue
 
             hard_rule_reason = await apply_hard_rules(candidate, extract)
             if hard_rule_reason:
@@ -5115,31 +5314,22 @@ async def _evaluate_candidates(
                     )
                     continue
 
-            # The poster, checked again by who it IS now that its LinkedIn page is known: Stage 1b
-            # had only the name on the card, which missed NTT DATA Europe & Latam against an
-            # application to its parent (2026-10-19). Agencies are skipped, as load_applied_jobs
-            # keeps them out of the blocklist. Here, just before the paid rating, so the About
-            # page is visited for as few companies as possible, each once ever.
-            if page is not None and page.company_slug and not derive_agency_posting(extract):
-                identity = await identify_poster(
-                    page.company_slug, candidate, playwright_mcp['url'], stage_stats['extraction'])
-                matched_pdf = await tools_module.company_matches_applied(candidate['company'], identity)
-                if matched_pdf:
-                    bump('poster_identity_already_applied')
-                    logger.info(f"Already applied by company identity [{index}/{len(candidates)}]: "
-                                f"{candidate['company']} — {candidate['title']}: matches {matched_pdf}")
-                    await _save_job(
-                        candidate, rating=RATING_AUTO_REJECT,
-                        summary=f"already applied to {candidate['company']} (same organization)",
-                        content=(f"# Already applied — {candidate['company']} is the same organization as "
-                                 f"an applied job\n\nMatched applied-job record: {matched_pdf}\n\n{extract_text}"),
-                    )
-                    tools_module.record_job_outcome(
-                        candidate['site'], candidate['job_id'], 'already_applied', rating=RATING_AUTO_REJECT,
-                        summary=f"{candidate['company']} matches {matched_pdf} by domain or parent",
-                        check='company_identity',
-                    )
-                    continue
+            # Already applied? Search Organization, for the poster and for the end client an agency
+            # names. It only WARNS (the user's rule, 2026-11-19): the job is rated and notified as
+            # usual, with a line naming the applied organization and why. Until then a match here
+            # auto-rejected the job, and Stage 1's model name match had hidden 23 jobs' companies
+            # on wrong guesses. Here, just before the paid rating, so the About page is visited
+            # and the search run for as few companies as possible.
+            #
+            # An agency's own name is never searched: applying once through a staffing firm says
+            # nothing about the other companies it posts for (load_applied_jobs keeps agency names
+            # out of the applied list for the same reason).
+            extract['already_applied_warnings'], search_counts = await already_applied_warnings(
+                candidate, extract, extract_text, page, playwright_mcp['url'], stage_stats)
+            for counter, count in search_counts.items():
+                funnel[counter] = funnel.get(counter, 0) + count
+            if extract['already_applied_warnings']:
+                bump('already_applied_warned')
 
             record_rating_inputs(candidate, evaluator_prompt, extract_text)
             rating_started = time.monotonic()
@@ -5853,6 +6043,8 @@ def _reset_run_state() -> None:
     tools_module._query_errors = {}
     tools_module._check_status_per_query = {}
     tools_module._queue_skipped_counts = {}
+    tools_module._queued_listing_keys = {}
+    tools_module._duplicate_listings = {}
     tools_module._current_query = None
     tools_module._current_region = None
     tools_module._distinct_listing_ids = set()
@@ -5953,6 +6145,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
 
         if not candidates:
             console.print('[red]Error: 0 jobs returned across all searches.[/red]')
+            await resend_notification_outbox()   # Stage 2's flush, which also resends, will not run
             elapsed_mins = (time.time() - start_time) / SECONDS_PER_MINUTE
             total_cost = sum(s['cost'] for s in stage_stats.values())
             # check_status distinguishes dedup-saturation (all already_processed) from an
@@ -5993,6 +6186,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 'listings_distinct_per_query': _listings_distinct_per_query(),
                 'queries_failed': dict(tools_module._query_errors),
                 'queue_skipped': dict(tools_module._queue_skipped_counts),
+                'duplicate_listings': {rep: list(ids) for rep, ids in tools_module._duplicate_listings.items()},
                 'candidates_queued': 0,
             }
             health_alerts = attach_run_health(zero_funnel)
@@ -6101,6 +6295,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         'listings_distinct_per_query': _listings_distinct_per_query(),
         'queries_failed': dict(tools_module._query_errors),
         'queue_skipped': dict(tools_module._queue_skipped_counts),
+        'duplicate_listings': {rep: list(ids) for rep, ids in tools_module._duplicate_listings.items()},
         'candidates_queued': len(candidates),
         'scrape_per_query': dict(tools_module._scrape_per_query),
         **funnel,
@@ -6465,6 +6660,12 @@ async def main() -> None:
         await tools_module.categorize_save_dir_pdfs()
         await tools_module.ingest_save_dir_applied_pdfs()
         await tools_module.load_applied_jobs()
+        applied_stats: dict = {}
+        await tools_module.build_applied_organizations(
+            applied_stats, lambda slug, company: read_applied_company_page(slug, company, applied_stats),
+            lambda url, job_id, company: read_recommended_job_company_slug(url, job_id, company, applied_stats))
+        if applied_stats.get('cost'):
+            logger.info(f"Applied organizations: built this run for ${applied_stats['cost']:.4f}")
 
         if args.job_ids:
             await run_job_ids_replay(args.job_ids, browser_mode=args.browser)
