@@ -169,6 +169,7 @@ src/agentic_job_search/
   job_path.py                     # Job Path: one Job Trace over a fixed map of Stage 2, exits read from its outcome step
   rating_inputs.py                # Record Rating Inputs: save each part of the rater's input once, for the trace to link
   linkedin_page.py                # Stage 2 page read: read-only DOM capture, archive, de-clutter, unknown-section LLM pass
+  linkedin_session.py             # Check LinkedIn Session: the feed opened once per run before any search; a signed-out profile stops the run
   linkedin_exa.py                 # Read LinkedIn Page via Exa: job and company pages fetched by Exa through OpenRouter's web_fetch (the default)
   linkedin_signed_out.py          # Read LinkedIn Page Signed Out: job and company pages, one cookie-free HTTP GET each
   job_page_prefetch.py            # Read Job Pages Ahead: queued jobs' pages read during Stage 1b (Exa or signed-out)
@@ -213,6 +214,7 @@ tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
   test_cache_io.py                # cache_io fail-open contract: missing/empty/unreadable/non-mapping loads, unwritable saves
+  test_linkedin_session.py        # Session check, the signed-out run gate, Telegram message split
   test_evidence.py                # Citation matching, LLM relocation, rejection
   test_job_audit.py               # Job choice, render failure, report rendering (with reportlab)
   test_job_path.py                # Job Path overlay, exits, aggregate (no reportlab)

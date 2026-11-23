@@ -85,6 +85,8 @@ from agentic_job_search.config import (
     EXTRACT_CITED_FIELDS,
     EXTRACT_RESUBMIT_UNGROUNDED,
     FAILED_QUERIES_NAMED_MAX,
+    HEALTH_ALERT_DETAIL_MAX_CHARS,
+    HEALTH_ALERT_LINE_MAX_CHARS,
     JOB_AUDIT_ENABLED,
     JOB_STALE_AGE_DAYS,
     LINKEDIN_JOB_DESCRIPTION_HEADING,
@@ -153,6 +155,8 @@ from agentic_job_search.config import (
     SCRAPER_MIN_TURNS_PER_QUERY,
     SECONDS_PER_MINUTE,
     STAGE2_PAGE_READS,
+    TELEGRAM_MESSAGE_MAX_CHARS,
+    TELEGRAM_PART_LABEL_RESERVE_CHARS,
     THINKING_MAX_CHARS,
     TOOL_SERVER_WAIT_MAX_SECONDS,
     TRIAGE_DISAGREEMENT_LOG_MIN,
@@ -191,6 +195,7 @@ from agentic_job_search.linkedin_page import (
     read_job_page,
     strip_saved_page_furniture,
 )
+from agentic_job_search.linkedin_session import check_linkedin_session
 from agentic_job_search.linkedin_signed_out import (
     SOURCE_SIGNED_OUT,
     card_place,
@@ -268,6 +273,34 @@ RATING_INPUTS_DIR = RUN_DIR / 'rating_inputs'
 NOTIFICATION_OUTBOX_PATH = RUN_DIR / 'notification_outbox.yaml'
 
 
+def split_telegram_message(text: str, max_chars: int = TELEGRAM_MESSAGE_MAX_CHARS) -> list[str]:
+    '''The message as one or more parts, each within max_chars, with nothing dropped.
+
+    A message within the limit comes back unchanged. A longer one is cut at line breaks into parts
+    labelled "(i/n) "; a single line longer than a part is cut inside the line. On 2026-11-23 a
+    5799-char run-failure alert was refused outright, so the run failed without anyone hearing.
+    '''
+    if len(text) <= max_chars:
+        return [text]
+    body_max = max_chars - TELEGRAM_PART_LABEL_RESERVE_CHARS
+    if body_max <= 0:
+        raise ValueError(f'max_chars {max_chars} leaves no room after TELEGRAM_PART_LABEL_RESERVE_CHARS')
+    parts: list[str] = []
+    current = ''
+    for line in text.split('\n'):
+        pieces = [line[start:start + body_max] for start in range(0, len(line), body_max)] or ['']
+        for piece in pieces:
+            if not current:
+                current = piece
+            elif len(current) + 1 + len(piece) <= body_max:
+                current = f'{current}\n{piece}'
+            else:
+                parts.append(current)
+                current = piece
+    parts.append(current)
+    return [f'({index}/{len(parts)}) {part}' for index, part in enumerate(parts, 1)]
+
+
 async def _send_pipeline_notification(text: str) -> bool:
     '''Send one Telegram message. False (after a WARNING) when the send failed; never raises.
 
@@ -280,15 +313,20 @@ async def _send_pipeline_notification(text: str) -> bool:
             handle.write(f'{text}\n\n---\n\n')
         logger.info(f'Replay: notification written to {replay_dir / REPLAY_NOTIFICATIONS_FILENAME}, not sent')
         return True
-    try:
-        await telegram_send_message(text)
-    except Exception as ex:
-        logger.warning(
-            f'Telegram pipeline notification failed ({len(text)}-char message {snippet(text)!r}): '
-            f'{unwrap_exception(ex)}'
-        )
-        console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
-        return False
+    parts = split_telegram_message(text)
+    if len(parts) > 1:
+        logger.info(f'Telegram pipeline notification is {len(text)} chars, over TELEGRAM_MESSAGE_MAX_CHARS '
+                    f'({TELEGRAM_MESSAGE_MAX_CHARS}): sending it in {len(parts)} parts')
+    for index, part in enumerate(parts, 1):
+        try:
+            await telegram_send_message(part)
+        except Exception as ex:
+            logger.warning(
+                f'Telegram pipeline notification failed (part {index} of {len(parts)}, {len(part)} chars, '
+                f'of a {len(text)}-char message {snippet(text)!r}): {unwrap_exception(ex)}'
+            )
+            console.print(f'[yellow]Warning: Telegram notification failed: {ex}[/yellow]')
+            return False
     return True
 
 
@@ -1973,12 +2011,49 @@ def audit_summary_lines(funnel: dict, audit: bool) -> list[str]:
     return lines
 
 
+# "KIND on SUBJECT: detail": the shape of most per-query alerts in assess_run_health.
+_ALERT_ON_SUBJECT_RE = re.compile(r'^(?P<kind>[^:]+?) on (?P<subject>[^:]+?): (?P<detail>.+)$', re.DOTALL)
+
+
 def health_alert_block(alerts: list[str]) -> str:
-    """The Telegram/console NEEDS ATTENTION section, or '' when the run was healthy."""
+    """The Telegram/console NEEDS ATTENTION section, or '' when the run was healthy.
+
+    Compact, because it goes to Telegram. Exact repeats are dropped. Alerts of one kind on several
+    queries become one line that names every subject and shows the first one's detail as an
+    example. A detail longer than HEALTH_ALERT_DETAIL_MAX_CHARS, or another alert longer than
+    HEALTH_ALERT_LINE_MAX_CHARS, is cut with the cut marked. Every alert stays whole in the run log
+    (attach_run_health) and the audit log. On 2026-11-23, 29 alerts made a 5799-char message: five
+    kinds, each repeated per query, with the same 355-char UI-contract detail four times.
+    """
     if not alerts:
         return ''
-    alert_lines = '\n'.join(f'  - {a}' for a in alerts)
-    return f'⚠️ NEEDS ATTENTION ({len(alerts)}):\n{alert_lines}'
+    entries: list[tuple[str, list[tuple[str, str]] | str]] = []
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for alert in dict.fromkeys(alerts):
+        match = _ALERT_ON_SUBJECT_RE.match(alert)
+        if match is None:
+            entries.append(('plain', alert))
+            continue
+        kind = match['kind']
+        if kind not in groups:
+            groups[kind] = []
+            entries.append((kind, groups[kind]))
+        groups[kind].append((match['subject'], match['detail']))
+    lines = []
+    for kind, value in entries:
+        if isinstance(value, str):
+            lines.append(snippet(value, HEALTH_ALERT_LINE_MAX_CHARS))
+            continue
+        subject, detail = value[0]
+        if len(value) == 1:
+            lines.append(f'{kind} on {subject}: {snippet(detail, HEALTH_ALERT_DETAIL_MAX_CHARS)}')
+        else:
+            subjects = '; '.join(dict.fromkeys(s for s, _d in value))
+            lines.append(f'{kind} ×{len(value)}: {subjects} — e.g. {subject}: '
+                         f'{snippet(detail, HEALTH_ALERT_DETAIL_MAX_CHARS)}')
+    grouped = ' — grouped by kind, each in full in the run and audit logs' if len(lines) < len(alerts) else ''
+    alert_lines = '\n'.join(f'  - {line}' for line in lines)
+    return f'⚠️ NEEDS ATTENTION ({len(alerts)}{grouped}):\n{alert_lines}'
 
 
 def _timestamp_date(timestamp: object) -> str:
@@ -6058,6 +6133,42 @@ def _reset_run_state() -> None:
     tools_module.prune_raw_postings()
 
 
+async def _linkedin_session_ok(browser: BrowserServer, stage_stats: dict, start_time: float) -> bool:
+    '''Check LinkedIn Session before any search: False (after alerting and logging) when signed out.
+
+    A check that cannot read the page is not a verdict: it is logged and alerted, and the run goes on,
+    leaving Stage 1b's own zero-listing handling as the backstop.
+    '''
+    console.print('[dim]Checking the LinkedIn session ...[/dim]')
+    try:
+        async with mcp_session(browser.mcp['url']) as call:
+            check = await check_linkedin_session(call)
+    except Exception as ex:
+        logger.warning(f'LinkedIn session check failed, continuing the run: {unwrap_exception(ex)}')
+        tools_module._ui_alerts.append({
+            'kind': 'session_check_failed', 'query': '(all)', 'region': '(all)',
+            'detail': f'LinkedIn session check could not read the feed: {unwrap_exception(ex)}'})
+        return True
+    if check.signed_in:
+        return True
+    console.print(f'[red]Error: LinkedIn is signed out ({check.reason}). Log in to the profile again.[/red]')
+    logger.error(f'LinkedIn SIGNED OUT at {check.url} ({check.reason}): run stopped before any search')
+    await _send_pipeline_notification(
+        'Job search run FAILED\n'
+        f'⚠️ LINKEDIN SIGNED OUT — log in to the profile again ({BROWSER_PROFILE_DIR})\n'
+        f'• Seen: {check.url} ({check.reason})\n'
+        '• No search was run.')
+    log_run_cost({
+        'timestamp': datetime.now().isoformat(),
+        'mode': 'non-interactive',
+        'status': 'failed_signed_out',
+        'stage_stats': public_stage_stats(stage_stats),
+        'total_cost': sum(s['cost'] for s in stage_stats.values()),
+        'elapsed_minutes': (time.time() - start_time) / SECONDS_PER_MINUTE,
+    })
+    return False
+
+
 async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0,
                               job_audit_enabled: bool = JOB_AUDIT_ENABLED, job_audit_job_id: str | None = None) -> None:
     global _prefetcher
@@ -6101,6 +6212,8 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     await endpoint_pin.pin_single_turn_endpoints(MODEL_NAME_SINGLE_TURN)
 
     try:
+        if not await _linkedin_session_ok(browser, stage_stats, start_time):
+            return
         # Stage 1: sonnet generates search queries, haiku scraper does the actual scraping
         console.print('[yellow]Stage 1a: Generating search queries ...[/yellow]')
         queries = await generate_search_queries(stage_stats['query_generation'])

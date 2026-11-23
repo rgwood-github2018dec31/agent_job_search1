@@ -949,6 +949,17 @@ COMPANY_PAGE_ARCHIVE_INTERVAL_SECONDS = (5.0, 8.0)
 JOB_PAGE_PREFETCH_POLL_SECONDS = 2
 # A redirect to one of these means the page wants a signed-in member.
 LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES = ('/uas/login', '/login', '/authwall', '/checkpoint', '/signup')
+# Check LinkedIn Session (2026-11-23): opened once per run before any search. A signed-in member
+# stays on it, and a signed-out profile is redirected to one of the paths above.
+LINKEDIN_SESSION_CHECK_URL = 'https://www.linkedin.com/feed/'
+# Telegram's sendMessage limit. A longer message is sent in numbered parts (Send Pipeline Notification).
+TELEGRAM_MESSAGE_MAX_CHARS = 4096
+# Room kept in each part for its "(i/n) " label.
+TELEGRAM_PART_LABEL_RESERVE_CHARS = 16
+# NEEDS ATTENTION block (health_alert_block): the example detail shown for a group of alerts of one
+# kind, and any other single alert. The full alerts are in the run and audit logs.
+HEALTH_ALERT_DETAIL_MAX_CHARS = 200
+HEALTH_ALERT_LINE_MAX_CHARS = 600
 # Model lookups for the applied-job companies run together at load; one cheap call each, once ever.
 COMPANY_IDENTITY_LOOKUP_CONCURRENCY = 8
 # Applied Organization records (2026-11-19): bumped when a record's fields change; an older record
