@@ -192,6 +192,7 @@ src/agentic_job_search/
   system_sleep.py                 # Holds a no-idle-sleep assertion for the run; logs and alerts a sleep it could not stop
   shadow.py                       # Shadow Local Model: a local model answers every single-turn remote call too; pairs recorded with confidence
 scripts/
+  sign_in_linkedin.py             # Sign In to LinkedIn: the profile opened visibly via Playwright; closes once signed in
   backtest_location_gate.py       # Replays saved postings through the location gate (live classifier)
   backfill_recruiter_notifications.py  # One-time seed of recruiter_notifications.yaml from saved jobs
   replay_evidence.py              # Re-extracts retained pages live; per-field citation outcomes (costs cents)

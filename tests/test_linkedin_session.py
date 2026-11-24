@@ -183,3 +183,19 @@ def test_distinct_alerts_are_listed_whole():
     alerts = ['LOCAL TRIAGE DISABLED: model missing', 'BROWSER RESTARTED: once']
     assert agent.health_alert_block(alerts) == (
         '⚠️ NEEDS ATTENTION (2):\n  - LOCAL TRIAGE DISABLED: model missing\n  - BROWSER RESTARTED: once')
+
+
+# --- is_past_login: Sign In to LinkedIn's wait --------------------------------------------------------
+
+@pytest.mark.parametrize(('url', 'past'), [
+    ('https://www.linkedin.com/feed/', True),
+    ('https://www.linkedin.com/feed/foryou/', True),
+    ('https://www.linkedin.com/login', False),
+    ('https://www.linkedin.com/checkpoint/lg/login-submit', False),
+    ('https://www.linkedin.com/uas/login-submit', False),
+    ('about:blank', False),
+    ('', False),
+    ('https://www.linkedin.com.evil.example/feed/', False),
+])
+def test_is_past_login(url, past):
+    assert linkedin_session.is_past_login(url) is past

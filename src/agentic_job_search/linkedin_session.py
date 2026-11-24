@@ -65,6 +65,19 @@ def decide_session(page: dict) -> SessionCheck:
     return SessionCheck(True, url, 'no sign-in redirect or guest links')
 
 
+def is_past_login(url: str) -> bool:
+    '''Whether a page the user is on during Sign In to LinkedIn is a signed-in LinkedIn page.
+
+    Read from the address only: a linkedin.com page outside the login, authwall, checkpoint and
+    signup paths. A blank or non-LinkedIn address (the tab still loading) is not past login.
+    '''
+    parsed = urlparse(url)
+    host = parsed.hostname or ''
+    if host != 'linkedin.com' and not host.endswith('.linkedin.com'):
+        return False
+    return not parsed.path.startswith(LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES)
+
+
 async def check_linkedin_session(call: BrowserCall) -> SessionCheck:
     '''Open the feed once and decide whether the profile is signed in. Raises when the page cannot be read.'''
     await call('browser_navigate', {'url': LINKEDIN_SESSION_CHECK_URL})

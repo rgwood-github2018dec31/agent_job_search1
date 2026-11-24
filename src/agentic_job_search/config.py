@@ -952,6 +952,15 @@ LINKEDIN_SIGNED_OUT_LOGIN_PATH_PREFIXES = ('/uas/login', '/login', '/authwall', 
 # Check LinkedIn Session (2026-11-23): opened once per run before any search. A signed-in member
 # stays on it, and a signed-out profile is redirected to one of the paths above.
 LINKEDIN_SESSION_CHECK_URL = 'https://www.linkedin.com/feed/'
+# Sign In to LinkedIn (scripts/sign_in_linkedin.py): the profile is opened only through Playwright, never a
+# Chromium started by hand. Playwright's browser keeps cookies under a mock keychain, so a login saved by a
+# hand-started browser is unreadable to the agent (2026-11-23).
+LINKEDIN_SIGN_IN_COMMAND = 'uv run python scripts/sign_in_linkedin.py'
+LINKEDIN_SIGN_IN_URL = 'https://www.linkedin.com/login'
+LINKEDIN_SIGN_IN_POLL_SECONDS = 5
+LINKEDIN_SIGN_IN_WAIT_MAX_SECONDS = 20 * SECONDS_PER_MINUTE
+# Time left after the feed appears for the browser to write its cookies before it is closed.
+LINKEDIN_SIGN_IN_SETTLE_SECONDS = 10
 # Telegram's sendMessage limit. A longer message is sent in numbered parts (Send Pipeline Notification).
 TELEGRAM_MESSAGE_MAX_CHARS = 4096
 # Room kept in each part for its "(i/n) " label.

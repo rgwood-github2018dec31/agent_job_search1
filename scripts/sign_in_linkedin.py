@@ -26,6 +26,7 @@ from agentic_job_search.config import (
     LINKEDIN_SIGN_IN_SETTLE_SECONDS,
     LINKEDIN_SIGN_IN_URL,
     LINKEDIN_SIGN_IN_WAIT_MAX_SECONDS,
+    SECONDS_PER_MINUTE,
 )
 from agentic_job_search.linkedin_session import check_linkedin_session, is_past_login
 from agentic_job_search.scrape_openrouter import parse_evaluate_result
@@ -44,7 +45,7 @@ async def wait_for_sign_in() -> bool:
         async with mcp_session(browser.mcp['url']) as call:
             await call('browser_navigate', {'url': LINKEDIN_SIGN_IN_URL})
             logger.info(f'Login page open in the agent profile; sign in there '
-                        f'(waiting up to {LINKEDIN_SIGN_IN_WAIT_MAX_SECONDS // 60} min)')
+                        f'(waiting up to {LINKEDIN_SIGN_IN_WAIT_MAX_SECONDS // SECONDS_PER_MINUTE} min)')
             deadline = time.monotonic() + LINKEDIN_SIGN_IN_WAIT_MAX_SECONDS
             while time.monotonic() < deadline:
                 await asyncio.sleep(LINKEDIN_SIGN_IN_POLL_SECONDS)
@@ -55,7 +56,7 @@ async def wait_for_sign_in() -> bool:
                                 f'for the cookies to be saved, then closing the browser')
                     await asyncio.sleep(LINKEDIN_SIGN_IN_SETTLE_SECONDS)
                     return True
-            logger.error(f'Timed out after {LINKEDIN_SIGN_IN_WAIT_MAX_SECONDS // 60} min without a sign-in')
+            logger.error(f'Timed out after {LINKEDIN_SIGN_IN_WAIT_MAX_SECONDS // SECONDS_PER_MINUTE} min without a sign-in')
             return False
     finally:
         await browser.stop()

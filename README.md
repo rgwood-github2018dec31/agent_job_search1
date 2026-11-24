@@ -15,7 +15,13 @@ TELEGRAM_BOT_TOKEN=<your bot token>
 TELEGRAM_CHAT_ID=<your chat ID>
 ```
 
-The agent uses a persistent browser profile at `~/.linkedin-agent-profile/` so your LinkedIn session is remembered between runs. Log in on first launch when the browser opens.
+The agent uses a persistent browser profile at `~/.linkedin-agent-profile/` so your LinkedIn session is remembered between runs. To sign in (first time, or when a run alerts `LINKEDIN SIGNED OUT`):
+
+```bash
+uv run python scripts/sign_in_linkedin.py
+```
+
+It opens the profile on the LinkedIn login page and closes the window by itself once you reach your feed. Always sign in this way, never by opening the profile in a Chromium you start yourself. Playwright's browser stores cookies under its own mock keychain, so a login saved by any other browser can't be read by the agent.
 
 Place your resume in `run_dir/`, named `*-resume-*.md` or `*-resume-*.pdf`. A resume labelled `cat-resume-*` in your downloads folder (the `save_dir` preference) is picked up as well. Whichever readable file (`.pdf` or `.md`) was modified most recently is the one used; a resume in any other format is ignored with a warning.
 
