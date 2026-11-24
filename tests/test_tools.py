@@ -1700,6 +1700,19 @@ def test_derive_education_requirement_equivalent_experience_with_words_between_s
     assert agent.derive_education_requirement(still_hard) == 'phd'
 
 
+def test_derive_education_requirement_a_bs_with_experience_is_a_bachelors_bar():
+    '''Job 4484289589 (2026-11-24): a master's "or 5+ years ... post-BS" was rejected for a master's.'''
+    extract = _make_extract(description=(
+        "- Education: Master's degree (or foreign equivalent) in Statistics, Economics, Mathematics, or a "
+        "highly related quantitative field.\n"
+        "- Experience: 5+ years of hands-on DS experience post-BS, or 3+ years of post-Graduate Degree "
+        "hands-on DS experience"))
+    assert agent.derive_education_requirement(extract) == ''
+    assert agent.derive_education_requirement(_make_extract(description='A B.S. or M.S. in CS is required.')) == ''
+    hard = _make_extract(description="A Master's degree in Machine Learning is required. We use AWS and GCP.")
+    assert agent.derive_education_requirement(hard) == 'master'
+
+
 async def test_apply_hard_rules_derives_degree_from_description():
     extract = _make_extract(description='Build agents in Python. A PhD in AI is required.')
     reason = await agent.apply_hard_rules(_make_candidate(), extract)

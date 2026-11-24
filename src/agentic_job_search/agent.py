@@ -96,6 +96,7 @@ from agentic_job_search.config import (
     LINKEDIN_PAGE_READER_SIGNED_IN_BROWSER,
     LINKEDIN_PAGE_READER_SIGNED_OUT_HTTP_GET,
     LINKEDIN_PAGE_READERS,
+    LINKEDIN_SIGN_IN_COMMAND,
     LISTING_ESTIMATE_HISTORY_RUNS,
     LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
@@ -3125,7 +3126,7 @@ _DEGREE_REQUIRED_RE = re.compile(
 _DEGREE_SOFTENER_RE = re.compile(
     r"\bpreferr?ed\b|\bpreferabl[ey]\b|\bor\s+equivalent\b|\bequivalent\s+(?:\w+\s+){0,3}experience\b"
     r"|\bnice\s+to\s+have\b|\ba\s+plus\b|\bbonus\b|\bideally\b|\bdesirable\b|\badvantage\b"
-    r"|\bbachelor'?s?\b|\bb\.?sc\.?\b",
+    r"|\bbachelor'?s?\b|\bb\.?sc?\.?\b",
     re.IGNORECASE,
 )
 # Negations are as disqualifying as softeners: postings routinely advertise "No PhD required" as a
@@ -3141,8 +3142,10 @@ _DEGREE_NEGATION_RE = re.compile(
 # A bachelor's degree or equivalent experience stated as the bar: no advanced degree is then a hard gate.
 # Up to three words may sit between 'equivalent' and 'experience' (2026-11-24): Jobgether 4492120408
 # accepted "equivalent practical research experience" in place of a PhD and was rejected for one.
+# 'BS' / 'B.S.' count as a bachelor's (2026-11-24): job 4484289589 took "5+ years ... post-BS" in
+# place of its master's and was rejected for one.
 _BACHELOR_OR_EQUIVALENT_RE = re.compile(
-    r"\bbachelor'?s?\b|\bb\.?sc\.?\b|\bequivalent\s+(?:\w+\s+){0,3}experience\b",
+    r"\bbachelor'?s?\b|\bb\.?sc?\.?\b|\bequivalent\s+(?:\w+\s+){0,3}experience\b",
     re.IGNORECASE,
 )
 # Split on sentence-final periods only (followed by whitespace or end), so 'Ph.D.' survives intact.
@@ -6197,11 +6200,11 @@ async def _linkedin_session_ok(browser: BrowserServer, stage_stats: dict, start_
         return True
     if check.signed_in:
         return True
-    console.print(f'[red]Error: LinkedIn is signed out ({check.reason}). Log in to the profile again.[/red]')
+    console.print(f'[red]Error: LinkedIn is signed out ({check.reason}). Sign in again: {LINKEDIN_SIGN_IN_COMMAND}[/red]')
     logger.error(f'LinkedIn SIGNED OUT at {check.url} ({check.reason}): run stopped before any search')
     await _send_pipeline_notification(
         'Job search run FAILED\n'
-        f'⚠️ LINKEDIN SIGNED OUT — log in to the profile again ({BROWSER_PROFILE_DIR})\n'
+        f'⚠️ LINKEDIN SIGNED OUT — sign in again: {LINKEDIN_SIGN_IN_COMMAND}\n'
         f'• Seen: {check.url} ({check.reason})\n'
         '• No search was run.')
     log_run_cost({
