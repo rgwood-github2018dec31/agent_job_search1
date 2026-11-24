@@ -107,8 +107,23 @@ class CompanyOverlapFileError(RuntimeError):
     '''The hand-editable verdicts file exists and cannot be used; it is never overwritten then.'''
 
 
-# Counted per run for the funnel: overlap_skipped, overlap_passed, overlap_failed.
+# Counted per run for the funnel: overlap_skipped and overlap_passed per card asked about, overlap_failed per
+# question that got no verdict (its card is passed too). Cleared by reset_counts at the start of a run.
 counts: Counter = Counter()
+
+
+def reset_counts() -> None:
+    counts.clear()
+
+
+def summary_line(overlap_counts: dict) -> str:
+    '''One line on the run's overlap step for the Stage 1 summary and the run summary; '' when no card was asked.'''
+    skipped, passed = overlap_counts.get('overlap_skipped', 0), overlap_counts.get('overlap_passed', 0)
+    failed = overlap_counts.get('overlap_failed', 0)
+    if not skipped + passed:
+        return ''
+    return (f'Company overlap: {skipped + passed} card(s) asked, {skipped} skipped as already applied, '
+            f'{passed} passed to Stage 2' + (f', {failed} question(s) failed (their cards passed)' if failed else ''))
 
 
 def overlap_kind(name: str, listed: str) -> str:

@@ -4270,6 +4270,7 @@ def test_find_run_processes_requires_project_marker(monkeypatch):
         '  111 /usr/bin/python3 /some/other/project/main.py\n'
         '  222 /path/agent_job_search1/.venv/bin/job-search -n\n'
         '  333 grep job-search\n'
+    monkeypatch.setattr(tools, 'find_run_processes', lambda: [])   # a real run on this machine is not this test's
     )
 
     class FakeCompleted:

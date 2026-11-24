@@ -1,6 +1,7 @@
 """Applied Organization records (Stage 1's skip list) and Search Organization (Stage 2's warning), 2026-11-19."""
 
 import json
+import logging
 
 import jsonschema
 import pytest
@@ -385,6 +386,52 @@ async def test_a_relative_whose_quote_joins_two_table_cells_is_kept_on_its_name_
     records = await applied_organizations.build_records({'HXLTech': 'h.pdf'}, {}, {})
     assert 'HXL Technologies Austria' in records['HXLTech'].names
     assert 'HXL Japan' not in records['HXLTech'].names
+
+
+async def test_a_quote_across_table_cells_and_headings_is_found_piece_by_piece(monkeypatch, fake_search, caplog):
+    company_domain._load_cache()['by_name']['KLAM'] = {'schema': 1, 'source': 'none'}
+    fake_search['results'] = [{'title': 'KLAM 10-K exhibit 21', 'url': 'https://www.sec.gov/klam-ex21.htm',
+                               'content': 'SUBSIDIARIES OF THE REGISTRANT\n\n| Name | Country |\n|---|---|\n'
+                                          '| KLAM Systems Albania SHPK | Albania |\n\nGlobal Locations\n\n'
+                                          '### KLAM Systems India Pvt. Ltd.\nNew Delhi'}]
+    monkeypatch.setattr(applied_organizations, 'chat_openrouter_tool', _FakeModel({'related': [
+        {'name': 'KLAM Systems Albania SHPK', 'relation': 'subsidiary', 'result': 1,
+         'quote': 'SUBSIDIARIES OF THE REGISTRANT | KLAM Systems Albania SHPK | Albania'},
+        {'name': 'KLAM Systems India Pvt. Ltd.', 'relation': 'subsidiary', 'result': 1,
+         'quote': 'Global Locations ... ### KLAM Systems India Pvt. Ltd. New Delhi'},
+        {'name': 'KLAM Systems Peru', 'relation': 'subsidiary', 'result': 1,
+         'quote': 'SUBSIDIARIES OF THE REGISTRANT | KLAM Systems Peru | Peru'},   # a piece in no result
+    ]}))
+    with caplog.at_level(logging.WARNING):
+        records = await applied_organizations.build_records({'KLAM': 'k.pdf'}, {}, {})
+    names = records['KLAM'].names
+    assert any('Albania' in n for n in names) and any('India' in n for n in names)
+    assert not any('Peru' in n for n in names)
+    rejected = [r.getMessage() for r in caplog.records if 'Hallucination rejected' in r.getMessage()]
+    assert len(rejected) == 1 and 'Peru' in rejected[0]
+
+
+async def test_a_misspelled_relative_is_kept_as_its_cited_result_spells_it(monkeypatch, fake_search):
+    company_domain._load_cache()['by_name']['KLAM'] = {'schema': 1, 'source': 'none'}
+    fake_search['results'] = [{'title': 'KLAM subsidiaries', 'url': 'https://www.sec.gov/klam-ex21.htm',
+                               'content': 'KLAM subsidiaries: | Maravir Technologies LLC | Delaware, USA |\n'
+                                          '| Moxa SA | Uruguay |'}]
+    monkeypatch.setattr(applied_organizations, 'chat_openrouter_tool', _FakeModel({'related': [
+        {'name': 'Maraavir Technologies LLC', 'relation': 'subsidiary', 'result': 1,
+         'quote': 'KLAM subsidiaries: | Maravir Technologies LLC | Delaware, USA'},
+        {'name': 'Moxi SA', 'relation': 'subsidiary', 'result': 1, 'quote': 'Moxi SA'},   # too short to respell
+    ]}))
+    names = (await applied_organizations.build_records({'KLAM': 'k.pdf'}, {}, {}))['KLAM'].names
+    assert any(n.startswith('Maravir Technologies') for n in names)
+    assert not any('Maraavir' in n for n in names)
+    assert not any(n.startswith(('Moxi', 'Moxa')) for n in names)
+
+
+def test_within_edits_counts_changed_added_and_dropped_letters():
+    assert applied_organizations._within_edits('maravir s.a.', 'maraavir s.a.', 1)
+    assert applied_organizations._within_edits('maravir s.a.', 'marevir s.a.', 1)
+    assert not applied_organizations._within_edits('maravir s.a.', 'marevar s.a.', 1)
+    assert not applied_organizations._within_edits('acme', 'acme systems', 1)
 
 
 async def test_a_name_kept_from_one_result_lets_another_result_name_the_organization(monkeypatch, fake_search):

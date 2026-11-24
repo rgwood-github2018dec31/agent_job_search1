@@ -51,6 +51,8 @@ from agentic_job_search import company_domain, evidence, web_search
 from agentic_job_search.config import (
     APPLIED_ORGANIZATION_SCHEMA_VERSION,
     APPLIED_RECOMMENDATION_PAGE_READS,
+    APPLIED_RELATIVE_RESPELLING_MAX_EDITS,
+    APPLIED_RELATIVE_RESPELLING_MIN_CHARS,
     APPLIED_WEB_SEARCH_PAGE_CANDIDATES,
     COMPANY_IDENTITY_LOOKUP_CONCURRENCY,
     MODEL_NAME_RELATED_ORGANIZATIONS,
@@ -561,6 +563,53 @@ def _results_text(results: list[dict]) -> str:
                        for i, r in enumerate(results, start=1))
 
 
+# 2026-11-20: on a table of subsidiaries or offices the model quotes across cells and headings ("SUBSIDIARIES
+# OF THE REGISTRANT | Acme Albania SHPK | Albania", "Global Locations | Acme ... ### Acme Systems India"),
+# words in no result in that order. A cell border or a heading marker in a quote is read as an elision, so
+# each piece must still be in the results, in order (evidence.find_quote).
+_QUOTE_TABLE_JOIN_RE = re.compile(r'\s*(?:\|+|(?<!\S)#{1,6}(?=\s))\s*')
+_ELISION = ' … '
+_WORD_RUN_RE = re.compile(r'\S+')
+# Cell borders and list punctuation at a run's edges, not part of a name; a name's own final '.' stays.
+_RESPELLING_EDGE_CHARS = ' |*#,;:'
+
+
+def _quote_across_cells(quote: str) -> str:
+    '''`quote` with each table-cell border and heading marker read as an elision.'''
+    return _QUOTE_TABLE_JOIN_RE.sub(_ELISION, quote).strip()
+
+
+def _within_edits(a: str, b: str, max_edits: int) -> bool:
+    '''True when `a` becomes `b` with at most `max_edits` letters changed, added or dropped.'''
+    if abs(len(a) - len(b)) > max_edits:
+        return False
+    previous = list(range(len(b) + 1))
+    for i, letter in enumerate(a, start=1):
+        current = [i] + [0] * len(b)
+        for j, other in enumerate(b, start=1):
+            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (letter != other))
+        if min(current) > max_edits:
+            return False
+        previous = current
+    return previous[-1] <= max_edits
+
+
+def _respelled_in(name: str, text: str) -> str | None:
+    '''The words of `text` that spell `name` a little differently (APPLIED_RELATIVE_RESPELLING_MAX_EDITS), as
+    `text` writes them, or None. Only a name of APPLIED_RELATIVE_RESPELLING_MIN_CHARS or more is respelled.'''
+    target = evidence.normalize_for_match(name).strip(_RESPELLING_EDGE_CHARS)
+    if len(target) < APPLIED_RELATIVE_RESPELLING_MIN_CHARS:
+        return None
+    width = len(target.split())
+    words = list(_WORD_RUN_RE.finditer(text))
+    for i in range(len(words) - width + 1):
+        run = text[words[i].start():words[i + width - 1].end()].strip(_RESPELLING_EDGE_CHARS)
+        folded = evidence.normalize_for_match(run).strip(_RESPELLING_EDGE_CHARS)
+        if folded and _within_edits(folded, target, APPLIED_RELATIVE_RESPELLING_MAX_EDITS):
+            return run
+    return None
+
+
 async def _add_web_search_relatives(builder: _RecordBuilder, stage_stats: dict) -> dict:
     '''Search once for the organization's relatives and add the ones a result names; the search's note.'''
     key = builder.key
@@ -592,7 +641,7 @@ async def _add_web_search_relatives(builder: _RecordBuilder, stage_stats: dict) 
     note['model'] = reply.model
 
     candidates = [r for r in arguments.get('related') or [] if isinstance(r, dict)]
-    claims = [evidence.Claim(f'related{i}', str(r.get('name') or ''), str(r.get('quote') or ''))
+    claims = [evidence.Claim(f'related{i}', str(r.get('name') or ''), _quote_across_cells(str(r.get('quote') or '')))
               for i, r in enumerate(candidates)]
     verdicts = await evidence.verify_claims('applied_organization_relatives', key, claims, source,
                                             f'web search results for {query!r}', stage_stats, use_llm=False)
@@ -620,8 +669,14 @@ async def _add_web_search_relatives(builder: _RecordBuilder, stage_stats: dict) 
             # "HXL Technologies Austria GmbH_English / … _Local"), which is in no result as written, and
             # dropped every true relative. The name itself written in the result it cites is the citation;
             # an underscore joins the cells' labels to it ("GmbH_English"), read as a space here.
-            if not quote and name and evidence.find_quote(name, result_text.replace('_', ' ')) is not None:
-                quote = name
+            cells = result_text.replace('_', ' ')
+            respelled_from = ''
+            if not quote and name:
+                if evidence.find_quote(name, cells) is not None:
+                    quote = name
+                elif (respelled := _respelled_in(name, cells)) is not None:
+                    # 2026-11-20: "Maraavir S.A." for the filing's "Maravir S.A."; the result's spelling is kept.
+                    respelled_from, name, quote = name, respelled, respelled
             if not name:
                 why_not[i] = 'no name'
             elif result is None:
@@ -634,6 +689,9 @@ async def _add_web_search_relatives(builder: _RecordBuilder, stage_stats: dict) 
                 why_not[i] = ''
                 builder.add_name(name, SOURCE_WEB_SEARCH, relation=related.get('relation'), url=result.get('url'),
                                  quote=quote)
+                if respelled_from:
+                    logger.info(f'Applied organizations: {key!r}: related {respelled_from!r} kept as {name!r}, '
+                                f'the spelling of the result it cites')
                 kept.append(name)
                 progress = True
     for i, reason in why_not.items():

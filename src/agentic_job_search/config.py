@@ -971,6 +971,12 @@ APPLIED_RECOMMENDATION_PAGE_READS = 2
 # Company pages read, from the results of one web search for an applied company's name, when neither its
 # records nor its recommended jobs link it to a LinkedIn page (Build Applied Organization Record).
 APPLIED_WEB_SEARCH_PAGE_CANDIDATES = 3
+# A relative's name the model misspelled is taken from its cited result when the result spells it with at
+# most this many letters changed, added or dropped (2026-11-20: "Maraavir S.A." for the filing's "Maravir
+# S.A."), and only for a name at least APPLIED_RELATIVE_RESPELLING_MIN_CHARS long: a short name one
+# letter away ("XO" / "XY") is another name, not a typo.
+APPLIED_RELATIVE_RESPELLING_MAX_EDITS = 1
+APPLIED_RELATIVE_RESPELLING_MIN_CHARS = 8
 # The tool server's web_search (Search the Web): engine, results per search, and the wait for one.
 WEB_SEARCH_ENGINE = 'exa'
 WEB_SEARCH_MAX_RESULTS = 5

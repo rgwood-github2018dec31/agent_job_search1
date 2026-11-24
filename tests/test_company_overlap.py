@@ -2,7 +2,7 @@
 
 import pytest
 import yaml
-from agentic_job_search import applied_organizations, company_overlap
+from agentic_job_search import agent, applied_organizations, company_overlap
 from agentic_job_search import tools_generic as tools
 from agentic_job_search.applied_organizations import AppliedOrganization
 from fakes import chat_reply
@@ -97,3 +97,16 @@ async def test_an_unreadable_verdicts_file_is_never_overwritten(monkeypatch, app
     assert await tools.company_matches_applied('Tessel') is None
     assert company_overlap.COMPANY_OVERLAP_VERDICTS_PATH.read_text(encoding='utf-8') == '{not: [yaml'
     assert 'move the file aside' in caplog.text
+
+
+def test_the_summary_line_counts_cards_and_failed_questions():
+    assert company_overlap.summary_line({}) == ''
+    line = company_overlap.summary_line({'overlap_skipped': 1, 'overlap_passed': 2, 'overlap_failed': 1})
+    assert '3 card(s) asked' in line and '1 skipped' in line and '2 passed' in line and '1 question(s) failed' in line
+    assert 'failed' not in company_overlap.summary_line({'overlap_passed': 1})
+
+
+def test_a_failed_overlap_question_is_a_run_health_alert():
+    alerts = agent.assess_run_health({'company_overlap': {'overlap_passed': 2, 'overlap_failed': 1}})
+    assert any(a.startswith('COMPANY OVERLAP FAILED 1 time(s)') for a in alerts)
+    assert not any('COMPANY OVERLAP' in a for a in agent.assess_run_health({'company_overlap': {'overlap_passed': 2}}))

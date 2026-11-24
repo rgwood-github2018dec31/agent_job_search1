@@ -56,6 +56,7 @@ import agentic_job_search.preferences as preferences
 import agentic_job_search.tools_generic as tools_module
 from agentic_job_search import (
     company_domain,
+    company_overlap,
     endpoint_pin,
     evidence,
     fx,
@@ -1969,6 +1970,11 @@ def assess_run_health(funnel: dict) -> list[str]:
                 f'REGION OVERLAP {overlap:.0%} on "{query}" — the location filter is not '
                 'separating regions, so half the searches are duplicates'
             )
+
+    # A failed overlap question passes its card on (fail open); the user should still see it happened.
+    if failed := (funnel.get('company_overlap') or {}).get('overlap_failed', 0):
+        alerts.append(f'COMPANY OVERLAP FAILED {failed} time(s): those cards went on to Stage 2 unchecked against '
+                      'the overlapping applied organization; see "Company overlap: could not decide" in the log')
 
     # 3. Saturation. Measured against DISTINCT listings; the call count double-counts a job seen
     #    in two regions and would flatter the ratio.
@@ -6168,6 +6174,7 @@ async def _linkedin_session_ok(browser: BrowserServer, stage_stats: dict, start_
     })
     return False
 
+    company_overlap.reset_counts()
 
 async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0,
                               job_audit_enabled: bool = JOB_AUDIT_ENABLED, job_audit_job_id: str | None = None) -> None:
@@ -6293,6 +6300,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 'listings_seen': sum(check_status_counts.values()),
                 'listings_distinct': _listings_distinct(),
                 'region_overlap': tools_module.region_overlap_report(),
+        if overlap_line := company_overlap.summary_line(company_overlap.counts):
+            logger.info(f'Stage 1: {overlap_line}')
+            console.print(f'[dim]  {overlap_line}[/dim]')
                 'ui_alerts': list(tools_module._ui_alerts),
                 'check_status': check_status_counts,
                 'check_status_per_query': dict(tools_module._check_status_per_query),
@@ -6450,6 +6460,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     ]
     stats_lines += audit_summary_lines(funnel, audit)
     if block := health_alert_block(health_alerts):
+        'company_overlap': dict(company_overlap.counts),
         stats_lines.insert(1, block)
         if history := recent_yield_history():
             stats_lines.append('• Recent yield:\n' + '\n'.join(f'  - {h}' for h in history))
@@ -6487,6 +6498,8 @@ def read_job_ids_file(path: Path) -> list[dict]:
             raise ValueError(f'{path}:{line_number}: expected a numeric LinkedIn job id first, got {line!r}')
         if job_id in seen:
             continue
+    if overlap_line := company_overlap.summary_line(funnel_summary['company_overlap']):
+        stats_lines.append(f'• {overlap_line}')
         seen.add(job_id)
         title = fields[1] if len(fields) > 1 else ''
         company = fields[2] if len(fields) > 2 else ''
