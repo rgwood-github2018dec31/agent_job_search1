@@ -1688,6 +1688,18 @@ def test_derive_education_requirement_a_stated_bachelors_bar_is_never_an_advance
     assert agent.derive_education_requirement(extract) == ''
 
 
+def test_derive_education_requirement_equivalent_experience_with_words_between_softens():
+    '''Jobgether 4492120408 (2026-11-23): "equivalent practical research experience" took a PhD's place.'''
+    extract = _make_extract(description=(
+        '- Education: PhD in Machine Learning, Computer Science, or a related discipline, or equivalent '
+        'practical research experience.\n'
+        '- Lead-level requirements: For Lead positions, at least three years of research experience '
+        'after completing a PhD.'))
+    assert agent.derive_education_requirement(extract) == ''
+    still_hard = _make_extract(description='PhD in Machine Learning is required. Equivalent tooling is used.')
+    assert agent.derive_education_requirement(still_hard) == 'phd'
+
+
 async def test_apply_hard_rules_derives_degree_from_description():
     extract = _make_extract(description='Build agents in Python. A PhD in AI is required.')
     reason = await agent.apply_hard_rules(_make_candidate(), extract)
@@ -3267,12 +3279,20 @@ def _scrape(client, queries, stats=None):
     return agent.run_scraper(agent._anthropic_run_pass(client, stats), queries, stats)
 
 
+def _report_every_region(query):
+    for region in agent._expected_regions():
+        tools._search_reports.append({'query': query, 'region': region})
+
+
 class _FakeScraperClient:
     '''Records each query() call so we can assert on request boundaries.'''
 
-    def __init__(self, listings_per_query=None):
+    def __init__(self, listings_per_query=None, unreported_queries=()):
         self.requests = []
         self.listings_per_query = listings_per_query or {}
+        # A query that harvests reports every configured region, as a working scraper does, unless
+        # named here: then its regions stay unverified and the region recovery pass runs.
+        self.unreported_queries = set(unreported_queries)
 
     async def query(self, instruction):
         self.requests.append(instruction)
@@ -3287,6 +3307,8 @@ class _FakeScraperClient:
                     tools._check_status_counts[key] = 1
                     tools._distinct_listing_ids.add(f'linkedin/{name}-{i}')
                     tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'{name}-{i}')
+                if count and name not in self.unreported_queries:
+                    _report_every_region(name)
                 break
 
     async def receive_response(self):
@@ -3347,6 +3369,7 @@ async def test_run_scraper_does_not_retry_a_query_whose_listings_earlier_queries
                 tools._check_status_counts[f'{len(self.requests)}-{i}'] = 1
                 tools._distinct_listing_ids.add(f'linkedin/shared-{i}')
                 tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'shared-{i}')
+            _report_every_region(tools._current_query or '')
 
     client = _OverlappingClient()
     await _scrape(client, ['First', 'Second'])
@@ -3595,6 +3618,7 @@ async def test_run_scraper_records_per_query_check_status(monkeypatch):
                 for i in range(28):
                     tools._distinct_listing_ids.add(f'linkedin/saturated-{i}')
                     tools._search_ids.setdefault((tools._current_query or '', ''), set()).add(f'saturated-{i}')
+                _report_every_region('Saturated')
 
         async def receive_response(self):
             return
@@ -4246,6 +4270,7 @@ def test_force_overrides_active_lock(tmp_path, monkeypatch):
 
 def test_describe_run_status_both_states(tmp_path, monkeypatch):
     lock = tmp_path / 'lock.json'
+    monkeypatch.setattr(tools, 'find_run_processes', lambda: [])   # a real run on this machine is not this test's
     assert 'No job search run is currently active' in tools.describe_run_status(lock)
 
     tools.acquire_run_lock('non-interactive', lock_path=lock)
@@ -4270,7 +4295,6 @@ def test_find_run_processes_requires_project_marker(monkeypatch):
         '  111 /usr/bin/python3 /some/other/project/main.py\n'
         '  222 /path/agent_job_search1/.venv/bin/job-search -n\n'
         '  333 grep job-search\n'
-    monkeypatch.setattr(tools, 'find_run_processes', lambda: [])   # a real run on this machine is not this test's
     )
 
     class FakeCompleted:
@@ -9084,12 +9108,49 @@ async def test_a_region_that_was_never_verified_is_reported(monkeypatch):
     monkeypatch.setattr(tools, '_search_reports', [{'query': 'Alpha, remote', 'region': 'Testland'}])
 
     healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
-    await _scrape(_FakeScraperClient({'Alpha': healthy}), ['Alpha'])
+    client = _FakeScraperClient({'Alpha': healthy}, unreported_queries={'Alpha'})
+    await _scrape(client, ['Alpha'])
 
+    assert len(client.requests) == 2, 'one region recovery pass, and no more'
     unverified = [a for a in tools._ui_alerts if a['kind'] == 'unverified_search']
-    assert unverified, 'a region with no report_search must raise an alert'
+    assert unverified, 'a region still unverified after its recovery pass must raise an alert'
     assert 'Test Union' in unverified[0]['region']
     assert 'Testland' not in unverified[0]['region'], 'the verified region must not be flagged'
+
+
+async def test_a_region_left_unverified_gets_one_recovery_pass_for_that_region(monkeypatch):
+    '''2026-11-23: "Staff AI Engineer" harvested Canada, hit the iteration cap setting up the EU
+    search, and the EU was never searched; only a low-yield query had a second pass. Same in 4 of
+    the 5 runs over 2026-11-17..23.'''
+    for name in ('_check_status_counts', '_search_ids', '_candidates_per_query', '_queries_searched',
+                 '_check_status_per_query'):
+        monkeypatch.setattr(tools, name, {})
+    for name in ('_ui_alerts', '_candidates'):
+        monkeypatch.setattr(tools, name, [])
+    monkeypatch.setattr(tools, '_distinct_listing_ids', set())
+    monkeypatch.setattr(tools, '_search_reports', [{'query': 'Alpha', 'region': 'Testland'}])
+    healthy = agent.SCRAPER_MIN_LISTINGS_PER_QUERY + 20
+
+    class _SecondRegionClient(_FakeScraperClient):
+        async def query(self, instruction):
+            self.requests.append(instruction)
+            if len(self.requests) == 1:
+                for i in range(healthy):
+                    tools._check_status_counts[f'alpha-{i}'] = 1
+                    tools._distinct_listing_ids.add(f'linkedin/alpha-{i}')
+                    tools._search_ids.setdefault(('Alpha', ''), set()).add(f'alpha-{i}')
+            else:
+                tools._search_reports.append({'query': 'Alpha', 'region': 'Test Union'})
+
+    client = _SecondRegionClient()
+    await _scrape(client, ['Alpha'])
+
+    assert len(client.requests) == 2
+    retry = client.requests[1]
+    assert 'Test Union' in retry and 'Testland' not in retry, 'the retry names the missing region only'
+    assert 'never click' in retry.lower()
+    assert not [a for a in tools._ui_alerts if a['kind'] == 'unverified_search'], \
+        'a region the recovery pass verified raises no alert'
 
 
 async def test_all_regions_verified_raises_no_coverage_alert(monkeypatch):

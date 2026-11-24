@@ -2328,7 +2328,8 @@ async def run_scraper(run_pass: Callable[[str], Awaitable[int | None]], queries:
       against the shared browser context, which looks exactly like an auth wall in the logs.
 
     Discovery resilience: if a query inspects fewer than SCRAPER_MIN_LISTINGS_PER_QUERY
-    listings, retry it once. Only a query still below SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY after
+    listings, retry it once; otherwise, if a configured region went unverified (no report_search),
+    run one pass for that region alone. Only a query still below SCRAPER_ALERT_MIN_LISTINGS_PER_QUERY after
     that retry raises a `low_listings` alert, carrying the query's historical median. The two
     failure shapes need opposite corrections:
 
@@ -2357,6 +2358,23 @@ async def run_scraper(run_pass: Callable[[str], Awaitable[int | None]], queries:
     finally:
         # Still open here means an exception left the loop mid-query: write what the model said.
         narration.close(unfinished=True)
+
+
+def _expected_regions() -> list[str]:
+    '''The region names every query is searched in, in configured order.'''
+    return [
+        str(r.get('name') or r.get('linkedin_location', '')) for r in preferences.search_regions()
+    ] or ['(unfiltered)']
+
+
+def _unverified_regions(query: str) -> list[str]:
+    '''The configured regions with no report_search for `query` yet, in configured order.'''
+    expected_regions = _expected_regions()
+    reported = {
+        str(rec.get('region', '')) for rec in tools_module._search_reports
+        if _same_query(rec.get('query', ''), query)
+    }
+    return [r for r in expected_regions if r not in reported]
 
 
 async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]], queries: list[str],
@@ -2451,6 +2469,8 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
         query_seen = _query_distinct_count(query)
         first_pass_seen = query_seen
         recovered = query_seen < SCRAPER_MIN_LISTINGS_PER_QUERY
+        missing_after_first_pass = _unverified_regions(query)
+        retry_instruction = None
         if recovered:
             if query_seen == 0:
                 logger.warning(
@@ -2490,11 +2510,35 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
                     'return the identical list of jobs, the location filter is not applying — say '
                     'so explicitly rather than treating the query as exhausted.'
                 )
+        elif missing_after_first_pass:
+            # A first pass that harvested one region and ran out of iterations setting up the next
+            # left that region unsearched in 4 of 5 runs over 2026-11-17..23, and only the low-yield
+            # case had a second pass. Each pass has its own iteration budget (2026-11-24).
+            regions_text = ', '.join(missing_after_first_pass)
+            logger.warning(
+                f'Stage 1b: query "{query}" never verified {regions_text} on its first pass '
+                f'({query_seen} listing(s) inspected) — one recovery pass for that region only.'
+            )
+            retry_instruction = (
+                f'Continue the query "{query}": the search for {regions_text} was never verified '
+                '(no report_search for it), so it did not count. Run ONLY that search now; the other '
+                'region is done and must not be searched again.\n\n'
+                'Open a fresh results page on the query text alone, then re-click EVERY filter chip, '
+                'location included: the location chip keeps displaying the previous region after a '
+                'navigation while the filter is gone. Set location, date posted and experience level '
+                'by clicking their chips, never by putting geoId/f_TPR in the URL. Then call '
+                'run_ui_contract with the region name and do what it tells you, then '
+                'harvest_listings, then record_listings.\n\n'
+                'Never click anything in the results LIST: the card and its Dismiss button are the '
+                'same element to you, and a stray click destroys a real job. Stop immediately if a '
+                'challenge or verification page appears.'
+            )
+        if retry_instruction is not None:
             await _human_pause(SCRAPER_INTER_SEARCH_DELAY_SECONDS, 'the recovery pass')
             try:
                 await run_pass(retry_instruction)
             except Exception as ex:
-                logger.warning(f'Stage 1b: recovery pass for "{query}" failed: {ex}')
+                logger.warning(f'Stage 1b: recovery pass for "{query}" failed: {type(ex).__name__}: {ex}')
             delta = _check_status_delta(before)
             # Recompute BOTH the same way the first pass did (line ~1406). Reassigning `seen` to a
             # call count here produced the impossible "100 distinct listing(s) of 50 checked", and
@@ -2513,18 +2557,11 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
         #
         # Judged AFTER the recovery pass: on 2026-09-28 a first pass that never started raised
         # this for both regions, the recovery pass then verified both, and the alert stayed.
-        expected_regions = [
-            str(r.get('name') or r.get('linkedin_location', '')) for r in preferences.search_regions()
-        ] or ['(unfiltered)']
-        reported = {
-            str(rec.get('region', '')) for rec in tools_module._search_reports
-            if _same_query(rec.get('query', ''), query)
-        }
-        missing = [r for r in expected_regions if r not in reported]
+        missing = _unverified_regions(query)
         if missing:
             logger.warning(
                 f'Stage 1b: query "{query}" never verified {len(missing)} of '
-                f'{len(expected_regions)} region(s): {", ".join(missing)} — the search either did '
+                f'{len(_expected_regions())} region(s): {", ".join(missing)} — the search either did '
                 'not run or ran without its filters confirmed.'
             )
             tools_module._ui_alerts.append({
@@ -3086,7 +3123,7 @@ _DEGREE_REQUIRED_RE = re.compile(
 # several accepted options, or substitutable with experience. A bachelor's mention counts as a
 # softener because an advanced degree cannot be mandatory if a bachelor's is also acceptable.
 _DEGREE_SOFTENER_RE = re.compile(
-    r"\bpreferr?ed\b|\bpreferabl[ey]\b|\bor\s+equivalent\b|\bequivalent\s+(?:practical\s+)?experience\b"
+    r"\bpreferr?ed\b|\bpreferabl[ey]\b|\bor\s+equivalent\b|\bequivalent\s+(?:\w+\s+){0,3}experience\b"
     r"|\bnice\s+to\s+have\b|\ba\s+plus\b|\bbonus\b|\bideally\b|\bdesirable\b|\badvantage\b"
     r"|\bbachelor'?s?\b|\bb\.?sc\.?\b",
     re.IGNORECASE,
@@ -3102,8 +3139,10 @@ _DEGREE_NEGATION_RE = re.compile(
     re.IGNORECASE,
 )
 # A bachelor's degree or equivalent experience stated as the bar: no advanced degree is then a hard gate.
+# Up to three words may sit between 'equivalent' and 'experience' (2026-11-24): Jobgether 4492120408
+# accepted "equivalent practical research experience" in place of a PhD and was rejected for one.
 _BACHELOR_OR_EQUIVALENT_RE = re.compile(
-    r"\bbachelor'?s?\b|\bb\.?sc\.?\b|\bequivalent\s+(?:practical\s+|professional\s+|work\s+)?experience\b",
+    r"\bbachelor'?s?\b|\bb\.?sc\.?\b|\bequivalent\s+(?:\w+\s+){0,3}experience\b",
     re.IGNORECASE,
 )
 # Split on sentence-final periods only (followed by whitespace or end), so 'Ph.D.' survives intact.
@@ -6135,6 +6174,7 @@ def _reset_run_state() -> None:
     location.reset_countries_seen()
     fx.reset_run_state()
     evidence.reset_rejections()
+    company_overlap.reset_counts()
     reset_location_guesses()
     tools_module.prune_raw_postings()
 
@@ -6174,7 +6214,6 @@ async def _linkedin_session_ok(browser: BrowserServer, stage_stats: dict, start_
     })
     return False
 
-    company_overlap.reset_counts()
 
 async def run_non_interactive(browser_mode: str = 'headless', audit: bool = False, audit_opus: int = 0,
                               job_audit_enabled: bool = JOB_AUDIT_ENABLED, job_audit_job_id: str | None = None) -> None:
@@ -6261,6 +6300,9 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         console.print(f'\n[dim]Stage 1 complete: {len(candidates)} candidate(s) queued.[/dim]')
         for line in query_summary_lines:
             console.print(f'[dim]{line}[/dim]')
+        if overlap_line := company_overlap.summary_line(company_overlap.counts):
+            logger.info(f'Stage 1: {overlap_line}')
+            console.print(f'[dim]  {overlap_line}[/dim]')
         console.print()
 
         if not candidates:
@@ -6300,9 +6342,6 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
                 'listings_seen': sum(check_status_counts.values()),
                 'listings_distinct': _listings_distinct(),
                 'region_overlap': tools_module.region_overlap_report(),
-        if overlap_line := company_overlap.summary_line(company_overlap.counts):
-            logger.info(f'Stage 1: {overlap_line}')
-            console.print(f'[dim]  {overlap_line}[/dim]')
                 'ui_alerts': list(tools_module._ui_alerts),
                 'check_status': check_status_counts,
                 'check_status_per_query': dict(tools_module._check_status_per_query),
@@ -6421,6 +6460,7 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         'duplicate_listings': {rep: list(ids) for rep, ids in tools_module._duplicate_listings.items()},
         'candidates_queued': len(candidates),
         'scrape_per_query': dict(tools_module._scrape_per_query),
+        'company_overlap': dict(company_overlap.counts),
         **funnel,
     }
     logger.debug(f'Run funnel: {json.dumps(funnel_summary)}')
@@ -6458,9 +6498,10 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
         f'• Cost by stage:\n{stage_cost_lines}',
         f'• Total cost: ${total_cost:.4f}',
     ]
+    if overlap_line := company_overlap.summary_line(funnel_summary['company_overlap']):
+        stats_lines.append(f'• {overlap_line}')
     stats_lines += audit_summary_lines(funnel, audit)
     if block := health_alert_block(health_alerts):
-        'company_overlap': dict(company_overlap.counts),
         stats_lines.insert(1, block)
         if history := recent_yield_history():
             stats_lines.append('• Recent yield:\n' + '\n'.join(f'  - {h}' for h in history))
@@ -6498,8 +6539,6 @@ def read_job_ids_file(path: Path) -> list[dict]:
             raise ValueError(f'{path}:{line_number}: expected a numeric LinkedIn job id first, got {line!r}')
         if job_id in seen:
             continue
-    if overlap_line := company_overlap.summary_line(funnel_summary['company_overlap']):
-        stats_lines.append(f'• {overlap_line}')
         seen.add(job_id)
         title = fields[1] if len(fields) > 1 else ''
         company = fields[2] if len(fields) > 2 else ''
