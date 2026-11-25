@@ -139,6 +139,8 @@ python main.py -n --scraper-snapshot-prune off  # Show Stage 1b the whole snapsh
 uv run python scripts/compare_scraper_models.py  # Same Stage 1b queries with several scraper models (drives the account; no records); run_dir/replays/scraper-compare-*/report.md
 uv run python scripts/compare_scraper_models_offline.py  # One Stage 1b turn per local model on saved pages, no LinkedIn; run it before a live comparison
 python main.py --job-ids FILE  # Diagnostic: rate the listed LinkedIn job ids (job_id[<TAB>title<TAB>company]) into run_dir/replays/; no dedup records, no Telegram
+uv run python scripts/measure_search_coverage.py  # Measure Search Coverage: LinkedIn's job emails vs what the pipeline listed; replays misses (cents)
+uv run python scripts/measure_search_coverage.py --no-harvest --no-replay  # Re-measure the harvested emails, report only
 
 # Tests
 uv run pytest                          # Run all tests; each marked group self-skips if unavailable
@@ -194,6 +196,7 @@ src/agentic_job_search/
   cache_io.py                     # Fail-open load/save of the YAML-mapping caches (location, salary, salary_estimate, fx)
   tool_server.py                  # Wait Out Tool Server Outage: tells a down LLM tool server from a job's failure, polls until it is back
   system_sleep.py                 # Holds a no-idle-sleep assertion for the run; logs and alerts a sleep it could not stop
+  search_coverage.py              # Measure Search Coverage: harvest LinkedIn job emails (claude -p + Gmail), classify, replay misses
   shadow.py                       # Shadow Local Model: a local model answers every single-turn remote call too; pairs recorded with confidence
 scripts/
   sign_in_linkedin.py             # Sign In to LinkedIn: the profile opened visibly via Playwright; closes once signed in
@@ -210,6 +213,7 @@ scripts/
   local_field_probe.py            # Asks local or OpenRouter models one extract field at a time; compares models and the extractor's runs
   pin_replay_corpus.py            # Copies retained captures into run_dir/replay_corpus/, out of reach of pruning, for the replay scripts
   replay_location_model.py        # The Job Location model over every retained page, beside the pipeline's decision (costs ~$1 at --repeat 2)
+  measure_search_coverage.py      # Coverage check against LinkedIn's job emails (agent_meta1 starts it daily with --if-due)
   shadow_replay.py                # Answers a shadow recording's pending calls (or all, with another local model) into a complete copy
   shadow_report.py                # Local vs remote decision agreement per call site, by the local model's confidence
   replay_forced_tool_ab.py        # JSON in text vs a forced function call, rater and gate fields, on saved calls (costs cents)
@@ -224,6 +228,7 @@ tests/
   test_linkedin_session.py        # Session check, the signed-out run gate, Telegram message split
   test_evidence.py                # Citation matching, LLM relocation, rejection
   test_job_audit.py               # Job choice, render failure, report rendering (with reportlab)
+  test_search_coverage.py         # Alert email parsing, harvest stream, coverage buckets, replay choice, report
   test_job_path.py                # Job Path overlay, exits, aggregate (no reportlab)
   test_scraper_local.py           # Local scraper route: conversation translation, context guard, dispatch, no-record replay
   test_snapshot_prune_levels.py   # Prune Search Snapshot: what each level keeps, and that no card ref survives
@@ -261,6 +266,7 @@ run_dir/
   rating_inputs/                  # The rater's JOB_REQUIREMENTS.md, ideal-role profile (with provenance), instructions and system message, one file per md5
   replay_corpus/                  # Pinned copies of raw_postings captures ({date}/ .txt .html .rater_posting.txt); never pruned; the replay scripts prefer them
   shadow_calls/                   # Shadow Recordings: shadow-{run}.jsonl, one remote/local answer pair per single-turn call (--shadow-model)
+  search_coverage/                # Alert Jobs per harvest, harvest transcripts, harvested_threads.yaml, replayed_jobs.yaml, coverage-{date}.md
   replays/                        # --job-ids output (job-ids-{timestamp}/ with saved postings and the REPLAY_*_FILENAME files) and scripts/replay_evidence.py reports
 preferences.example.yaml          # Tracked, neutral template for run_dir/preferences.yaml
 ```

@@ -635,8 +635,13 @@ REPLAY_SUMMARY_FILENAME = 'summary.tsv'               # one row per requested jo
 # Harvest Alert Emails: a headless `claude -p` session holding only the Gmail read tools fetches
 # the emails; code parses the job links out of the raw tool results. The model only fetches.
 MODEL_NAME_COVERAGE_HARVEST = ANTHROPIC_MODEL_NAME_LOW
-COVERAGE_HARVEST_MAX_BUDGET_USD = 1.0       # passed to `claude -p --max-budget-usd`; ~$0.005 per 2 emails measured
+COVERAGE_HARVEST_MAX_BUDGET_USD = 1.0       # passed to `claude -p --max-budget-usd`; 16 emails cost $0.14 on 2026-11-25
 COVERAGE_HARVEST_TIMEOUT_SECONDS = 900
+# The claude.ai connectors load only from the user setting source, and in -p mode they can still be
+# missing from a session's tool list when it starts (measured 2026-11-25: one of four sessions). A
+# session whose init event lacks the Gmail tools is started again after a pause, this many times.
+COVERAGE_HARVEST_ATTEMPTS = 3
+COVERAGE_HARVEST_RETRY_WAIT_SECONDS = 15
 COVERAGE_ALERT_SENDERS = ('jobs-noreply@linkedin.com', 'jobalerts-noreply@linkedin.com')
 COVERAGE_GMAIL_SEARCH_PAGE_SIZE = 50        # the Gmail tool's maximum
 COVERAGE_WINDOW_DAYS = 8                    # emails measured: received within this many days
