@@ -1,6 +1,7 @@
 from http import HTTPStatus
 
 from utils_tools_n_agents_common.models import (
+    ANTHROPIC_MODEL_NAME_LOW,
     OPENROUTER_MODEL_NAME_DEFAULT_INTELLIGENCE,
     OPENROUTER_MODEL_NAME_SCRAPER,
 )
@@ -99,6 +100,7 @@ LLM_LOCAL_PURPOSE_REFERENCE_SUMMARY = 'reference-summary'
 LLM_LOCAL_PURPOSE_SHADOW = 'shadow-compare'
 LLM_LOCAL_PURPOSE_PDF_OCR = 'pdf-ocr'
 LLM_LOCAL_PURPOSE_PDF_CATEGORIZE = 'pdf-categorize'
+LLM_LOCAL_PURPOSE_SCRAPER = 'linkedin-scraper'
 
 # PDF OCR (2026-11-06). A PDF whose text layer is shorter than PDF_MIN_TEXT_CHARS is a scan or a
 # photo: IMG_5568_IMG_5572.pdf had 44 chars, was sent to a paid model every run, and every run the
@@ -479,7 +481,56 @@ MODEL_NAME_PAGE_SECTIONS = MODEL_NAME_SINGLE_TURN
 # for the same price reason. The win is specific to the flash tier. Pointing it at
 # an ANTHROPIC_MODEL_NAME_* const instead routes Stage 1b through the original
 # ClaudeSDKClient scraper, kept intact as the rollback path.
-MODEL_NAME_SCRAPER = OPENROUTER_MODEL_NAME_SCRAPER
+# 2026-11-25, the user's choice: Stage 1b runs on a local model, qwen3.6:35b-mlx (Ollama MLX,
+# nvfp4, 35B total / 3B active), at $0. Offline it made a valid, safe call on 6 of 6 turns on saved
+# search pages once snapshots were pruned to 'cards' (scripts/compare_scraper_models_offline.py;
+# unpruned it timed out on the page turn). Not yet measured on a live query. What the local model
+# cannot do falls to SCRAPER_REMOTE_MODEL below, not to the Anthropic scraper.
+MODEL_NAME_SCRAPER = 'qwen3.6:35b-mlx'
+# The OpenRouter scraper a local MODEL_NAME_SCRAPER hands over to: for the whole run when the local
+# model is not available at run start (Preflight Local Model), and for each query the local loop
+# failed. Its reasons are the DeepSeek paragraph above (~$0.06 per query, against Haiku's fallback).
+SCRAPER_REMOTE_MODEL = OPENROUTER_MODEL_NAME_SCRAPER
+# Run-scoped override for MODEL_NAME_SCRAPER (CLI --scraper-model, scripts/compare_scraper_models.py).
+# None keeps MODEL_NAME_SCRAPER. A local Ollama tag runs the same function-calling loop through
+# tools_llm_local instead of OpenRouter (2026-11-24, to compare local models on Stage 1b, the
+# costliest stage at ~$0.23 of a run). The mlx sidecar has no tool calling, so those names are refused.
+SCRAPER_MODEL_OVERRIDE: str | None = None
+# Context window asked of Ollama for a local scraper model. Ollama's default window is a few
+# thousand tokens, and it drops the oldest messages of a longer prompt without an error: on
+# 2026-11-24 Nex-N2.5-mini's 336K-char conversation lost its user message that way and failed in the
+# chat template ("No user query found"). 128K is gpt-oss:20b's maximum. The page-result window
+# below keeps a conversation far inside it; one that outgrows it still stops with an error.
+SCRAPER_LOCAL_NUM_CTX = 131_072
+# Characters per token assumed when checking a local scraper prompt against SCRAPER_LOCAL_NUM_CTX
+# before sending it. Measured 2026-11-24/25: ~2.6 chars/token on a late Nex conversation, ~3.2 on
+# snapshot-like rows with gpt-oss:20b; set below both so the check stops early, never late.
+SCRAPER_LOCAL_CHARS_PER_TOKEN = 2.4
+# After a local turn, a prompt that filled this share of SCRAPER_LOCAL_NUM_CTX (Ollama's own
+# prompt_eval_count, the whole prompt including its reused prefix) may already have been cut: stop.
+SCRAPER_LOCAL_CONTEXT_FULL_SHARE = 0.95
+# Page results kept whole in a scraper conversation: the newest N browser-tool results of at least
+# SCRAPER_PAGE_RESULT_MIN_CHARS; each older one is replaced by a short stub saying what it was and
+# that its refs are stale (elide_superseded_page_results). Without it every snapshot stays: the
+# baseline query of 2026-11-24 averaged ~93K prompt tokens per turn (8.4M over 90). Every harvest is
+# read by code from the live page, so an old snapshot is only the model's memory of a page that has
+# since changed. Eliding the result just before the newest costs the local route almost nothing:
+# Ollama reuses the prompt up to the first changed message, which is near the end (measured
+# 2026-11-25: a repeated 31K-token prompt re-evaluated in 0.0 s on gpt-oss:20b). None keeps every
+# result: the OpenRouter route, whose history is ~97% cheap cache reads, is unchanged until measured.
+SCRAPER_LOCAL_PAGE_RESULTS_KEPT: int | None = 1
+SCRAPER_OPENROUTER_PAGE_RESULTS_KEPT: int | None = None
+# A browser-tool result at least this long is a page read (a snapshot, or a navigate/click that
+# returns the page) and falls under the window above; shorter results (errors, a click's "done")
+# stay, since they are the model's record of what it tried.
+SCRAPER_PAGE_RESULT_MIN_CHARS = 2_000
+# The start of an elided page result kept in its stub (the URL and page title lead it), so the
+# model still knows which page it was on at that step.
+SCRAPER_ELIDED_RESULT_HEAD_CHARS = 300
+# Ollama answers HTTP 500 "error parsing tool call" when a model writes text into a tool call
+# (gpt-oss:20b, 2026-11-24, turn 6). The turn is asked again this many times, with a note on what
+# went wrong appended to that one request only, so the conversation and its cached prefix stay as they were.
+SCRAPER_LOCAL_TOOL_CALL_PARSE_RETRIES = 2
 # Replaces max_turns for the OpenRouter loop. A healthy search measured 26 iterations; this is sized
 # for two regions plus recovery, with headroom, because starvation is silent (see Search coverage).
 SCRAPER_OPENROUTER_MAX_ITERATIONS = 90
@@ -559,12 +610,43 @@ SNAPSHOT_DETAIL_PANE_HEADING = 'heading "About the job"'
 SNAPSHOT_RESULT_CARD_RE = r'^- button ".* Dismiss .* job\b.*\[cursor=pointer\]'
 # The results count ("99+ results") above the card list; also never inside the detail pane.
 SNAPSHOT_RESULT_COUNT_RE = r'\b\d+\+? results?\b'
+# Prune Search Snapshot levels (snapshot_prune.prune_search_snapshot; POC 2026-11-25, not wired in).
+SNAPSHOT_PRUNE_LEVEL_CHROME = 'chrome'
+SNAPSHOT_PRUNE_LEVEL_CARDS = 'cards'
+SNAPSHOT_PRUNE_LEVEL_NO_CARDS = 'no_cards'
+# What the scraper model is shown of every browser_snapshot, after the job detail pane is dropped
+# (Prune Search Snapshot; None shows it whole). 'cards' (2026-11-25, the user's choice): navigation
+# chrome dropped and each job card one line with no ref. Offline on saved search pages it cut a
+# snapshot from ~43K to ~7K chars (~12.9K -> ~2.9K tokens) with every turn still valid, and no card
+# can be clicked because none has a ref. Code harvests the cards from the live page either way.
+# Applies to both routes; --scraper-snapshot-prune overrides it for one run.
+SCRAPER_SNAPSHOT_PRUNE_LEVEL: str | None = SNAPSHOT_PRUNE_LEVEL_CARDS
 
 # Audit configuration
 AUDIT_OPUS_SAMPLE_SIZE = 2  # jobs sampled per un-surfaced pool for --audit-opus
 # --job-ids replay: what a replay directory under run_dir/replays/ holds besides the saved postings.
 REPLAY_NOTIFICATIONS_FILENAME = 'notifications.md'  # the messages a real run would have sent
 REPLAY_SUMMARY_FILENAME = 'summary.tsv'               # one row per requested job: outcome and rating
+
+# Measure Search Coverage (scripts/measure_search_coverage.py, run weekly by agent_meta1). LinkedIn's
+# own job emails are the yardstick: a job LinkedIn emailed in a searched region that no run ever
+# listed is a Stage 1 miss. The 2026-10-22 check, done once by hand, found 76 such jobs in two
+# months; a replay that late mostly met closed postings, so the check runs on fresh emails.
+# Harvest Alert Emails: a headless `claude -p` session holding only the Gmail read tools fetches
+# the emails; code parses the job links out of the raw tool results. The model only fetches.
+MODEL_NAME_COVERAGE_HARVEST = ANTHROPIC_MODEL_NAME_LOW
+COVERAGE_HARVEST_MAX_BUDGET_USD = 1.0       # passed to `claude -p --max-budget-usd`; ~$0.005 per 2 emails measured
+COVERAGE_HARVEST_TIMEOUT_SECONDS = 900
+COVERAGE_ALERT_SENDERS = ('jobs-noreply@linkedin.com', 'jobalerts-noreply@linkedin.com')
+COVERAGE_GMAIL_SEARCH_PAGE_SIZE = 50        # the Gmail tool's maximum
+COVERAGE_WINDOW_DAYS = 8                    # emails measured: received within this many days
+# An email younger than this is left for the next check: the pipeline may simply not have run since.
+COVERAGE_EMAIL_SETTLE_DAYS = 1
+COVERAGE_INTERVAL_DAYS = 7                  # --if-due: skip when a check completed this recently
+COVERAGE_REPLAY_MAX_JOBS = 25               # never-seen jobs replayed per check (~cents each)
+COVERAGE_REPLAY_TIMEOUT_SECONDS = 3600
+COVERAGE_NOTIFY_MIN_RATING = 4              # a replayed miss at or above this is one the User should have had
+COVERAGE_EXIT_DEFERRED = 75                 # EX_TEMPFAIL: a job search run holds the lock; try again later
 
 # Stage 2 (evaluation) configuration
 EXTRACTOR_OPENROUTER_MAX_ITERATIONS = 10

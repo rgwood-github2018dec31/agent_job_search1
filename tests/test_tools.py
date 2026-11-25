@@ -47,6 +47,14 @@ from utils_tools_n_agents_common.models import (
     OPENROUTER_MODEL_NAME_SCRAPER,
 )
 
+
+@pytest.fixture(autouse=True)
+def _openrouter_scraper_default(monkeypatch):
+    '''These tests drive the OpenRouter loop; MODEL_NAME_SCRAPER is a local model since 2026-11-25.'''
+    monkeypatch.setattr(scrape_openrouter, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
+    monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
+
+
 # ---------------------------------------------------------------------------
 # underscorify
 # ---------------------------------------------------------------------------
@@ -3706,7 +3714,7 @@ async def test_stage_1b_falls_back_to_anthropic_when_the_provider_runs_out_of_cr
 
     monkeypatch.setattr(agent, 'mcp_session', lambda url: _Session())
 
-    def failing_run_pass(browser_call, tool_defs, stats, per_query):
+    def failing_run_pass(browser_call, tool_defs, stats, per_query, provider_pin=None, model=None):
         async def run_pass(instruction):
             raise triage.ProviderUnavailableError(
                 'OpenRouter chat failed: 402 Client Error: Payment Required for url: x', status=402)
@@ -11092,6 +11100,7 @@ def _run_scraper_with_one_browser_call(monkeypatch, tool_name: str, result: str)
 
 def test_scraper_snapshot_drops_the_detail_pane_and_keeps_every_card(monkeypatch, caplog):
     '''The pane inflated every snapshot past the cap, and the cut fell inside the cards (2026-09-30).'''
+    monkeypatch.setattr(config, 'SCRAPER_SNAPSHOT_PRUNE_LEVEL', None)   # the pane drop alone
     card = '    - button "Acme Toronto (Remote) Dismiss Staff ML Engineer job" [ref=e{}] [cursor=pointer]\n'
     cards = ''.join(card.format(i) for i in range(config.SCRAPER_TOOL_RESULT_MAX_CHARS // len(card) + 1))
     pane_filler = '      - paragraph: posting text\n' * (config.SCRAPER_SNAPSHOT_RESULT_MAX_CHARS // 10)
@@ -11108,6 +11117,19 @@ def test_scraper_snapshot_drops_the_detail_pane_and_keeps_every_card(monkeypatch
     assert 'About the job' not in content and '[job detail pane omitted: ' in content
     assert '[truncated' not in content
     assert not any('Truncating' in m for m in _warnings(caplog))
+
+
+def test_by_default_each_card_reaches_the_model_as_one_line_with_no_ref(monkeypatch):
+    '''SCRAPER_SNAPSHOT_PRUNE_LEVEL 'cards': the model sees every listing, and cannot click one.'''
+    assert config.SCRAPER_SNAPSHOT_PRUNE_LEVEL == config.SNAPSHOT_PRUNE_LEVEL_CARDS
+    snapshot = ('- main [ref=e1]:\n  - paragraph [ref=e2]: 99+ results\n  - generic [ref=e3]:\n'
+                '    - button [ref=e4] [cursor=pointer]:\n      - paragraph [ref=e5]: Staff ML Engineer\n'
+                '      - paragraph [ref=e6]: Acme\n      - paragraph [ref=e7]: Toronto (Remote)\n'
+                '      - button "Dismiss Staff ML Engineer job" [ref=e8]\n')
+    content = _run_scraper_with_one_browser_call(monkeypatch, 'browser_snapshot', snapshot)
+    assert '- job card: Staff ML Engineer · Acme · Toronto (Remote)' in content
+    assert '99+ results' in content
+    assert 'Dismiss' not in content and 'ref=e4]' not in content and 'ref=e8]' not in content
 
 
 def _run_scraper_with_browser_calls(monkeypatch, calls: list[tuple[str, dict]], browser) -> str:

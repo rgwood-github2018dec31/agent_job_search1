@@ -134,6 +134,10 @@ python main.py -n --no-job-audit       # Skip the end-of-run Job Audit PDF
 python main.py -n --job-and-company-pages-via signed-out-http-get  # Stage 2 reads pages with our own signed-out GET (default: Exa via OpenRouter)
 python main.py -n --job-and-company-pages-via signed-in-browser  # Stage 2 reads job pages through the account
 python main.py -n --shadow-model mlx-lm-server:<org>/<repo>  # Data collection: a local model answers every single-turn remote call too, and the remote model gives its confidence (run_dir/shadow_calls/)
+python main.py -n --scraper-model deepseek/deepseek-v4.1-flash-1017  # Stage 1b on another model this run (default MODEL_NAME_SCRAPER: local qwen3.6:35b-mlx; failed queries re-run on SCRAPER_REMOTE_MODEL)
+python main.py -n --scraper-snapshot-prune off  # Show Stage 1b the whole snapshot this run (default SCRAPER_SNAPSHOT_PRUNE_LEVEL: cards)
+uv run python scripts/compare_scraper_models.py  # Same Stage 1b queries with several scraper models (drives the account; no records); run_dir/replays/scraper-compare-*/report.md
+uv run python scripts/compare_scraper_models_offline.py  # One Stage 1b turn per local model on saved pages, no LinkedIn; run it before a live comparison
 python main.py --job-ids FILE  # Diagnostic: rate the listed LinkedIn job ids (job_id[<TAB>title<TAB>company]) into run_dir/replays/; no dedup records, no Telegram
 
 # Tests
@@ -158,7 +162,7 @@ src/agentic_job_search/
   triage.py                       # Local triage and non-Anthropic rating calls (MCP client lives in utils_tools_n_agents_common)
   endpoint_pin.py                 # Per-run OpenRouter endpoint choice for MODEL_NAME_SINGLE_TURN (asks the tool server's rank_providers)
   scrape_openrouter.py            # Stage 1b: OpenRouter function-calling scraper loop (default path)
-  snapshot_prune.py               # Stage 1b: drops the job detail pane from a search-page snapshot before the cap
+  snapshot_prune.py               # Stage 1b: drops the job detail pane, then prunes the snapshot to SCRAPER_SNAPSHOT_PRUNE_LEVEL (chrome/cards/no_cards)
   extract_openrouter.py           # Page text in, one submit_job_extract out (the model has no browser)
   evidence.py                     # Verify Source Reference: a prediction stands only on a citation found in its input
   pdf_ocr.py                      # OCR Scanned PDF: a PDF with no text layer is rendered and read by a local vision model, labelled locally
@@ -211,6 +215,8 @@ scripts/
   replay_forced_tool_ab.py        # JSON in text vs a forced function call, rater and gate fields, on saved calls (costs cents)
   release_wrong_sponsorship_rejections.py  # One-time release of jobs the pre-2026-10-27 sponsorship rule rejected outside sponsorship_required_in
   compare_company_overlap_models.py  # Local vs remote models on Decide Company Overlap over the labelled overlap pairs (costs cents)
+  compare_scraper_models.py       # The same Stage 1b queries with several scraper models (OpenRouter and local); listings, overlap, time (drives the account)
+  compare_scraper_models_offline.py  # Single Stage 1b turns on saved search-page snapshots per local model: valid, safe tool call, time (no account traffic)
 tests/
   test_tools.py                   # Unit tests for all tools
   test_linkedin_page.py           # Page capture, archive, clutter removal, unknown-section decisions
@@ -219,6 +225,8 @@ tests/
   test_evidence.py                # Citation matching, LLM relocation, rejection
   test_job_audit.py               # Job choice, render failure, report rendering (with reportlab)
   test_job_path.py                # Job Path overlay, exits, aggregate (no reportlab)
+  test_scraper_local.py           # Local scraper route: conversation translation, context guard, dispatch, no-record replay
+  test_snapshot_prune_levels.py   # Prune Search Snapshot: what each level keeps, and that no card ref survives
 docs/
   architecture.md                 # Applied-job corpus, model routing, pipeline stages, tools, dedup
   requirements.md                 # Actors, Business Object Model, Use Cases, Non-functional Requirements (incl. lessons from past incidents)

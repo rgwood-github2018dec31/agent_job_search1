@@ -155,6 +155,8 @@ from agentic_job_search.config import (
     SCRAPER_MAX_TURNS_PER_QUERY,
     SCRAPER_MIN_LISTINGS_PER_QUERY,
     SCRAPER_MIN_TURNS_PER_QUERY,
+    SCRAPER_REMOTE_MODEL,
+    SCRAPER_SNAPSHOT_PRUNE_LEVEL,
     SECONDS_PER_MINUTE,
     STAGE2_PAGE_READS,
     TELEGRAM_MESSAGE_MAX_CHARS,
@@ -215,6 +217,7 @@ from agentic_job_search.salary import (
     salary_facts_of,
 )
 from agentic_job_search.salary_estimate import estimate_salary
+from agentic_job_search.snapshot_prune import SNAPSHOT_PRUNE_LEVELS
 from agentic_job_search.text_budget import (
     pages_to_prompt,
     snippet,
@@ -1903,6 +1906,10 @@ def assess_run_health(funnel: dict) -> list[str]:
             alerts.append(f'SCRAPER PROVIDER NOT PINNED (cost is OpenRouter\'s choice): {alert.get("detail")}')
         elif kind == 'scrape_cost':
             alerts.append(f'SCRAPER COST HIGH on {alert.get("query", "?")}: {alert.get("detail")}')
+        elif kind == 'local_scraper_unavailable':
+            alerts.append(f'LOCAL SCRAPER MODEL UNAVAILABLE, RUN SCRAPED ON OPENROUTER: {alert.get("detail")}')
+        elif kind == 'local_scraper_fallback':
+            alerts.append(f'LOCAL SCRAPER FAILED QUERIES, RE-RUN ON OPENROUTER: {alert.get("detail")}')
         elif kind == 'provider_fallback':
             alerts.append(f'SCRAPER FELL BACK TO ANTHROPIC (billed at Anthropic prices): {alert.get("detail")}')
         elif kind == 'scrape_budget':
@@ -2199,9 +2206,89 @@ def _anthropic_run_pass(client: ClaudeSDKClient, stage_stats: dict, max_cost_usd
     return run_pass
 
 
+async def scraper_model_preflight(model: str) -> str | None:
+    '''None when `model` can drive Stage 1b, otherwise why not (shape, precision floor, not installed).'''
+    if problem := scrape_openrouter.scraper_model_problem(model):
+        return problem
+    if route_for(model) == 'openrouter':
+        try:
+            scrape_openrouter.min_bits_for(model)
+        except KeyError as ex:
+            return str(ex)
+        return None
+    from agentic_job_search.triage import preflight_local_model
+    return await preflight_local_model(model)
+
+
+async def _rerun_failed_local_queries(model: str, queries: list[str], browser_call, tool_defs: list[dict],
+                                      scraping_stats: dict, before_query) -> None:
+    '''Search again on SCRAPER_REMOTE_MODEL every query the local scraper `model` failed.
+
+    run_scraper keeps a query's failure to itself (marked 'error'), so without this a local model
+    that cannot finish a query loses it for the run. What the local pass recorded before failing
+    stays recorded, and a listing seen twice is deduplicated by check_and_record_job.
+    '''
+    failed = [q for q in queries if tools_module._queries_searched.get(q) == 'error']
+    if not failed:
+        return
+    errors = '; '.join(f'{q}: {snippet(str(tools_module._query_errors.get(q, "")))}' for q in failed)
+    logger.warning(f'Stage 1b: local scraper {model} failed {len(failed)} of {len(queries)} quer(ies); '
+                   f'searching them again on {SCRAPER_REMOTE_MODEL}: {errors}')
+    tools_module._ui_alerts.append({
+        'kind': 'local_scraper_fallback', 'query': ', '.join(failed), 'region': '(all)',
+        'detail': f'{model} failed {len(failed)} of {len(queries)} quer(ies), re-run on {SCRAPER_REMOTE_MODEL}: {errors}'})
+    provider_pin = await scrape_openrouter.pin_scraper_provider(SCRAPER_REMOTE_MODEL)
+    await run_scraper(
+        _openrouter_run_pass(browser_call, tool_defs, scraping_stats, tools_module._scrape_per_query,
+                             provider_pin, model=SCRAPER_REMOTE_MODEL),
+        failed, scraping_stats, before_query=before_query)
+
+
+async def ensure_scraper_model_available() -> None:
+    '''Hand this run's Stage 1b to SCRAPER_REMOTE_MODEL when its local scraper model cannot run.
+
+    A down tools_llm_local or an uninstalled tag would otherwise fail every query, each after its
+    pacing delay, and the run would end on the Anthropic fallback. Logged and alerted, never silent.
+    '''
+    import agentic_job_search.config as _config
+    model = scraper_model()
+    if route_for(model) != scrape_openrouter.LOCAL_ROUTE:
+        return
+    if (problem := await scraper_model_preflight(model)) is None:
+        return
+    logger.warning(f'Stage 1b: local scraper model {model} is not available ({problem}); this run '
+                   f'scrapes on {SCRAPER_REMOTE_MODEL}')
+    tools_module._ui_alerts.append({'kind': 'local_scraper_unavailable', 'query': '(all)', 'region': '(all)',
+                                    'detail': f'{model}: {problem}; ran on {SCRAPER_REMOTE_MODEL}'})
+    _config.SCRAPER_MODEL_OVERRIDE = SCRAPER_REMOTE_MODEL
+
+
+def scraper_model() -> str:
+    '''This run's Stage 1b model: --scraper-model when given (config.SCRAPER_MODEL_OVERRIDE), else MODEL_NAME_SCRAPER.'''
+    import agentic_job_search.config as _config
+    return _config.SCRAPER_MODEL_OVERRIDE or MODEL_NAME_SCRAPER
+
+
+def scraper_query_instruction(query: str) -> str:
+    '''The user turn that opens one query's scraper conversation.'''
+    return (
+        f'Search LinkedIn for this ONE query only: "{query}"\n\n'
+        'Run every search listed in your instructions (one per region). Search on the '
+        'query text alone, then set the location, date-posted and experience-level '
+        'filters by CLICKING their chips — never by putting geoId/f_TPR in the URL. Then '
+        'call run_ui_contract with the region name and do what it tells you, then '
+        'harvest_listings, then record_listings. Clicking filter chips is fine; never '
+        'click anything in the results LIST — the card and its Dismiss button are '
+        'indistinguishable to you, and a stray click destroys a real job. If anything is '
+        'missing or unreadable, call report_problem and stop rather than guessing. Do not '
+        'ask for permission — call the tools directly. Do not navigate to individual job '
+        'pages. Stop when you have worked through the searches for this query.'
+    )
+
+
 def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per_query: dict,
-                         provider_pin: scrape_openrouter.ProviderPin | None = None):
-    '''One Stage 1b request through the OpenRouter function-calling loop.
+                         provider_pin: scrape_openrouter.ProviderPin | None = None, model: str | None = None):
+    '''One Stage 1b request through the function-calling loop (OpenRouter, or a local Ollama `model`).
 
     A FRESH conversation per request. On the Anthropic path all six queries share one transcript,
     so context per turn grew 41K -> 162K across a run and every later query paid for every earlier
@@ -2212,7 +2299,7 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
         query = tools_module._current_query or ''
         if provider_pin is not None:
             await provider_pin.start_query()   # a provider a 429 sidelined in an earlier query comes back
-        session = scrape_openrouter.ScrapeSession(browser_call, query, provider_pin=provider_pin)
+        session = scrape_openrouter.ScrapeSession(browser_call, query, model=model, provider_pin=provider_pin)
         try:
             await session.run(build_scraper_prompt(), instruction, tools)
         finally:
@@ -2220,8 +2307,11 @@ def _openrouter_run_pass(browser_call, tools: list[dict], stage_stats: dict, per
             stage_stats['input_tokens'] += session.usage['prompt'] - session.usage['cached']
             stage_stats['output_tokens'] += session.usage['completion']
             stage_stats['cache_read_input_tokens'] += session.usage['cached']
-            entry = per_query.setdefault(query, {'cost': 0.0, 'iterations': 0, 'prompt': 0, 'cached': 0})
+            entry = per_query.setdefault(query, {'cost': 0.0, 'iterations': 0, 'prompt': 0, 'cached': 0,
+                                                 'model_seconds': 0.0, 'elided_results': 0})
             entry['cost'] += session.cost
+            entry['model_seconds'] += session.model_seconds
+            entry['elided_results'] = entry.get('elided_results', 0) + session.elided_results
             entry['iterations'] += session.iterations
             entry['prompt'] += session.usage['prompt']
             entry['cached'] += session.usage['cached']
@@ -2406,19 +2496,7 @@ async def _run_scraper_queries(run_pass: Callable[[str], Awaitable[int | None]],
         before = _check_status_snapshot()
         before_distinct = _distinct_snapshot()
         try:
-            turns = await run_pass(
-                f'Search LinkedIn for this ONE query only: "{query}"\n\n'
-                'Run every search listed in your instructions (one per region). Search on the '
-                'query text alone, then set the location, date-posted and experience-level '
-                'filters by CLICKING their chips — never by putting geoId/f_TPR in the URL. Then '
-                'call run_ui_contract with the region name and do what it tells you, then '
-                'harvest_listings, then record_listings. Clicking filter chips is fine; never '
-                'click anything in the results LIST — the card and its Dismiss button are '
-                'indistinguishable to you, and a stray click destroys a real job. If anything is '
-                'missing or unreadable, call report_problem and stop rather than guessing. Do not '
-                'ask for permission — call the tools directly. Do not navigate to individual job '
-                'pages. Stop when you have worked through the searches for this query.'
-            )
+            turns = await run_pass(scraper_query_instruction(query))
         except ProviderUnavailableError as ex:
             # Systemic, not per-query: the provider is refusing every call, so the remaining
             # queries would each fail identically -- after paying their full human-emulation
@@ -5856,14 +5934,17 @@ def prompt_playwright_mcp_upgrade(interactive: bool) -> None:
     logger.info(f'Continuing on pinned @playwright/mcp {PLAYWRIGHT_MCP_VERSION} ({published} available)')
 
 
-async def start_playwright_server(port: int, browser_mode: str = 'minimized') -> asyncio.subprocess.Process:
-    cmd = [
-        'npx', '--yes', PLAYWRIGHT_MCP_PACKAGE,
-        '--port', str(port),
-        '--user-data-dir', str(BROWSER_PROFILE_DIR),
-        '--shared-browser-context',
-        '--output-dir', str(PLAYWRIGHT_OUTPUT_DIR),
-    ]
+async def start_playwright_server(port: int, browser_mode: str = 'minimized',
+                                  isolated_output_dir: Path | None = None) -> asyncio.subprocess.Process:
+    '''The pinned @playwright/mcp on `port`, on the LinkedIn profile.
+
+    With `isolated_output_dir`, a throwaway in-memory profile instead (`--isolated`) writing there:
+    no cookie of the account is loaded, for a script that needs only the tool surface.
+    '''
+    profile = (['--isolated', '--output-dir', str(isolated_output_dir)] if isolated_output_dir is not None
+               else ['--user-data-dir', str(BROWSER_PROFILE_DIR), '--shared-browser-context',
+                     '--output-dir', str(PLAYWRIGHT_OUTPUT_DIR)])
+    cmd = ['npx', '--yes', PLAYWRIGHT_MCP_PACKAGE, '--port', str(port), *profile]
     tmp_config: str | None = None
     if browser_mode == 'headless':
         cmd.append('--headless')
@@ -6088,11 +6169,14 @@ class ReattachableBrowserCall:
 
 
 async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scraping_stats: dict,
-                       browser: BrowserServer | None = None) -> bool:
+                       browser: BrowserServer | None = None, fallback: bool = True) -> bool:
     """Run Stage 1b, falling back to the Anthropic scraper on failure.
 
-    The route (and model) is MODEL_NAME_SCRAPER: an OPENROUTER_* family value runs the
-    function-calling loop; anything else routes Stage 1b straight to the Anthropic scraper.
+    The model is scraper_model() (MODEL_NAME_SCRAPER unless --scraper-model): an OpenRouter id or
+    a local Ollama tag runs the function-calling loop; anything else routes Stage 1b straight to
+    the Anthropic scraper. `fallback=False` re-raises the loop's failure instead of falling back,
+    so a comparison of scraper models (scripts/compare_scraper_models.py) never reports Haiku's
+    listings as another model's.
 
     Extracted from `run_non_interactive` so the fallback is REACHABLE BY A TEST. It was previously
     inline, and the bug it hides is not hypothetical: on 2026-09-02 an OpenRouter 402 was swallowed
@@ -6100,13 +6184,15 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
     the Anthropic scraper -- sitting right there, correct, and never called -- did not run. Nothing
     could have caught that, because nothing could call this code without a live browser.
 
-    Returns True if the OpenRouter path completed, False if the Anthropic fallback ran.
+    Returns True if the function-calling loop completed, False if the Anthropic fallback ran.
 
     ``browser``, when given, is recycled once old (BrowserServer.recycle_if_old) before a query and
     before the Anthropic fallback starts. The fallback itself is never recycled mid-way: its SDK
     client holds a session to the browser for all its queries.
     """
-    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
+    model = scraper_model()
+    route = route_for(model)
+    if route in ('openrouter', scrape_openrouter.LOCAL_ROUTE):
         # Browser tools come from the running Playwright server's own schemas rather than a
         # hand-transcribed constant, so a server-side change cannot drift silently.
         try:
@@ -6119,16 +6205,22 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
 
                 tool_defs = (scrape_openrouter.browser_tool_defs(await browser_call.list_tools())
                              + scrape_openrouter.LOCAL_TOOL_DEFS)
-                logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to '
-                            f'{MODEL_NAME_SCRAPER}')
+                logger.info(f'Stage 1b: {len(tool_defs)} tools exposed to {model} (route {route})')
                 # One endpoint for the whole run, chosen by effective price (see ProviderPin).
-                provider_pin = await scrape_openrouter.pin_scraper_provider(MODEL_NAME_SCRAPER)
+                # A local model has no endpoints to choose between.
+                provider_pin = (await scrape_openrouter.pin_scraper_provider(model)
+                                if route == 'openrouter' else None)
                 await run_scraper(
                     _openrouter_run_pass(browser_call, tool_defs, scraping_stats,
-                                         tools_module._scrape_per_query, provider_pin),
+                                         tools_module._scrape_per_query, provider_pin, model=model),
                     queries, scraping_stats, before_query=recycle_if_old)
+                if route == scrape_openrouter.LOCAL_ROUTE and fallback:
+                    await _rerun_failed_local_queries(model, queries, browser_call, tool_defs, scraping_stats,
+                                                      recycle_if_old)
             return True
         except Exception as ex:
+            if not fallback:
+                raise
             # A provider outage must not end the run: fall through to the Anthropic scraper,
             # exactly as query generation, rating and extraction already do.
             # Only what OpenRouter did not finish. On 2026-09-28 the fallback re-scraped the two
@@ -6139,13 +6231,13 @@ async def run_stage_1b(port: int, playwright_mcp: dict, queries: list[str], scra
             queries = [q for q in queries if q not in done]
             scope = (f'{len(queries)} unfinished quer(ies); {len(done)} already complete, not re-run'
                      if done else f'all {len(queries)} quer(ies)')
-            logger.warning(f'Stage 1b: OpenRouter scraper failed ({unwrap_exception(ex)}) — '
+            logger.warning(f'Stage 1b: {route} scraper ({model}) failed ({unwrap_exception(ex)}) — '
                            f'falling back to the Anthropic scraper for {scope}')
             if done:
-                logger.info(f'Stage 1b: fallback skips {", ".join(done)} — completed on OpenRouter')
+                logger.info(f'Stage 1b: fallback skips {", ".join(done)} — completed on {route}')
             tools_module._ui_alerts.append({
                 'kind': 'provider_fallback', 'query': '(all)', 'region': '(all)',
-                'detail': f'OpenRouter scraper failed, fell back to Anthropic for {scope}: '
+                'detail': f'{route} scraper ({model}) failed, fell back to Anthropic for {scope}: '
                           f'{unwrap_exception(ex)}'})
             if not queries:
                 return False
@@ -6223,9 +6315,10 @@ async def run_non_interactive(browser_mode: str = 'headless', audit: bool = Fals
     global _prefetcher
     # Fail fast on a scraper model with no precision floor. Checked here, not only at pin time,
     # because run_stage_1b's fallback `except` would turn the KeyError into a quiet Anthropic run.
-    if route_for(MODEL_NAME_SCRAPER) == 'openrouter':
-        scrape_openrouter.min_bits_for(MODEL_NAME_SCRAPER)
+    if route_for(scraper_model()) == 'openrouter':
+        scrape_openrouter.min_bits_for(scraper_model())
     _reset_run_state()
+    await ensure_scraper_model_available()   # after the reset, so its alert reaches this run's report
     funnel: dict[str, int] = {}
     audit_findings: list[dict] = []
     if audit:
@@ -6675,6 +6768,23 @@ async def main() -> None:
              'local LLM MCP server to the mlx-lm sidecar.',
     )
     parser.add_argument(
+        '--scraper-snapshot-prune',
+        choices=['off', *SNAPSHOT_PRUNE_LEVELS],
+        default=None,
+        help='Run-scoped: how much of each search-page snapshot the Stage 1b model is shown '
+             '(default SCRAPER_SNAPSHOT_PRUNE_LEVEL). chrome drops navigation; cards also makes each '
+             'job card one line with no ref; no_cards replaces the list with a count; off shows it whole.',
+    )
+    parser.add_argument(
+        '--scraper-model',
+        metavar='MODEL',
+        default=None,
+        help='Run-scoped: drive Stage 1b with MODEL instead of MODEL_NAME_SCRAPER. An OpenRouter id, '
+             'or a local Ollama tag (tool calling through tools_llm_local, $0, much slower). Its '
+             'failure still falls back to the Anthropic scraper. Compare models with '
+             'scripts/compare_scraper_models.py.',
+    )
+    parser.add_argument(
         '--shadow-model',
         metavar='MODEL',
         default=None,
@@ -6799,6 +6909,22 @@ async def main() -> None:
         logger.warning(f'Rating override active for this run: primary rater '
                        f'{args.rating_model} (route ollama); fallbacks unchanged '
                        f'{MODEL_NAME_RATING_FALLBACKS}')
+
+    if args.scraper_snapshot_prune:
+        import agentic_job_search.config as _config
+        _config.SCRAPER_SNAPSHOT_PRUNE_LEVEL = None if args.scraper_snapshot_prune == 'off' else args.scraper_snapshot_prune
+        logger.warning(f'Snapshot prune override for this run: {args.scraper_snapshot_prune} '
+                       f'(default {SCRAPER_SNAPSHOT_PRUNE_LEVEL!r})')
+
+    if args.scraper_model:
+        if problem := await scraper_model_preflight(args.scraper_model):
+            logger.error(f'--scraper-model {args.scraper_model} rejected before the run: {problem}')
+            console.print(f'[red]--scraper-model {args.scraper_model}: {problem}[/red]')
+            sys.exit(1)
+        import agentic_job_search.config as _config
+        _config.SCRAPER_MODEL_OVERRIDE = args.scraper_model
+        logger.warning(f'Scraper override active for this run: Stage 1b on {args.scraper_model} '
+                       f'(route {route_for(args.scraper_model)}) instead of {MODEL_NAME_SCRAPER}')
 
     if args.shadow_model:
         from agentic_job_search.triage import preflight_local_model

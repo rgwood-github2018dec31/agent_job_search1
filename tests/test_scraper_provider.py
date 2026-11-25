@@ -25,9 +25,17 @@ from agentic_job_search.config import (
     SCRAPER_VERBOSE_MIN_ITERATIONS,
 )
 from agentic_job_search.triage import ProviderUnavailableError
+from utils_tools_n_agents_common.models import OPENROUTER_MODEL_NAME_SCRAPER
 
 # Imported at collection time, before conftest's autouse stub replaces it on the module.
 REAL_PIN_SCRAPER_PROVIDER = so.pin_scraper_provider
+
+
+@pytest.fixture(autouse=True)
+def _openrouter_scraper_default(monkeypatch):
+    '''These tests drive the OpenRouter loop; MODEL_NAME_SCRAPER is a local model since 2026-11-25.'''
+    monkeypatch.setattr(so, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
+    monkeypatch.setattr(agent, 'MODEL_NAME_SCRAPER', OPENROUTER_MODEL_NAME_SCRAPER)
 
 MODEL = 'deepseek/deepseek-v4.1-flash-1017'
 MIN_BITS = SCRAPER_MIN_BITS_PER_WEIGHT[MODEL]

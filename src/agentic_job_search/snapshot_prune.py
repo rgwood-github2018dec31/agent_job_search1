@@ -12,6 +12,9 @@ import re
 
 from agentic_job_search.config import (
     SNAPSHOT_DETAIL_PANE_HEADING,
+    SNAPSHOT_PRUNE_LEVEL_CARDS,
+    SNAPSHOT_PRUNE_LEVEL_CHROME,
+    SNAPSHOT_PRUNE_LEVEL_NO_CARDS,
     SNAPSHOT_RESULT_CARD_RE,
     SNAPSHOT_RESULT_COUNT_RE,
 )
@@ -83,3 +86,149 @@ def drop_job_detail_pane(text: str, what: str) -> str:
     pruned = '\n'.join([*lines[:start], marker, *lines[end:]])
     logger.debug(f'{what}: removed job detail pane, {len(text)} -> {len(pruned)} chars')
     return pruned
+
+
+# --- Prune Search Snapshot (POC, 2026-11-25): what the scraper model reads of a search page -------
+# Levels (SNAPSHOT_PRUNE_LEVEL_*), each including the one before:
+#   chrome    drop what no search step uses: the global navigation (its iframe and banners, keeping
+#             the search box), the sidebar, toasts, images and figures, `/url` lines, the
+#             `[cursor=pointer]` and `[aria-hidden]` tags, and nameless `generic` wrappers (their
+#             children move up a level).
+#   cards     each job card becomes one line with no ref: title · company · location. Code
+#             harvests the cards from the live page (harvest_listings), so the model loses no
+#             listing, and with no ref it cannot click into a card (its Dismiss button).
+#   no_cards  the whole results list becomes one line giving the card count.
+# Not wired into Stage 1b yet: scripts/compare_scraper_models_offline.py --snapshot-prune-level.
+
+SNAPSHOT_PRUNE_LEVELS = (SNAPSHOT_PRUNE_LEVEL_CHROME, SNAPSHOT_PRUNE_LEVEL_CARDS, SNAPSHOT_PRUNE_LEVEL_NO_CARDS)
+_YAML_FENCE_RE = re.compile(r'(```yaml\n)(.*?)(\n```)', re.DOTALL)
+_DROPPED_NODE_RE = re.compile(
+    r'^- (iframe|complementary|img|figure|/url:|region "Toast message"|heading "\d+ notifications"'
+    r'|generic "Skip navigation menu")(?=[\s:\[]|$)')
+_DROPPED_TAG_RE = re.compile(r' \[(cursor=pointer|aria-hidden)\]')
+_NAMELESS_WRAPPER_RE = re.compile(r'^- generic( \[ref=[^\]]+\])?:?$')
+_DISMISS_RE = re.compile(r'^- button "Dismiss ')
+_TEXT_LEAF_RE = re.compile(r'^- [a-z]+(?: "[^"]*")?(?: \[[^\]]*\])*: (.+)$')
+# The texts a card line keeps, in page order: title, company, location.
+_CARD_TEXT_FIELDS = 3
+_VERIFIED_RE = re.compile(r'\s*\(Verified job\)')
+_CARD_LINE_PREFIX = '- job card: '
+
+
+class _Node:
+    __slots__ = ('children', 'line')
+
+    def __init__(self, line: str) -> None:
+        self.line = line
+        self.children: list[_Node] = []
+
+
+def _tree(lines: list[str]) -> list[_Node]:
+    '''Snapshot lines as a forest, by indentation; a non-node line belongs to the node above it.'''
+    roots: list[_Node] = []
+    stack: list[tuple[int, _Node]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        node = _Node(line.strip())
+        depth = _indent(line)
+        if not node.line.startswith('- ') and stack:
+            stack[-1][1].line += ' ' + node.line
+            continue
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        (stack[-1][1].children if stack else roots).append(node)
+        stack.append((depth, node))
+    return roots
+
+
+def _render(nodes: list[_Node], depth: int = 0) -> list[str]:
+    out = []
+    for node in nodes:
+        out.append('  ' * depth + node.line)
+        out += _render(node.children, depth + 1)
+    return out
+
+
+def _descendants(node: _Node):
+    for child in node.children:
+        yield child
+        yield from _descendants(child)
+
+
+def _is_card(node: _Node) -> bool:
+    return node.line.startswith('- button') and any(_DISMISS_RE.match(d.line) for d in _descendants(node))
+
+
+def _card_line(node: _Node) -> str:
+    texts = []
+    for d in _descendants(node):
+        if _DISMISS_RE.match(d.line):
+            continue
+        if (match := _TEXT_LEAF_RE.match(d.line)) and (text := _VERIFIED_RE.sub('', match.group(1)).strip()) \
+                and text not in texts:
+            texts.append(text)
+    return f'{_CARD_LINE_PREFIX}{" · ".join(texts[:_CARD_TEXT_FIELDS])}'
+
+
+def _cards_as_count(nodes: list[_Node]) -> list[_Node]:
+    '''Each run of consecutive card lines replaced by one line giving its count.'''
+    out: list[_Node] = []
+    run = 0
+    for node in [*nodes, None]:
+        if node is not None and node.line.startswith(_CARD_LINE_PREFIX):
+            run += 1
+            continue
+        if run:
+            out.append(_Node(f'- [results list: {run} job cards omitted; harvest_listings reads them from the '
+                             f'page. Never click inside the results list]'))
+            run = 0
+        if node is not None:
+            out.append(node)
+    return out
+
+
+def _search_boxes(node: _Node) -> list[_Node]:
+    return [d for d in _descendants(node) if d.line.startswith('- search')]
+
+
+def _prune(nodes: list[_Node], level: str, stats: dict) -> list[_Node]:
+    out: list[_Node] = []
+    for node in nodes:
+        if _DROPPED_NODE_RE.match(node.line):
+            continue
+        node.line = _DROPPED_TAG_RE.sub('', node.line)
+        if node.line.startswith('- banner'):
+            node.children = _search_boxes(node)
+        if level != SNAPSHOT_PRUNE_LEVEL_CHROME and _is_card(node):
+            stats['cards'] += 1
+            out.append(_Node(_card_line(node)))
+            continue
+        node.children = _prune(node.children, level, stats)
+        if level == SNAPSHOT_PRUNE_LEVEL_NO_CARDS:
+            node.children = _cards_as_count(node.children)
+        if _NAMELESS_WRAPPER_RE.match(node.line):
+            out += node.children
+        else:
+            out.append(node)
+    return out
+
+
+def prune_search_snapshot(text: str, level: str, what: str) -> str:
+    '''The snapshot in `text` (a tool result's ```yaml block, else the whole text) pruned to `level`.
+
+    Run after drop_job_detail_pane. Raises ValueError on an unknown level.
+    '''
+    if level not in SNAPSHOT_PRUNE_LEVELS:
+        raise ValueError(f'unknown snapshot prune level {level!r} for {what}; one of {SNAPSHOT_PRUNE_LEVELS}')
+
+    def prune_block(block: str) -> str:
+        stats = {'cards': 0}
+        pruned = '\n'.join(_render(_prune(_tree(block.split('\n')), level, stats)))
+        logger.debug(f'{what}: snapshot pruned to {level!r}, {len(block):,} -> {len(pruned):,} chars, '
+                     f'{stats["cards"]} job card(s) collapsed')
+        return pruned
+
+    if _YAML_FENCE_RE.search(text):
+        return _YAML_FENCE_RE.sub(lambda m: m.group(1) + prune_block(m.group(2)) + m.group(3), text)
+    return prune_block(text)

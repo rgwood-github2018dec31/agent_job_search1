@@ -134,9 +134,10 @@ _reference_job_pages: list[list[str]] = []
 _reference_job_files: list[str] = []
 # In-horizon applied-job records: filename, applied_date, company, job_title, is_agency, end_client
 _applied_jobs: list[dict] = []
-# Set by a --job-ids replay: Stage 2 saves into this directory and writes notifications there, and
-# leaves processed_jobs/, eval_error_releases.yaml and recruiter_notifications.yaml untouched, so a
-# diagnostic re-rating of given jobs cannot change what a real run dedups or suppresses.
+# Set by a --job-ids replay or scripts/compare_scraper_models.py: Stage 2 saves into this directory
+# and writes notifications there, and processed_jobs/ (Stage 1b's records too),
+# eval_error_releases.yaml and recruiter_notifications.yaml are left untouched, so a diagnostic run
+# cannot change what a real run dedups or suppresses.
 _replay_dir: Path | None = None
 # Scraper funnel observability: counts every check_and_record_job outcome this run.
 _check_status_counts: dict[str, int] = {}  # status -> count (new/already_processed/already_applied/too_old/auth_required)
@@ -2140,6 +2141,11 @@ async def do_check_and_record_job(
         console.print(f'[dim]Skipping {company} — requires current US work authorization.[/dim]')
         return _result('auth_required')
 
+    if _replay_dir is not None:
+        # A replay (e.g. scripts/compare_scraper_models.py) must not mark a job processed: Stage 2
+        # never sees it there, so the next real run would dedup away a job nobody rated.
+        _processed_jobs.add(key)
+        return _result('new')
     PROCESSED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime('%Y%b%d')
     ts = int(time.time())

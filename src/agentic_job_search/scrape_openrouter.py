@@ -24,23 +24,37 @@ from datetime import datetime
 from typing import Any
 
 from utils_tools_n_agents_common.mcp_client import call_mcp_tool
+from utils_tools_n_agents_common.models import route_for
 
+import agentic_job_search.config as _config
 from agentic_job_search import tools_generic
 from agentic_job_search.config import (
     FIND_CAPTURE_MAX_FILES,
+    LLM_LOCAL_MCP_URL,
+    LLM_LOCAL_PURPOSE_SCRAPER,
+    LLM_LOCAL_SERVICE_NAME,
     LLM_MCP_CALL_TIMEOUT_SECONDS,
     LLM_OPENROUTER_MCP_URL,
+    LOCAL_LLM_TEMPERATURE,
     MODEL_NAME_SCRAPER,
     OPENROUTER_TOOL_DESCRIPTION_MAX_CHARS,
     SCRAPER_CACHED_PROMPT_SHARE,
     SCRAPER_COMPLETION_TOKENS_PER_PROMPT_TOKEN,
     SCRAPER_DISALLOWED_BROWSER_TOOLS,
     SCRAPER_DROP_SLOWEST_SHARE,
+    SCRAPER_ELIDED_RESULT_HEAD_CHARS,
     SCRAPER_FIND_RESULT_MAX_CHARS,
+    SCRAPER_LOCAL_CHARS_PER_TOKEN,
+    SCRAPER_LOCAL_CONTEXT_FULL_SHARE,
+    SCRAPER_LOCAL_NUM_CTX,
+    SCRAPER_LOCAL_PAGE_RESULTS_KEPT,
+    SCRAPER_LOCAL_TOOL_CALL_PARSE_RETRIES,
     SCRAPER_MAX_COMPLETION_TOKENS_PER_ITERATION,
     SCRAPER_MIN_BITS_PER_WEIGHT,
     SCRAPER_NO_TOOL_NUDGES,
     SCRAPER_OPENROUTER_MAX_ITERATIONS,
+    SCRAPER_OPENROUTER_PAGE_RESULTS_KEPT,
+    SCRAPER_PAGE_RESULT_MIN_CHARS,
     SCRAPER_PROGRESS_LOG_SECONDS,
     SCRAPER_PROVIDER_MAX_SWITCHES,
     SCRAPER_SNAPSHOT_RESULT_MAX_CHARS,
@@ -53,7 +67,7 @@ from agentic_job_search.config import (
 )
 from agentic_job_search.endpoint_pin import http_status_of, is_rate_limited, price_text, provider_of
 from agentic_job_search.preferences import RUN_DIR
-from agentic_job_search.snapshot_prune import drop_job_detail_pane
+from agentic_job_search.snapshot_prune import drop_job_detail_pane, prune_search_snapshot
 from agentic_job_search.text_budget import quote_for_error, snippet, truncate_reported
 from agentic_job_search.triage import provider_error
 
@@ -190,6 +204,161 @@ def parse_chat_reply(raw: str, query: str) -> dict:
         raise ValueError(f'OpenRouter chat reply for query {query!r} is not an object '
                          f'({type(data).__name__}): {quote_for_error(raw, "OpenRouter chat reply")!r}')
     return data
+
+
+# The route a local scraper model takes (models.route_for); the loop below serves it and 'openrouter'.
+LOCAL_ROUTE = 'ollama'
+# Names that route 'ollama' but reach the mlx sidecar, which has no tool calling (tools_llm_local refuses).
+_SIDECAR_PREFIXES = ('mlx-lm-server:', 'mtplx:')
+
+
+class ScraperContextOverflowError(RuntimeError):
+    '''A local scraper conversation outgrew SCRAPER_LOCAL_NUM_CTX: stopped, never sent to be cut silently.'''
+
+
+def scraper_model_problem(model: str) -> str | None:
+    '''None when the function-calling loop can drive `model`, otherwise why it cannot.'''
+    if model.startswith(_SIDECAR_PREFIXES):
+        return (f'{model!r} is an mlx sidecar model, and the sidecar has no tool calling; '
+                'use an Ollama tag')
+    if route_for(model) not in ('openrouter', LOCAL_ROUTE):
+        return (f'{model!r} routes {route_for(model)!r}; the scraper loop takes an OpenRouter id '
+                'or a local Ollama tag (an Anthropic name is the MODEL_NAME_SCRAPER rollback in config.py)')
+    return None
+
+
+def ollama_messages(messages: list[dict]) -> list[dict]:
+    '''The loop's OpenAI-shaped conversation in the shape Ollama's /api/chat takes.
+
+    Ollama wants a tool call's arguments as an object, not a JSON string, and names the tool on a
+    tool result instead of a call id. Arguments that are not a JSON object (the loop already told
+    the model they were invalid) are carried under `_unparsed_arguments`, so the model's own text is
+    neither dropped nor replaced.
+    '''
+    names_by_call_id: dict[str, str] = {}
+    out: list[dict] = []
+    for message in messages:
+        role = message.get('role')
+        if role == 'assistant' and message.get('tool_calls'):
+            calls = []
+            for call in message['tool_calls']:
+                function = call.get('function') or {}
+                raw = function.get('arguments')
+                if isinstance(raw, str):
+                    try:
+                        arguments = json.loads(raw or '{}')
+                    except json.JSONDecodeError:
+                        arguments = {'_unparsed_arguments': raw}
+                else:
+                    arguments = raw or {}
+                if not isinstance(arguments, dict):
+                    arguments = {'_unparsed_arguments': raw}
+                names_by_call_id[str(call.get('id', ''))] = str(function.get('name', ''))
+                calls.append({'function': {'name': function.get('name', ''), 'arguments': arguments}})
+            out.append({'role': 'assistant', 'content': message.get('content') or '', 'tool_calls': calls})
+        elif role == 'tool':
+            out.append({'role': 'tool', 'content': message.get('content') or '',
+                        'tool_name': names_by_call_id.get(str(message.get('tool_call_id', '')), '')})
+        else:
+            out.append({'role': role, 'content': message.get('content') or ''})
+    return out
+
+
+def estimated_prompt_tokens(messages: list[dict], tools: list[dict]) -> int:
+    '''A deliberately high token estimate of a prompt (see SCRAPER_LOCAL_CHARS_PER_TOKEN).'''
+    chars = len(json.dumps(messages, ensure_ascii=False)) + len(json.dumps(tools, ensure_ascii=False))
+    return int(chars / SCRAPER_LOCAL_CHARS_PER_TOKEN)
+
+
+def local_reply_as_chat_reply(raw: str, model: str, query: str, call_id_prefix: str) -> dict:
+    '''tools_llm_local's chat reply (Ollama's shape) in the shape the loop reads from OpenRouter's.
+
+    Tool calls get ids here (`call_id_prefix` + index) because Ollama's carry none, and arguments go
+    back to a JSON string. Raises with the whole reply quoted when it is not a usable chat reply.
+    '''
+    where = f'local chat reply ({model}) for query {query!r}'
+    try:
+        data = json.loads(raw)
+    except ValueError as ex:
+        raise ValueError(f'{where} is not JSON ({ex}): {quote_for_error(raw, where)!r}') from ex
+    if not isinstance(data, dict):
+        raise ValueError(f'{where} is not an object ({type(data).__name__}): {quote_for_error(raw, where)!r}')
+    if data.get('error') or data.get('ok') is False:
+        raise RuntimeError(f'{where} reported an error: {quote_for_error(raw, where)!r}')
+    message = data.get('message')
+    if not isinstance(message, dict):
+        raise ValueError(f'{where} has no message object: {quote_for_error(raw, where)!r}')
+    tool_calls = []
+    for index, call in enumerate(message.get('tool_calls') or []):
+        function = call.get('function') if isinstance(call, dict) else None
+        if not isinstance(function, dict) or not function.get('name'):
+            raise ValueError(f'{where} has a tool call with no function name (#{index}): '
+                             f'{quote_for_error(raw, where)!r}')
+        arguments = function.get('arguments')
+        tool_calls.append({
+            'id': str(call.get('id') or f'{call_id_prefix}{index}'), 'type': 'function',
+            'function': {'name': function['name'],
+                         'arguments': arguments if isinstance(arguments, str)
+                         else json.dumps(arguments or {}, ensure_ascii=False)},
+        })
+    return {
+        'ok': True,
+        'content': message.get('content') or None,
+        'tool_calls': tool_calls or None,
+        'finish_reason': data.get('done_reason'),
+        # prompt_eval_count is the whole prompt, its reused prefix included (measured 2026-11-25);
+        # the reused part is prompt_eval_cached_count, reported as OpenRouter reports cached tokens.
+        'usage': {'prompt_tokens': data.get('prompt_eval_count') or 0,
+                  'completion_tokens': data.get('eval_count') or 0,
+                  'prompt_tokens_details': {'cached_tokens': data.get('prompt_eval_cached_count') or 0}},
+        'cost_usd': 0.0,
+        'provider': 'local',
+    }
+
+
+# Starts every stub left in place of an elided page result; a message starting with it is not elided again.
+ELIDED_RESULT_MARKER = '[Elided from the conversation:'
+# A tool-call parse failure as Ollama words it (HTTP 500 body), retried by ScrapeSession._chat_local.
+OLLAMA_TOOL_CALL_PARSE_ERROR = 'error parsing tool call'
+TOOL_CALL_PARSE_RETRY_NOTE = (
+    'Your last reply could not be read as a tool call: text was written into the call itself '
+    '(Ollama: {error}). Reply again with exactly one tool call whose arguments are a single JSON '
+    'object, with no other text inside the call.')
+
+
+def page_results_kept_for(model: str) -> int | None:
+    '''How many page results a scraper conversation on `model` keeps whole; None keeps all.'''
+    return SCRAPER_LOCAL_PAGE_RESULTS_KEPT if route_for(model) == LOCAL_ROUTE else SCRAPER_OPENROUTER_PAGE_RESULTS_KEPT
+
+
+def elide_superseded_page_results(messages: list[dict], keep: int) -> list[tuple[int, str, int]]:
+    '''Replace every browser page result but the newest `keep` with a stub; return (index, tool, chars) of each.
+
+    A page result is a browser-tool result (not one of LOCAL_TOOL_NAMES, whose short replies carry
+    the loop's own guidance) of at least SCRAPER_PAGE_RESULT_MIN_CHARS. The stub keeps the result's
+    start (SCRAPER_ELIDED_RESULT_HEAD_CHARS: the URL and title lead it), its size, and tells the
+    model the refs in it are stale, so nothing is cut without the model being told. Mutates
+    `messages` in place: an elided message stays elided, so the prompt prefix before it is stable
+    from then on, which is what lets Ollama reuse it.
+    '''
+    names_by_call_id = {str(call.get('id', '')): str((call.get('function') or {}).get('name', ''))
+                        for message in messages if message.get('role') == 'assistant'
+                        for call in message.get('tool_calls') or []}
+    page_results = [index for index, message in enumerate(messages)
+                    if message.get('role') == 'tool'
+                    and names_by_call_id.get(str(message.get('tool_call_id', ''))) not in LOCAL_TOOL_NAMES
+                    and len(message.get('content') or '') >= SCRAPER_PAGE_RESULT_MIN_CHARS
+                    and not str(message.get('content')).startswith(ELIDED_RESULT_MARKER)]
+    elided = []
+    for index in page_results[:max(len(page_results) - keep, 0)]:
+        content = str(messages[index]['content'])
+        name = names_by_call_id.get(str(messages[index].get('tool_call_id', '')), 'browser tool')
+        messages[index]['content'] = (
+            f'{ELIDED_RESULT_MARKER} this {name} result ({len(content):,} chars) was replaced by this note '
+            f'because a later page read supersedes it; every ref in it is stale. It began: '
+            f'{content[:SCRAPER_ELIDED_RESULT_HEAD_CHARS]!r} … Call browser_snapshot to see the page as it is now.]')
+        elided.append((index, name, len(content)))
+    return elided
 
 
 def min_bits_for(model: str) -> int:
@@ -530,6 +699,9 @@ class ScrapeSession:
         self.iterations = 0
         self.cost = 0.0
         self.usage = {'prompt': 0, 'completion': 0, 'cached': 0}
+        self.model_seconds = 0.0   # waiting on the model, apart from the browser and the pacing
+        self.elided_results = 0    # page results replaced by a stub (elide_superseded_page_results)
+        self.elided_chars = 0
         self._started_at = time.monotonic()
         self._last_info_at = self._started_at
         # True until a full snapshot is taken and again after any page-changing browser tool:
@@ -605,14 +777,21 @@ class ScrapeSession:
         if name == _FIND_TOOL_NAME:
             _capture_oversized_find(out, self.query)
         if name in (_SNAPSHOT_TOOL_NAME, _FIND_TOOL_NAME):
-            out = drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
+            out = self._prune_page(name, out)
         return out
+
+    def _prune_page(self, name: str, out: str) -> str:
+        '''A page read as the model is shown it: no job detail pane, then SCRAPER_SNAPSHOT_PRUNE_LEVEL.'''
+        what = f'{name} result for query {self.query!r}'
+        out = drop_job_detail_pane(out, what)
+        level = _config.SCRAPER_SNAPSHOT_PRUNE_LEVEL   # read per call: --scraper-snapshot-prune sets it
+        return prune_search_snapshot(out, level, what) if level else out
 
     def _full_snapshot_reply(self, name: str, target: str, why: str, out: str) -> str:
         '''A full snapshot given in place of one narrowed to `target`, with a note telling the model so.'''
         note = (f'NOTE: browser_snapshot with target {target!r} was not used: {why}. '
                 f'Here is a full snapshot instead. Only refs from this snapshot are valid now.\n\n')
-        return note + drop_job_detail_pane(out, f'{name} result for query {self.query!r}')
+        return note + self._prune_page(name, out)
 
     def _log_step(self, name: str, args: dict) -> None:
         '''One DEBUG line naming the step just taken, if SCRAPER_PROGRESS_LOG_SECONDS passed in silence.
@@ -719,6 +898,8 @@ class ScrapeSession:
         A timeout used to fail the query and leave the run pinned where it was, so the next query
         met the same endpoint: three timeouts on one endpoint on 2026-10-02.
         '''
+        if route_for(self.model) == LOCAL_ROUTE:
+            return await self._chat_local(chat_args)
         try:
             return await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                        timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
@@ -731,6 +912,48 @@ class ScrapeSession:
             chat_args['quantization'] = self.pin.quantization
             return await call_mcp_tool(LLM_OPENROUTER_MCP_URL, 'chat', chat_args,
                                        timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+
+    async def _chat_local(self, chat_args: dict) -> str:
+        '''One turn on tools_llm_local, returned as the JSON text of an OpenRouter-shaped reply.
+
+        Free, so no cost; the time is what it spends, kept in `model_seconds`. Raises
+        ScraperContextOverflowError before sending a prompt that may not fit SCRAPER_LOCAL_NUM_CTX.
+        '''
+        messages, tools = chat_args['messages'], chat_args.get('tools') or []
+        estimate = estimated_prompt_tokens(messages, tools)
+        if estimate > SCRAPER_LOCAL_NUM_CTX:
+            raise ScraperContextOverflowError(
+                f'Stage 1b: local scraper prompt for query {self.query!r} is ~{estimate:,} tokens at turn '
+                f'{self.iterations}, over SCRAPER_LOCAL_NUM_CTX ({SCRAPER_LOCAL_NUM_CTX:,}); stopped, so '
+                f'Ollama does not cut it from the front')
+        args = {'messages': ollama_messages(messages), 'model': self.model, 'tools': tools,
+                'num_ctx': SCRAPER_LOCAL_NUM_CTX, 'temperature': LOCAL_LLM_TEMPERATURE,
+                'service_name': LLM_LOCAL_SERVICE_NAME, 'purpose_slug': LLM_LOCAL_PURPOSE_SCRAPER}
+        for attempt in range(SCRAPER_LOCAL_TOOL_CALL_PARSE_RETRIES + 1):
+            try:
+                raw = await call_mcp_tool(LLM_LOCAL_MCP_URL, 'chat', args,
+                                          timeout_seconds=LLM_MCP_CALL_TIMEOUT_SECONDS)
+                break
+            except RuntimeError as ex:
+                if OLLAMA_TOOL_CALL_PARSE_ERROR not in str(ex) or attempt == SCRAPER_LOCAL_TOOL_CALL_PARSE_RETRIES:
+                    raise
+                logger.warning(f'Stage 1b: {self.model} wrote an unparsable tool call at turn {self.iterations} '
+                               f'for query {self.query!r}; asking again ({attempt + 1} of '
+                               f'{SCRAPER_LOCAL_TOOL_CALL_PARSE_RETRIES}): {snippet(str(ex))}')
+                # Appended to this request only: the conversation, and Ollama's cached prefix, stay as they were.
+                note = {'role': 'user', 'content': TOOL_CALL_PARSE_RETRY_NOTE.format(error=snippet(str(ex)))}
+                args = {**args, 'messages': [*ollama_messages(messages), note]}
+        reply = local_reply_as_chat_reply(raw, self.model, self.query, f'call_{len(messages)}_')
+        prompt_tokens = reply['usage']['prompt_tokens']
+        if prompt_tokens >= SCRAPER_LOCAL_NUM_CTX * SCRAPER_LOCAL_CONTEXT_FULL_SHARE:
+            raise ScraperContextOverflowError(
+                f'Stage 1b: local scraper prompt for query {self.query!r} filled {prompt_tokens:,} of '
+                f'SCRAPER_LOCAL_NUM_CTX ({SCRAPER_LOCAL_NUM_CTX:,}) tokens at turn {self.iterations} '
+                f'(estimated ~{estimate:,}, over SCRAPER_LOCAL_CONTEXT_FULL_SHARE); Ollama may have cut it '
+                f'from the front, so the reply is not used')
+        logger.debug(f'Stage 1b: local turn {self.iterations}: {prompt_tokens:,} prompt tokens '
+                     f'({reply["usage"]["prompt_tokens_details"]["cached_tokens"]:,} reused, ~{estimate:,} estimated)')
+        return json.dumps(reply)
 
     async def _drop_verbose_endpoint(self, completion_tokens: int) -> None:
         '''Switch off an endpoint whose turns are far longer than this job needs.
@@ -759,13 +982,24 @@ class ScrapeSession:
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt},
         ]
+        keep = page_results_kept_for(self.model)
         for i in range(SCRAPER_OPENROUTER_MAX_ITERATIONS):
             self.iterations = i + 1
+            if keep is not None:
+                for index, name, chars in elide_superseded_page_results(messages, keep):
+                    self.elided_results += 1
+                    self.elided_chars += chars
+                    # INFO, not WARNING: the window is by design (SCRAPER_*_PAGE_RESULTS_KEPT) and the
+                    # model is told in the stub; one line per elision keeps what was cut visible.
+                    logger.info(f'Stage 1b: elided the {name} result at message {index} ({chars:,} chars) for '
+                                f'query {self.query!r} at turn {self.iterations}; newest {keep} kept whole')
             chat_args = {'messages': messages, 'model': self.model, 'tools': tools}
             if self.pin is not None and self.pin.tag:
                 chat_args['provider'] = self.pin.tag
                 chat_args['quantization'] = self.pin.quantization
+            turn_started = time.monotonic()
             raw = await self._chat(chat_args)
+            self.model_seconds += time.monotonic() - turn_started
             data = parse_chat_reply(raw, self.query)
             if not data.get('ok') and http_status_of(str(data.get('error') or '')) in TRANSIENT_HTTP_STATUSES:
                 # A gateway hiccup is not this query failing. Without a retry one 502 discarded a
