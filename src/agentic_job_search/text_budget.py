@@ -15,6 +15,30 @@ _WHITESPACE_RUN_RE = re.compile(r'[ \t\f\v\r]+')
 _BLANK_LINES_RE = re.compile(r'\n\s*\n+')
 
 
+# format_compact_count: each step up is this factor, shown with the next suffix, to this many significant digits.
+COMPACT_COUNT_STEP = 1000
+COMPACT_COUNT_SUFFIXES = ('', 'k', 'M', 'G')
+COMPACT_COUNT_SIGNIFICANT_DIGITS = 3
+
+
+def format_compact_count(count: int) -> str:
+    '''A count for a log line, to COMPACT_COUNT_SIGNIFICANT_DIGITS digits: 412, 7.75k, 12.3k, 234k, 2.34M.'''
+    value = float(count)
+    suffix_index = 0
+    while abs(value) >= COMPACT_COUNT_STEP and suffix_index < len(COMPACT_COUNT_SUFFIXES) - 1:
+        value /= COMPACT_COUNT_STEP
+        suffix_index += 1
+    if suffix_index == 0:
+        return str(count)
+    text = f'{value:.{COMPACT_COUNT_SIGNIFICANT_DIGITS}g}'
+    if abs(float(text)) >= COMPACT_COUNT_STEP and suffix_index < len(COMPACT_COUNT_SUFFIXES) - 1:
+        # 999,950 rounds to "1e+03k": carry into the next suffix
+        value /= COMPACT_COUNT_STEP
+        suffix_index += 1
+        text = f'{value:.{COMPACT_COUNT_SIGNIFICANT_DIGITS}g}'
+    return text + COMPACT_COUNT_SUFFIXES[suffix_index]
+
+
 def truncation_marker(kept: int, total: int) -> str:
     return f'\n[truncated: kept {kept} of {total} chars]'
 

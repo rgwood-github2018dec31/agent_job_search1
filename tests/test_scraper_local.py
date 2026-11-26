@@ -20,6 +20,7 @@ from agentic_job_search.config import (
     SCRAPER_LOCAL_CHARS_PER_TOKEN,
     SCRAPER_LOCAL_NUM_CTX,
 )
+from agentic_job_search.text_budget import format_compact_count
 
 LOCAL_MODEL = 'gpt-oss:20b'
 TOOLS = [{'type': 'function', 'function': {'name': 'harvest_listings', 'description': 'd',
@@ -222,8 +223,9 @@ def test_only_the_newest_page_results_stay_whole_and_each_stub_says_what_was_cut
     big = so.SCRAPER_PAGE_RESULT_MIN_CHARS * 3
     messages = _page_conversation([big, big, so.SCRAPER_PAGE_RESULT_MIN_CHARS // 2, big])
     elided = so.elide_superseded_page_results(messages, keep=1)
-    assert [(index, name) for index, name, _ in elided] == [(3, 'browser_snapshot'), (5, 'browser_snapshot')]
+    assert [(index, name) for index, name, _, _ in elided] == [(3, 'browser_snapshot'), (5, 'browser_snapshot')]
     stub = messages[3]['content']
+    assert elided[0][3] == len(stub)
     assert stub.startswith(so.ELIDED_RESULT_MARKER) and 'stale' in stub and 'page0' in stub
     assert f'{len("- Page URL: page0") + 1 + big:,} chars' in stub
     assert len(stub) < big
@@ -378,3 +380,10 @@ async def test_nothing_is_searched_again_when_every_local_query_finished(monkeyp
 
     monkeypatch.setattr(agent, 'run_scraper', must_not_run)
     await agent._rerun_failed_local_queries(LOCAL_MODEL, ['Q1'], None, TOOLS, {'cost': 0.0}, None)
+
+
+@pytest.mark.parametrize(('count', 'expected'), [
+    (412, '412'), (999, '999'), (1000, '1k'), (7747, '7.75k'), (12300, '12.3k'),
+    (234000, '234k'), (999_950, '1M'), (2_340_000, '2.34M')])
+def test_a_log_count_is_shown_to_three_significant_digits(count, expected):
+    assert format_compact_count(count) == expected

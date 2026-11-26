@@ -68,7 +68,7 @@ from agentic_job_search.config import (
 from agentic_job_search.endpoint_pin import http_status_of, is_rate_limited, price_text, provider_of
 from agentic_job_search.preferences import RUN_DIR
 from agentic_job_search.snapshot_prune import drop_job_detail_pane, prune_search_snapshot
-from agentic_job_search.text_budget import quote_for_error, snippet, truncate_reported
+from agentic_job_search.text_budget import format_compact_count, quote_for_error, snippet, truncate_reported
 from agentic_job_search.triage import provider_error
 
 logger = logging.getLogger(__name__)
@@ -331,8 +331,10 @@ def page_results_kept_for(model: str) -> int | None:
     return SCRAPER_LOCAL_PAGE_RESULTS_KEPT if route_for(model) == LOCAL_ROUTE else SCRAPER_OPENROUTER_PAGE_RESULTS_KEPT
 
 
-def elide_superseded_page_results(messages: list[dict], keep: int) -> list[tuple[int, str, int]]:
-    '''Replace every browser page result but the newest `keep` with a stub; return (index, tool, chars) of each.
+def elide_superseded_page_results(messages: list[dict], keep: int) -> list[tuple[int, str, int, int]]:
+    '''Replace every browser page result but the newest `keep` with a stub.
+
+    Returns (message index, tool name, chars before, chars of the stub) for each result replaced.
 
     A page result is a browser-tool result (not one of LOCAL_TOOL_NAMES, whose short replies carry
     the loop's own guidance) of at least SCRAPER_PAGE_RESULT_MIN_CHARS. The stub keeps the result's
@@ -357,7 +359,7 @@ def elide_superseded_page_results(messages: list[dict], keep: int) -> list[tuple
             f'{ELIDED_RESULT_MARKER} this {name} result ({len(content):,} chars) was replaced by this note '
             f'because a later page read supersedes it; every ref in it is stale. It began: '
             f'{content[:SCRAPER_ELIDED_RESULT_HEAD_CHARS]!r} … Call browser_snapshot to see the page as it is now.]')
-        elided.append((index, name, len(content)))
+        elided.append((index, name, len(content), len(messages[index]['content'])))
     return elided
 
 
@@ -986,12 +988,14 @@ class ScrapeSession:
         for i in range(SCRAPER_OPENROUTER_MAX_ITERATIONS):
             self.iterations = i + 1
             if keep is not None:
-                for index, name, chars in elide_superseded_page_results(messages, keep):
+                for _, name, chars_before, chars_after in elide_superseded_page_results(messages, keep):
                     self.elided_results += 1
-                    self.elided_chars += chars
+                    self.elided_chars += chars_before
+                    reduction_percent = round(100 * (1 - chars_after / chars_before))
                     # INFO, not WARNING: the window is by design (SCRAPER_*_PAGE_RESULTS_KEPT) and the
                     # model is told in the stub; one line per elision keeps what was cut visible.
-                    logger.info(f'Stage 1b: elided the {name} result at message {index} ({chars:,} chars) for '
+                    logger.info(f'Stage 1b: elided {name} yaml {format_compact_count(chars_before)} -> '
+                                f'{format_compact_count(chars_after)} chars (-{reduction_percent}%) for '
                                 f'query {self.query!r} at turn {self.iterations}; newest {keep} kept whole')
             chat_args = {'messages': messages, 'model': self.model, 'tools': tools}
             if self.pin is not None and self.pin.tag:
